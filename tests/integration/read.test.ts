@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { expect, test } from 'vitest';
+import { BrainError } from '../../src/contracts/errors.js';
 import { RENDERED_NOTE_MAX_BYTES } from '../../src/core/limits.js';
 import type { MutationReceipt, NoteInput, StoredRevision } from '../../src/core/types.js';
 import { clampReadBudget, paginate, read, READ_WARNING_HISTORICAL } from '../../src/features/read.js';
@@ -209,6 +210,130 @@ test('returns an old revision with a historical warning', async () => {
   await h.close();
 });
 
+test('reports the historical warning on every page selected by an old revision', async () => {
+  const h = await createHarness();
+  await installSecret(h);
+  const head = await h.seed(longLesson(4000));
+  (await review(
+    reviewerContext,
+    {
+      scope: 'freellmapi',
+      operation: {
+        action: 'revise',
+        idempotency_key: randomUUID(),
+        id: head.revision.id,
+        expected_etag: head.source.etag,
+        rationale: 'chain for per-page history',
+        note: { ...lessonFixture, title: 'Revised lesson fixture' }
+      }
+    },
+    h.deps
+  )) as MutationReceipt;
+  const first = await read(
+    workerContext,
+    {
+      scope: 'freellmapi',
+      id: head.revision.id,
+      revision_id: head.revision.revision_id,
+      budget_tokens: 256
+    },
+    h.deps
+  );
+  expect(first.source.warnings).toContain(READ_WARNING_HISTORICAL);
+  expect(first.next_cursor).toBeDefined();
+  const second = await read(
+    workerContext,
+    { scope: 'freellmapi', id: head.revision.id, budget_tokens: 256, cursor: first.next_cursor as string },
+    h.deps
+  );
+  expect(second.source.warnings).toContain(READ_WARNING_HISTORICAL);
+  expect(second.source.revision_id).toBe(head.revision.revision_id);
+  expect(second.source.etag).toBe(first.source.etag);
+  await h.close();
+});
+
+test('returns NOT_FOUND when a selected historical revision disappeared', async () => {
+  const h = await createHarness();
+  await installSecret(h);
+  const head = await h.seed(longLesson(4000));
+  (await review(
+    reviewerContext,
+    {
+      scope: 'freellmapi',
+      operation: {
+        action: 'revise',
+        idempotency_key: randomUUID(),
+        id: head.revision.id,
+        expected_etag: head.source.etag,
+        rationale: 'chain for deleted history',
+        note: { ...lessonFixture, title: 'Revised lesson fixture' }
+      }
+    },
+    h.deps
+  )) as MutationReceipt;
+  const updated = await h.deps.catalogue.get('freellmapi', head.revision.id);
+  expect(updated.revision.revision_id).not.toBe(head.revision.revision_id);
+  const first = await read(
+    workerContext,
+    {
+      scope: 'freellmapi',
+      id: head.revision.id,
+      revision_id: head.revision.revision_id,
+      budget_tokens: 256
+    },
+    h.deps
+  );
+  expect(first.next_cursor).toBeDefined();
+  await rm(vaultAbsolute(h, head.source.relative_path));
+  await expect(
+    read(
+      workerContext,
+      { scope: 'freellmapi', id: head.revision.id, revision_id: head.revision.revision_id },
+      h.deps
+    )
+  ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  await expect(
+    read(
+      workerContext,
+      {
+        scope: 'freellmapi',
+        id: head.revision.id,
+        budget_tokens: 256,
+        cursor: first.next_cursor as string
+      },
+      h.deps
+    )
+  ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  const current = await read(workerContext, { scope: 'freellmapi', id: head.revision.id }, h.deps).catch(
+    (error: unknown) => error
+  );
+  expect(current).toMatchObject({ code: 'CONFLICT' });
+  await h.close();
+});
+
+test('serves a manually-edited head with the manual_unreviewed warning', async () => {
+  const h = await createHarness();
+  await installSecret(h);
+  const head = await h.seed(lessonFixture, { status: 'active' });
+  await h.externalEdit(head, (raw) => raw.replace('First-token latency', 'Manually edited latency'));
+  const result = await read(workerContext, { scope: 'freellmapi', id: head.revision.id }, h.deps);
+  expect(result.source.warnings).toContain('manual_unreviewed');
+  expect(result.source.status).toBe('candidate');
+  expect(result.markdown).toContain('Manually edited latency');
+  await h.close();
+});
+
+test('refuses a malformed head', async () => {
+  const h = await createHarness();
+  await installSecret(h);
+  const head = await h.seed(lessonFixture);
+  await h.externalEdit(head, (raw) => raw.replace('---\n', '---\nbroken: [unclosed\n'));
+  await expect(
+    read(workerContext, { scope: 'freellmapi', id: head.revision.id }, h.deps)
+  ).rejects.toMatchObject({ code: 'CONFLICT' });
+  await h.close();
+});
+
 test('refuses to continue a page after the file changed', async () => {
   const h = await createHarness();
   await installSecret(h);
@@ -393,6 +518,13 @@ test('requires a unique valid head', async () => {
   await expect(
     read(workerContext, { scope: 'freellmapi', id: head.revision.id }, h.deps)
   ).rejects.toMatchObject({ code: 'CONFLICT' });
+  await expect(
+    read(
+      workerContext,
+      { scope: 'freellmapi', id: head.revision.id, revision_id: head.revision.revision_id },
+      h.deps
+    )
+  ).rejects.toMatchObject({ code: 'CONFLICT' });
   await h.close();
 });
 
@@ -416,9 +548,20 @@ test('returns UNSUPPORTED_SCHEMA without inventing a source reference', async ()
   ].join('\n');
   await writeVaultFile(h, `freellmapi/Lessons/${id}/${revisionId}.md`, raw);
   await h.deps.catalogue.reconcile('freellmapi');
-  await expect(
-    read(workerContext, { scope: 'freellmapi', id }, h.deps)
-  ).rejects.toMatchObject({ code: 'UNSUPPORTED_SCHEMA' });
+  let caught: unknown;
+  try {
+    await read(workerContext, { scope: 'freellmapi', id }, h.deps);
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toMatchObject({ code: 'UNSUPPORTED_SCHEMA' });
+  expect(caught).not.toHaveProperty('source');
+  expect(caught).not.toHaveProperty('markdown');
+  const message = (caught as Error).message;
+  expect(message).toContain(id);
+  expect(message).toContain('freellmapi');
+  expect(message).not.toContain('Future schema');
+  expect(message).not.toContain('body');
   await h.close();
 });
 
@@ -428,6 +571,58 @@ test('fails closed when the cursor secret is not configured', async () => {
   await expect(
     read(workerContext, { scope: 'freellmapi', id: head.revision.id, budget_tokens: 256 }, h.deps)
   ).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+  await h.close();
+});
+
+test('fails closed when the cursor secret is too short', async () => {
+  const h = await createHarness();
+  await mkdir(secretRoot, { recursive: true });
+  const directory = await mkdtemp(join(secretRoot, 'short-'));
+  const path = join(directory, 'cursor-key');
+  await writeFile(path, Buffer.alloc(16, 1));
+  h.deps.config.cursor_secret_file = path;
+  const head = await h.seed(longLesson(4000));
+  await expect(
+    read(workerContext, { scope: 'freellmapi', id: head.revision.id, budget_tokens: 256 }, h.deps)
+  ).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+  await h.close();
+});
+
+test('propagates a vault failure while checking a conflicted source', async () => {
+  const h = await createHarness();
+  await installSecret(h);
+  const head = await h.seed(lessonFixture);
+  const raw = await readFile(vaultAbsolute(h, head.source.relative_path), 'utf8');
+  const directory = head.source.relative_path.split('/').slice(0, -1).join('/');
+  await writeVaultFile(h, `${directory}/duplicate.md`, raw);
+  await h.deps.catalogue.reconcile('freellmapi');
+  h.deps.vault.list = async () => {
+    throw new BrainError({ code: 'RECOVERY_REQUIRED', message: 'vault list failed' });
+  };
+  await expect(
+    read(workerContext, { scope: 'freellmapi', id: head.revision.id }, h.deps)
+  ).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+  await h.close();
+});
+
+test('rejects an over-limit materialized document before pagination', async () => {  const h = await createHarness();
+  await installSecret(h);
+  const head = await h.seed(lessonFixture);
+  const real = await h.deps.vault.read('freellmapi', head.source.relative_path);
+  const original = h.deps.vault.read.bind(h.deps.vault);
+  let calls = 0;
+  h.deps.vault.read = async (scope, relativePath) => {
+    calls += 1;
+    if (calls === 1) return original(scope, relativePath);
+    return {
+      raw: 'x'.repeat(RENDERED_NOTE_MAX_BYTES + 1),
+      raw_hash: real.raw_hash,
+      relative_path: relativePath
+    };
+  };
+  await expect(
+    read(workerContext, { scope: 'freellmapi', id: head.revision.id }, h.deps)
+  ).rejects.toMatchObject({ code: 'LIMIT_EXCEEDED' });
   await h.close();
 });
 

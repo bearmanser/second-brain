@@ -17,6 +17,7 @@ import type {
   ScopeConfig,
   SourceRef
 } from '../core/types.js';
+import { decodeRevision } from '../notes/codec.js';
 import { resolveScopes } from '../security/authorise.js';
 import { countReferenceTokens } from '../retrieval/budget.js';
 import {
@@ -26,6 +27,8 @@ import {
 } from '../retrieval/cursor.js';
 
 export const READ_WARNING_HISTORICAL = 'historical';
+
+const MIN_CURSOR_SECRET_BYTES = 32;
 
 function invalidInput(message: string, cause?: unknown): BrainError {
   return new BrainError({ code: 'INVALID_INPUT', message, cause });
@@ -41,6 +44,10 @@ function conflict(message: string): BrainError {
 
 function notFound(message: string): BrainError {
   return new BrainError({ code: 'NOT_FOUND', message });
+}
+
+function limitExceeded(message: string): BrainError {
+  return new BrainError({ code: 'LIMIT_EXCEEDED', message });
 }
 
 function recoveryRequired(message: string, cause?: unknown): BrainError {
@@ -83,17 +90,75 @@ function loadCursorSecret(deps: BrainDeps): Uint8Array {
   if (bytes.length === 0) {
     throw recoveryRequired('the read-cursor signing secret is empty');
   }
+  if (bytes.length < MIN_CURSOR_SECRET_BYTES) {
+    throw recoveryRequired(
+      `the read-cursor signing secret must be at least ${MIN_CURSOR_SECRET_BYTES} bytes`
+    );
+  }
   return new Uint8Array(bytes);
 }
 
-async function sourcePresent(scope: string, id: string, deps: BrainDeps): Promise<boolean> {
-  let paths: string[];
-  try {
-    paths = await deps.vault.list(scope);
-  } catch {
-    return true;
+function declaredIdentity(raw: string): { id?: string; revisionId?: string } {
+  const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+  const lines = text.split('\n');
+  if (lines[0]?.trim() !== '---') return {};
+  let close = -1;
+  for (let index = 1; index < lines.length; index += 1) {
+    if (lines[index].trim() === '---') {
+      close = index;
+      break;
+    }
   }
-  return paths.some((path) => path.split('/').includes(id));
+  if (close === -1) return {};
+  const frontmatter = lines.slice(1, close).join('\n');
+  const read = (key: string): string | undefined => {
+    const match = new RegExp(`^[ \\t]*${key}:[ \\t]*(.*)$`, 'm').exec(frontmatter);
+    if (match === null) return undefined;
+    const value = match[1].trim().replace(/^["']|["']$/g, '');
+    return value.length > 0 ? value : undefined;
+  };
+  return { id: read('brain_id'), revisionId: read('brain_revision_id') };
+}
+
+interface SelectedIdentity {
+  id: string;
+  revision_id?: string;
+}
+
+type SourceLookup = 'present' | 'missing' | 'unreadable';
+
+async function selectedSourceState(
+  scope: ScopeConfig,
+  selected: SelectedIdentity,
+  deps: BrainDeps
+): Promise<SourceLookup> {
+  const paths = await deps.vault.list(scope.id);
+  let unreadable = false;
+  for (const path of paths) {
+    let file: { raw: string; raw_hash: string; relative_path: string };
+    try {
+      file = await deps.vault.read(scope.id, path);
+    } catch (error) {
+      if (isBrainError(error) && error.code === 'NOT_FOUND') continue;
+      throw error;
+    }
+    try {
+      const revision = decodeRevision(file.raw);
+      if (revision.id !== selected.id) continue;
+      if (selected.revision_id !== undefined && revision.revision_id !== selected.revision_id) {
+        continue;
+      }
+      return 'present';
+    } catch {
+      const declared = declaredIdentity(file.raw);
+      if (declared.id !== selected.id) continue;
+      if (selected.revision_id !== undefined && declared.revisionId !== selected.revision_id) {
+        continue;
+      }
+      unreadable = true;
+    }
+  }
+  return unreadable ? 'unreadable' : 'missing';
 }
 
 async function loadHead(
@@ -108,12 +173,15 @@ async function loadHead(
       ? await deps.catalogue.get(scope.id, request.id)
       : await deps.catalogue.getRevision(scope.id, request.id, revisionId);
   } catch (error) {
-    if (
-      isBrainError(error) &&
-      error.code === 'CONFLICT' &&
-      !(await sourcePresent(scope.id, request.id, deps))
-    ) {
-      throw notFound(`note ${request.id} has no remaining source file in scope ${scope.id}`);
+    if (isBrainError(error) && error.code === 'CONFLICT') {
+      const lookup = await selectedSourceState(
+        scope,
+        { id: request.id, ...(revisionId === undefined ? {} : { revision_id: revisionId }) },
+        deps
+      );
+      if (lookup === 'missing') {
+        throw notFound(`note ${request.id} has no remaining source file in scope ${scope.id}`);
+      }
     }
     throw error;
   }
@@ -121,15 +189,15 @@ async function loadHead(
 
 async function ensureHistoricalWarning(
   scope: ScopeConfig,
-  request: ReadRequest,
   head: Head,
+  selectedRevisionId: string | undefined,
   warnings: string[],
   deps: BrainDeps
 ): Promise<void> {
-  if (request.revision_id === undefined || warnings.includes(READ_WARNING_HISTORICAL)) return;
+  if (selectedRevisionId === undefined || warnings.includes(READ_WARNING_HISTORICAL)) return;
   let current: Head | undefined;
   try {
-    current = await deps.catalogue.get(scope.id, request.id);
+    current = await deps.catalogue.get(scope.id, head.revision.id);
   } catch {
     current = undefined;
   }
@@ -201,17 +269,26 @@ export async function read(
   }
 
   const head = await loadHead(scope, request, cursor, deps);
-  if (head.state === 'malformed') {
-    throw conflict(`note ${request.id} is malformed and cannot be read`);
+  if (head.state === 'conflict' || head.state === 'malformed') {
+    throw conflict(`note ${request.id} has a ${head.state} head and cannot be read`);
   }
 
   const markdown = await readMaterialized(scope, head, deps);
   if (cursor !== undefined && cursor.raw_hash !== head.raw_hash) {
     throw conflict('the note changed since the page cursor was issued; restart the read');
   }
+  if (Buffer.byteLength(markdown, 'utf8') > RENDERED_NOTE_MAX_BYTES) {
+    throw limitExceeded(
+      `note ${request.id} exceeds the ${RENDERED_NOTE_MAX_BYTES} byte rendered note limit`
+    );
+  }
 
   const warnings = [...head.source.warnings];
-  await ensureHistoricalWarning(scope, request, head, warnings, deps);
+  if (head.state === 'manual_unreviewed' && !warnings.includes('manual_unreviewed')) {
+    warnings.push('manual_unreviewed');
+  }
+  const selectedRevisionId = cursor?.revision_id ?? request.revision_id;
+  await ensureHistoricalWarning(scope, head, selectedRevisionId, warnings, deps);
   const source: SourceRef = { ...head.source, warnings };
 
   const budget = clampReadBudget(request.budget_tokens);

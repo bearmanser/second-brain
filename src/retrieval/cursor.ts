@@ -35,6 +35,7 @@ const STRING_FIELDS: readonly CursorField[] = [
 ];
 
 const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
+const UTC_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
 
 function invalid(message: string): BrainError {
   return new BrainError({ code: 'INVALID_INPUT', message });
@@ -82,6 +83,9 @@ function parsePayload(value: unknown): CursorPayload {
       throw invalid(`read cursor ${field} is invalid`);
     }
     strings[field] = entry;
+  }
+  if (!UTC_TIMESTAMP_PATTERN.test(strings.expires_at)) {
+    throw invalid('read cursor expires_at must be a UTC RFC3339 timestamp');
   }
   const offset = record.offset;
   if (typeof offset !== 'number' || !Number.isSafeInteger(offset) || offset < 0) {

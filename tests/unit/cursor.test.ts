@@ -120,6 +120,19 @@ test('rejects an invalid expiry', () => {
   expect(() => verifyCursor(cursor, KEY, reviewerContext, NOW)).toThrow(/INVALID_INPUT/);
 });
 
+test('rejects a non-UTC or non-RFC3339 expiry', () => {
+  for (const value of [
+    '2026-09-20T12:10:00+02:00',
+    '2026-09-20T12:10:00z',
+    '2026-09-20T12:10:00',
+    '2026-09-20',
+    '20260920T121000Z'
+  ]) {
+    const cursor = signCursor(payload({ expires_at: value }) as never, KEY);
+    expect(() => verifyCursor(cursor, KEY, reviewerContext, NOW)).toThrow(/INVALID_INPUT/);
+  }
+});
+
 test('rejects negative, fractional, and non-numeric offsets', () => {
   for (const offset of [-1, 1.5, Number.NaN, '5']) {
     const cursor = signCursor(payload({ offset }) as never, KEY);
