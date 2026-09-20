@@ -7,3 +7,6 @@ coverage/
 *.log
 .DS_Store
 basic-memory-data/
+secrets/
+vault/
+config/brain.yaml

@@ -29,13 +29,16 @@ function applyEnvironment(config: BrainConfig, env: NodeJS.ProcessEnv): BrainCon
   return next;
 }
 
-export async function main(env: NodeJS.ProcessEnv = process.env): Promise<BrainRuntime> {
+export function resolveConfig(env: NodeJS.ProcessEnv = process.env): BrainConfig {
   const configPath = env.BRAIN_CONFIG ?? DEFAULT_CONFIG_PATH;
-  const config = applyEnvironment(loadConfig(configPath), env);
-  return createRuntime(config);
+  return applyEnvironment(loadConfig(configPath), env);
 }
 
-function installShutdownHandlers(runtime: BrainRuntime): void {
+export async function main(env: NodeJS.ProcessEnv = process.env): Promise<BrainRuntime> {
+  return createRuntime(resolveConfig(env));
+}
+
+export function installShutdownHandlers(runtime: BrainRuntime): void {
   let shuttingDown = false;
   const shutdown = (): void => {
     if (shuttingDown) return;

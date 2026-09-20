@@ -191,3 +191,51 @@ npm run typecheck
 node scripts/lock-images.mjs
 BACKEND_MCP_URL=http://127.0.0.1:8000/mcp npx tsx scripts/probe-compatibility.mts
 ```
+
+## Task 16 deployment observations
+
+Observed on the execution host on 2026-09-20 by running the packaged Compose
+deployment end to end (`tests/e2e/docker.test.ts`, 6 tests) against the
+digest-pinned images recorded above.
+
+- **Embedding model cache path.** The backend writes FastEmbed artifacts under
+  its data directory, not the process home `~/.cache`. With
+  `BASIC_MEMORY_CONFIG_DIR=/home/appuser/.basic-memory`, the measured cache path
+  is `/home/appuser/.basic-memory/fastembed_cache`
+  (`models--qdrant--bge-small-en-v1.5-onnx-q`, 64.1 MiB after the first semantic
+  use). `compose.yaml` mounts the `model-cache` named volume at that verified
+  path instead of the planned `/home/appuser/.cache`. After warming, hybrid
+  search returned the seeded note with the Compose network switched to
+  `internal: true` (no external egress), so the cached model is sufficient
+  offline. Recreating the stack that way requires `docker compose down` first;
+  a `docker compose stop` followed by an override `up` failed with
+  `failed to set up container networking: network <id> not found` because the
+  default network had been recreated. That is a Compose network-lifecycle
+  behavior, not a backend property.
+- **Implicit `main` project.** Basic Memory seeds a `main` project when the
+  config file is first created. `BASIC_MEMORY_HOME` is set to
+  `/home/appuser/.basic-memory/home` so that placeholder stays inside the
+  `memory-state` volume and does not add a `basic-memory/` directory to the
+  Obsidian vault.
+- **Project seeding.** `basic-memory project add` ignores an explicit path when
+  `BASIC_MEMORY_PROJECT_ROOT` is set and instead maps `name` to
+  `<root>/<name>`. The one-shot seeding helper therefore runs with
+  `BASIC_MEMORY_PROJECT_ROOT` unset, which records the documented nested paths
+  `/app/data/Projects/freellmapi`, `/app/data/Shared`, and `/app/data/Profile`.
+  The long-running service keeps `BASIC_MEMORY_PROJECT_ROOT=/app/data`; it loads
+  those explicit paths unchanged, and the vault layout matches the scope
+  `relative_root` values.
+- **Host header allowlist.** The gateway matches the `Host` header by hostname
+  only (`src/mcp/http.ts`), so the generated `config/brain.yaml` uses bare
+  `127.0.0.1` and `localhost`. The port-qualified entries in the documented
+  `config/brain.example.yaml` never match a real request; operators copying that
+  example should drop the ports. The generated deployment config is correct.
+- **Deployment commands verified.** `scripts/setup.sh` (strict
+  `config/images.env` parsing, image build, one-shot bootstrap, named-volume
+  initialization, Basic Memory project seeding) is idempotent: a rerun preserved
+  the client token, the credentials digest, project mappings, and `.env` user
+  settings. `docker compose config` interpolated the pinned digests;
+  `docker compose up -d --build` produced one published loopback gateway port
+  and no published backend port; `docker compose exec brain node dist/cli.js
+  health` exited 0; a restart preserved captured state; the gateway vault mount
+  was read-only; both containers ran as uid 1000.
