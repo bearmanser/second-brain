@@ -64,6 +64,7 @@ export class FakeBackend implements BackendPort {
   readonly projects: readonly string[];
   readonly create_calls: PlannedWrite[] = [];
   fail_once?: FakeBackendFault;
+  on_create?: (write: PlannedWrite) => void | Promise<void>;
   call_count = 0;
   private connected = false;
 
@@ -104,6 +105,7 @@ export class FakeBackend implements BackendPort {
     }
     mkdirSync(dirname(absolutePath), { recursive: true });
     writeFileSync(absolutePath, this.renderDocument(write), 'utf8');
+    if (this.on_create !== undefined) await this.on_create(write);
     if (this.fail_once === 'after_write') {
       this.fail_once = undefined;
       throw unavailable('fake backend wrote the note but lost the response');
