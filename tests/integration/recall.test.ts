@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { expect, test, vi } from 'vitest';
+import { BrainError } from '../../src/contracts/errors.js';
 import type {
   BackendSearch,
   Head,
@@ -9,6 +10,7 @@ import type {
   StoredRevision
 } from '../../src/core/types.js';
 import {
+  RECALL_WARNING_BACKEND_PARTIAL,
   RECALL_WARNING_CANDIDATE,
   RECALL_WARNING_DEADLINE_EXCEEDED,
   RECALL_WARNING_EMBEDDINGS_FALLBACK,
@@ -745,6 +747,80 @@ test('returns accumulated results with a deadline warning when retrieval runs ou
   expect(result.partial).toBe(true);
   expect(result.warnings).toContain(RECALL_WARNING_DEADLINE_EXCEEDED);
   expect(result.items).toHaveLength(1);
+  await h.close();
+});
+
+test('flags a single call that completes after the internal retrieval deadline', async () => {
+  const h = await createHarness();
+  await h.seed(lessonFixture, { status: 'active' });
+  h.deps.config.limits.backend_timeout_ms = 50;
+  const original = h.backend.search.bind(h.backend);
+  let calls = 0;
+  h.backend.search = async (input: BackendSearch) => {
+    calls += 1;
+    const real = await original(input);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    return { hits: real.hits, has_more: false };
+  };
+
+  const result = await recall(reviewerContext, { scope: 'freellmapi', query: 'streaming' }, h.deps);
+  expect(calls).toBe(1);
+  expect(result.partial).toBe(true);
+  expect(result.warnings).toContain(RECALL_WARNING_DEADLINE_EXCEEDED);
+  expect(result.items).toHaveLength(1);
+  await h.close();
+});
+
+test('keeps page-one results when a later page times out', async () => {
+  const h = await createHarness();
+  await h.seed(lessonFixture, { status: 'active' });
+  const original = h.backend.search.bind(h.backend);
+  let calls = 0;
+  h.backend.search = async (input: BackendSearch) => {
+    calls += 1;
+    if (calls === 1) {
+      const real = await original(input);
+      return { hits: real.hits, has_more: true };
+    }
+    throw new BrainError({ code: 'BACKEND_UNAVAILABLE', message: 'backend timed out on page two' });
+  };
+
+  const result = await recall(reviewerContext, { scope: 'freellmapi', query: 'streaming' }, h.deps);
+  expect(calls).toBe(2);
+  expect(result.partial).toBe(true);
+  expect(result.warnings).toContain(RECALL_WARNING_BACKEND_PARTIAL);
+  expect(result.items).toHaveLength(1);
+  expect(result.budget.used).toBeLessThanOrEqual(result.budget.limit);
+  await h.close();
+});
+
+test('keeps the earlier scope results when a later scope times out', async () => {
+  const h = await createHarness();
+  await h.seed(
+    lessonNote('scopefailquery owned note'),
+    { scope: 'freellmapi', status: 'active' }
+  );
+  await h.seed(
+    lessonNote('scopefailquery shared note'),
+    { scope: 'shared', status: 'active' }
+  );
+  const original = h.backend.search.bind(h.backend);
+  h.backend.search = async (input: BackendSearch) => {
+    if (input.project === 'shared') {
+      throw new BrainError({ code: 'BACKEND_UNAVAILABLE', message: 'shared scope is offline' });
+    }
+    return original(input);
+  };
+
+  const result = await recall(reviewerContext, {
+    scope: 'freellmapi',
+    query: 'scopefailquery',
+    include_shared: true
+  }, h.deps);
+  expect(result.partial).toBe(true);
+  expect(result.warnings).toContain(RECALL_WARNING_BACKEND_PARTIAL);
+  expect(result.items).toHaveLength(1);
+  expect(result.items[0].scope).toBe('freellmapi');
   await h.close();
 });
 

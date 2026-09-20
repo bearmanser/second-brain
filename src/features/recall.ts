@@ -33,6 +33,7 @@ export const RECALL_WARNING_SEARCH_TRUNCATED = 'search_truncated';
 export const RECALL_WARNING_HIT_UNRESOLVED = 'hit_unresolved';
 export const RECALL_WARNING_STALE_HITS_EXCLUDED = 'stale_hits_excluded';
 export const RECALL_WARNING_DEADLINE_EXCEEDED = 'retrieval_deadline_exceeded';
+export const RECALL_WARNING_BACKEND_PARTIAL = 'backend_unavailable_partial';
 export const RECALL_WARNING_EMBEDDINGS_FALLBACK = 'embeddings_unavailable_text_fallback';
 export const RECALL_WARNING_CANDIDATE = 'candidate';
 export const RECALL_WARNING_SHARED_SCOPE = 'shared_scope';
@@ -116,45 +117,16 @@ function vaultRelativePath(scope: ScopeConfig, relativePath: string): string {
   return relativePath.startsWith(prefix) ? relativePath : `${prefix}${relativePath}`;
 }
 
-async function searchScope(
-  ctx: RequestContext,
-  scope: ScopeConfig,
-  searchText: string,
-  kinds: NoteKind[],
-  mode: 'hybrid' | 'text',
-  deps: BrainDeps,
-  deadline: number
-): Promise<ScopeHits> {
-  const hits: BackendHit[] = [];
-  let page = 1;
-  let deadlineExceeded = false;
-  for (; page <= BACKEND_SEARCH_PAGES; page += 1) {
-    if (ctx.signal.aborted) throw cancelled();
-    if (Date.now() >= deadline) {
-      deadlineExceeded = true;
-      break;
-    }
-    const result = await deps.backend.search({
-      project: scope.backend_project,
-      query: searchText,
-      mode,
-      kinds,
-      statuses: [...LIFECYCLES],
-      page,
-      page_size: BACKEND_SEARCH_PAGE_SIZE
-    });
-    hits.push(...result.hits);
-    if (!result.has_more) break;
-  }
-  return {
-    scope,
-    hits,
-    truncated: !deadlineExceeded && page > BACKEND_SEARCH_PAGES,
-    deadlineExceeded
-  };
+interface SearchAccumulator {
+  scopeHits: ScopeHits[];
+  processedPages: number;
+  hits: number;
+  truncated: boolean;
+  deadlineExceeded: boolean;
+  failure?: unknown;
 }
 
-async function runSearch(
+async function collectScopes(
   ctx: RequestContext,
   scopes: ScopeConfig[],
   searchText: string,
@@ -162,12 +134,64 @@ async function runSearch(
   mode: 'hybrid' | 'text',
   deps: BrainDeps,
   deadline: number
-): Promise<ScopeHits[]> {
-  const collected: ScopeHits[] = [];
+): Promise<SearchAccumulator> {
+  const accumulator: SearchAccumulator = {
+    scopeHits: [],
+    processedPages: 0,
+    hits: 0,
+    truncated: false,
+    deadlineExceeded: false
+  };
+
   for (const scope of scopes) {
-    collected.push(await searchScope(ctx, scope, searchText, kinds, mode, deps, deadline));
+    const result: ScopeHits = {
+      scope,
+      hits: [],
+      truncated: false,
+      deadlineExceeded: false
+    };
+    let page = 1;
+    for (; page <= BACKEND_SEARCH_PAGES; page += 1) {
+      if (ctx.signal.aborted) throw cancelled();
+      if (Date.now() >= deadline) {
+        result.deadlineExceeded = true;
+        accumulator.deadlineExceeded = true;
+        break;
+      }
+      let pageResult: { hits: BackendHit[]; has_more: boolean };
+      try {
+        pageResult = await deps.backend.search({
+          project: scope.backend_project,
+          query: searchText,
+          mode,
+          kinds,
+          statuses: [...LIFECYCLES],
+          page,
+          page_size: BACKEND_SEARCH_PAGE_SIZE
+        });
+      } catch (error) {
+        accumulator.failure = error;
+        accumulator.scopeHits.push(result);
+        return accumulator;
+      }
+      accumulator.processedPages += 1;
+      result.hits.push(...pageResult.hits);
+      accumulator.hits += pageResult.hits.length;
+      if (Date.now() >= deadline) {
+        result.deadlineExceeded = true;
+        accumulator.deadlineExceeded = true;
+        break;
+      }
+      if (!pageResult.has_more) break;
+    }
+    if (!result.deadlineExceeded && page > BACKEND_SEARCH_PAGES) {
+      result.truncated = true;
+      accumulator.truncated = true;
+    }
+    accumulator.scopeHits.push(result);
   }
-  return collected;
+
+  return accumulator;
 }
 
 type HeadLookup =
@@ -417,22 +441,47 @@ export async function recall(
   const deadline =
     Date.now() + (deps.config.limits.backend_timeout_ms ?? BACKEND_TIMEOUT_MS);
 
-  let scopeHits: ScopeHits[];
-  try {
-    scopeHits = await runSearch(ctx, scopes, searchText, kinds, mode, deps, deadline);
-  } catch (error) {
-    if (
-      isBrainError(error) &&
-      error.code === 'EMBEDDINGS_UNAVAILABLE' &&
-      mode === 'hybrid' &&
-      request.allow_text_fallback === true
-    ) {
-      mode = 'text';
-      partial = true;
+  let accumulator = await collectScopes(ctx, scopes, searchText, kinds, mode, deps, deadline);
+
+  if (
+    accumulator.failure !== undefined &&
+    isBrainError(accumulator.failure) &&
+    accumulator.failure.code === 'EMBEDDINGS_UNAVAILABLE' &&
+    mode === 'hybrid' &&
+    request.allow_text_fallback === true
+  ) {
+    const fallback = await collectScopes(ctx, scopes, searchText, kinds, 'text', deps, deadline);
+    mode = 'text';
+    partial = true;
+    if (!warnings.includes(RECALL_WARNING_EMBEDDINGS_FALLBACK)) {
       warnings.push(RECALL_WARNING_EMBEDDINGS_FALLBACK);
-      scopeHits = await runSearch(ctx, scopes, searchText, kinds, mode, deps, deadline);
-    } else {
-      throw error;
+    }
+    if (fallback.failure === undefined) {
+      accumulator = fallback;
+    } else if (accumulator.processedPages === 0 && accumulator.hits === 0) {
+      throw fallback.failure;
+    }
+  }
+
+  if (accumulator.failure !== undefined) {
+    if (accumulator.processedPages === 0 && accumulator.hits === 0) {
+      throw accumulator.failure;
+    }
+    partial = true;
+    if (!warnings.includes(RECALL_WARNING_BACKEND_PARTIAL)) {
+      warnings.push(RECALL_WARNING_BACKEND_PARTIAL);
+    }
+  }
+  if (accumulator.deadlineExceeded) {
+    partial = true;
+    if (!warnings.includes(RECALL_WARNING_DEADLINE_EXCEEDED)) {
+      warnings.push(RECALL_WARNING_DEADLINE_EXCEEDED);
+    }
+  }
+  if (accumulator.truncated) {
+    partial = true;
+    if (!warnings.includes(RECALL_WARNING_SEARCH_TRUNCATED)) {
+      warnings.push(RECALL_WARNING_SEARCH_TRUNCATED);
     }
   }
 
@@ -442,16 +491,8 @@ export async function recall(
   const headCache = new Map<string, HeadLookup>();
   let unresolved = false;
   let staleExcluded = false;
-  let deadlineExceeded = false;
 
-  for (const hits of scopeHits) {
-    if (hits.truncated) {
-      partial = true;
-      if (!warnings.includes(RECALL_WARNING_SEARCH_TRUNCATED)) {
-        warnings.push(RECALL_WARNING_SEARCH_TRUNCATED);
-      }
-    }
-    if (hits.deadlineExceeded) deadlineExceeded = true;
+  for (const hits of accumulator.scopeHits) {
     for (const hit of hits.hits) {
       const resolution = await resolveHit(hits.scope, hit, deps, headCache);
       if (resolution.kind === 'unresolved') {
@@ -480,12 +521,6 @@ export async function recall(
     }
   }
 
-  if (deadlineExceeded) {
-    partial = true;
-    if (!warnings.includes(RECALL_WARNING_DEADLINE_EXCEEDED)) {
-      warnings.push(RECALL_WARNING_DEADLINE_EXCEEDED);
-    }
-  }
   if (unresolved) {
     partial = true;
     if (!warnings.includes(RECALL_WARNING_HIT_UNRESOLVED)) {
