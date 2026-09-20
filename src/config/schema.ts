@@ -138,6 +138,7 @@ export const brainConfigSchema = z.strictObject({
   port: z.int().min(1).max(65535),
   mounts: brainMountsSchema,
   credentials_file: mountPath,
+  cursor_secret_file: mountPath.optional(),
   scopes: scopeListSchema,
   limits: brainLimitsSchema.default(() => ({ ...DEFAULT_LIMITS })),
   allowed_hosts: z.array(safeName).min(1),
@@ -165,6 +166,7 @@ export interface BrainConfig {
   port: number;
   mounts: BrainMounts;
   credentials_file: string;
+  cursor_secret_file?: string;
   scopes: ScopeConfig[];
   limits: BrainLimits;
   allowed_hosts: string[];

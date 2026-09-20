@@ -1,0 +1,238 @@
+import { readFileSync } from 'node:fs';
+import { BrainError, isBrainError } from '../contracts/errors.js';
+import { readRequestSchema } from '../contracts/protocol.js';
+import {
+  CURSOR_TTL_MS,
+  READ_BUDGET_TOKENS_DEFAULT,
+  READ_BUDGET_TOKENS_MAX,
+  READ_BUDGET_TOKENS_MIN,
+  RENDERED_NOTE_MAX_BYTES
+} from '../core/limits.js';
+import type { BrainDeps } from '../core/mutation.js';
+import type {
+  Head,
+  ReadRequest,
+  ReadResult,
+  RequestContext,
+  ScopeConfig,
+  SourceRef
+} from '../core/types.js';
+import { resolveScopes } from '../security/authorise.js';
+import { countReferenceTokens } from '../retrieval/budget.js';
+import {
+  signCursor,
+  verifyCursor,
+  type CursorPayload
+} from '../retrieval/cursor.js';
+
+export const READ_WARNING_HISTORICAL = 'historical';
+
+function invalidInput(message: string, cause?: unknown): BrainError {
+  return new BrainError({ code: 'INVALID_INPUT', message, cause });
+}
+
+function cancelled(): BrainError {
+  return new BrainError({ code: 'CANCELLED', message: 'the caller cancelled the read' });
+}
+
+function conflict(message: string): BrainError {
+  return new BrainError({ code: 'CONFLICT', message });
+}
+
+function notFound(message: string): BrainError {
+  return new BrainError({ code: 'NOT_FOUND', message });
+}
+
+function recoveryRequired(message: string, cause?: unknown): BrainError {
+  return new BrainError({ code: 'RECOVERY_REQUIRED', message, cause });
+}
+
+export function clampReadBudget(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return READ_BUDGET_TOKENS_DEFAULT;
+  const rounded = Math.trunc(value);
+  if (rounded < READ_BUDGET_TOKENS_MIN) return READ_BUDGET_TOKENS_MIN;
+  if (rounded > READ_BUDGET_TOKENS_MAX) return READ_BUDGET_TOKENS_MAX;
+  return rounded;
+}
+
+function parseRequest(input: ReadRequest): ReadRequest {
+  const candidate: ReadRequest = { ...input, budget_tokens: clampReadBudget(input.budget_tokens) };
+  const parsed = readRequestSchema.safeParse(candidate);
+  if (!parsed.success) {
+    const detail = parsed.error.issues
+      .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
+      .join('; ');
+    throw invalidInput(`read request is invalid: ${detail}`);
+  }
+  return parsed.data as ReadRequest;
+}
+
+function loadCursorSecret(deps: BrainDeps): Uint8Array {
+  const path = deps.config.cursor_secret_file;
+  if (path === undefined || path.length === 0) {
+    throw recoveryRequired(
+      'the read-cursor signing secret is not configured; set cursor_secret_file from BRAIN_CURSOR_SECRET'
+    );
+  }
+  let bytes: Buffer;
+  try {
+    bytes = readFileSync(path);
+  } catch (cause) {
+    throw recoveryRequired('the read-cursor signing secret cannot be read', cause);
+  }
+  if (bytes.length === 0) {
+    throw recoveryRequired('the read-cursor signing secret is empty');
+  }
+  return new Uint8Array(bytes);
+}
+
+async function sourcePresent(scope: string, id: string, deps: BrainDeps): Promise<boolean> {
+  let paths: string[];
+  try {
+    paths = await deps.vault.list(scope);
+  } catch {
+    return true;
+  }
+  return paths.some((path) => path.split('/').includes(id));
+}
+
+async function loadHead(
+  scope: ScopeConfig,
+  request: ReadRequest,
+  cursor: CursorPayload | undefined,
+  deps: BrainDeps
+): Promise<Head> {
+  const revisionId = cursor?.revision_id ?? request.revision_id;
+  try {
+    return revisionId === undefined
+      ? await deps.catalogue.get(scope.id, request.id)
+      : await deps.catalogue.getRevision(scope.id, request.id, revisionId);
+  } catch (error) {
+    if (
+      isBrainError(error) &&
+      error.code === 'CONFLICT' &&
+      !(await sourcePresent(scope.id, request.id, deps))
+    ) {
+      throw notFound(`note ${request.id} has no remaining source file in scope ${scope.id}`);
+    }
+    throw error;
+  }
+}
+
+async function ensureHistoricalWarning(
+  scope: ScopeConfig,
+  request: ReadRequest,
+  head: Head,
+  warnings: string[],
+  deps: BrainDeps
+): Promise<void> {
+  if (request.revision_id === undefined || warnings.includes(READ_WARNING_HISTORICAL)) return;
+  let current: Head | undefined;
+  try {
+    current = await deps.catalogue.get(scope.id, request.id);
+  } catch {
+    current = undefined;
+  }
+  if (current === undefined || current.revision.revision_id !== head.revision.revision_id) {
+    warnings.push(READ_WARNING_HISTORICAL);
+  }
+}
+
+async function readMaterialized(scope: ScopeConfig, head: Head, deps: BrainDeps): Promise<string> {
+  const file = await deps.vault.read(scope.id, head.source.relative_path);
+  if (file.raw_hash !== head.raw_hash) {
+    throw conflict('the note changed while it was being read; retry the request');
+  }
+  return file.raw;
+}
+
+export function paginate(
+  markdown: string,
+  offset: number,
+  budget: number
+): { page: string; nextOffset?: number } {
+  const points = [...markdown];
+  const total = points.length;
+  if (offset >= total) return { page: '' };
+  const remaining = total - offset;
+  let low = 1;
+  let high = remaining;
+  let best = 0;
+  while (low <= high) {
+    const middle = (low + high) >> 1;
+    const candidate = points.slice(offset, offset + middle).join('');
+    if (
+      countReferenceTokens(candidate) <= budget &&
+      Buffer.byteLength(candidate, 'utf8') <= RENDERED_NOTE_MAX_BYTES
+    ) {
+      best = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  if (best === 0) best = 1;
+  const end = offset + best;
+  const page = points.slice(offset, end).join('');
+  return end >= total ? { page } : { page, nextOffset: end };
+}
+
+export async function read(
+  ctx: RequestContext,
+  input: ReadRequest,
+  deps: BrainDeps
+): Promise<ReadResult> {
+  if (ctx.signal.aborted) throw cancelled();
+  const [scope] = resolveScopes(ctx.principal, input.scope, false, 'read', deps.config.scopes);
+  const request = parseRequest(input);
+  const now = deps.clock.now();
+
+  if (ctx.signal.aborted) throw cancelled();
+
+  let cursor: CursorPayload | undefined;
+  if (request.cursor !== undefined) {
+    cursor = verifyCursor(request.cursor, loadCursorSecret(deps), ctx, now);
+    if (cursor.scope !== scope.id || cursor.id !== request.id) {
+      throw invalidInput('read cursor does not belong to the requested note');
+    }
+    if (request.revision_id !== undefined && request.revision_id !== cursor.revision_id) {
+      throw invalidInput('read cursor does not match the requested revision');
+    }
+  }
+
+  const head = await loadHead(scope, request, cursor, deps);
+  if (head.state === 'malformed') {
+    throw conflict(`note ${request.id} is malformed and cannot be read`);
+  }
+
+  const markdown = await readMaterialized(scope, head, deps);
+  if (cursor !== undefined && cursor.raw_hash !== head.raw_hash) {
+    throw conflict('the note changed since the page cursor was issued; restart the read');
+  }
+
+  const warnings = [...head.source.warnings];
+  await ensureHistoricalWarning(scope, request, head, warnings, deps);
+  const source: SourceRef = { ...head.source, warnings };
+
+  const budget = clampReadBudget(request.budget_tokens);
+  const offset = cursor?.offset ?? 0;
+  const { page, nextOffset } = paginate(markdown, offset, budget);
+
+  if (nextOffset === undefined) {
+    return { source, markdown: page };
+  }
+  const expires = new Date(now.getTime() + CURSOR_TTL_MS).toISOString();
+  const next_cursor = signCursor(
+    {
+      principal_id: ctx.principal.id,
+      scope: scope.id,
+      id: head.revision.id,
+      revision_id: head.revision.revision_id,
+      raw_hash: head.raw_hash,
+      offset: nextOffset,
+      expires_at: expires
+    },
+    loadCursorSecret(deps)
+  );
+  return { source, markdown: page, next_cursor };
+}

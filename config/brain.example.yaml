@@ -29,6 +29,12 @@ mounts:
 # a high-entropy bearer token plus the exact permissions for that identity.
 credentials_file: /run/secrets/brain_credentials
 
+# Persistent, independent HMAC-SHA256 key used to sign paginated brain_read
+# cursors. `setup` generates a random 32-byte key at secrets/cursor-key and
+# Compose exposes its path as BRAIN_CURSOR_SECRET (/run/secrets/brain_cursor).
+# The key is never derived from note content and is never inlined here.
+cursor_secret_file: /run/secrets/brain_cursor
+
 # Exact Host header allowlist and optional Origin validation.
 allowed_hosts:
   - 127.0.0.1:7331
