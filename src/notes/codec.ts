@@ -182,7 +182,9 @@ function parseYamlListSection(content: string, title: string): unknown[] {
 }
 
 function parseParents(value: unknown): { revision_id: string; raw_hash: string }[] {
-  if (value === undefined) return [];
+  if (value === undefined) {
+    throw invalid('frontmatter brain_parents is required');
+  }
   if (!Array.isArray(value)) {
     throw invalid('frontmatter brain_parents must be a list');
   }
@@ -316,12 +318,18 @@ export function decodeRevision(raw: string): StoredRevision {
   const content = assembleContent(kind, sectionText);
   const evidenceSection = sectionText.get(EVIDENCE_SECTION_TITLE);
   const relatedSection = sectionText.get(RELATED_SECTION_TITLE);
-  const evidence = evidenceSection === undefined ? [] : parseYamlListSection(evidenceSection, EVIDENCE_SECTION_TITLE);
-  const relatedIds = relatedSection === undefined ? [] : parseYamlListSection(relatedSection, RELATED_SECTION_TITLE);
+  if (evidenceSection === undefined) {
+    throw invalid(`managed note is missing the ## ${EVIDENCE_SECTION_TITLE} section`);
+  }
+  if (relatedSection === undefined) {
+    throw invalid(`managed note is missing the ## ${RELATED_SECTION_TITLE} section`);
+  }
+  const evidence = parseYamlListSection(evidenceSection, EVIDENCE_SECTION_TITLE);
+  const relatedIds = parseYamlListSection(relatedSection, RELATED_SECTION_TITLE);
 
   const tagsValue = frontmatter.tags;
-  if (tagsValue !== undefined && !Array.isArray(tagsValue)) {
-    throw invalid('frontmatter tags must be a list');
+  if (!Array.isArray(tagsValue)) {
+    throw invalid('frontmatter tags is required and must be a list');
   }
 
   const scope = requireString(frontmatter, 'brain_scope');
@@ -354,7 +362,7 @@ export function decodeRevision(raw: string): StoredRevision {
 
   const candidate: NoteInput = {
     title: requireString(frontmatter, 'brain_title'),
-    tags: Array.isArray(tagsValue) ? (tagsValue as string[]) : [],
+    tags: tagsValue as string[],
     content: content as NoteInput['content'],
     evidence: evidence as NoteInput['evidence'],
     related_ids: relatedIds as NoteInput['related_ids']
@@ -514,28 +522,40 @@ export function renderRevisionBody(revision: StoredRevision): string {
   return `${blocks.join('\n\n')}\n`;
 }
 
-export function renderRevision(revision: StoredRevision, scope: ScopeConfig): string {
-  const { frontmatter } = buildFrontmatter(revision, scope);
-  const body = renderRevisionBody(revision);
-  return `---\n${stringifyYaml(frontmatter)}\n---\n\n${body}`;
+interface RenderedDocument {
+  frontmatter: Record<string, unknown>;
+  body: string;
+  document: string;
+  directory: string;
+  storedTitle: string;
+  permalink: string;
 }
 
-export function encodeRevision(revision: StoredRevision, scope: ScopeConfig): PlannedWrite {
+function renderDocument(revision: StoredRevision, scope: ScopeConfig): RenderedDocument {
   const { frontmatter, directory, storedTitle, permalink } = buildFrontmatter(revision, scope);
   const body = renderRevisionBody(revision);
-  const rendered = `---\n${stringifyYaml(frontmatter)}\n---\n\n${body}`;
-  const renderedBytes = Buffer.byteLength(rendered, 'utf8');
+  const document = `---\n${stringifyYaml(frontmatter)}\n---\n\n${body}`;
+  const renderedBytes = Buffer.byteLength(document, 'utf8');
   if (renderedBytes > RENDERED_NOTE_MAX_BYTES) {
     throw limitExceeded(`rendered note is ${renderedBytes} bytes and exceeds the ${RENDERED_NOTE_MAX_BYTES} byte limit`);
   }
+  return { frontmatter, body, document, directory, storedTitle, permalink };
+}
+
+export function renderRevision(revision: StoredRevision, scope: ScopeConfig): string {
+  return renderDocument(revision, scope).document;
+}
+
+export function encodeRevision(revision: StoredRevision, scope: ScopeConfig): PlannedWrite {
+  const rendered = renderDocument(revision, scope);
   return {
     revision,
     backend_project: scope.backend_project,
-    directory,
-    storage_title: storedTitle,
-    permalink,
-    body,
-    metadata: frontmatter
+    directory: rendered.directory,
+    storage_title: rendered.storedTitle,
+    permalink: rendered.permalink,
+    body: rendered.body,
+    metadata: rendered.frontmatter
   };
 }
 

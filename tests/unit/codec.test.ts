@@ -15,6 +15,7 @@ import {
   sectionTitle
 } from '../../src/notes/registry.js';
 import { revisionDirectory } from '../../src/notes/identity.js';
+import { BrainError, type BrainErrorCode } from '../../src/contracts/errors.js';
 import type { NoteContent, NoteInput, ScopeConfig, StoredRevision } from '../../src/core/types.js';
 import { fixtureIds, lessonFixture } from '../fixtures/content.js';
 import { scopeFixtures } from '../fixtures/principals.js';
@@ -124,6 +125,17 @@ const makeRevision = (note: NoteInput, overrides: Partial<StoredRevision> = {}):
 
 const lessonRevision = makeRevision(lessonFixture);
 
+const expectBrainCode = (run: () => unknown, code: BrainErrorCode): void => {
+  try {
+    run();
+  } catch (error) {
+    expect(error).toBeInstanceOf(BrainError);
+    expect((error as BrainError).code).toBe(code);
+    return;
+  }
+  throw new Error(`expected BrainError ${code} but nothing was thrown`);
+};
+
 test('preserves manual additions outside typed fields', () => {
   const raw = readFileSync('tests/fixtures/vault/lesson.md', 'utf8');
   const revision = decodeRevision(raw);
@@ -207,8 +219,8 @@ test('uses generated directories that never depend on a model-supplied path', ()
 
 test('verifies the configured scope instead of reading global state', () => {
   const mismatched = makeRevision(lessonFixture, { scope: 'profile' });
-  expect(() => encodeRevision(mismatched, scope)).toThrowError(/INVALID_INPUT/);
-  expect(() => encodeRevision(lessonRevision, scopeById('shared'))).toThrowError(/INVALID_INPUT/);
+  expectBrainCode(() => encodeRevision(mismatched, scope), 'INVALID_INPUT');
+  expectBrainCode(() => encodeRevision(lessonRevision, scopeById('shared')), 'INVALID_INPUT');
 });
 
 test('makeEtag binds the revision identity to the raw hash', () => {
@@ -256,7 +268,7 @@ test('rejects duplicate reserved headings instead of guessing', () => {
     '## Lesson\n\n',
     '## Lesson\n\nFirst lesson paragraph.\n\n## Lesson\n\nSecond lesson paragraph.\n\n'
   );
-  expect(() => decodeRevision(raw)).toThrowError(/INVALID_INPUT/);
+  expectBrainCode(() => decodeRevision(raw), 'INVALID_INPUT');
 });
 
 test('treats headings inside code fences as section content', () => {
@@ -294,62 +306,81 @@ test('rejects YAML duplicate keys, aliases, and explicit tags', () => {
     /^brain_id: /m,
     'brain_id: 00000000-0000-4000-8000-000000000009\nbrain_id: '
   );
-  expect(() => decodeRevision(duplicateKey)).toThrowError(/INVALID_INPUT/);
+  expectBrainCode(() => decodeRevision(duplicateKey), 'INVALID_INPUT');
 
   const aliased = renderRevision(lessonRevision, scope).replace(
     '\n---\n\n',
     '\nanchored: &a 1\nreference: *a\n---\n\n'
   );
-  expect(() => decodeRevision(aliased)).toThrowError(/INVALID_INPUT/);
+  expectBrainCode(() => decodeRevision(aliased), 'INVALID_INPUT');
 
   const tagged = renderRevision(lessonRevision, scope).replace(
     '\n---\n\n',
     '\ntagged: !!binary aGk=\n---\n\n'
   );
-  expect(() => decodeRevision(tagged)).toThrowError(/INVALID_INPUT/);
+  expectBrainCode(() => decodeRevision(tagged), 'INVALID_INPUT');
 });
 
 test('rejects reserved-field collisions and malformed parents', () => {
   const colliding = makeRevision(lessonFixture, {
     extra_frontmatter: { brain_id: fixtureIds.replacement }
   });
-  expect(() => encodeRevision(colliding, scope)).toThrowError(/INVALID_INPUT/);
+  expectBrainCode(() => encodeRevision(colliding, scope), 'INVALID_INPUT');
 
   const badParent = renderRevision(lessonRevision, scope).replace(
     'brain_parents: []',
     'brain_parents:\n  - not-a-uuid@zzz'
   );
-  expect(() => decodeRevision(badParent)).toThrowError(/INVALID_INPUT/);
+  expectBrainCode(() => decodeRevision(badParent), 'INVALID_INPUT');
 });
 
 test('rejects unparseable managed notes and future schemas', () => {
-  expect(() => decodeRevision('# Not a managed note\n')).toThrowError(/INVALID_INPUT/);
+  expectBrainCode(() => decodeRevision('# Not a managed note\n'), 'INVALID_INPUT');
 
   const unknownType = renderRevision(lessonRevision, scope).replace('type: lesson', 'type: bogus');
-  expect(() => decodeRevision(unknownType)).toThrowError(/INVALID_INPUT/);
+  expectBrainCode(() => decodeRevision(unknownType), 'INVALID_INPUT');
 
   const futureSchema = renderRevision(lessonRevision, scope).replace(
     'brain_schema_version: 1',
     'brain_schema_version: 2'
   );
-  expect(() => decodeRevision(futureSchema)).toThrowError(/UNSUPPORTED_SCHEMA/);
+  expectBrainCode(() => decodeRevision(futureSchema), 'UNSUPPORTED_SCHEMA');
 
   const badSection = renderRevision(lessonRevision, scope).replace('```yaml\n- kind: test_run', '```text\n- kind: test_run');
-  expect(() => decodeRevision(badSection)).toThrowError(/INVALID_INPUT/);
+  expectBrainCode(() => decodeRevision(badSection), 'INVALID_INPUT');
 
   const badStatus = renderRevision(lessonRevision, scope).replace('brain_status: candidate', 'brain_status: bogus');
-  expect(() => decodeRevision(badStatus)).toThrowError(/INVALID_INPUT/);
+  expectBrainCode(() => decodeRevision(badStatus), 'INVALID_INPUT');
 
   const badTimestamp = renderRevision(lessonRevision, scope).replace(
     'created: 2026-09-01T00:00:00Z',
     'created: 2026-09-01T00:00:00+02:00'
   );
-  expect(() => decodeRevision(badTimestamp)).toThrowError(/INVALID_INPUT/);
+  expectBrainCode(() => decodeRevision(badTimestamp), 'INVALID_INPUT');
+});
+
+test('rejects managed fields and sections deleted by a manual edit', () => {
+  const raw = renderRevision(lessonRevision, scope);
+  expectBrainCode(() => decodeRevision(raw.replace(/^brain_parents: \[\]\n/m, '')), 'INVALID_INPUT');
+  expectBrainCode(() => decodeRevision(raw.replace('tags:\n  - streaming\n', '')), 'INVALID_INPUT');
+  expectBrainCode(() => decodeRevision(raw.replace('## Evidence\n\n', '')), 'INVALID_INPUT');
+  expectBrainCode(() => decodeRevision(raw.replace('## Related\n\n', '')), 'INVALID_INPUT');
+});
+
+test('truncates the storage title so the revision suffix still fits the C3 bound', () => {
+  const title = '😀'.repeat(160);
+  const revision = makeRevision({ ...lessonFixture, title });
+  const write = encodeRevision(revision, scope);
+  expect([...write.storage_title].length).toBeLessThanOrEqual(160);
+  expect(write.storage_title.endsWith(` r${fixtureIds.revision}`)).toBe(true);
+  expect(write.metadata.brain_title).toBe(title);
+  expect(decodeRevision(renderRevision(revision, scope)).note.title).toBe(title);
 });
 
 test('rejects an oversized rendered note instead of writing it', () => {
   const oversized = makeRevision(lessonFixture, { extra_markdown: 'x'.repeat(80 * 1024) });
-  expect(() => encodeRevision(oversized, scope)).toThrowError(/LIMIT_EXCEEDED/);
+  expectBrainCode(() => encodeRevision(oversized, scope), 'LIMIT_EXCEEDED');
+  expectBrainCode(() => renderRevision(oversized, scope), 'LIMIT_EXCEEDED');
 });
 
 test('round-trips non-Latin text and titles containing quotes or colons', () => {
@@ -397,7 +428,8 @@ test('reads an oversized existing note but never renders an oversized revision',
   const raw = `${renderRevision(lessonRevision, scope)}\n${'x'.repeat(80 * 1024)}`;
   const decoded = decodeRevision(raw);
   expect(decoded.extra_markdown.length).toBeGreaterThan(80 * 1024);
-  expect(() => encodeRevision(decoded, scope)).toThrowError(/LIMIT_EXCEEDED/);
+  expectBrainCode(() => encodeRevision(decoded, scope), 'LIMIT_EXCEEDED');
+  expectBrainCode(() => renderRevision(decoded, scope), 'LIMIT_EXCEEDED');
 });
 
 test('exposes a stable registry of section titles and folders', () => {

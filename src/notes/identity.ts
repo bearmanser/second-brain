@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto';
+import { TITLE_MAX_CODE_POINTS } from '../core/limits.js';
 import type { NoteKind } from '../core/types.js';
 import { KIND_FOLDERS } from './registry.js';
+
+export const REVISION_SUFFIX_PREFIX = ' r';
 
 export function slugify(value: string): string {
   const slug = value
@@ -19,7 +22,11 @@ export function slugifyPath(value: string): string {
 }
 
 export function storageTitle(noteTitle: string, revisionId: string): string {
-  return `${noteTitle} r${revisionId}`;
+  const suffix = `${REVISION_SUFFIX_PREFIX}${revisionId}`;
+  const maxHumanCodePoints = Math.max(0, TITLE_MAX_CODE_POINTS - [...suffix].length);
+  const human = [...noteTitle];
+  const trimmed = human.length <= maxHumanCodePoints ? noteTitle : human.slice(0, maxHumanCodePoints).join('');
+  return `${trimmed}${suffix}`;
 }
 
 export function revisionDirectory(kind: NoteKind, id: string): string {
