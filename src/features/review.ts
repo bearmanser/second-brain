@@ -132,11 +132,48 @@ function reviewScope(ctx: RequestContext, requested: string, deps: BrainDeps): S
   return scope;
 }
 
-function isProtected(scope: string, revision: StoredRevision): boolean {
+function hasValidApproval(revision: StoredRevision): boolean {
+  return revision.approval !== undefined && revision.approval.payload_hash === payloadHash(revision);
+}
+
+async function hasApprovedAncestor(
+  scope: string,
+  revision: StoredRevision,
+  deps: BrainDeps
+): Promise<boolean> {
+  const visited = new Set<string>();
+  const queue: StoredRevision[] = [revision];
+  while (queue.length > 0) {
+    const current = queue.shift() as StoredRevision;
+    if (visited.has(current.revision_id)) continue;
+    visited.add(current.revision_id);
+    if (hasValidApproval(current)) return true;
+    for (const parent of current.parents) {
+      if (visited.has(parent.revision_id)) return true;
+      let head: Head;
+      try {
+        head = await deps.catalogue.getRevision(scope, revision.id, parent.revision_id);
+      } catch {
+        return true;
+      }
+      if (head.state !== 'ready' && head.state !== 'manual_unreviewed') return true;
+      if (head.raw_hash !== parent.raw_hash) return true;
+      queue.push(head.revision);
+    }
+  }
+  return false;
+}
+
+async function isProtectedNote(
+  scope: string,
+  revision: StoredRevision,
+  deps: BrainDeps
+): Promise<boolean> {
   const kind = revision.note.content.kind;
   if (kind === 'preference') return true;
   if (PROTECTED_SCOPES.includes(scope)) return true;
-  return kind === 'decision' && revision.status === 'active';
+  if (kind !== 'decision') return false;
+  return hasApprovedAncestor(scope, revision, deps);
 }
 
 function requireSingleHead(heads: Head[], id: string): Head {
@@ -151,8 +188,7 @@ function parentOf(head: Head): { revision_id: string; raw_hash: string }[] {
 }
 
 function preservedApproval(revision: StoredRevision): StoredRevision['approval'] {
-  if (revision.approval === undefined) return undefined;
-  return revision.approval.payload_hash === payloadHash(revision) ? revision.approval : undefined;
+  return hasValidApproval(revision) ? revision.approval : undefined;
 }
 
 function assertApprovable(head: Head): void {
@@ -191,17 +227,6 @@ function decisionPayload(
   };
 }
 
-async function optionalHead(deps: BrainDeps, scope: string, id: string): Promise<Head | undefined> {
-  try {
-    return await deps.catalogue.get(scope, id);
-  } catch (error) {
-    if (isBrainError(error) && (error.code === 'NOT_FOUND' || error.code === 'CONFLICT')) {
-      return undefined;
-    }
-    throw error;
-  }
-}
-
 function declaredBrainId(raw: string): string | undefined {
   const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
   const lines = text.split('\n');
@@ -221,9 +246,24 @@ function declaredBrainId(raw: string): string | undefined {
   return value.length > 0 ? value : undefined;
 }
 
-interface ForkAnalysis {
-  heads: ParsedRevision[];
-  error?: BrainError;
+function parsedRevisionToHead(scope: string, parsed: ParsedRevision): Head {
+  const revision = parsed.revision;
+  return {
+    revision,
+    source: {
+      id: revision.id,
+      revision_id: revision.revision_id,
+      scope,
+      title: revision.note.title,
+      kind: revision.note.content.kind,
+      status: revision.status,
+      etag: makeEtag(revision.revision_id, parsed.raw_hash),
+      relative_path: parsed.relative_path,
+      warnings: []
+    },
+    raw_hash: parsed.raw_hash,
+    state: 'conflict'
+  };
 }
 
 async function analyseFork(
@@ -231,21 +271,21 @@ async function analyseFork(
   scope: ScopeConfig,
   operation: { id: string; expected_heads: { revision_id: string; etag: string }[] },
   deps: BrainDeps
-): Promise<ForkAnalysis> {
-  const parsed: ParsedRevision[] = [];
-  const unreadable: string[] = [];
+): Promise<Head[]> {
   let paths: string[];
   try {
     paths = await deps.vault.list(scope.id);
   } catch (error) {
-    return { heads: [], error: recoveryRequired(`scope ${scope.id} cannot be enumerated`) };
+    throw recoveryRequired(`scope ${scope.id} cannot be enumerated`, error);
   }
+  const parsed: ParsedRevision[] = [];
+  const unreadable: string[] = [];
   for (const path of paths) {
     let read: { raw: string; raw_hash: string; relative_path: string };
     try {
       read = await deps.vault.read(scope.id, path);
-    } catch {
-      continue;
+    } catch (error) {
+      throw recoveryRequired(`scope ${scope.id} cannot be read while resolving a fork`, error);
     }
     try {
       const revision = decodeRevision(read.raw);
@@ -259,120 +299,108 @@ async function analyseFork(
     }
   }
   if (unreadable.length > 0) {
-    return {
-      heads: [],
-      error: recoveryRequired(
-        `note ${operation.id} has unreadable revisions: ${[...new Set(unreadable)].join(', ')}`
-      )
-    };
+    throw recoveryRequired(
+      `note ${operation.id} has unreadable revisions: ${[...new Set(unreadable)].join(', ')}`
+    );
   }
   if (parsed.length === 0) {
-    return { heads: [], error: notFound(`note ${operation.id} is not present in scope ${scope.id}`) };
+    throw notFound(`note ${operation.id} is not present in scope ${scope.id}`);
   }
   const resolution = resolveHead(parsed);
   if (resolution.state === 'ready') {
-    return {
-      heads: [],
-      error: conflict(`note ${operation.id} has a unique head; there is no revision fork to resolve`)
-    };
+    throw conflict(`note ${operation.id} has a unique head; there is no revision fork to resolve`);
   }
   const structural = [
     ...new Set(resolution.reasons.filter((reason) => STRUCTURAL_REASONS.includes(reason)))
   ];
   if (structural.length > 0) {
-    return {
-      heads: resolution.heads,
-      error: recoveryRequired(`note ${operation.id} has corrupt ancestry: ${structural.join(', ')}`)
-    };
+    throw recoveryRequired(`note ${operation.id} has corrupt ancestry: ${structural.join(', ')}`);
   }
   const heads = resolution.heads;
-  const protectedNote = heads.some((head) => isProtected(scope.id, head.revision));
-  if (protectedNote && !canReview(ctx.principal, scope.id, true)) {
-    return { heads, error: forbidden('a protected note can only be resolved by an owner') };
+  for (const head of heads) {
+    if ((await isProtectedNote(scope.id, head.revision, deps)) && !canReview(ctx.principal, scope.id, true)) {
+      throw forbidden('a protected note can only be resolved by an owner');
+    }
   }
   const expected = new Map(
     heads.map((head) => [head.revision.revision_id, makeEtag(head.revision.revision_id, head.raw_hash)])
   );
   if (operation.expected_heads.length !== expected.size) {
-    return {
-      heads,
-      error: conflict(
-        `resolve requires exactly the complete set of ${expected.size} conflict heads`
-      )
-    };
+    throw conflict(`resolve requires exactly the complete set of ${expected.size} conflict heads`);
   }
   const seen = new Set<string>();
   for (const item of operation.expected_heads) {
     if (seen.has(item.revision_id)) {
-      return { heads, error: conflict('expected_heads contains a duplicate revision') };
+      throw conflict('expected_heads contains a duplicate revision');
     }
     seen.add(item.revision_id);
     const etag = expected.get(item.revision_id);
     if (etag === undefined) {
-      return {
-        heads,
-        error: conflict(`expected head ${item.revision_id} is not a current conflict head`)
-      };
+      throw conflict(`expected head ${item.revision_id} is not a current conflict head`);
     }
     if (etag !== item.etag) {
-      return { heads, error: conflict(`expected head ${item.revision_id} has a stale etag`) };
+      throw conflict(`expected head ${item.revision_id} has a stale etag`);
     }
   }
-  return { heads };
+  return heads.map((head) => parsedRevisionToHead(scope.id, head));
 }
 
-interface ReplacementAnalysis {
-  error?: BrainError;
+async function requireChainHead(scope: string, id: string, deps: BrainDeps): Promise<Head> {
+  let head: Head;
+  try {
+    head = await deps.catalogue.get(scope, id);
+  } catch (error) {
+    if (isBrainError(error)) {
+      if (error.code === 'UNSUPPORTED_SCHEMA') {
+        throw recoveryRequired(`replacement chain link ${id} uses an unsupported schema`, error);
+      }
+      if (error.code === 'NOT_FOUND') {
+        throw conflict(`replacement chain link ${id} is missing`);
+      }
+      if (error.code === 'CONFLICT') {
+        throw conflict(`replacement chain link ${id} is conflicted`);
+      }
+    }
+    throw error;
+  }
+  if (head.state !== 'ready' && head.state !== 'manual_unreviewed') {
+    throw conflict(`replacement chain link ${id} is conflicted`);
+  }
+  return head;
 }
 
-async function analyseReplacement(
+async function assertReplacement(
   ctx: RequestContext,
   scope: ScopeConfig,
   operation: { id: string; replacement_id: string },
   deps: BrainDeps
-): Promise<ReplacementAnalysis> {
+): Promise<void> {
   if (operation.replacement_id === operation.id) {
-    return { error: invalidInput('a note cannot supersede itself') };
+    throw invalidInput('a note cannot supersede itself');
   }
   if (!ctx.principal.read_scopes.includes(scope.id)) {
-    return { error: forbidden('the replacement note is not readable by this principal') };
+    throw forbidden('the replacement note is not readable by this principal');
   }
-  let replacement: Head;
-  try {
-    replacement = await deps.catalogue.get(scope.id, operation.replacement_id);
-  } catch (error) {
-    if (isBrainError(error) && error.code === 'NOT_FOUND') {
-      return {
-        error: conflict('the replacement note is not an active note in the same readable scope')
-      };
-    }
-    if (isBrainError(error) && error.code === 'CONFLICT') {
-      return { error: conflict('the replacement note is conflicted and cannot be superseded-to') };
-    }
-    throw error;
-  }
-  if (replacement.state !== 'ready' || replacement.revision.status !== 'active') {
-    return {
-      error: conflict('supersession requires a readable active replacement in the same scope')
-    };
+  const replacement = await requireChainHead(scope.id, operation.replacement_id, deps);
+  if (replacement.revision.status !== 'active') {
+    throw conflict('supersession requires a readable active replacement in the same scope');
   }
   let cursor = replacement.revision.replacement_id;
   const visited = new Set<string>([operation.replacement_id]);
   for (let depth = 0; cursor !== undefined; depth += 1) {
     if (cursor === operation.id) {
-      return { error: conflict('supersession would create a replacement cycle') };
+      throw conflict('supersession would create a replacement cycle');
     }
     if (visited.has(cursor)) {
-      return { error: conflict('the replacement chain already contains a cycle') };
+      throw conflict('the replacement chain already contains a cycle');
     }
     if (depth > MAX_SUPERSESSION_DEPTH) {
-      return { error: conflict('the replacement chain is too deep') };
+      throw conflict('the replacement chain is too deep');
     }
     visited.add(cursor);
-    const next = await optionalHead(deps, scope.id, cursor);
-    cursor = next?.revision.replacement_id;
+    const link = await requireChainHead(scope.id, cursor, deps);
+    cursor = link.revision.replacement_id;
   }
-  return {};
 }
 
 async function listAction(
@@ -400,11 +428,13 @@ async function approveAction(
     scope: scope.id,
     idempotency_key: operation.idempotency_key,
     payload: decisionPayload('approve', operation),
-    expected_heads: [{ id: operation.id, etag: operation.expected_etag }]
+    expected_heads: [{ id: operation.id, etag: operation.expected_etag }],
+    authorization: 'review'
   };
-  const build: RevisionBuilder = (identities, heads) => {
+  const build: RevisionBuilder = async (identities, heads) => {
     const head = requireSingleHead(heads, operation.id);
-    if (!canReview(ctx.principal, scope.id, isProtected(scope.id, head.revision))) {
+    const protectedNote = await isProtectedNote(scope.id, head.revision, deps);
+    if (!canReview(ctx.principal, scope.id, protectedNote)) {
       throw forbidden(`principal ${ctx.principal.id} may not approve note ${operation.id}`);
     }
     assertApprovable(head);
@@ -445,7 +475,8 @@ async function archiveAction(
     scope: scope.id,
     idempotency_key: operation.idempotency_key,
     payload: decisionPayload('archive', operation),
-    expected_heads: [{ id: operation.id, etag: operation.expected_etag }]
+    expected_heads: [{ id: operation.id, etag: operation.expected_etag }],
+    authorization: 'review'
   };
   const build: RevisionBuilder = (identities, heads) => {
     const head = requireSingleHead(heads, operation.id);
@@ -489,11 +520,12 @@ async function reviseAction(
     scope: scope.id,
     idempotency_key: operation.idempotency_key,
     payload: { ...decisionPayload('revise', operation), note },
-    expected_heads: [{ id: operation.id, etag: operation.expected_etag }]
+    expected_heads: [{ id: operation.id, etag: operation.expected_etag }],
+    authorization: 'write'
   };
-  const build: RevisionBuilder = (identities, heads) => {
+  const build: RevisionBuilder = async (identities, heads) => {
     const head = requireSingleHead(heads, operation.id);
-    if (isProtected(scope.id, head.revision) && !canReview(ctx.principal, scope.id, true)) {
+    if ((await isProtectedNote(scope.id, head.revision, deps)) && !canReview(ctx.principal, scope.id, true)) {
       throw forbidden(`only an owner may revise the protected note ${operation.id}`);
     }
     return {
@@ -525,21 +557,21 @@ async function supersedeAction(
   },
   deps: BrainDeps
 ): Promise<MutationReceipt> {
-  const replacement = await analyseReplacement(ctx, scope, operation, deps);
   const intent: MutationIntent = {
     tool: REVIEW_TOOL,
     scope: scope.id,
     idempotency_key: operation.idempotency_key,
     payload: { ...decisionPayload('supersede', operation), replacement_id: operation.replacement_id },
-    expected_heads: [{ id: operation.id, etag: operation.expected_etag }]
+    expected_heads: [{ id: operation.id, etag: operation.expected_etag }],
+    authorization: 'review'
   };
-  const build: RevisionBuilder = (identities, heads) => {
-    if (replacement.error !== undefined) throw replacement.error;
+  const build: RevisionBuilder = async (identities, heads) => {
     const head = requireSingleHead(heads, operation.id);
     if (!canReview(ctx.principal, scope.id, false)) {
       throw forbidden(`principal ${ctx.principal.id} may not supersede note ${operation.id}`);
     }
-    const base: StoredRevision = {
+    await assertReplacement(ctx, scope, operation, deps);
+    return {
       id: identities.note_id,
       revision_id: identities.revision_id,
       parents: parentOf(head),
@@ -554,7 +586,6 @@ async function supersedeAction(
       extra_frontmatter: head.revision.extra_frontmatter,
       extra_markdown: head.revision.extra_markdown
     };
-    return base;
   };
   return deps.mutations.commit(ctx, intent, build);
 }
@@ -573,7 +604,6 @@ async function resolveAction(
 ): Promise<MutationReceipt> {
   const note = normalizeNote(operation.note);
   rejectCredentialText(note);
-  const fork = await analyseFork(ctx, scope, operation, deps);
   const intent: MutationIntent = {
     tool: REVIEW_TOOL,
     scope: scope.id,
@@ -585,25 +615,21 @@ async function resolveAction(
       expected_heads: operation.expected_heads,
       note
     },
-    expected_heads: operation.expected_heads.map((item) => ({
-      id: operation.id,
-      revision_id: item.revision_id,
-      etag: item.etag
-    }))
+    expected_heads: [],
+    authorization: 'review',
+    resolve_heads: (lockedScope) => analyseFork(ctx, lockedScope, operation, deps)
   };
   const build: RevisionBuilder = (identities, heads) => {
-    if (fork.error !== undefined) throw fork.error;
     if (heads.length !== operation.expected_heads.length || heads.length === 0) {
       throw conflict('resolve did not verify the complete set of conflict heads');
     }
-    const parents = heads.map((head) => ({
-      revision_id: head.revision.revision_id,
-      raw_hash: head.raw_hash
-    }));
     return {
       id: identities.note_id,
       revision_id: identities.revision_id,
-      parents,
+      parents: heads.map((head) => ({
+        revision_id: head.revision.revision_id,
+        raw_hash: head.raw_hash
+      })),
       scope: scope.id,
       status: 'candidate',
       note,

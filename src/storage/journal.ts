@@ -395,6 +395,19 @@ export class Journal {
     return rows.map(toRecord);
   }
 
+  abort(id: string): void {
+    this.assertOpen();
+    const run = this.database.transaction((): void => {
+      const row = this.requireRow(id);
+      const current = requireState(row.state, id);
+      if (current !== 'prepared' || row.plan_json !== null || row.receipt_json !== null) {
+        throw conflict(`operation ${id} is not an abortable prepared reservation`, id);
+      }
+      this.database.prepare('DELETE FROM operations WHERE operation_id = ?').run(id);
+    });
+    run.immediate();
+  }
+
   pruneTerminalPayloads(now: Date): number {
     this.assertOpen();
     const cutoff = new Date(now.getTime() - SEVEN_DAYS_MS).toISOString();

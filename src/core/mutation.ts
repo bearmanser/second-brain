@@ -45,6 +45,8 @@ export interface MutationAdvisory {
   possible_duplicates?: SourceRef[];
 }
 
+export type MutationAuthorization = 'write' | 'review';
+
 export interface MutationIntent {
   tool: string;
   scope: string;
@@ -52,6 +54,8 @@ export interface MutationIntent {
   payload: unknown;
   expected_heads: ExpectedHead[];
   advisory?: MutationAdvisory;
+  authorization?: MutationAuthorization;
+  resolve_heads?: (scope: ScopeConfig) => Promise<Head[]>;
 }
 
 export interface AllocatedIdentity {
@@ -61,7 +65,10 @@ export interface AllocatedIdentity {
   timestamp: string;
 }
 
-export type RevisionBuilder = (identities: AllocatedIdentity, heads: Head[]) => StoredRevision;
+export type RevisionBuilder = (
+  identities: AllocatedIdentity,
+  heads: Head[]
+) => StoredRevision | Promise<StoredRevision>;
 
 export interface MutationJournal {
   reserve(input: OperationReservation): ReservationResult;
@@ -69,6 +76,7 @@ export interface MutationJournal {
   mark(id: string, state: OperationState, receipt?: MutationReceipt): void;
   get(id: string): OperationRecord | undefined;
   pending(): OperationRecord[];
+  abort(id: string): void;
   refreshReceiptAvailability(id: string, availability: ReceiptAvailability): OperationRecord;
 }
 
@@ -427,7 +435,7 @@ export class MutationCoordinator {
     intent: MutationIntent,
     build: RevisionBuilder
   ): Promise<MutationReceipt> {
-    const scope = this.authorize(ctx.principal, intent.scope);
+    const scope = this.authorize(ctx.principal, intent.scope, intent.authorization ?? 'write');
     if (ctx.signal.aborted) throw cancelled();
     const digest = payloadDigest(intent.payload);
     const advisory = normalizeAdvisory(intent.advisory);
@@ -443,8 +451,12 @@ export class MutationCoordinator {
     return this.drive(ctx, scope, reserved, intent, build);
   }
 
-  private authorize(principal: Principal, requested: string): ScopeConfig {
-    const [scope] = resolveScopes(principal, requested, false, 'write', this.deps.config.scopes);
+  private authorize(
+    principal: Principal,
+    requested: string,
+    authorization: MutationAuthorization
+  ): ScopeConfig {
+    const [scope] = resolveScopes(principal, requested, false, authorization, this.deps.config.scopes);
     return scope;
   }
 
@@ -505,12 +517,27 @@ export class MutationCoordinator {
     }
 
     await this.deps.catalogue.reconcile(scope.id);
-    const heads = await this.verifyExpectedHeads(scope, intent.expected_heads, record.operation_id);
+    let heads: Head[];
+    try {
+      heads =
+        intent.resolve_heads !== undefined
+          ? await intent.resolve_heads(scope)
+          : await this.verifyExpectedHeads(scope, intent.expected_heads, record.operation_id);
+    } catch (error) {
+      this.abortPrepared(record.operation_id);
+      throw error;
+    }
 
     let plan = persisted;
     if (plan === undefined) {
-      const identities = this.deriveIdentity(record, intent);
-      const revision = this.buildRevision(build, identities, heads, scope);
+      const identities = this.deriveIdentity(record, heads);
+      let revision: StoredRevision;
+      try {
+        revision = await this.buildRevision(build, identities, heads, scope);
+      } catch (error) {
+        this.abortPrepared(record.operation_id);
+        throw error;
+      }
       plan = encodeRevision(revision, scope);
       this.deps.journal.savePlan(record.operation_id, plan);
     }
@@ -520,8 +547,18 @@ export class MutationCoordinator {
     return this.submit(ctx, scope, plan, record.operation_id, advisory);
   }
 
-  private deriveIdentity(record: OperationRecord, intent: MutationIntent): AllocatedIdentity {
-    const targets = [...new Set(intent.expected_heads.map((head) => head.id))];
+  private abortPrepared(operation_id: string): void {
+    try {
+      const record = this.deps.journal.get(operation_id);
+      if (record === undefined || record.state !== 'prepared') return;
+      this.deps.journal.abort(operation_id);
+    } catch {
+      return;
+    }
+  }
+
+  private deriveIdentity(record: OperationRecord, heads: Head[]): AllocatedIdentity {
+    const targets = [...new Set(heads.map((head) => head.revision.id))];
     if (targets.length > 1) {
       throw invalidInput('a mutation may target only one logical note');
     }
@@ -535,15 +572,15 @@ export class MutationCoordinator {
     };
   }
 
-  private buildRevision(
+  private async buildRevision(
     build: RevisionBuilder,
     identities: AllocatedIdentity,
     heads: Head[],
     scope: ScopeConfig
-  ): StoredRevision {
+  ): Promise<StoredRevision> {
     let revision: StoredRevision;
     try {
-      revision = build(identities, heads);
+      revision = await build(identities, heads);
     } catch (error) {
       if (isBrainError(error)) throw error;
       throw invalidInput('revision builder failed', error);

@@ -72,6 +72,9 @@ export function wrapJournal(journal: Journal, scheduler: FaultScheduler): Journa
     pending(): OperationRecord[] {
       return journal.pending();
     },
+    abort(id: string): void {
+      journal.abort(id);
+    },
     refreshReceiptAvailability(id: string, availability: ReceiptAvailability): OperationRecord {
       maybeThrow('refresh_receipt');
       return journal.refreshReceiptAvailability(id, availability);

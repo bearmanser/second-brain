@@ -1,10 +1,18 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { expect, test } from 'vitest';
 import { BrainError, type BrainErrorCode } from '../../src/contracts/errors.js';
-import type { Head, MutationReceipt, NoteContent, NoteInput, ReviewListResult } from '../../src/core/types.js';
-import { payloadHash } from '../../src/notes/codec.js';
+import type {
+  Head,
+  MutationReceipt,
+  NoteContent,
+  NoteInput,
+  Principal,
+  RequestContext,
+  ReviewListResult
+} from '../../src/core/types.js';
+import { makeEtag, payloadHash } from '../../src/notes/codec.js';
 import { review } from '../../src/features/review.js';
 import { lessonFixture } from '../fixtures/content.js';
 import {
@@ -92,11 +100,11 @@ function vaultPath(h: MemoryHarness, relative: string): string {
   return join(h.deps.config.mounts.vault, relative);
 }
 
-async function scopeFiles(h: MemoryHarness, scope = SCOPE): Promise<Map<string, string>> {
+async function scopeFiles(h: MemoryHarness, scope = SCOPE): Promise<Map<string, Buffer>> {
   const scopeConfig = h.deps.config.scopes.find((candidate) => candidate.id === scope);
   if (scopeConfig === undefined) throw new Error(`no configured scope ${scope}`);
   const root = join(h.deps.config.mounts.vault, scopeConfig.relative_root);
-  const files = new Map<string, string>();
+  const files = new Map<string, Buffer>();
   const walk = async (directory: string): Promise<void> => {
     let entries;
     try {
@@ -108,7 +116,7 @@ async function scopeFiles(h: MemoryHarness, scope = SCOPE): Promise<Map<string, 
       const absolute = join(directory, entry.name);
       if (entry.isDirectory()) await walk(absolute);
       else if (entry.isFile() && entry.name.endsWith('.md')) {
-        files.set(absolute, await readFile(absolute, 'utf8'));
+        files.set(absolute, await readFile(absolute));
       }
     }
   };
@@ -116,9 +124,11 @@ async function scopeFiles(h: MemoryHarness, scope = SCOPE): Promise<Map<string, 
   return files;
 }
 
-function expectUntouched(before: Map<string, string>, after: Map<string, string>): void {
+function expectUntouched(before: Map<string, Buffer>, after: Map<string, Buffer>): void {
   for (const [path, raw] of before) {
-    expect(after.get(path)).toBe(raw);
+    const current = after.get(path);
+    expect(current).toBeDefined();
+    expect(current?.equals(raw)).toBe(true);
   }
 }
 
@@ -139,6 +149,47 @@ async function duplicateRevisionFile(
   await h.deps.catalogue.reconcile(head.source.scope);
   return { revisionId, path };
 }
+
+async function duplicateIdentityFile(h: MemoryHarness, head: Head, label: string): Promise<string> {
+  const absolute = vaultPath(h, head.source.relative_path);
+  const raw = await readFile(absolute, 'utf8');
+  const path = join(dirname(absolute), `${label}.md`);
+  await writeFile(path, raw, 'utf8');
+  await h.deps.catalogue.reconcile(head.source.scope);
+  return path;
+}
+
+function rawHashOf(raw: Buffer): string {
+  return createHash('sha256').update(raw).digest('hex');
+}
+
+const reviewOnlyPrincipal: Principal = {
+  id: '00000000-0000-4000-8000-0000000000a1',
+  role: 'reviewer',
+  read_scopes: [SCOPE],
+  write_scopes: [],
+  review_scopes: [SCOPE]
+};
+
+const reviewOnlyContext: RequestContext = {
+  principal: reviewOnlyPrincipal,
+  request_id: randomUUID(),
+  signal: new AbortController().signal
+};
+
+const scopedReviewerPrincipal: Principal = {
+  id: '00000000-0000-4000-8000-0000000000a2',
+  role: 'reviewer',
+  read_scopes: ['shared', 'profile'],
+  write_scopes: ['shared', 'profile'],
+  review_scopes: ['shared', 'profile']
+};
+
+const scopedReviewerContext: RequestContext = {
+  principal: scopedReviewerPrincipal,
+  request_id: randomUUID(),
+  signal: new AbortController().signal
+};
 
 test('a worker cannot approve its own candidate by naming a review action', async () => {
   const h = await createHarness();
@@ -1054,5 +1105,704 @@ test('rejects a revise whose etag is stale', async () => {
     }, h.deps),
     'CONFLICT'
   );
+  await h.close();
+});
+
+test('a review-only principal can approve, archive, supersede, and resolve without write scope', async () => {
+  const h = await createHarness();
+  const candidate = await h.seed(lessonFixture, { status: 'candidate' });
+  const approved = asReceipt(
+    await review(reviewOnlyContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'approve',
+        id: candidate.source.id,
+        expected_etag: candidate.source.etag,
+        idempotency_key: key(90),
+        rationale: 'Review-only approval.'
+      }
+    }, h.deps)
+  );
+  expect(approved.outcome).toBe('stored');
+
+  const archivable = await h.seed(noteWith(lessonContentOf({ lesson: 'Archive me.' })), { status: 'active' });
+  const archived = asReceipt(
+    await review(reviewOnlyContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'archive',
+        id: archivable.source.id,
+        expected_etag: archivable.source.etag,
+        idempotency_key: key(91),
+        rationale: 'Review-only archive.'
+      }
+    }, h.deps)
+  );
+  expect(archived.outcome).toBe('stored');
+
+  const source = await h.seed(noteWith(lessonContentOf({ lesson: 'Supersede source.' })), { status: 'active' });
+  const replacement = await h.seed(noteWith(lessonContentOf({ lesson: 'Supersede replacement.' })), {
+    status: 'active'
+  });
+  const superseded = asReceipt(
+    await review(reviewOnlyContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'supersede',
+        id: source.source.id,
+        expected_etag: source.source.etag,
+        idempotency_key: key(92),
+        rationale: 'Review-only supersede.',
+        replacement_id: replacement.source.id
+      }
+    }, h.deps)
+  );
+  expect(superseded.outcome).toBe('stored');
+
+  const root = await h.seed(noteWith(lessonContentOf({ lesson: 'Fork root.' })), { status: 'candidate' });
+  const copy = await duplicateRevisionFile(h, root, 'review-only-fork');
+  const rootHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, root.source.revision_id);
+  const copyHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, copy.revisionId);
+  const resolved = asReceipt(
+    await review(reviewOnlyContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'resolve',
+        id: root.source.id,
+        idempotency_key: key(93),
+        rationale: 'Review-only resolve.',
+        expected_heads: [
+          { revision_id: root.source.revision_id, etag: rootHead.source.etag },
+          { revision_id: copy.revisionId, etag: copyHead.source.etag }
+        ],
+        note: noteWith(lessonContentOf({ lesson: 'Resolved by a review-only principal.' }))
+      }
+    }, h.deps)
+  );
+  expect(resolved.outcome).toBe('stored');
+
+  const reviseCandidate = await h.seed(noteWith(lessonContentOf({ lesson: 'Revise needs write.' })), {
+    status: 'candidate'
+  });
+  await expectCode(
+    review(reviewOnlyContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'revise',
+        id: reviseCandidate.source.id,
+        expected_etag: reviseCandidate.source.etag,
+        idempotency_key: key(94),
+        rationale: 'A review-only principal cannot revise.',
+        note: noteWith(lessonContentOf({ lesson: 'nope' }))
+      }
+    }, h.deps),
+    'FORBIDDEN'
+  );
+  await h.close();
+});
+
+test('requires owner permission to approve notes in shared and profile scopes', async () => {
+  const h = await createHarness();
+  const sharedNote = await h.seed(noteWith(lessonContentOf({ lesson: 'Shared scope lesson.' })), {
+    scope: 'shared',
+    status: 'candidate'
+  });
+  const profileNote = await h.seed(noteWith(lessonContentOf({ lesson: 'Profile scope lesson.' })), {
+    scope: 'profile',
+    status: 'candidate'
+  });
+
+  await expectCode(
+    review(scopedReviewerContext, {
+      scope: 'shared',
+      operation: {
+        action: 'approve',
+        id: sharedNote.source.id,
+        expected_etag: sharedNote.source.etag,
+        idempotency_key: key(95),
+        rationale: 'Shared promotion needs an owner.'
+      }
+    }, h.deps),
+    'FORBIDDEN'
+  );
+  await expectCode(
+    review(scopedReviewerContext, {
+      scope: 'profile',
+      operation: {
+        action: 'approve',
+        id: profileNote.source.id,
+        expected_etag: profileNote.source.etag,
+        idempotency_key: key(96),
+        rationale: 'Profile change needs an owner.'
+      }
+    }, h.deps),
+    'FORBIDDEN'
+  );
+
+  const shared = asReceipt(
+    await review(ownerContext, {
+      scope: 'shared',
+      operation: {
+        action: 'approve',
+        id: sharedNote.source.id,
+        expected_etag: sharedNote.source.etag,
+        idempotency_key: key(97),
+        rationale: 'Owner promotes the shared lesson.'
+      }
+    }, h.deps)
+  );
+  expect(shared.outcome).toBe('stored');
+  const profile = asReceipt(
+    await review(ownerContext, {
+      scope: 'profile',
+      operation: {
+        action: 'approve',
+        id: profileNote.source.id,
+        expected_etag: profileNote.source.etag,
+        idempotency_key: key(98),
+        rationale: 'Owner approves the profile lesson.'
+      }
+    }, h.deps)
+  );
+  expect(profile.outcome).toBe('stored');
+  await h.close();
+});
+
+test('protects archived decisions and candidate descendants of approved decisions from reviewer revision', async () => {
+  const h = await createHarness();
+  const archivedSource = await h.seed(noteWith(decisionContent, { evidence: [] }), { status: 'active' });
+  asReceipt(
+    await review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'archive',
+        id: archivedSource.source.id,
+        expected_etag: archivedSource.source.etag,
+        idempotency_key: key(99),
+        rationale: 'Archive the approved decision.'
+      }
+    }, h.deps)
+  );
+  const archived = await currentHead(h, archivedSource.source.id);
+  expect(archived.revision.status).toBe('archived');
+  await expectCode(
+    review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'revise',
+        id: archived.source.id,
+        expected_etag: archived.source.etag,
+        idempotency_key: key(100),
+        rationale: 'Reviewer must not revise an approved decision.',
+        note: noteWith(decisionContent)
+      }
+    }, h.deps),
+    'FORBIDDEN'
+  );
+  const ownerRevised = asReceipt(
+    await review(ownerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'revise',
+        id: archived.source.id,
+        expected_etag: archived.source.etag,
+        idempotency_key: key(101),
+        rationale: 'Owner revises the archived decision.',
+        note: noteWith(decisionContent)
+      }
+    }, h.deps)
+  );
+  expect(ownerRevised.outcome).toBe('stored');
+
+  const approved = await h.seed(noteWith(decisionContent, { evidence: [] }), { status: 'active' });
+  asReceipt(
+    await review(ownerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'revise',
+        id: approved.source.id,
+        expected_etag: approved.source.etag,
+        idempotency_key: key(102),
+        rationale: 'Owner creates a candidate descendant.',
+        note: noteWith(decisionContent)
+      }
+    }, h.deps)
+  );
+  const child = await currentHead(h, approved.source.id);
+  expect(child.revision.status).toBe('candidate');
+  await expectCode(
+    review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'revise',
+        id: child.source.id,
+        expected_etag: child.source.etag,
+        idempotency_key: key(103),
+        rationale: 'Reviewer must not revise an approved-decision descendant.',
+        note: noteWith(decisionContent)
+      }
+    }, h.deps),
+    'FORBIDDEN'
+  );
+  await h.close();
+});
+
+test('requires owner permission to resolve a fork of approved decisions', async () => {
+  const h = await createHarness();
+  const root = await h.seed(noteWith(decisionContent, { evidence: [] }), { status: 'active' });
+  const copy = await duplicateRevisionFile(h, root, 'decision-fork');
+  const rootHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, root.source.revision_id);
+  const copyHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, copy.revisionId);
+  const expected_heads = [
+    { revision_id: root.source.revision_id, etag: rootHead.source.etag },
+    { revision_id: copy.revisionId, etag: copyHead.source.etag }
+  ];
+  await expectCode(
+    review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'resolve',
+        id: root.source.id,
+        idempotency_key: key(104),
+        rationale: 'Reviewer must not resolve an approved decision fork.',
+        expected_heads,
+        note: noteWith(decisionContent)
+      }
+    }, h.deps),
+    'FORBIDDEN'
+  );
+  const resolved = asReceipt(
+    await review(ownerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'resolve',
+        id: root.source.id,
+        idempotency_key: key(105),
+        rationale: 'Owner resolves the decision fork.',
+        expected_heads,
+        note: noteWith(decisionContent)
+      }
+    }, h.deps)
+  );
+  expect(resolved.outcome).toBe('stored');
+  await h.close();
+});
+
+test('refuses to resolve a structural cycle', async () => {
+  const h = await createHarness();
+  const root = await h.seed(lessonFixture, { status: 'candidate' });
+  asReceipt(
+    await review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'revise',
+        id: root.source.id,
+        expected_etag: root.source.etag,
+        idempotency_key: key(106),
+        rationale: 'Create a child revision.',
+        note: noteWith(lessonContentOf({ lesson: 'Child lesson.' }))
+      }
+    }, h.deps)
+  );
+  const child = await currentHead(h, root.source.id);
+  expect(child.revision.parents.map((parent) => parent.revision_id)).toEqual([
+    root.source.revision_id
+  ]);
+
+  const rootPath = vaultPath(h, root.source.relative_path);
+  const raw = await readFile(rootPath, 'utf8');
+  await writeFile(
+    rootPath,
+    raw.replace(
+      /^brain_parents: \[\]$/m,
+      `brain_parents:\n  - ${child.source.revision_id}@${child.raw_hash}`
+    ),
+    'utf8'
+  );
+  await h.deps.catalogue.reconcile(SCOPE);
+
+  await expectCode(
+    review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'resolve',
+        id: root.source.id,
+        idempotency_key: key(107),
+        rationale: 'Cycles are corruption, not ordinary forks.',
+        expected_heads: [{ revision_id: child.source.revision_id, etag: child.source.etag }],
+        note: noteWith(lessonContentOf({ lesson: 'Should not be written.' }))
+      }
+    }, h.deps),
+    'RECOVERY_REQUIRED'
+  );
+  await h.close();
+});
+
+test('fails closed on malformed and duplicate revision identities', async () => {
+  const h = await createHarness();
+  const root = await h.seed(lessonFixture, { status: 'candidate' });
+  const malformed = await duplicateRevisionFile(h, root, 'fork-malformed');
+  const malformedRaw = await readFile(malformed.path, 'utf8');
+  await writeFile(
+    malformed.path,
+    malformedRaw.replace(/^brain_parents: \[\]$/m, 'brain_parents: [not-a-uuid]'),
+    'utf8'
+  );
+  await h.deps.catalogue.reconcile(SCOPE);
+  const rootHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, root.source.revision_id);
+  await expectCode(
+    review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'resolve',
+        id: root.source.id,
+        idempotency_key: key(108),
+        rationale: 'Malformed revisions are corruption.',
+        expected_heads: [{ revision_id: root.source.revision_id, etag: rootHead.source.etag }],
+        note: noteWith(lessonContentOf({ lesson: 'Should not be written.' }))
+      }
+    }, h.deps),
+    'RECOVERY_REQUIRED'
+  );
+  await h.close();
+
+  const dup = await createHarness();
+  const dupRoot = await dup.seed(lessonFixture, { status: 'candidate' });
+  await duplicateIdentityFile(dup, dupRoot, 'fork-duplicate-identity');
+  const dupRootHead = await dup.deps.catalogue.getRevision(SCOPE, dupRoot.source.id, dupRoot.source.revision_id);
+  await expectCode(
+    review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'resolve',
+        id: dupRoot.source.id,
+        idempotency_key: key(109),
+        rationale: 'Duplicate identities are corruption.',
+        expected_heads: [{ revision_id: dupRoot.source.revision_id, etag: dupRootHead.source.etag }],
+        note: noteWith(lessonContentOf({ lesson: 'Should not be written.' }))
+      }
+    }, dup.deps),
+    'RECOVERY_REQUIRED'
+  );
+  await dup.close();
+});
+
+test('fails with RECOVERY_REQUIRED when a fork entry cannot be read under the lock', async () => {
+  const h = await createHarness();
+  const root = await h.seed(lessonFixture, { status: 'candidate' });
+  await duplicateRevisionFile(h, root, 'fork-unreadable');
+  const rootHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, root.source.revision_id);
+
+  let armed = false;
+  const originalReconcile = h.deps.catalogue.reconcile.bind(h.deps.catalogue);
+  h.deps.catalogue.reconcile = async (scope) => {
+    await originalReconcile(scope);
+    armed = true;
+  };
+  const originalRead = h.deps.vault.read.bind(h.deps.vault);
+  h.deps.vault.read = async (scope, path) => {
+    if (armed && path.includes('fork-unreadable')) {
+      throw new BrainError({ code: 'RECOVERY_REQUIRED', message: 'simulated unreadable entry' });
+    }
+    return originalRead(scope, path);
+  };
+
+  await expectCode(
+    review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'resolve',
+        id: root.source.id,
+        idempotency_key: key(110),
+        rationale: 'An unreadable retained entry is structural uncertainty.',
+        expected_heads: [{ revision_id: root.source.revision_id, etag: rootHead.source.etag }],
+        note: noteWith(lessonContentOf({ lesson: 'Should not be written.' }))
+      }
+    }, h.deps),
+    'RECOVERY_REQUIRED'
+  );
+  await h.close();
+});
+
+test('normalizes a submitted unsupported head to RECOVERY_REQUIRED', async () => {
+  const h = await createHarness();
+  const root = await h.seed(lessonFixture, { status: 'candidate' });
+  const unsupported = await duplicateRevisionFile(h, root, 'fork-unsupported-submitted');
+  const raw = await readFile(unsupported.path, 'utf8');
+  await writeFile(unsupported.path, raw.replace(/^brain_schema_version: 1$/m, 'brain_schema_version: 2'), 'utf8');
+  await h.deps.catalogue.reconcile(SCOPE);
+  const rootHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, root.source.revision_id);
+  const unsupportedEtag = makeEtag(unsupported.revisionId, rawHashOf(await readFile(unsupported.path)));
+
+  await expectCode(
+    review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'resolve',
+        id: root.source.id,
+        idempotency_key: key(111),
+        rationale: 'A submitted unsupported head is corruption.',
+        expected_heads: [
+          { revision_id: root.source.revision_id, etag: rootHead.source.etag },
+          { revision_id: unsupported.revisionId, etag: unsupportedEtag }
+        ],
+        note: noteWith(lessonContentOf({ lesson: 'Should not be written.' }))
+      }
+    }, h.deps),
+    'RECOVERY_REQUIRED'
+  );
+  await h.close();
+});
+
+test('rejects duplicate, extra, and stale conflict-head submissions', async () => {
+  const h = await createHarness();
+  const root = await h.seed(lessonFixture, { status: 'candidate' });
+  const copy = await duplicateRevisionFile(h, root, 'fork-sets');
+  const rootHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, root.source.revision_id);
+  const copyHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, copy.revisionId);
+
+  await expectCode(
+    review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'resolve',
+        id: root.source.id,
+        idempotency_key: key(112),
+        rationale: 'A duplicated conflict head is not the exact set.',
+        expected_heads: [
+          { revision_id: root.source.revision_id, etag: rootHead.source.etag },
+          { revision_id: root.source.revision_id, etag: rootHead.source.etag }
+        ],
+        note: noteWith(lessonContentOf({ lesson: 'no write' }))
+      }
+    }, h.deps),
+    'CONFLICT'
+  );
+  await expectCode(
+    review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'resolve',
+        id: root.source.id,
+        idempotency_key: key(113),
+        rationale: 'An extra conflict head is not the exact set.',
+        expected_heads: [
+          { revision_id: root.source.revision_id, etag: rootHead.source.etag },
+          { revision_id: copy.revisionId, etag: copyHead.source.etag },
+          { revision_id: randomUUID(), etag: 'a'.repeat(64) }
+        ],
+        note: noteWith(lessonContentOf({ lesson: 'no write' }))
+      }
+    }, h.deps),
+    'CONFLICT'
+  );
+
+  const copyRaw = await readFile(copy.path, 'utf8');
+  await writeFile(
+    copy.path,
+    copyRaw.replace(
+      'Measure the direct and proxied request',
+      'Measure the direct and proxied request now'
+    ),
+    'utf8'
+  );
+  await h.deps.catalogue.reconcile(SCOPE);
+  const refreshedRoot = await h.deps.catalogue.getRevision(SCOPE, root.source.id, root.source.revision_id);
+  await expectCode(
+    review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'resolve',
+        id: root.source.id,
+        idempotency_key: key(114),
+        rationale: 'A stale conflict-head etag is not the exact set.',
+        expected_heads: [
+          { revision_id: root.source.revision_id, etag: refreshedRoot.source.etag },
+          { revision_id: copy.revisionId, etag: copyHead.source.etag }
+        ],
+        note: noteWith(lessonContentOf({ lesson: 'no write' }))
+      }
+    }, h.deps),
+    'CONFLICT'
+  );
+  await h.close();
+});
+
+test('rejects a resolve when a new fork head appeared after the caller read the fork', async () => {
+  const h = await createHarness();
+  const root = await h.seed(lessonFixture, { status: 'candidate' });
+  const copy = await duplicateRevisionFile(h, root, 'fork-concurrent-a');
+  const rootHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, root.source.revision_id);
+  const copyHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, copy.revisionId);
+  await duplicateRevisionFile(h, root, 'fork-concurrent-b');
+
+  await expectCode(
+    review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'resolve',
+        id: root.source.id,
+        idempotency_key: key(115),
+        rationale: 'A third head appeared after the caller read the fork.',
+        expected_heads: [
+          { revision_id: root.source.revision_id, etag: rootHead.source.etag },
+          { revision_id: copy.revisionId, etag: copyHead.source.etag }
+        ],
+        note: noteWith(lessonContentOf({ lesson: 'no write' }))
+      }
+    }, h.deps),
+    'CONFLICT'
+  );
+  await h.close();
+});
+
+test('rejects a supersession when the replacement became inactive before the locked check', async () => {
+  const h = await createHarness();
+  const source = await h.seed(lessonFixture, { status: 'active' });
+  const replacement = await h.seed(noteWith(lessonContentOf({ lesson: 'Replacement goes inactive.' })), {
+    status: 'active'
+  });
+
+  const originalGet = h.deps.catalogue.get.bind(h.deps.catalogue);
+  h.deps.catalogue.get = async (scope, id) => {
+    const head = await originalGet(scope, id);
+    if (id === replacement.source.id) {
+      return {
+        ...head,
+        revision: { ...head.revision, status: 'superseded' as const },
+        source: { ...head.source, status: 'superseded' as const }
+      };
+    }
+    return head;
+  };
+
+  await expectCode(
+    review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'supersede',
+        id: source.source.id,
+        expected_etag: source.source.etag,
+        idempotency_key: key(116),
+        rationale: 'The replacement went inactive concurrently.',
+        replacement_id: replacement.source.id
+      }
+    }, h.deps),
+    'CONFLICT'
+  );
+  await h.close();
+});
+
+test('releases the reservation when a review request is rejected before submission', async () => {
+  const h = await createHarness();
+  const root = await h.seed(lessonFixture, { status: 'candidate' });
+  const copy = await duplicateRevisionFile(h, root, 'abort-fork');
+  const rootHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, root.source.revision_id);
+  const copyHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, copy.revisionId);
+  const rationale = 'Partial conflict-head set aborts the reservation.';
+
+  await expectCode(
+    review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'resolve',
+        id: root.source.id,
+        idempotency_key: key(117),
+        rationale,
+        expected_heads: [{ revision_id: root.source.revision_id, etag: rootHead.source.etag }],
+        note: noteWith(lessonContentOf({ lesson: 'first attempt' }))
+      }
+    }, h.deps),
+    'CONFLICT'
+  );
+  expect(h.deps.journal.pending()).toHaveLength(0);
+
+  const receipt = asReceipt(
+    await review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'resolve',
+        id: root.source.id,
+        idempotency_key: key(117),
+        rationale,
+        expected_heads: [
+          { revision_id: root.source.revision_id, etag: rootHead.source.etag },
+          { revision_id: copy.revisionId, etag: copyHead.source.etag }
+        ],
+        note: noteWith(lessonContentOf({ lesson: 'first attempt' }))
+      }
+    }, h.deps)
+  );
+  expect(receipt.outcome).toBe('stored');
+  await h.close();
+});
+
+test('rejects a supersession whose replacement chain contains a conflicted link', async () => {
+  const h = await createHarness();
+  const source = await h.seed(lessonFixture, { status: 'active' });
+  const replacement = await h.seed(noteWith(lessonContentOf({ lesson: 'Chain head.' })), {
+    status: 'active'
+  });
+  const chainLink = await h.seed(noteWith(lessonContentOf({ lesson: 'Chain link.' })), {
+    status: 'active'
+  });
+  await h.externalEdit(replacement, (raw) =>
+    raw.replace(/^(brain_status:.*)$/m, `$1\nbrain_replacement_id: ${chainLink.source.id}`)
+  );
+  await duplicateRevisionFile(h, chainLink, 'chain-link-conflict');
+  await h.deps.catalogue.reconcile(SCOPE);
+
+  await expectCode(
+    review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'supersede',
+        id: source.source.id,
+        expected_etag: source.source.etag,
+        idempotency_key: key(119),
+        rationale: 'A conflicted replacement-chain link must not be concealed.',
+        replacement_id: replacement.source.id
+      }
+    }, h.deps),
+    'CONFLICT'
+  );
+  await h.close();
+});
+
+test('releases the reservation when a builder rejects a review request before submission', async () => {
+  const h = await createHarness();
+  const head = await h.seed(
+    { ...lessonFixture, evidence: [{ kind: 'hypothesis', ref: 'h-1', description: 'An untested guess' }] },
+    { status: 'candidate' }
+  );
+
+  await expectCode(
+    review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'approve',
+        id: head.source.id,
+        expected_etag: head.source.etag,
+        idempotency_key: key(118),
+        rationale: 'Only a hypothesis is offered.'
+      }
+    }, h.deps),
+    'INVALID_INPUT'
+  );
+  expect(h.deps.journal.pending()).toHaveLength(0);
+
+  const archived = asReceipt(
+    await review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'archive',
+        id: head.source.id,
+        expected_etag: head.source.etag,
+        idempotency_key: key(118),
+        rationale: 'Archive with the released key.'
+      }
+    }, h.deps)
+  );
+  expect(archived.outcome).toBe('stored');
   await h.close();
 });
