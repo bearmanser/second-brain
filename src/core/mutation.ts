@@ -421,6 +421,10 @@ export class MutationCoordinator {
     });
   }
 
+  async serialize<T>(work: () => Promise<T>): Promise<T> {
+    return this.withLock(work);
+  }
+
   private withLock<T>(work: () => Promise<T>): Promise<T> {
     const result = this.tail.then(work, work);
     this.tail = result.then(

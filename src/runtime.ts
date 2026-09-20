@@ -18,6 +18,7 @@ import type {
   StatusResult,
   VaultPort
 } from './core/types.js';
+import { RECONCILE_INTERVAL_MS } from './core/limits.js';
 import { capture } from './features/capture.js';
 import { feedback, retrievalEventFromRecall } from './features/feedback.js';
 import { read } from './features/read.js';
@@ -28,6 +29,7 @@ import { createHttpApp } from './mcp/http.js';
 import type { BrainServices } from './mcp/server.js';
 import { internalDiagnostic } from './mcp/tools.js';
 import { RevisionCatalogue } from './notes/catalogue.js';
+import { JournalApprovalProvenance, reconcileVault } from './notes/reconcile.js';
 import { resolveScopes } from './security/authorise.js';
 import { BasicMemoryBackend } from './storage/basic-memory.js';
 import { Journal } from './storage/journal.js';
@@ -172,6 +174,8 @@ class BrainRuntimeImpl implements BrainRuntime {
   private backend: BackendPort | undefined;
   private httpServer: HttpServer | undefined;
   private pruneTimer: NodeJS.Timeout | undefined;
+  private reconcileTimer: NodeJS.Timeout | undefined;
+  private reconciling = false;
   private credentialsWatcher: StatWatcher | undefined;
   private credentialsListener: (() => void) | undefined;
 
@@ -202,7 +206,8 @@ class BrainRuntimeImpl implements BrainRuntime {
       const catalogue = RevisionCatalogue.open(join(this.config.mounts.state, 'catalogue.db'), {
         vault,
         scopes: this.config.scopes,
-        clock: this.clock
+        clock: this.clock,
+        approval_provenance: new JournalApprovalProvenance(journal)
       });
       this.catalogue = catalogue;
       const backend =
@@ -236,6 +241,7 @@ class BrainRuntimeImpl implements BrainRuntime {
       this.deps = deps;
 
       await mutations.recover();
+      await this.reconcileAll();
 
       this.credentials = loadCredentials(this.config.credentials_file);
       await loadCursorSecret(this.config);
@@ -267,6 +273,13 @@ class BrainRuntimeImpl implements BrainRuntime {
         this.prune();
       }, PRUNE_INTERVAL_MS);
       this.pruneTimer.unref?.();
+
+      const reconcileInterval =
+        this.config.limits.reconcile_interval_ms ?? RECONCILE_INTERVAL_MS;
+      this.reconcileTimer = setInterval(() => {
+        void this.reconcileAll();
+      }, reconcileInterval);
+      this.reconcileTimer.unref?.();
 
       this.ready = true;
       started = true;
@@ -354,6 +367,27 @@ class BrainRuntimeImpl implements BrainRuntime {
     }
   }
 
+  private reconcileAll(): Promise<void> {
+    if (this.reconciling || this.closing) return Promise.resolve();
+    this.reconciling = true;
+    const work = async (): Promise<void> => {
+      try {
+        const report = await this.deps.mutations.serialize(() => reconcileVault(this.deps));
+        this.log(
+          `reconciled ${report.scanned} files in ${report.scopes.length} scopes; ` +
+            `${report.updated} updated, ${report.unmanaged} unmanaged, ${report.malformed} malformed, ` +
+            `${report.conflicted} conflicted, ${report.manual_unreviewed} manual_unreviewed, ` +
+            `${report.unsupported_schema} unsupported_schema`
+        );
+      } catch (error) {
+        this.log(internalDiagnostic(error));
+      } finally {
+        this.reconciling = false;
+      }
+    };
+    return this.trackOperation(work());
+  }
+
   private async stopListening(): Promise<void> {
     const server = this.httpServer;
     this.httpServer = undefined;
@@ -380,6 +414,10 @@ class BrainRuntimeImpl implements BrainRuntime {
     if (this.pruneTimer !== undefined) {
       clearInterval(this.pruneTimer);
       this.pruneTimer = undefined;
+    }
+    if (this.reconcileTimer !== undefined) {
+      clearInterval(this.reconcileTimer);
+      this.reconcileTimer = undefined;
     }
     if (this.credentialsWatcher !== undefined && this.credentialsListener !== undefined) {
       unwatchFile(this.config.credentials_file, this.credentialsListener);

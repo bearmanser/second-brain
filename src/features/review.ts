@@ -132,8 +132,8 @@ function reviewScope(ctx: RequestContext, requested: string, deps: BrainDeps): S
   return scope;
 }
 
-function hasValidApproval(revision: StoredRevision): boolean {
-  return revision.approval !== undefined && revision.approval.payload_hash === payloadHash(revision);
+function hasValidApproval(revision: StoredRevision, deps: BrainDeps): boolean {
+  return deps.catalogue.approvalIsValid(revision);
 }
 
 async function hasApprovedAncestor(
@@ -147,7 +147,7 @@ async function hasApprovedAncestor(
     const current = queue.shift() as StoredRevision;
     if (visited.has(current.revision_id)) continue;
     visited.add(current.revision_id);
-    if (hasValidApproval(current)) return true;
+    if (hasValidApproval(current, deps)) return true;
     for (const parent of current.parents) {
       if (visited.has(parent.revision_id)) return true;
       let head: Head;
@@ -187,8 +187,11 @@ function parentOf(head: Head): { revision_id: string; raw_hash: string }[] {
   return [{ revision_id: head.revision.revision_id, raw_hash: head.raw_hash }];
 }
 
-function preservedApproval(revision: StoredRevision): StoredRevision['approval'] {
-  return hasValidApproval(revision) ? revision.approval : undefined;
+function preservedApproval(
+  revision: StoredRevision,
+  deps: BrainDeps
+): StoredRevision['approval'] {
+  return hasValidApproval(revision, deps) ? revision.approval : undefined;
 }
 
 function assertApprovable(head: Head): void {
@@ -493,7 +496,7 @@ async function archiveAction(
       created_at: identities.timestamp,
       modified_at: identities.timestamp,
       operation_id: identities.operation_id,
-      approval: preservedApproval(head.revision),
+      approval: preservedApproval(head.revision, deps),
       extra_frontmatter: head.revision.extra_frontmatter,
       extra_markdown: head.revision.extra_markdown
     };
@@ -582,7 +585,7 @@ async function supersedeAction(
       modified_at: identities.timestamp,
       operation_id: identities.operation_id,
       replacement_id: operation.replacement_id,
-      approval: preservedApproval(head.revision),
+      approval: preservedApproval(head.revision, deps),
       extra_frontmatter: head.revision.extra_frontmatter,
       extra_markdown: head.revision.extra_markdown
     };

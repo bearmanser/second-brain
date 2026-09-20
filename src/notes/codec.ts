@@ -36,6 +36,40 @@ const timestampSchema = z.iso.datetime();
 const lifecycleSchema = z.enum(LIFECYCLES);
 const hashSchema = z.string().regex(/^[a-f0-9]{64}$/);
 
+export const CURRENT_SCHEMA_VERSION = 1;
+
+export interface SchemaVersionTransform {
+  from: number;
+  to: number;
+  apply(input: {
+    frontmatter: Record<string, unknown>;
+    body: string;
+  }): { frontmatter: Record<string, unknown>; body: string };
+}
+
+const schemaVersionTransforms = new Map<number, SchemaVersionTransform>();
+
+export function registerSchemaVersionTransform(transform: SchemaVersionTransform): void {
+  if (!Number.isInteger(transform.from) || !Number.isInteger(transform.to)) {
+    throw invalid('a schema version transform must name integer versions');
+  }
+  if (transform.to !== CURRENT_SCHEMA_VERSION) {
+    throw invalid('a schema version transform must target the current schema version');
+  }
+  if (transform.from >= CURRENT_SCHEMA_VERSION) {
+    throw invalid('a schema version transform must upgrade an older schema version');
+  }
+  schemaVersionTransforms.set(transform.from, transform);
+}
+
+export function schemaVersionTransform(from: number): SchemaVersionTransform | undefined {
+  return schemaVersionTransforms.get(from);
+}
+
+export function schemaVersionSupport(): { current: number; transforms: number[] } {
+  return { current: CURRENT_SCHEMA_VERSION, transforms: [...schemaVersionTransforms.keys()].sort() };
+}
+
 function invalid(message: string, cause?: unknown): BrainError {
   return new BrainError({ code: 'INVALID_INPUT', message, cause });
 }
@@ -262,18 +296,36 @@ function assembleContent(
 
 export function decodeRevision(raw: string): StoredRevision {
   const normalized = normalizeLineEndings(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
-  const { frontmatter: frontmatterText, body } = splitFrontmatter(normalized);
-  const frontmatter = asRecord(parseYamlValue(frontmatterText, 'frontmatter'), 'frontmatter');
+  const split = splitFrontmatter(normalized);
+  let frontmatter = asRecord(parseYamlValue(split.frontmatter, 'frontmatter'), 'frontmatter');
+  let body = split.body;
 
   const schemaVersion = frontmatter.brain_schema_version;
   if (schemaVersion === undefined) {
     throw invalid('frontmatter brain_schema_version is required');
   }
-  if (schemaVersion !== 1) {
-    if (typeof schemaVersion === 'number' && Number.isInteger(schemaVersion) && schemaVersion > 1) {
-      throw unsupportedSchema(`brain_schema_version ${schemaVersion} is newer than this gateway supports`);
+  if (schemaVersion !== CURRENT_SCHEMA_VERSION) {
+    const transform =
+      typeof schemaVersion === 'number' && Number.isInteger(schemaVersion)
+        ? schemaVersionTransform(schemaVersion)
+        : undefined;
+    if (transform !== undefined) {
+      const upgraded = transform.apply({ frontmatter, body });
+      frontmatter = asRecord(upgraded.frontmatter, 'frontmatter');
+      body = upgraded.body;
+    } else if (
+      typeof schemaVersion === 'number' &&
+      Number.isInteger(schemaVersion) &&
+      schemaVersion > CURRENT_SCHEMA_VERSION
+    ) {
+      throw unsupportedSchema(
+        `brain_schema_version ${schemaVersion} is newer than this gateway supports`
+      );
+    } else {
+      throw invalid(
+        `frontmatter brain_schema_version must be the integer ${CURRENT_SCHEMA_VERSION}`
+      );
     }
-    throw invalid('frontmatter brain_schema_version must be the integer 1');
   }
 
   const kind = resolveKind(frontmatter);

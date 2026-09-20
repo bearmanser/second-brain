@@ -157,6 +157,15 @@ export class FileVault implements VaultPort {
   }
 
   async list(scope: string): Promise<string[]> {
+    const inventory = await this.inventory(scope);
+    return inventory.managed;
+  }
+
+  async scan(scope: string): Promise<{ managed: string[]; unmanaged: string[] }> {
+    return this.inventory(scope);
+  }
+
+  private async inventory(scope: string): Promise<{ managed: string[]; unmanaged: string[] }> {
     const config = this.requireScope(scope);
     const canonicalScopeRoot = this.scopeRoots.get(config.id);
     if (canonicalScopeRoot === undefined) {
@@ -168,22 +177,24 @@ export class FileVault implements VaultPort {
     try {
       info = await lstat(directory);
     } catch (error) {
-      if (hasErrno(error, 'ENOENT')) return [];
+      if (hasErrno(error, 'ENOENT')) return { managed: [], unmanaged: [] };
       throw recoveryRequired(`scope root ${directory} cannot be inspected`, error);
     }
     if (info.isSymbolicLink()) {
       throw forbidden(`scope root ${config.relative_root} is a symbolic link`);
     }
-    if (!info.isDirectory()) return [];
+    if (!info.isDirectory()) return { managed: [], unmanaged: [] };
     await this.assertDirectoryChain(prefix);
     const canonicalDirectory = await this.canonicalPath(directory);
     if (canonicalDirectory === undefined || !isInside(this.canonicalRoot, canonicalDirectory)) {
       throw forbidden(`scope root ${config.relative_root} resolves outside the vault root`);
     }
-    const found: string[] = [];
-    await this.walk(directory, prefix.join('/'), canonicalScopeRoot, found);
-    found.sort();
-    return found;
+    const managed: string[] = [];
+    const unmanaged: string[] = [];
+    await this.walk(directory, prefix.join('/'), canonicalScopeRoot, managed, unmanaged);
+    managed.sort();
+    unmanaged.sort();
+    return { managed, unmanaged };
   }
 
   async read(
@@ -289,7 +300,8 @@ export class FileVault implements VaultPort {
     directory: string,
     relative: string,
     canonicalScopeRoot: string,
-    found: string[]
+    managed: string[],
+    unmanaged: string[]
   ): Promise<void> {
     let entries;
     try {
@@ -313,12 +325,20 @@ export class FileVault implements VaultPort {
       if (info.isDirectory()) {
         const canonical = await this.canonicalPath(absolute);
         if (canonical === undefined || !isStrictlyInside(canonicalScopeRoot, canonical)) continue;
-        await this.walk(absolute, relativePath, canonicalScopeRoot, found);
+        await this.walk(absolute, relativePath, canonicalScopeRoot, managed, unmanaged);
         continue;
       }
-      if (!info.isFile() || !entry.name.endsWith('.md')) continue;
+      if (!info.isFile()) continue;
+      if (!entry.name.endsWith('.md')) {
+        unmanaged.push(relativePath);
+        continue;
+      }
       const prefix = await this.readPrefix(absolute, info.size, canonicalScopeRoot);
-      if (prefix !== undefined && hasBrainMarker(prefix)) found.push(relativePath);
+      if (prefix !== undefined && hasBrainMarker(prefix)) {
+        managed.push(relativePath);
+      } else {
+        unmanaged.push(relativePath);
+      }
     }
   }
 

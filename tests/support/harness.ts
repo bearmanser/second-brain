@@ -310,6 +310,7 @@ export interface HttpHarnessOptions {
   result_delivery?: ResultDelivery;
   allowed_hosts?: string[];
   allowed_origins?: string[];
+  reconcile_interval_ms?: number;
 }
 
 export interface HttpHarness {
@@ -417,7 +418,7 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
       tool_result_max_bytes: TOOL_RESULT_MAX_BYTES,
       backend_timeout_ms: BACKEND_TIMEOUT_MS,
       materialization_timeout_ms: MATERIALIZATION_TIMEOUT_MS,
-      reconcile_interval_ms: RECONCILE_INTERVAL_MS,
+      reconcile_interval_ms: options.reconcile_interval_ms ?? RECONCILE_INTERVAL_MS,
       concurrent_reads: CONCURRENT_READS
     },
     allowed_hosts: options.allowed_hosts ?? ['127.0.0.1', 'localhost'],

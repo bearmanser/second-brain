@@ -302,16 +302,66 @@ export interface BackendPort {
   close(): Promise<void>;
 }
 
+export type CatalogueState =
+  | 'ready'
+  | 'manual_unreviewed'
+  | 'conflict'
+  | 'malformed'
+  | 'unsupported_schema';
+
+export interface VaultScan {
+  managed: string[];
+  unmanaged: string[];
+}
+
 export interface VaultPort {
   list(scope: string): Promise<string[]>;
   read(
     scope: string,
     relative_path: string
   ): Promise<{ raw: string; raw_hash: string; relative_path: string }>;
+  scan?(scope: string): Promise<VaultScan>;
+}
+
+export interface ReconcileFinding {
+  scope: string;
+  relative_path: string;
+  state: CatalogueState;
+  id?: string;
+  revision_id?: string;
+  warnings: string[];
+}
+
+export interface ReconcileCounts {
+  scanned: number;
+  updated: number;
+  unmanaged: number;
+  malformed: number;
+  conflicted: number;
+  manual_unreviewed: number;
+  unsupported_schema: number;
+}
+
+export interface ReconcileScopeReport extends ReconcileCounts {
+  scope: string;
+  findings: ReconcileFinding[];
+}
+
+export interface ReconcileReport extends ReconcileCounts {
+  scopes: string[];
+  ids?: {
+    malformed: string[];
+    conflicted: string[];
+    manual_unreviewed: string[];
+    unsupported_schema: string[];
+  };
+  findings?: ReconcileFinding[];
 }
 
 export interface CataloguePort {
   reconcile(scope: string): Promise<void>;
+  reconcileReport(scope: string): Promise<ReconcileScopeReport>;
+  approvalIsValid(revision: StoredRevision): boolean;
   get(scope: string, id: string): Promise<Head>;
   getRevision(scope: string, id: string, revision_id: string): Promise<Head>;
   locate(

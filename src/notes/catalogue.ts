@@ -5,10 +5,13 @@ import {
   LIFECYCLES,
   NOTE_KINDS,
   type CataloguePort,
+  type CatalogueState,
   type Clock,
   type Head,
   type Lifecycle,
   type NoteKind,
+  type ReconcileFinding,
+  type ReconcileScopeReport,
   type ScopeConfig,
   type SourceRef,
   type StoredRevision,
@@ -27,17 +30,24 @@ export type HeadResolution =
   | { state: 'ready'; head: ParsedRevision }
   | { state: 'conflict'; reasons: string[]; heads: ParsedRevision[] };
 
-export type CatalogueState =
-  | 'ready'
-  | 'manual_unreviewed'
-  | 'conflict'
-  | 'malformed'
-  | 'unsupported_schema';
+export interface ApprovalProvenanceInput {
+  scope: string;
+  id: string;
+  revision_id: string;
+  operation_id: string;
+  principal_id: string;
+  payload_hash: string;
+}
+
+export interface ApprovalProvenance {
+  verify(input: ApprovalProvenanceInput): boolean;
+}
 
 export interface CatalogueOptions {
   vault: VaultPort;
   scopes: ScopeConfig[];
   clock?: Clock;
+  approval_provenance?: ApprovalProvenance;
 }
 
 const LIST_PAGE_SIZE = 50;
@@ -245,18 +255,21 @@ export class RevisionCatalogue implements CataloguePort {
   private readonly vault: VaultPort;
   private readonly scopes: Set<string>;
   private readonly clock: Clock;
+  private readonly approvalProvenance: ApprovalProvenance | undefined;
   private closed = false;
 
   private constructor(
     database: Database.Database,
     vault: VaultPort,
     scopes: Set<string>,
-    clock: Clock
+    clock: Clock,
+    approvalProvenance: ApprovalProvenance | undefined
   ) {
     this.database = database;
     this.vault = vault;
     this.scopes = scopes;
     this.clock = clock;
+    this.approvalProvenance = approvalProvenance;
   }
 
   static open(path: string, options: CatalogueOptions): RevisionCatalogue {
@@ -281,14 +294,20 @@ export class RevisionCatalogue implements CataloguePort {
       database,
       options.vault,
       new Set(options.scopes.map((scope) => scope.id)),
-      clock
+      clock,
+      options.approval_provenance
     );
   }
 
   async reconcile(scope: string): Promise<void> {
+    await this.reconcileReport(scope);
+  }
+
+  async reconcileReport(scope: string): Promise<ReconcileScopeReport> {
     this.assertOpen();
     this.requireScope(scope);
-    const paths = await this.vault.list(scope);
+    const inventory = await this.inventory(scope);
+    const paths = inventory.managed;
     const observations: Observation[] = [];
     for (const path of paths) {
       try {
@@ -322,6 +341,8 @@ export class RevisionCatalogue implements CataloguePort {
       }
     }
 
+    const previous = this.persistedScopeRows(scope);
+    const previousByPath = new Map(previous.map((row) => [row.relative_path, row]));
     const rows: RevisionRow[] = [];
     const parents: ParentRow[] = [];
     const observedAt = this.clock.now().toISOString();
@@ -378,8 +399,7 @@ export class RevisionCatalogue implements CataloguePort {
         resolution.state === 'ready' ? resolution.head.revision.revision_id : undefined;
       for (const item of group) {
         const revision = item.revision;
-        const approvalChanged =
-          revision.approval !== undefined && revision.approval.payload_hash !== payloadHash(revision);
+        const approvalChanged = this.approvalInvalid(revision);
         const isConflict = conflictingPaths.has(item.path);
         const warnings = isConflict
           ? conflictWarnings
@@ -404,7 +424,13 @@ export class RevisionCatalogue implements CataloguePort {
           state,
           is_head: !isConflict && headRevisionId === revision.revision_id ? 1 : 0,
           warnings_json: JSON.stringify(warnings),
-          observed_at: observedAt
+          observed_at: this.observedAtFor(
+            previousByPath,
+            item.path,
+            item.raw_hash,
+            state,
+            observedAt
+          )
         });
         for (const parent of revision.parents) {
           parents.push({
@@ -420,6 +446,7 @@ export class RevisionCatalogue implements CataloguePort {
     for (const item of observations) {
       if (item.revision !== undefined) continue;
       const identity = item.identity ?? {};
+      const state = item.state ?? 'malformed';
       rows.push({
         scope,
         relative_path: item.path,
@@ -430,15 +457,16 @@ export class RevisionCatalogue implements CataloguePort {
         kind: identity.kind ?? null,
         stored_status: identity.status ?? null,
         effective_status: asLifecycle(identity.status),
-        state: item.state ?? 'malformed',
+        state,
         is_head: 0,
         warnings_json: JSON.stringify(item.warnings ?? ['malformed']),
-        observed_at: observedAt
+        observed_at: this.observedAtFor(previousByPath, item.path, item.raw_hash, state, observedAt)
       });
     }
 
     this.persist(scope, rows, parents);
     this.normalizeDuplicateConflicts();
+    return this.summarize(scope, observations.length, inventory.unmanaged.length, previousByPath);
   }
 
   async get(scope: string, id: string): Promise<Head> {
@@ -448,6 +476,10 @@ export class RevisionCatalogue implements CataloguePort {
     if (rows.length === 0) throw notFound(`note ${id} is not catalogued in scope ${scope}`);
     const loaded = await this.loadRows(scope, rows);
     return this.resolveUniqueHead(scope, id, loaded, rows);
+  }
+
+  approvalIsValid(revision: StoredRevision): boolean {
+    return revision.approval !== undefined && !this.approvalInvalid(revision);
   }
 
   async getRevision(scope: string, id: string, revisionId: string): Promise<Head> {
@@ -641,8 +673,7 @@ export class RevisionCatalogue implements CataloguePort {
     forcedState?: Head['state']
   ): Head {
     const revision = item.revision;
-    const approvalChanged =
-      revision.approval !== undefined && revision.approval.payload_hash !== payloadHash(revision);
+    const approvalChanged = this.approvalInvalid(revision);
     const warnings = [...baseWarnings];
     if (approvalChanged && !warnings.includes('manual_unreviewed')) {
       warnings.push('manual_unreviewed');
@@ -864,6 +895,109 @@ export class RevisionCatalogue implements CataloguePort {
       }
     });
     run.immediate();
+  }
+
+  private async inventory(scope: string): Promise<{ managed: string[]; unmanaged: string[] }> {
+    const scan = this.vault.scan;
+    if (typeof scan === 'function') {
+      const result = await scan.call(this.vault, scope);
+      return { managed: [...result.managed], unmanaged: [...result.unmanaged] };
+    }
+    return { managed: await this.vault.list(scope), unmanaged: [] };
+  }
+
+  private persistedScopeRows(scope: string): RevisionRow[] {
+    return this.database
+      .prepare('SELECT * FROM catalogue_revisions WHERE scope = ? ORDER BY relative_path ASC')
+      .all(scope) as RevisionRow[];
+  }
+
+  private observedAtFor(
+    previousByPath: Map<string, RevisionRow>,
+    path: string,
+    rawHash: string,
+    state: CatalogueState,
+    observedAt: string
+  ): string {
+    const prior = previousByPath.get(path);
+    if (prior !== undefined && prior.raw_hash === rawHash && prior.state === state) {
+      return prior.observed_at;
+    }
+    return observedAt;
+  }
+
+  private approvalInvalid(revision: StoredRevision): boolean {
+    const approval = revision.approval;
+    if (approval === undefined) return false;
+    if (approval.payload_hash !== payloadHash(revision)) return true;
+    const provenance = this.approvalProvenance;
+    if (provenance === undefined) return false;
+    return !provenance.verify({
+      scope: revision.scope,
+      id: revision.id,
+      revision_id: revision.revision_id,
+      operation_id: revision.operation_id,
+      principal_id: approval.principal_id,
+      payload_hash: approval.payload_hash
+    });
+  }
+
+  private summarize(
+    scope: string,
+    scanned: number,
+    unmanaged: number,
+    previousByPath: Map<string, RevisionRow>
+  ): ReconcileScopeReport {
+    const rows = this.persistedScopeRows(scope);
+    const currentPaths = new Set(rows.map((row) => row.relative_path));
+    let updated = 0;
+    for (const row of rows) {
+      const prior = previousByPath.get(row.relative_path);
+      if (
+        prior === undefined ||
+        prior.revision_id !== row.revision_id ||
+        prior.raw_hash !== row.raw_hash ||
+        prior.state !== row.state ||
+        prior.warnings_json !== row.warnings_json
+      ) {
+        updated += 1;
+      }
+    }
+    for (const path of previousByPath.keys()) {
+      if (!currentPaths.has(path)) updated += 1;
+    }
+    const findings: ReconcileFinding[] = [];
+    let malformed = 0;
+    let conflicted = 0;
+    let manual_unreviewed = 0;
+    let unsupported_schema = 0;
+    for (const row of rows) {
+      const state = row.state as CatalogueState;
+      if (state === 'malformed') malformed += 1;
+      else if (state === 'conflict') conflicted += 1;
+      else if (state === 'manual_unreviewed') manual_unreviewed += 1;
+      else if (state === 'unsupported_schema') unsupported_schema += 1;
+      else continue;
+      findings.push({
+        scope: row.scope,
+        relative_path: row.relative_path,
+        state,
+        ...(row.logical_id === null ? {} : { id: row.logical_id }),
+        ...(row.revision_id === null ? {} : { revision_id: row.revision_id }),
+        warnings: parseWarnings(row.warnings_json)
+      });
+    }
+    return {
+      scope,
+      scanned,
+      updated,
+      unmanaged,
+      malformed,
+      conflicted,
+      manual_unreviewed,
+      unsupported_schema,
+      findings
+    };
   }
 
   private encodeCursor(offset: number, scope: string, filter: string): string {
