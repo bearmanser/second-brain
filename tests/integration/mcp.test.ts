@@ -3,6 +3,7 @@ import { writeFile } from 'node:fs/promises';
 import { expect, test } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
 import { createRuntime } from '../../src/runtime.js';
 import { lessonFixture } from '../fixtures/content.js';
 import { workerPrincipal } from '../fixtures/principals.js';
@@ -82,10 +83,9 @@ test('lists the six tools and completes a status call with structured content', 
     expect(captureMeta?.['second-brain/outputSchema']).toBeTruthy();
 
     const reviewTool = tools.find((tool) => tool.name === 'brain_review');
-    const reviewProperties = (reviewTool?.outputSchema as { properties?: Record<string, unknown> })
-      ?.properties;
-    expect(reviewProperties?.items).toBeTruthy();
-    expect(reviewProperties?.operation_id).toBeTruthy();
+    const reviewSchema = reviewTool?.outputSchema as { type?: string; oneOf?: unknown[] } | undefined;
+    expect(reviewSchema?.type).toBe('object');
+    expect(reviewSchema?.oneOf).toHaveLength(2);
 
     const result = await call(client, 'brain_status', {});
     expect(result.isError).toBeFalsy();
@@ -193,6 +193,39 @@ test('read and both review result branches survive output validation', async () 
   } finally {
     await worker.close();
     await reviewer.close();
+    await h.close();
+  }
+});
+
+test('the published review schema encodes the result union', async () => {
+  const h = await startHttpHarness();
+  const client = await h.connect(h.reviewerToken);
+  try {
+    const review = (await client.listTools()).tools.find((tool) => tool.name === 'brain_review');
+    const schema = review?.outputSchema as { type?: string; oneOf?: unknown[] } | undefined;
+    expect(schema?.type).toBe('object');
+    expect(schema?.oneOf).toHaveLength(2);
+
+    const validator = new AjvJsonSchemaValidator().getValidator(
+      review?.outputSchema as Record<string, unknown>
+    );
+    const receipt = {
+      operation_id: randomUUID(),
+      id: randomUUID(),
+      revision_id: randomUUID(),
+      outcome: 'stored',
+      materialized: true,
+      indexed: true,
+      possible_duplicates: [],
+      warnings: []
+    };
+    expect(validator(receipt).valid).toBe(true);
+    expect(validator({ items: [] }).valid).toBe(true);
+    expect(validator({}).valid).toBe(false);
+    expect(validator({ operation_id: receipt.operation_id, items: [] }).valid).toBe(false);
+    expect(validator({ id: receipt.id, materialized: true }).valid).toBe(false);
+  } finally {
+    await client.close();
     await h.close();
   }
 });

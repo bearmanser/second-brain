@@ -1,5 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import type { ResultDelivery } from '../config/schema.js';
 import { isBrainError } from '../contracts/errors.js';
@@ -30,6 +31,7 @@ import {
   toToolError,
   toToolResult,
   internalDiagnostic,
+  type ToolDefinition,
   type ToolName
 } from './tools.js';
 
@@ -80,23 +82,12 @@ const mutationReceiptOutputSchema = z.strictObject({
   warnings: stringListOutputSchema
 });
 
-const reviewOutputSchema = z
-  .strictObject({
-    operation_id: uuidOutputSchema.optional(),
-    id: uuidOutputSchema.optional(),
-    revision_id: uuidOutputSchema.optional(),
-    outcome: z.enum(['stored', 'stored_conflict', 'pending']).optional(),
-    materialized: z.boolean().optional(),
-    indexed: z.boolean().optional(),
-    etag: etagOutputSchema.optional(),
-    possible_duplicates: z.array(sourceRefOutputSchema).optional(),
-    warnings: stringListOutputSchema.optional(),
-    items: z.array(sourceRefOutputSchema).optional(),
-    next_cursor: z.string().optional()
-  })
-  .describe(
-    'A MutationReceipt for a review mutation or a ReviewListResult for a review listing; the two branches are distinguished by items versus operation_id'
-  );
+const reviewListOutputSchema = z.strictObject({
+  items: z.array(sourceRefOutputSchema),
+  next_cursor: z.string().optional()
+});
+
+const reviewResultSchema = z.union([mutationReceiptOutputSchema, reviewListOutputSchema]);
 
 const readOutputSchema = z.strictObject({
   source: sourceRefOutputSchema,
@@ -148,9 +139,28 @@ const TOOL_OUTPUT_SCHEMAS: Partial<Record<ToolName, z.ZodType>> = {
   brain_feedback: feedbackOutputSchema,
   brain_read: readOutputSchema,
   brain_recall: recallOutputSchema,
-  brain_review: reviewOutputSchema,
   brain_status: statusOutputSchema
 };
+
+export function publishedOutputSchema(definition: ToolDefinition): Record<string, unknown> {
+  if (definition.name === 'brain_review') {
+    const branches = (definition.outputSchema as { oneOf?: unknown[] }).oneOf ?? [];
+    return { type: 'object', oneOf: branches };
+  }
+  return definition.outputSchema;
+}
+
+export function publishedTools(): Tool[] {
+  return toolDefinitions.map((definition) => ({
+    name: definition.name,
+    title: definition.annotations.title,
+    description: definition.description,
+    inputSchema: definition.inputSchema as Tool['inputSchema'],
+    outputSchema: publishedOutputSchema(definition) as NonNullable<Tool['outputSchema']>,
+    annotations: { ...definition.annotations },
+    _meta: { [OUTPUT_SCHEMA_META_KEY]: definition.outputSchema }
+  }));
+}
 
 type ToolInvoker = (
   services: BrainServices,
@@ -163,7 +173,8 @@ const TOOL_HANDLERS: Record<ToolName, ToolInvoker> = {
   brain_feedback: (services, ctx, args) => services.feedback(ctx, args as FeedbackRequest),
   brain_read: (services, ctx, args) => services.read(ctx, args as ReadRequest),
   brain_recall: (services, ctx, args) => services.recall(ctx, args as RecallRequest),
-  brain_review: (services, ctx, args) => services.review(ctx, args as ReviewRequest),
+  brain_review: async (services, ctx, args) =>
+    reviewResultSchema.parse(await services.review(ctx, args as ReviewRequest)),
   brain_status: (services, ctx, args) => services.status(ctx, args as StatusRequest)
 };
 
@@ -199,6 +210,10 @@ export function createMcpServer(services: BrainServices, ctx: RequestContext): M
       }
     );
   }
+
+  const tools = publishedTools();
+  server.server.removeRequestHandler('tools/list');
+  server.server.setRequestHandler(ListToolsRequestSchema, () => ({ tools }));
 
   return server;
 }

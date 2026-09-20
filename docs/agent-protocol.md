@@ -100,6 +100,17 @@ gateway configuration:
   for clients that ignore `structuredContent`. The structured payload remains
   present so the declared output schema stays valid.
 
+Every tool publishes a standard JSON `outputSchema`. Five tools return a single
+object shape. `brain_review` returns a union — a `MutationReceipt` for a
+mutation action or a `ReviewListResult` for `list` — and publishes it as
+`{ "type": "object", "oneOf": [<MutationReceipt>, <ReviewListResult>] }`. The
+pinned SDK's `registerTool.outputSchema` accepts only Zod schemas, and its
+built-in `tools/list` generator cannot emit a union, so the gateway builds the
+published tool list from the same declared output contract and installs it
+explicitly, and it validates every `brain_review` result against the union
+before returning it. `_meta["second-brain/outputSchema"]` repeats the declared
+schema as a compatibility extension.
+
 `text-json` exists because a client that cannot see structured content would
 otherwise observe only the pointer. It is the operator's explicit choice, and it
 increases the model-visible context cost, so it should be enabled only after
