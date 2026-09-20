@@ -93,6 +93,21 @@ interface LocatedMaterialization {
   revision: StoredRevision;
 }
 
+type Inspection =
+  | { kind: 'match'; match: LocatedMaterialization }
+  | { kind: 'absent' }
+  | { kind: 'undecodable' }
+  | { kind: 'error'; reason: string };
+
+type ScanOutcome =
+  | { kind: 'conclusive'; matches: LocatedMaterialization[] }
+  | { kind: 'inconclusive'; reason: string };
+
+type MaterializationWait =
+  | { kind: 'matched'; matches: LocatedMaterialization[] }
+  | { kind: 'absent' }
+  | { kind: 'inconclusive' };
+
 function invalidInput(message: string, cause?: unknown): BrainError {
   return new BrainError({ code: 'INVALID_INPUT', message, cause });
 }
@@ -380,18 +395,29 @@ export class MutationCoordinator {
       if (persisted.revision.scope !== scope.id) {
         throw recoveryRequired('persisted plan does not match the authorized scope', record.operation_id);
       }
-      const immediate = await this.findMaterializations(scope, persisted);
-      if (immediate.length > 0) return this.finalize(scope, persisted, immediate, record.operation_id);
-      if (record.state === 'materialized') {
-        this.markConflict(record.operation_id);
-        throw conflict('operation was marked materialized but its file is absent', record.operation_id);
-      }
       if (record.state === 'submitted') {
-        const settled = await this.awaitMaterialization(scope, persisted);
-        if (settled !== undefined && settled.length > 0) {
-          return this.finalize(scope, persisted, settled, record.operation_id);
+        const wait = await this.awaitMaterialization(scope, persisted);
+        if (wait.kind === 'matched') {
+          return this.finalize(scope, persisted, wait.matches, record.operation_id);
         }
-        return this.submit(ctx, scope, persisted, record.operation_id);
+        if (wait.kind === 'absent') {
+          return this.submit(ctx, scope, persisted, record.operation_id);
+        }
+        return this.pending(record.operation_id, persisted);
+      }
+      if (record.state === 'materialized') {
+        const wait = await this.awaitMaterialization(scope, persisted);
+        if (wait.kind === 'matched') {
+          return this.finalize(scope, persisted, wait.matches, record.operation_id);
+        }
+        if (wait.kind === 'absent') {
+          this.markConflict(record.operation_id);
+          throw conflict('operation was marked materialized but its file is absent', record.operation_id);
+        }
+        return this.pending(record.operation_id, persisted);
+      }
+      if (record.state !== 'prepared') {
+        throw recoveryRequired(`operation is stuck in state ${record.state}`, record.operation_id);
       }
     }
 
@@ -501,81 +527,102 @@ export class MutationCoordinator {
       await this.deps.backend.create(plan);
     } catch (error) {
       if (isBrainError(error) && error.code === 'CONFLICT') {
-        const matches = await this.findMaterializations(scope, plan);
-        if (matches.length === 0) {
-          this.markConflict(operation_id);
-          throw conflict('backend rejected a create that had no materialised file', operation_id);
-        }
-        return this.finalize(scope, plan, matches, operation_id);
+        const scan = await this.scanMaterializations(scope, plan);
+        if (scan.kind === 'inconclusive') return this.pending(operation_id, plan);
+        if (scan.matches.length > 0) return this.finalize(scope, plan, scan.matches, operation_id);
+        this.markConflict(operation_id);
+        throw conflict('backend rejected a create that had no materialised file', operation_id);
       }
       if (!isUncertainWrite(error)) throw error;
-      const matches = await this.awaitMaterialization(scope, plan);
-      if (matches === undefined || matches.length === 0) return this.pending(operation_id, plan);
-      return this.finalize(scope, plan, matches, operation_id);
+      const wait = await this.awaitMaterialization(scope, plan);
+      if (wait.kind === 'matched') return this.finalize(scope, plan, wait.matches, operation_id);
+      return this.pending(operation_id, plan);
     }
-    const matches = await this.awaitMaterialization(scope, plan);
-    if (matches === undefined || matches.length === 0) return this.pending(operation_id, plan);
-    return this.finalize(scope, plan, matches, operation_id);
+    const wait = await this.awaitMaterialization(scope, plan);
+    if (wait.kind === 'matched') return this.finalize(scope, plan, wait.matches, operation_id);
+    return this.pending(operation_id, plan);
   }
 
   private async awaitMaterialization(
     scope: ScopeConfig,
     plan: PlannedWrite
-  ): Promise<LocatedMaterialization[] | undefined> {
+  ): Promise<MaterializationWait> {
     const timeout = this.deps.config.limits.materialization_timeout_ms ?? MATERIALIZATION_TIMEOUT_MS;
     const deadline = Date.now() + timeout;
+    let conclusiveZero = false;
     for (;;) {
-      const matches = await this.findMaterializations(scope, plan);
-      if (matches.length > 0) return matches;
+      const scan = await this.scanMaterializations(scope, plan);
+      if (scan.kind === 'conclusive') {
+        if (scan.matches.length > 0) return { kind: 'matched', matches: scan.matches };
+        conclusiveZero = true;
+      } else {
+        conclusiveZero = false;
+      }
       const remaining = deadline - Date.now();
-      if (remaining <= 0) return undefined;
+      if (remaining <= 0) return conclusiveZero ? { kind: 'absent' } : { kind: 'inconclusive' };
       await delay(Math.min(POLL_INTERVAL_MS, remaining));
     }
   }
 
-  private async findMaterializations(
+  private async scanMaterializations(
     scope: ScopeConfig,
     plan: PlannedWrite
-  ): Promise<LocatedMaterialization[]> {
+  ): Promise<ScanOutcome> {
     const found = new Map<string, LocatedMaterialization>();
-    const consider = async (relativePath: string): Promise<void> => {
-      const candidate = await this.readCandidate(scope, relativePath, plan);
-      if (candidate !== undefined) found.set(candidate.relative_path, candidate);
-    };
-    await consider(expectedRelativePath(scope, plan));
+    const expected = expectedRelativePath(scope, plan);
+
+    const direct = await this.inspect(scope, expected, plan);
+    if (direct.kind === 'error') return { kind: 'inconclusive', reason: direct.reason };
+    if (direct.kind === 'undecodable') {
+      return { kind: 'inconclusive', reason: 'undecodable_materialization' };
+    }
+    if (direct.kind === 'match') found.set(direct.match.relative_path, direct.match);
+
     let paths: string[];
     try {
       paths = await this.deps.vault.list(scope.id);
-    } catch {
-      return [...found.values()];
+    } catch (error) {
+      return {
+        kind: 'inconclusive',
+        reason: isBrainError(error) ? `vault_list_${error.code}` : 'vault_list_failed'
+      };
     }
-    for (const path of paths) await consider(path);
-    return [...found.values()];
+    for (const path of paths) {
+      if (path === expected) continue;
+      const inspected = await this.inspect(scope, path, plan);
+      if (inspected.kind === 'error') return { kind: 'inconclusive', reason: inspected.reason };
+      if (inspected.kind === 'match') found.set(inspected.match.relative_path, inspected.match);
+    }
+    return { kind: 'conclusive', matches: [...found.values()] };
   }
 
-  private async readCandidate(
+  private async inspect(
     scope: ScopeConfig,
     relativePath: string,
     plan: PlannedWrite
-  ): Promise<LocatedMaterialization | undefined> {
+  ): Promise<Inspection> {
     let read: { raw: string; raw_hash: string; relative_path: string };
     try {
       read = await this.deps.vault.read(scope.id, relativePath);
-    } catch {
-      return undefined;
+    } catch (error) {
+      if (isBrainError(error) && error.code === 'NOT_FOUND') return { kind: 'absent' };
+      return { kind: 'error', reason: isBrainError(error) ? `vault_read_${error.code}` : 'vault_read_failed' };
     }
     let revision: StoredRevision;
     try {
       revision = decodeRevision(read.raw);
     } catch {
-      return undefined;
+      return { kind: 'undecodable' };
     }
-    if (revision.revision_id !== plan.revision.revision_id) return undefined;
+    if (revision.revision_id !== plan.revision.revision_id) return { kind: 'absent' };
     return {
-      raw: read.raw,
-      raw_hash: read.raw_hash,
-      relative_path: read.relative_path,
-      revision
+      kind: 'match',
+      match: {
+        raw: read.raw,
+        raw_hash: read.raw_hash,
+        relative_path: read.relative_path,
+        revision
+      }
     };
   }
 
@@ -741,8 +788,8 @@ export class MutationCoordinator {
     if (plan === undefined) return;
     const scope = this.deps.config.scopes.find((candidate) => candidate.id === record.scope);
     if (scope === undefined) return;
-    const matches = await this.findMaterializations(scope, plan);
-    if (matches.length === 0) return;
-    await this.finalize(scope, plan, matches, record.operation_id);
+    const scan = await this.scanMaterializations(scope, plan);
+    if (scan.kind !== 'conclusive' || scan.matches.length === 0) return;
+    await this.finalize(scope, plan, scan.matches, record.operation_id);
   }
 }

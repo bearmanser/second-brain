@@ -558,3 +558,52 @@ test('never reports stored for a foreign revision id', async () => {
   expect(h.backend.create_calls).toHaveLength(1);
   await h.close();
 });
+
+test('stays pending when the vault cannot be enumerated during materialization', async () => {
+  const h = await createHarness();
+  const originalList = h.deps.vault.list.bind(h.deps.vault);
+  let listingUnavailable = false;
+  h.deps.vault.list = async (scope) => {
+    if (listingUnavailable) throw new Error('vault listing unavailable');
+    return originalList(scope);
+  };
+  h.backend.on_create = () => {
+    listingUnavailable = true;
+  };
+  const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
+  const receipt = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+  expect(receipt.outcome).toBe('pending');
+  expect(receipt.materialized).toBe(false);
+  expect(h.backend.create_calls).toHaveLength(1);
+  expect(h.backend.materialisedPaths('freellmapi')).toHaveLength(1);
+  await h.close();
+});
+
+test('does not resend when the vault cannot be enumerated during a submitted replay', async () => {
+  const h = await createHarness();
+  const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
+  h.backend.fail_once = 'before_write';
+  const first = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+  expect(first.outcome).toBe('pending');
+  expect(h.backend.create_calls).toHaveLength(1);
+  h.deps.vault.list = async () => {
+    throw new Error('vault listing unavailable');
+  };
+  const replay = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+  expect(replay.outcome).toBe('pending');
+  expect(h.backend.create_calls).toHaveLength(1);
+  await h.close();
+});
+
+test('resends a submitted operation only after a conclusive zero-match window', async () => {
+  const h = await createHarness();
+  const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
+  h.backend.fail_once = 'before_write';
+  const first = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+  expect(first.outcome).toBe('pending');
+  expect(h.backend.create_calls).toHaveLength(1);
+  const replay = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+  expect(replay.outcome).toBe('stored');
+  expect(h.backend.create_calls).toHaveLength(2);
+  await h.close();
+});
