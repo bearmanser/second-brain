@@ -492,6 +492,24 @@ export class RevisionCatalogue implements CataloguePort {
     return this.buildHead(target, unique(warnings), conflicted ? 'conflict' : undefined);
   }
 
+  async locate(
+    scope: string,
+    id: string,
+    revisionId?: string
+  ): Promise<{ relative_path: string } | undefined> {
+    this.assertOpen();
+    this.requireScope(scope);
+    const rows =
+      revisionId === undefined ? this.rowsForLogicalId(scope, id) : this.rowsForRevision(scope, id, revisionId);
+    const selected =
+      revisionId === undefined
+        ? rows.find((row) => row.is_head === 1) ??
+          rows.find((row) => row.revision_id !== null) ??
+          rows[0]
+        : rows[0];
+    return selected === undefined ? undefined : { relative_path: selected.relative_path };
+  }
+
   async list(
     scope: string,
     filter: 'candidate' | 'conflict',

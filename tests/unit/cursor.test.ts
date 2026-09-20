@@ -133,6 +133,28 @@ test('rejects a non-UTC or non-RFC3339 expiry', () => {
   }
 });
 
+test('rejects impossible calendar instants such as February 30', () => {
+  for (const value of [
+    '2026-02-30T12:10:00Z',
+    '2026-02-29T12:10:00Z',
+    '2026-13-01T12:10:00Z',
+    '2026-09-20T25:10:00Z'
+  ]) {
+    const cursor = signCursor(payload({ expires_at: value }) as never, KEY);
+    expect(() => verifyCursor(cursor, KEY, reviewerContext, NOW)).toThrow(/INVALID_INPUT/);
+  }
+  const leap = signCursor(payload({ expires_at: '2024-02-29T12:10:00Z' }) as never, KEY);
+  expect(verifyCursor(leap, KEY, reviewerContext, new Date('2024-02-29T12:00:00Z')).offset).toBe(100);
+});
+
+test('rejects short or empty signing secrets in both directions', () => {
+  const valid = signCursor(payload() as never, KEY);
+  for (const key of [new Uint8Array(0), new Uint8Array(16).fill(1), new Uint8Array(31).fill(1)]) {
+    expect(() => signCursor(payload() as never, key)).toThrow(/INVALID_INPUT/);
+    expect(() => verifyCursor(valid, key, reviewerContext, NOW)).toThrow(/INVALID_INPUT/);
+  }
+});
+
 test('rejects negative, fractional, and non-numeric offsets', () => {
   for (const offset of [-1, 1.5, Number.NaN, '5']) {
     const cursor = signCursor(payload({ offset }) as never, KEY);

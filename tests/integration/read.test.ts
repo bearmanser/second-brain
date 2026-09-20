@@ -588,16 +588,16 @@ test('fails closed when the cursor secret is too short', async () => {
   await h.close();
 });
 
-test('propagates a vault failure while checking a conflicted source', async () => {
+test('propagates a typed vault failure for a present selected source', async () => {
   const h = await createHarness();
   await installSecret(h);
   const head = await h.seed(lessonFixture);
-  const raw = await readFile(vaultAbsolute(h, head.source.relative_path), 'utf8');
-  const directory = head.source.relative_path.split('/').slice(0, -1).join('/');
-  await writeVaultFile(h, `${directory}/duplicate.md`, raw);
-  await h.deps.catalogue.reconcile('freellmapi');
-  h.deps.vault.list = async () => {
-    throw new BrainError({ code: 'RECOVERY_REQUIRED', message: 'vault list failed' });
+  const original = h.deps.vault.read.bind(h.deps.vault);
+  h.deps.vault.read = async (scope, relativePath) => {
+    if (relativePath === head.source.relative_path) {
+      throw new BrainError({ code: 'RECOVERY_REQUIRED', message: 'selected source unreadable' });
+    }
+    return original(scope, relativePath);
   };
   await expect(
     read(workerContext, { scope: 'freellmapi', id: head.revision.id }, h.deps)
@@ -605,7 +605,48 @@ test('propagates a vault failure while checking a conflicted source', async () =
   await h.close();
 });
 
-test('rejects an over-limit materialized document before pagination', async () => {  const h = await createHarness();
+test('returns CONFLICT when the selected file exists with destroyed identity metadata', async () => {
+  const h = await createHarness();
+  await installSecret(h);
+  const head = await h.seed(lessonFixture);
+  await h.externalEdit(head, (raw) =>
+    raw.replace(/^brain_id:.*\n/m, '').replace(/^brain_revision_id:.*\n/m, '')
+  );
+  await expect(
+    read(workerContext, { scope: 'freellmapi', id: head.revision.id }, h.deps)
+  ).rejects.toMatchObject({ code: 'CONFLICT' });
+  await expect(
+    read(
+      workerContext,
+      { scope: 'freellmapi', id: head.revision.id, revision_id: head.revision.revision_id },
+      h.deps
+    )
+  ).rejects.toMatchObject({ code: 'CONFLICT' });
+  await h.close();
+});
+
+test('does not let an unrelated unreadable file change the selected note result', async () => {
+  const h = await createHarness();
+  await installSecret(h);
+  const head = await h.seed(lessonFixture);
+  const raw = await readFile(vaultAbsolute(h, head.source.relative_path), 'utf8');
+  const directory = head.source.relative_path.split('/').slice(0, -1).join('/');
+  await writeVaultFile(h, `${directory}/duplicate.md`, raw);
+  const marker = '---\ntitle: unrelated\nbrain_schema_version: 1\n---\n';
+  await writeVaultFile(
+    h,
+    `freellmapi/Lessons/${randomUUID()}/${randomUUID()}.md`,
+    marker + 'x'.repeat(RENDERED_NOTE_MAX_BYTES)
+  );
+  await h.deps.catalogue.reconcile('freellmapi');
+  await expect(
+    read(workerContext, { scope: 'freellmapi', id: head.revision.id }, h.deps)
+  ).rejects.toMatchObject({ code: 'CONFLICT' });
+  await h.close();
+});
+
+test('rejects an over-limit materialized document before pagination', async () => {
+  const h = await createHarness();
   await installSecret(h);
   const head = await h.seed(lessonFixture);
   const real = await h.deps.vault.read('freellmapi', head.source.relative_path);

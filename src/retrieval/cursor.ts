@@ -36,9 +36,26 @@ const STRING_FIELDS: readonly CursorField[] = [
 
 const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
 const UTC_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+const MIN_SECRET_BYTES = 32;
 
 function invalid(message: string): BrainError {
   return new BrainError({ code: 'INVALID_INPUT', message });
+}
+
+function requireSecret(secret: Uint8Array): void {
+  if (!(secret instanceof Uint8Array) || secret.length < MIN_SECRET_BYTES) {
+    throw invalid(`read cursor signing secret must be at least ${MIN_SECRET_BYTES} bytes`);
+  }
+}
+
+function isUtcInstant(value: string): boolean {
+  if (!UTC_TIMESTAMP_PATTERN.test(value)) return false;
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return false;
+  const [datePart, timePart] = value.slice(0, -1).split('T');
+  const [clock, fraction = ''] = timePart.split('.');
+  const normalized = `${datePart}T${clock}.${fraction.padEnd(3, '0').slice(0, 3)}Z`;
+  return normalized === new Date(parsed).toISOString();
 }
 
 function canonicalBody(payload: CursorPayload): Buffer {
@@ -84,8 +101,8 @@ function parsePayload(value: unknown): CursorPayload {
     }
     strings[field] = entry;
   }
-  if (!UTC_TIMESTAMP_PATTERN.test(strings.expires_at)) {
-    throw invalid('read cursor expires_at must be a UTC RFC3339 timestamp');
+  if (!isUtcInstant(strings.expires_at)) {
+    throw invalid('read cursor expires_at must be a valid UTC RFC3339 instant');
   }
   const offset = record.offset;
   if (typeof offset !== 'number' || !Number.isSafeInteger(offset) || offset < 0) {
@@ -103,6 +120,7 @@ function parsePayload(value: unknown): CursorPayload {
 }
 
 export function signCursor(payload: CursorPayload, secret: Uint8Array): string {
+  requireSecret(secret);
   const body = canonicalBody(payload);
   const signature = signatureOf(body, secret);
   return `${encodeBase64Url(body)}.${encodeBase64Url(signature)}`;
@@ -114,6 +132,7 @@ export function verifyCursor(
   ctx: RequestContext,
   now: Date
 ): CursorPayload {
+  requireSecret(secret);
   if (typeof cursor !== 'string' || cursor.length === 0) {
     throw invalid('read cursor is missing');
   }

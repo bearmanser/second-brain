@@ -17,7 +17,6 @@ import type {
   ScopeConfig,
   SourceRef
 } from '../core/types.js';
-import { decodeRevision } from '../notes/codec.js';
 import { resolveScopes } from '../security/authorise.js';
 import { countReferenceTokens } from '../retrieval/budget.js';
 import {
@@ -98,67 +97,25 @@ function loadCursorSecret(deps: BrainDeps): Uint8Array {
   return new Uint8Array(bytes);
 }
 
-function declaredIdentity(raw: string): { id?: string; revisionId?: string } {
-  const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
-  const lines = text.split('\n');
-  if (lines[0]?.trim() !== '---') return {};
-  let close = -1;
-  for (let index = 1; index < lines.length; index += 1) {
-    if (lines[index].trim() === '---') {
-      close = index;
-      break;
-    }
-  }
-  if (close === -1) return {};
-  const frontmatter = lines.slice(1, close).join('\n');
-  const read = (key: string): string | undefined => {
-    const match = new RegExp(`^[ \\t]*${key}:[ \\t]*(.*)$`, 'm').exec(frontmatter);
-    if (match === null) return undefined;
-    const value = match[1].trim().replace(/^["']|["']$/g, '');
-    return value.length > 0 ? value : undefined;
-  };
-  return { id: read('brain_id'), revisionId: read('brain_revision_id') };
-}
-
-interface SelectedIdentity {
-  id: string;
-  revision_id?: string;
-}
-
-type SourceLookup = 'present' | 'missing' | 'unreadable';
-
-async function selectedSourceState(
+async function requireSelectedSource(
   scope: ScopeConfig,
-  selected: SelectedIdentity,
+  request: ReadRequest,
+  revisionId: string | undefined,
   deps: BrainDeps
-): Promise<SourceLookup> {
-  const paths = await deps.vault.list(scope.id);
-  let unreadable = false;
-  for (const path of paths) {
-    let file: { raw: string; raw_hash: string; relative_path: string };
-    try {
-      file = await deps.vault.read(scope.id, path);
-    } catch (error) {
-      if (isBrainError(error) && error.code === 'NOT_FOUND') continue;
-      throw error;
-    }
-    try {
-      const revision = decodeRevision(file.raw);
-      if (revision.id !== selected.id) continue;
-      if (selected.revision_id !== undefined && revision.revision_id !== selected.revision_id) {
-        continue;
-      }
-      return 'present';
-    } catch {
-      const declared = declaredIdentity(file.raw);
-      if (declared.id !== selected.id) continue;
-      if (selected.revision_id !== undefined && declared.revisionId !== selected.revision_id) {
-        continue;
-      }
-      unreadable = true;
-    }
+): Promise<void> {
+  const located = await deps.catalogue.locate(scope.id, request.id, revisionId);
+  if (located === undefined) {
+    throw notFound(`note ${request.id} is not catalogued in scope ${scope.id}`);
   }
-  return unreadable ? 'unreadable' : 'missing';
+  try {
+    await deps.vault.read(scope.id, located.relative_path);
+  } catch (error) {
+    if (isBrainError(error) && error.code === 'NOT_FOUND') {
+      throw notFound(`note ${request.id} has no remaining source file in scope ${scope.id}`);
+    }
+    throw error;
+  }
+  throw conflict(`note ${request.id} has a conflicting source in scope ${scope.id}`);
 }
 
 async function loadHead(
@@ -174,14 +131,7 @@ async function loadHead(
       : await deps.catalogue.getRevision(scope.id, request.id, revisionId);
   } catch (error) {
     if (isBrainError(error) && error.code === 'CONFLICT') {
-      const lookup = await selectedSourceState(
-        scope,
-        { id: request.id, ...(revisionId === undefined ? {} : { revision_id: revisionId }) },
-        deps
-      );
-      if (lookup === 'missing') {
-        throw notFound(`note ${request.id} has no remaining source file in scope ${scope.id}`);
-      }
+      await requireSelectedSource(scope, request, revisionId, deps);
     }
     throw error;
   }

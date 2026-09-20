@@ -314,6 +314,11 @@ export interface CataloguePort {
   reconcile(scope: string): Promise<void>;
   get(scope: string, id: string): Promise<Head>;
   getRevision(scope: string, id: string, revision_id: string): Promise<Head>;
+  locate(
+    scope: string,
+    id: string,
+    revision_id?: string
+  ): Promise<{ relative_path: string } | undefined>;
   list(
     scope: string,
     filter: 'candidate' | 'conflict',
