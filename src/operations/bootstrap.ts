@@ -16,7 +16,7 @@ import {
 import type { Principal, ScopeConfig } from '../core/types.js';
 import type { BrainConfig, CredentialRecord } from '../config/schema.js';
 import { BrainError } from '../contracts/errors.js';
-import { brainConfigSchema } from '../config/schema.js';
+import { brainConfigSchema, credentialsFileSchema } from '../config/schema.js';
 
 export interface BootstrapOptions {
   root: string;
@@ -144,38 +144,109 @@ async function readBinaryIfExists(path: string): Promise<Buffer | undefined> {
   }
 }
 
-function scopePermissionMask(): number {
-  return fsConstants.W_OK | fsConstants.X_OK;
-}
+const DIRECTORY_ACCESS_MASK = fsConstants.R_OK | fsConstants.W_OK | fsConstants.X_OK;
 
-function hasAccess(info: { uid: number; gid: number; mode: number }, uid: number, gid: number, mask: number): boolean {
+function hasAccess(
+  info: { uid: number; gid: number; mode: number },
+  uid: number,
+  gid: number,
+  mask: number
+): boolean {
   if (info.uid === uid && (info.mode & (mask << 6)) === mask << 6) return true;
   if (info.gid === gid && (info.mode & (mask << 3)) === mask << 3) return true;
   return (info.mode & mask) === mask;
 }
 
-async function assertScopesAccessible(
-  vaultPath: string,
-  scopes: ScopeConfig[],
+async function assertDirectoryAccess(
+  path: string,
   uid: number,
-  gid: number
+  gid: number,
+  mask: number,
+  label: string
 ): Promise<void> {
-  for (const scope of scopes) {
-    const absolute = join(vaultPath, scope.relative_root);
+  let info;
+  try {
+    info = await stat(path);
+  } catch {
+    throw invalidInput(`${label} is not accessible: ${path}`);
+  }
+  if (!info.isDirectory()) {
+    throw invalidInput(`${label} is not a directory: ${path}`);
+  }
+  if (!hasAccess({ uid: info.uid, gid: info.gid, mode: info.mode }, uid, gid, mask)) {
+    throw invalidInput(`${label} does not grant uid ${uid} the required permissions: ${path}`);
+  }
+}
+
+async function ensureScopePath(
+  vaultPath: string,
+  relativeRoot: string,
+  uid: number | undefined,
+  gid: number | undefined,
+  created: string[]
+): Promise<void> {
+  let current = vaultPath;
+  for (const segment of relativeRoot.split('/').filter((entry) => entry.length > 0)) {
+    current = join(current, segment);
     let info;
     try {
-      info = await stat(absolute);
+      info = await stat(current);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
-      throw invalidInput(`vault scope path is not accessible: ${absolute}`);
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw invalidInput(`vault scope path is not accessible: ${current}`);
+      }
+      await mkdir(current, { recursive: true, mode: DIRECTORY_MODE });
+      await applyOwnership(current, uid, gid);
+      created.push(current);
+      continue;
     }
     if (!info.isDirectory()) {
-      throw invalidInput(`vault scope path is not a directory: ${absolute}`);
+      throw invalidInput(`vault scope path is not a directory: ${current}`);
     }
-    if (!hasAccess({ uid: info.uid, gid: info.gid, mode: info.mode }, uid, gid, scopePermissionMask())) {
-      throw invalidInput(`vault scope path is not writable by uid ${uid}: ${absolute}`);
+    if (uid !== undefined && uid !== 0) {
+      const effectiveGid = gid ?? uid;
+      if (!hasAccess({ uid: info.uid, gid: info.gid, mode: info.mode }, uid, effectiveGid, DIRECTORY_ACCESS_MASK)) {
+        throw invalidInput(`vault scope path does not grant uid ${uid} the required permissions: ${current}`);
+      }
     }
   }
+}
+
+function reviewerPrincipal(scope: string): Principal {
+  const readScopes = [scope];
+  if (!readScopes.includes('shared')) readScopes.push('shared');
+  return {
+    id: randomUUID(),
+    role: 'reviewer',
+    read_scopes: readScopes,
+    write_scopes: [scope],
+    review_scopes: [scope]
+  };
+}
+
+function ownerPrincipal(scopes: ScopeConfig[]): Principal {
+  const ids = scopes.map((entry) => entry.id);
+  return {
+    id: randomUUID(),
+    role: 'owner',
+    read_scopes: ids,
+    write_scopes: ids,
+    review_scopes: ids
+  };
+}
+
+function parseCredentialsDocument(text: string): { credentials: CredentialRecord[] } {
+  let document: unknown;
+  try {
+    document = JSON.parse(text);
+  } catch {
+    throw invalidInput('secrets/credentials.json is not valid JSON; refusing to modify it');
+  }
+  const parsed = credentialsFileSchema.safeParse(document);
+  if (!parsed.success) {
+    throw invalidInput('secrets/credentials.json is invalid; refusing to modify it');
+  }
+  return { credentials: parsed.data.credentials };
 }
 
 async function applyOwnership(path: string, uid?: number, gid?: number): Promise<void> {
@@ -211,6 +282,43 @@ export async function bootstrap(options: BootstrapOptions): Promise<BootstrapRes
   const created: string[] = [];
   const preserved: string[] = [];
 
+  const vaultPath = options.vault_path === undefined
+    ? join(root, 'vault')
+    : isAbsolute(options.vault_path)
+      ? options.vault_path
+      : resolve(root, options.vault_path);
+  let vaultInfo;
+  try {
+    vaultInfo = await stat(vaultPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    vaultInfo = undefined;
+  }
+  if (vaultInfo === undefined) {
+    await mkdir(vaultPath, { recursive: true, mode: DIRECTORY_MODE });
+    await applyOwnership(vaultPath, uid, gid);
+    created.push('vault');
+  } else {
+    if (!vaultInfo.isDirectory()) {
+      throw invalidInput(`vault path is not a directory: ${vaultPath}`);
+    }
+    try {
+      await access(vaultPath, fsConstants.R_OK | fsConstants.X_OK);
+    } catch {
+      throw invalidInput(`vault path is not readable: ${vaultPath}`);
+    }
+    preserved.push('vault');
+  }
+
+  if (uid !== undefined && uid !== 0) {
+    const effectiveGid = gid ?? uid;
+    await assertDirectoryAccess(vaultPath, uid, effectiveGid, DIRECTORY_ACCESS_MASK, 'vault path');
+  }
+
+  for (const entry of scopes) {
+    await ensureScopePath(vaultPath, entry.relative_root, uid, gid, created);
+  }
+
   const existingConfig = await readIfExists(configPath);
   if (existingConfig === undefined) {
     const config = buildConfig(scopes);
@@ -244,44 +352,39 @@ export async function bootstrap(options: BootstrapOptions): Promise<BootstrapRes
     preserved.push(CURSOR_KEY_RELATIVE);
   }
 
+  const existingCredentials = await readIfExists(credentialsPath);
+  const credentialsDocument =
+    existingCredentials === undefined ? undefined : parseCredentialsDocument(existingCredentials);
+
   let ownerToken: string | undefined;
   const existingOwner = await readIfExists(ownerTokenPath);
   if (wantOwner) {
-    ownerToken = existingOwner === undefined ? newToken() : existingOwner.trim();
-    if (existingOwner === undefined) {
+    if (existingOwner !== undefined) {
+      ownerToken = existingOwner.trim();
+      preserved.push(OWNER_TOKEN_RELATIVE);
+    } else if (
+      credentialsDocument !== undefined &&
+      credentialsDocument.credentials.some((record) => record.principal.role === 'owner')
+    ) {
+      throw invalidInput(
+        'an owner credential is recorded in secrets/credentials.json but secrets/owner-token is missing; restore the token file or remove the owner record before enabling owner_credential'
+      );
+    } else {
+      ownerToken = newToken();
       await writeFile(ownerTokenPath, `${ownerToken}\n`, { mode: SECRET_MODE });
       await applyOwnership(ownerTokenPath, uid, gid);
       created.push(OWNER_TOKEN_RELATIVE);
-    } else {
-      preserved.push(OWNER_TOKEN_RELATIVE);
     }
   } else if (existingOwner !== undefined) {
     preserved.push(OWNER_TOKEN_RELATIVE);
   }
 
-  const existingCredentials = await readIfExists(credentialsPath);
-  if (existingCredentials === undefined) {
-    const readScopes = [scope];
-    if (!readScopes.includes('shared')) readScopes.push('shared');
-    const reviewer: Principal = {
-      id: randomUUID(),
-      role: 'reviewer',
-      read_scopes: readScopes,
-      write_scopes: [scope],
-      review_scopes: [scope]
-    };
+  if (credentialsDocument === undefined) {
     const records: CredentialRecord[] = [
-      { token_sha256: tokenDigest(reviewerToken), principal: reviewer }
+      { token_sha256: tokenDigest(reviewerToken), principal: reviewerPrincipal(scope) }
     ];
     if (wantOwner && ownerToken !== undefined) {
-      const owner: Principal = {
-        id: randomUUID(),
-        role: 'owner',
-        read_scopes: scopes.map((entry) => entry.id),
-        write_scopes: scopes.map((entry) => entry.id),
-        review_scopes: scopes.map((entry) => entry.id)
-      };
-      records.push({ token_sha256: tokenDigest(ownerToken), principal: owner });
+      records.push({ token_sha256: tokenDigest(ownerToken), principal: ownerPrincipal(scopes) });
     }
     await writeFile(credentialsPath, `${JSON.stringify({ credentials: records }, null, 2)}\n`, {
       mode: SECRET_MODE
@@ -289,47 +392,29 @@ export async function bootstrap(options: BootstrapOptions): Promise<BootstrapRes
     await applyOwnership(credentialsPath, uid, gid);
     created.push(CREDENTIALS_RELATIVE);
   } else {
-    preserved.push(CREDENTIALS_RELATIVE);
-  }
-
-  const vaultPath = options.vault_path === undefined
-    ? join(root, 'vault')
-    : isAbsolute(options.vault_path)
-      ? options.vault_path
-      : resolve(root, options.vault_path);
-  let vaultInfo;
-  try {
-    vaultInfo = await stat(vaultPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    vaultInfo = undefined;
-  }
-  if (vaultInfo === undefined) {
-    await mkdir(vaultPath, { recursive: true, mode: DIRECTORY_MODE });
-    for (const entry of scopes) {
-      const scopePath = join(vaultPath, entry.relative_root);
-      await mkdir(scopePath, { recursive: true, mode: DIRECTORY_MODE });
-      await applyOwnership(scopePath, uid, gid);
+    const records = credentialsDocument.credentials;
+    let changed = false;
+    const reviewerDigest = tokenDigest(reviewerToken);
+    if (!records.some((record) => record.token_sha256 === reviewerDigest)) {
+      records.push({ token_sha256: reviewerDigest, principal: reviewerPrincipal(scope) });
+      changed = true;
     }
-    await applyOwnership(vaultPath, uid, gid);
-    created.push('vault');
-  } else {
-    if (!vaultInfo.isDirectory()) {
-      throw invalidInput(`vault path is not a directory: ${vaultPath}`);
-    }
-    try {
-      await access(vaultPath, fsConstants.R_OK | fsConstants.X_OK);
-    } catch {
-      throw invalidInput(`vault path is not readable: ${vaultPath}`);
-    }
-    if (uid !== undefined && uid !== 0) {
-      const info = await stat(vaultPath);
-      if (!hasAccess({ uid: info.uid, gid: info.gid, mode: info.mode }, uid, gid ?? uid, scopePermissionMask())) {
-        throw invalidInput(`vault path is not writable by uid ${uid}: ${vaultPath}`);
+    if (wantOwner && ownerToken !== undefined) {
+      const ownerDigest = tokenDigest(ownerToken);
+      if (!records.some((record) => record.token_sha256 === ownerDigest)) {
+        records.push({ token_sha256: ownerDigest, principal: ownerPrincipal(scopes) });
+        changed = true;
       }
-      await assertScopesAccessible(vaultPath, scopes, uid, gid ?? uid);
     }
-    preserved.push('vault');
+    if (changed) {
+      await writeFile(credentialsPath, `${JSON.stringify({ credentials: records }, null, 2)}\n`, {
+        mode: SECRET_MODE
+      });
+      await applyOwnership(credentialsPath, uid, gid);
+      created.push(CREDENTIALS_RELATIVE);
+    } else {
+      preserved.push(CREDENTIALS_RELATIVE);
+    }
   }
 
   await chmod(join(root, 'secrets'), 0o700);

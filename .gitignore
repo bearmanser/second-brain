@@ -10,3 +10,4 @@ basic-memory-data/
 secrets/
 vault/
 config/brain.yaml
+.setup-volumes

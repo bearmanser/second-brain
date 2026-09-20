@@ -51,17 +51,18 @@ parse_images_env() {
   done < "$file"
   [ -n "$NODE_IMAGE" ] || fail "NODE_IMAGE is missing from $file"
   [ -n "$BASIC_MEMORY_IMAGE" ] || fail "BASIC_MEMORY_IMAGE is missing from $file"
-  case "$NODE_IMAGE" in
-    *@sha256:*) ;;
-    *) fail "NODE_IMAGE must be digest-pinned" ;;
-  esac
-  case "$BASIC_MEMORY_IMAGE" in
-    *@sha256:*) ;;
-    *) fail "BASIC_MEMORY_IMAGE must be digest-pinned" ;;
-  esac
+  require_digest_reference "NODE_IMAGE" "$NODE_IMAGE"
+  require_digest_reference "BASIC_MEMORY_IMAGE" "$BASIC_MEMORY_IMAGE"
   case "$NODE_IMAGE$BASIC_MEMORY_IMAGE" in
     *:latest*) fail "floating 'latest' references are not allowed" ;;
   esac
+}
+
+require_digest_reference() {
+  local name="$1" value="$2"
+  if [[ ! "$value" =~ ^[A-Za-z0-9._:/-]+@sha256:[0-9a-fA-F]{64}$ ]]; then
+    fail "$name must be a digest-pinned reference ending in @sha256:<64 hex digits>"
+  fi
 }
 
 read_env_value() {
@@ -100,6 +101,59 @@ write_env_file() {
 
 run_as_root() {
   docker run --rm --user 0:0 "$@"
+}
+
+scope_relative_root() {
+  case "$1" in
+    freellmapi) printf 'Projects/freellmapi' ;;
+    shared) printf 'Shared' ;;
+    profile) printf 'Profile' ;;
+    *) printf 'Projects/%s' "$1" ;;
+  esac
+}
+
+required_projects() {
+  printf '%s\n' "$BRAIN_SCOPE"
+  [ "$BRAIN_SCOPE" = "shared" ] || printf 'shared\n'
+  [ "$BRAIN_SCOPE" = "profile" ] || printf 'profile\n'
+}
+
+expected_project_path() {
+  printf '/app/data/%s' "$(scope_relative_root "$1")"
+}
+
+inspect_memory_mappings() {
+  local config_volume="$1" expected_file="$2" script
+  script='const fs=require("fs");let doc;try{doc=JSON.parse(fs.readFileSync("/cfg/config.json","utf8"));}catch(e){if(e&&e.code==="ENOENT"){console.log("CONFIG_MISSING");process.exit(0);}console.log("CONFIG_INVALID");process.exit(0);}const projects=(doc&&doc.projects)||{};const lines=fs.readFileSync("/expected.txt","utf8").split("\n").filter(Boolean);for(const line of lines){const parts=line.split("\t");const entry=projects[parts[0]];if(!entry){console.log("MISSING\t"+parts[0]);}else if(entry.path!==parts[1]){console.log("MISMATCH\t"+parts[0]+"\t"+entry.path);}}'
+  docker run --rm --user 0:0 \
+    -v "$config_volume":/cfg:ro \
+    -v "$expected_file":/expected.txt:ro \
+    --entrypoint node "$NODE_IMAGE" -e "$script"
+}
+
+volume_state_file() {
+  printf '%s/.setup-volumes' "$ROOT_DIR"
+}
+
+volume_is_known() {
+  local state
+  state="$(volume_state_file)"
+  [ -f "$state" ] || return 1
+  grep -qxF "$1" "$state"
+}
+
+record_volume() {
+  printf '%s\n' "$1" >> "$(volume_state_file)"
+}
+
+volume_is_initialized() {
+  docker run --rm --user "$BRAIN_UID:$BRAIN_GID" -v "$1":/volume \
+    --entrypoint sh "$NODE_IMAGE" -c 'test -f /volume/.brain-initialized'
+}
+
+initialize_volume() {
+  run_as_root -v "$1":/volume "$NODE_IMAGE" \
+    sh -c "chown -R $BRAIN_UID:$BRAIN_GID /volume && touch /volume/.brain-initialized && chown $BRAIN_UID:$BRAIN_GID /volume/.brain-initialized"
 }
 
 main() {
@@ -162,22 +216,61 @@ main() {
   for name in brain-state memory-state model-cache; do
     vol="${COMPOSE_PROJECT_NAME}_${name}"
     if docker volume inspect "$vol" >/dev/null 2>&1; then
+      if volume_is_known "$vol"; then
+        if volume_is_initialized "$vol"; then
+          printf 'setup: volume %s already initialized; leaving ownership unchanged\n' "$vol"
+          continue
+        fi
+        printf 'setup: repairing initialization of %s\n' "$vol"
+        initialize_volume "$vol"
+        continue
+      fi
       printf 'setup: volume %s already exists; leaving ownership unchanged\n' "$vol"
       continue
     fi
-    docker volume create "$vol" >/dev/null
-    run_as_root -v "$vol":/volume "$NODE_IMAGE" chown -R "$BRAIN_UID:$BRAIN_GID" /volume
+    docker volume create \
+      --label "com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
+      --label "com.docker.compose.volume=$name" \
+      "$vol" >/dev/null
+    record_volume "$vol"
+    initialize_volume "$vol"
   done
 
   local config_volume="${COMPOSE_PROJECT_NAME}_memory-state"
-  if docker run --rm --user "$BRAIN_UID:$BRAIN_GID" \
-      -v "$config_volume":/home/appuser/.basic-memory \
-      --entrypoint sh "$BASIC_MEMORY_IMAGE" \
-      -c 'test -f /home/appuser/.basic-memory/config.json'; then
-    printf 'setup: Basic Memory configuration already present; preserving project mappings\n'
+  local expected_file
+  expected_file="$(mktemp)"
+  local project
+  while IFS= read -r project; do
+    printf '%s\t%s\n' "$project" "$(expected_project_path "$project")" >> "$expected_file"
+  done < <(required_projects)
+
+  local verdict mismatch=()
+  verdict="$(inspect_memory_mappings "$config_volume" "$expected_file")"
+  if printf '%s' "$verdict" | grep -q '^CONFIG_INVALID$'; then
+    rm -f "$expected_file"
+    fail "Basic Memory config.json is not valid JSON; refusing to seed project mappings"
+  fi
+
+  local missing=()
+  while IFS=$'\t' read -r kind first second; do
+    case "$kind" in
+      CONFIG_MISSING) while IFS= read -r project; do missing+=("$project"); done < <(required_projects) ;;
+      MISSING) missing+=("$first") ;;
+      MISMATCH) mismatch+=("$first=$second") ;;
+    esac
+  done <<< "$verdict"
+
+  if [ ${#mismatch[@]} -gt 0 ]; then
+    rm -f "$expected_file"
+    fail "Basic Memory project mapping mismatch (expected path differs): ${mismatch[*]}"
+  fi
+
+  if [ ${#missing[@]} -eq 0 ]; then
+    printf 'setup: Basic Memory project mappings already correct; preserving\n'
   else
     if ! docker run --rm --user "$BRAIN_UID:$BRAIN_GID" -v "$vault_abs":/app/data "$NODE_IMAGE" \
         sh -c 'test -w /app/data'; then
+      rm -f "$expected_file"
       fail "vault path is not writable by uid $BRAIN_UID: $vault_abs"
     fi
     local bm=(docker run --rm --user "$BRAIN_UID:$BRAIN_GID"
@@ -187,23 +280,22 @@ main() {
       -v "$config_volume":/home/appuser/.basic-memory
       -v "$vault_abs":/app/data
       --entrypoint basic-memory "$BASIC_MEMORY_IMAGE")
-    "${bm[@]}" project add "$BRAIN_SCOPE" "/app/data/$(scope_relative_root "$BRAIN_SCOPE")"
-    "${bm[@]}" project add shared /app/data/Shared
-    "${bm[@]}" project add profile /app/data/Profile
+    for project in ${missing[@]+"${missing[@]}"}; do
+      "${bm[@]}" project add "$project" "$(expected_project_path "$project")"
+    done
+    local after
+    after="$(inspect_memory_mappings "$config_volume" "$expected_file")"
+    if printf '%s' "$after" | grep -qE '^(MISSING|MISMATCH|CONFIG_)'; then
+      rm -f "$expected_file"
+      fail "Basic Memory project mappings are still incomplete after seeding"
+    fi
+    printf 'setup: seeded Basic Memory project mappings: %s\n' "${missing[*]}"
   fi
+  rm -f "$expected_file"
 
   printf 'setup: complete\n'
   printf 'setup: next run "docker compose up -d --build"\n'
   printf 'setup: check with "docker compose exec brain node dist/cli.js health"\n'
-}
-
-scope_relative_root() {
-  case "$1" in
-    freellmapi) printf 'Projects/freellmapi' ;;
-    shared) printf 'Shared' ;;
-    profile) printf 'Profile' ;;
-    *) printf 'Projects/%s' "$1" ;;
-  esac
 }
 
 main "$@"

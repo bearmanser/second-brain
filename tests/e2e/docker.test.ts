@@ -209,18 +209,14 @@ beforeAll(async () => {
 afterAll(async () => {
   try {
     await client?.close();
-  } catch {
-    /* ignore */
-  }
+  } catch {}
   try {
     if (existsSync(join(workDir, OVERRIDE_FILE))) {
       composeOffline(['down', '-v', '--remove-orphans']);
     } else {
       compose(['down', '-v', '--remove-orphans']);
     }
-  } catch {
-    /* ignore */
-  }
+  } catch {}
   for (const name of ['brain-state', 'memory-state', 'model-cache']) {
     spawnSync('docker', ['volume', 'rm', `${project}_${name}`], { encoding: 'utf8' });
   }
