@@ -201,7 +201,7 @@ test('reconciles a single revision into a unique head and stays rebuildable', as
 
   const database = new Database(join(root, 'catalogue.sqlite'));
   const versions = database.prepare('SELECT version FROM schema_migrations ORDER BY version').all();
-  expect(versions).toEqual([{ version: 1 }, { version: 2 }]);
+  expect(versions).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
   database.close();
 });
 

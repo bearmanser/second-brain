@@ -4,7 +4,15 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { BrainError, isBrainError } from '../contracts/errors.js';
-import type { Clock, IdSource, MutationReceipt, PlannedWrite } from '../core/types.js';
+import type {
+  Clock,
+  FeedbackVerdict,
+  IdSource,
+  MutationReceipt,
+  PlannedWrite,
+  RecallMode
+} from '../core/types.js';
+import { containsCredentials } from '../security/redact.js';
 
 export const OPERATION_STATES = [
   'prepared',
@@ -28,7 +36,17 @@ const ALLOWED_TRANSITIONS: Record<OperationState, readonly OperationState[]> = {
   failed: []
 };
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 const MIGRATION_FILE_PATTERN = /^(\d+)-[a-z0-9-]+\.sql$/;
+const AUDIT_TEXT_MAX_LENGTH = 256;
+
+export const AUDIT_FIELDS = ['request_id', 'tool', 'outcome', 'duration_ms', 'note_count'] as const;
+export type AuditField = (typeof AUDIT_FIELDS)[number];
+
+export const RETRIEVAL_OUTCOMES = ['ok', 'partial', 'error'] as const;
+export type RetrievalOutcome = (typeof RETRIEVAL_OUTCOMES)[number];
+
+export const FEEDBACK_REASON_MAX_LENGTH = 240;
 
 export const MIGRATIONS_DIRECTORY = fileURLToPath(new URL('./migrations/', import.meta.url));
 
@@ -72,6 +90,101 @@ export interface Migration {
 export interface ReceiptAvailability {
   materialized?: boolean;
   indexed?: boolean;
+}
+
+export interface AuditEvent {
+  request_id: string;
+  tool: string;
+  outcome: string;
+  duration_ms: number;
+  note_count: number;
+}
+
+export interface AuditEventRecord extends AuditEvent {
+  created_at: string;
+}
+
+export interface RetrievalEventInput {
+  retrieval_id: string;
+  principal_id: string;
+  scope: string;
+  scope_ids: string[];
+  returned_ids: { id: string; revision_id: string }[];
+  item_count: number;
+  token_used: number;
+  token_limit: number;
+  mode: RecallMode;
+  outcome: RetrievalOutcome;
+  partial: boolean;
+  duration_ms: number;
+  created_at?: string;
+}
+
+export interface RetrievalEvent extends Omit<RetrievalEventInput, 'created_at'> {
+  created_at: string;
+}
+
+export interface FeedbackWrite {
+  principal_id: string;
+  idempotency_key: string;
+  scope: string;
+  logical_id: string;
+  revision_id: string;
+  retrieval_id?: string;
+  related_id?: string;
+  verdict: FeedbackVerdict;
+  reason: string;
+  warning?: string;
+}
+
+export interface FeedbackEntry extends FeedbackWrite {
+  feedback_id: string;
+  created_at: string;
+}
+
+export interface FeedbackWriteResult {
+  kind: 'new' | 'replay';
+  entry: FeedbackEntry;
+}
+
+interface RetrievalRow {
+  retrieval_id: string;
+  principal_id: string;
+  scope: string;
+  scope_ids_json: string;
+  returned_ids_json: string;
+  item_count: number;
+  token_used: number;
+  token_limit: number;
+  mode: string;
+  outcome: string;
+  partial: number;
+  duration_ms: number;
+  created_at: string;
+}
+
+interface FeedbackRow {
+  feedback_id: string;
+  principal_id: string;
+  idempotency_key: string;
+  scope: string;
+  logical_id: string;
+  revision_id: string;
+  retrieval_id: string | null;
+  related_id: string | null;
+  verdict: string;
+  reason: string;
+  warning: string | null;
+  created_at: string;
+}
+
+interface AuditRow {
+  request_id: string;
+  tool: string;
+  outcome: string;
+  duration_ms: number;
+  note_count: number;
+  created_at: string;
 }
 
 interface OperationRow {
@@ -191,6 +304,92 @@ export function applyMigrations(
     newlyApplied.push(migration.version);
   }
   return newlyApplied;
+}
+
+function toRetrieval(row: RetrievalRow): RetrievalEvent {
+  let scopeIds: string[];
+  let returnedIds: { id: string; revision_id: string }[];
+  try {
+    scopeIds = JSON.parse(row.scope_ids_json) as string[];
+    returnedIds = JSON.parse(row.returned_ids_json) as { id: string; revision_id: string }[];
+  } catch (cause) {
+    throw recoveryRequired(`retrieval ${row.retrieval_id} has unreadable metadata`, cause);
+  }
+  if (!Array.isArray(scopeIds) || !Array.isArray(returnedIds)) {
+    throw recoveryRequired(`retrieval ${row.retrieval_id} has invalid metadata`);
+  }
+  if (!(RETRIEVAL_OUTCOMES as readonly string[]).includes(row.outcome)) {
+    throw recoveryRequired(`retrieval ${row.retrieval_id} has an unknown outcome`);
+  }
+  return {
+    retrieval_id: row.retrieval_id,
+    principal_id: row.principal_id,
+    scope: row.scope,
+    scope_ids: scopeIds,
+    returned_ids: returnedIds,
+    item_count: row.item_count,
+    token_used: row.token_used,
+    token_limit: row.token_limit,
+    mode: row.mode as RecallMode,
+    outcome: row.outcome as RetrievalOutcome,
+    partial: row.partial === 1,
+    duration_ms: row.duration_ms,
+    created_at: row.created_at
+  };
+}
+
+function toFeedback(row: FeedbackRow): FeedbackEntry {
+  return {
+    feedback_id: row.feedback_id,
+    principal_id: row.principal_id,
+    idempotency_key: row.idempotency_key,
+    scope: row.scope,
+    logical_id: row.logical_id,
+    revision_id: row.revision_id,
+    ...(row.retrieval_id === null ? {} : { retrieval_id: row.retrieval_id }),
+    ...(row.related_id === null ? {} : { related_id: row.related_id }),
+    verdict: row.verdict as FeedbackVerdict,
+    reason: row.reason,
+    ...(row.warning === null ? {} : { warning: row.warning }),
+    created_at: row.created_at
+  };
+}
+
+function toAudit(row: AuditRow): AuditEventRecord {
+  return {
+    request_id: row.request_id,
+    tool: row.tool,
+    outcome: row.outcome,
+    duration_ms: row.duration_ms,
+    note_count: row.note_count,
+    created_at: row.created_at
+  };
+}
+
+function boundReason(value: string): string {
+  const points = [...value];
+  if (points.length <= FEEDBACK_REASON_MAX_LENGTH) return value;
+  return points.slice(0, FEEDBACK_REASON_MAX_LENGTH).join('');
+}
+
+function requireFiniteCount(value: number, field: string): number {
+  if (!Number.isFinite(value) || value < 0) {
+    throw invalidInput(`${field} must be a non-negative finite number`);
+  }
+  return Math.trunc(value);
+}
+
+function requireAuditText(value: string, field: string): string {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw invalidInput(`${field} must be a non-empty string`);
+  }
+  if (value.length > AUDIT_TEXT_MAX_LENGTH) {
+    throw invalidInput(`${field} exceeds the audit field length limit`);
+  }
+  if (containsCredentials(value)) {
+    throw invalidInput(`${field} rejected because it contains an obvious credential`);
+  }
+  return value;
 }
 
 function toRecord(row: OperationRow): OperationRecord {
@@ -422,6 +621,189 @@ export class Journal {
     return result.changes;
   }
 
+  recordRetrieval(input: RetrievalEventInput): RetrievalEvent {
+    this.assertOpen();
+    if (!(RETRIEVAL_OUTCOMES as readonly string[]).includes(input.outcome)) {
+      throw invalidInput(`unknown retrieval outcome ${String(input.outcome)}`);
+    }
+    if (!Array.isArray(input.scope_ids) || !Array.isArray(input.returned_ids)) {
+      throw invalidInput('retrieval metadata must use arrays');
+    }
+    const created_at = input.created_at ?? this.timestamp();
+    requireFiniteCount(input.item_count, 'item_count');
+    requireFiniteCount(input.token_used, 'token_used');
+    requireFiniteCount(input.token_limit, 'token_limit');
+    requireFiniteCount(input.duration_ms, 'duration_ms');
+    const run = this.database.transaction((): RetrievalEvent => {
+      const existing = this.selectRetrieval(input.retrieval_id);
+      if (existing !== undefined) return existing;
+      this.database
+        .prepare(
+          `INSERT INTO retrieval_events (
+            retrieval_id, principal_id, scope, scope_ids_json, returned_ids_json,
+            item_count, token_used, token_limit, mode, outcome, partial, duration_ms, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          input.retrieval_id,
+          input.principal_id,
+          input.scope,
+          JSON.stringify([...new Set(input.scope_ids)]),
+          JSON.stringify(input.returned_ids),
+          Math.trunc(input.item_count),
+          Math.trunc(input.token_used),
+          Math.trunc(input.token_limit),
+          input.mode,
+          input.outcome,
+          input.partial ? 1 : 0,
+          Math.trunc(input.duration_ms),
+          created_at
+        );
+      return {
+        ...input,
+        scope_ids: [...new Set(input.scope_ids)],
+        created_at
+      };
+    });
+    return run.immediate();
+  }
+
+  getRetrieval(retrieval_id: string): RetrievalEvent | undefined {
+    this.assertOpen();
+    return this.selectRetrieval(retrieval_id);
+  }
+
+  pruneRetrievalEvents(now: Date): number {
+    this.assertOpen();
+    const cutoff = new Date(now.getTime() - THIRTY_DAYS_MS).toISOString();
+    const result = this.database
+      .prepare('DELETE FROM retrieval_events WHERE created_at < ?')
+      .run(cutoff);
+    return result.changes;
+  }
+
+  recordFeedback(input: FeedbackWrite): FeedbackWriteResult {
+    this.assertOpen();
+    const reason = boundReason(input.reason);
+    const run = this.database.transaction((): FeedbackWriteResult => {
+      const existing = this.selectFeedbackByKey(input.principal_id, input.idempotency_key);
+      if (existing !== undefined) {
+        const same =
+          existing.scope === input.scope &&
+          existing.logical_id === input.logical_id &&
+          existing.revision_id === input.revision_id &&
+          existing.retrieval_id === input.retrieval_id &&
+          existing.related_id === input.related_id &&
+          existing.verdict === input.verdict &&
+          existing.reason === reason &&
+          existing.warning === input.warning;
+        if (!same) {
+          throw new BrainError({
+            code: 'IDEMPOTENCY_CONFLICT',
+            message: `idempotency key ${input.idempotency_key} was used for different feedback`
+          });
+        }
+        return { kind: 'replay', entry: existing };
+      }
+      const feedback_id = this.ids.next();
+      const created_at = this.timestamp();
+      this.database
+        .prepare(
+          `INSERT INTO feedback_records (
+            feedback_id, principal_id, idempotency_key, scope, logical_id, revision_id,
+            retrieval_id, related_id, verdict, reason, warning, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          feedback_id,
+          input.principal_id,
+          input.idempotency_key,
+          input.scope,
+          input.logical_id,
+          input.revision_id,
+          input.retrieval_id ?? null,
+          input.related_id ?? null,
+          input.verdict,
+          reason,
+          input.warning ?? null,
+          created_at
+        );
+      const stored = this.selectFeedbackById(feedback_id);
+      if (stored === undefined) {
+        throw recoveryRequired(`feedback ${feedback_id} was not persisted`);
+      }
+      return { kind: 'new', entry: stored };
+    });
+    return run.immediate();
+  }
+
+  getFeedback(feedback_id: string): FeedbackEntry | undefined {
+    this.assertOpen();
+    return this.selectFeedbackById(feedback_id);
+  }
+
+  listFeedback(scope?: string): FeedbackEntry[] {
+    this.assertOpen();
+    const rows =
+      scope === undefined
+        ? (this.database
+            .prepare('SELECT * FROM feedback_records ORDER BY created_at ASC, rowid ASC')
+            .all() as FeedbackRow[])
+        : (this.database
+            .prepare(
+              'SELECT * FROM feedback_records WHERE scope = ? ORDER BY created_at ASC, rowid ASC'
+            )
+            .all(scope) as FeedbackRow[]);
+    return rows.map(toFeedback);
+  }
+
+  purgeFeedback(scope: string): number {
+    this.assertOpen();
+    const result = this.database.prepare('DELETE FROM feedback_records WHERE scope = ?').run(scope);
+    return result.changes;
+  }
+
+  appendAudit(event: AuditEvent): AuditEventRecord {
+    this.assertOpen();
+    const keys = Object.keys(event);
+    if (
+      keys.length !== AUDIT_FIELDS.length ||
+      !keys.every((key) => (AUDIT_FIELDS as readonly string[]).includes(key))
+    ) {
+      throw invalidInput('audit events are restricted to the content-free allowlist');
+    }
+    const request_id = requireAuditText(event.request_id, 'request_id');
+    const tool = requireAuditText(event.tool, 'tool');
+    const outcome = requireAuditText(event.outcome, 'outcome');
+    const duration_ms = requireFiniteCount(event.duration_ms, 'duration_ms');
+    const note_count = requireFiniteCount(event.note_count, 'note_count');
+    const created_at = this.timestamp();
+    this.database
+      .prepare(
+        `INSERT INTO audit_events (request_id, tool, outcome, duration_ms, note_count, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(request_id, tool, outcome, duration_ms, note_count, created_at);
+    return { request_id, tool, outcome, duration_ms, note_count, created_at };
+  }
+
+  listAudit(): AuditEventRecord[] {
+    this.assertOpen();
+    const rows = this.database
+      .prepare('SELECT * FROM audit_events ORDER BY created_at ASC, rowid ASC')
+      .all() as AuditRow[];
+    return rows.map(toAudit);
+  }
+
+  pruneAuditEvents(now: Date): number {
+    this.assertOpen();
+    const cutoff = new Date(now.getTime() - THIRTY_DAYS_MS).toISOString();
+    const result = this.database
+      .prepare('DELETE FROM audit_events WHERE created_at < ?')
+      .run(cutoff);
+    return result.changes;
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -447,6 +829,32 @@ export class Journal {
       .prepare('SELECT * FROM operations WHERE principal_id = ? AND idempotency_key = ?')
       .get(principal_id, idempotency_key) as OperationRow | undefined;
     return row === undefined ? undefined : toRecord(row);
+  }
+
+  private selectRetrieval(retrieval_id: string): RetrievalEvent | undefined {
+    const row = this.database
+      .prepare('SELECT * FROM retrieval_events WHERE retrieval_id = ?')
+      .get(retrieval_id) as RetrievalRow | undefined;
+    return row === undefined ? undefined : toRetrieval(row);
+  }
+
+  private selectFeedbackById(feedback_id: string): FeedbackEntry | undefined {
+    const row = this.database
+      .prepare('SELECT * FROM feedback_records WHERE feedback_id = ?')
+      .get(feedback_id) as FeedbackRow | undefined;
+    return row === undefined ? undefined : toFeedback(row);
+  }
+
+  private selectFeedbackByKey(
+    principal_id: string,
+    idempotency_key: string
+  ): FeedbackEntry | undefined {
+    const row = this.database
+      .prepare(
+        'SELECT * FROM feedback_records WHERE principal_id = ? AND idempotency_key = ?'
+      )
+      .get(principal_id, idempotency_key) as FeedbackRow | undefined;
+    return row === undefined ? undefined : toFeedback(row);
   }
 
   private requireRow(id: string): OperationRow {

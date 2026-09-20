@@ -336,7 +336,7 @@ test('applies versioned migrations in order and reruns them idempotently', () =>
   const versionsAfterRerun = probe
     .prepare('SELECT version FROM schema_migrations ORDER BY version')
     .all() as { version: number }[];
-  expect(versionsAfterRerun).toEqual([{ version: 1 }, { version: 2 }]);
+  expect(versionsAfterRerun).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
   expect(second.get(record.record.operation_id)?.idempotency_key).toBe('c1');
   probe.close();
   second.close();

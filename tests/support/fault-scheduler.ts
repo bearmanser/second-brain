@@ -1,11 +1,18 @@
 import type { MutationReceipt, PlannedWrite } from '../../src/core/types.js';
 import type {
+  AuditEvent,
+  AuditEventRecord,
+  FeedbackEntry,
+  FeedbackWrite,
+  FeedbackWriteResult,
   Journal,
   OperationRecord,
   OperationReservation,
   OperationState,
   ReceiptAvailability,
-  ReservationResult
+  ReservationResult,
+  RetrievalEvent,
+  RetrievalEventInput
 } from '../../src/storage/journal.js';
 
 export type FaultPoint = 'reserve' | 'save_plan' | 'mark' | 'refresh_receipt';
@@ -81,6 +88,36 @@ export function wrapJournal(journal: Journal, scheduler: FaultScheduler): Journa
     },
     pruneTerminalPayloads(now: Date): number {
       return journal.pruneTerminalPayloads(now);
+    },
+    recordRetrieval(input: RetrievalEventInput): RetrievalEvent {
+      return journal.recordRetrieval(input);
+    },
+    getRetrieval(retrieval_id: string): RetrievalEvent | undefined {
+      return journal.getRetrieval(retrieval_id);
+    },
+    pruneRetrievalEvents(now: Date): number {
+      return journal.pruneRetrievalEvents(now);
+    },
+    recordFeedback(input: FeedbackWrite): FeedbackWriteResult {
+      return journal.recordFeedback(input);
+    },
+    getFeedback(feedback_id: string): FeedbackEntry | undefined {
+      return journal.getFeedback(feedback_id);
+    },
+    listFeedback(scope?: string): FeedbackEntry[] {
+      return journal.listFeedback(scope);
+    },
+    purgeFeedback(scope: string): number {
+      return journal.purgeFeedback(scope);
+    },
+    appendAudit(event: AuditEvent): AuditEventRecord {
+      return journal.appendAudit(event);
+    },
+    listAudit(): AuditEventRecord[] {
+      return journal.listAudit();
+    },
+    pruneAuditEvents(now: Date): number {
+      return journal.pruneAuditEvents(now);
     },
     close(): void {
       journal.close();
