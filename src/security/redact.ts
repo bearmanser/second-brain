@@ -15,8 +15,42 @@ const PRIVATE_KEY_PATTERN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----E
 const BEARER_PATTERN = /\bBearer[ ]+[A-Za-z0-9\-._~+/]+=*/gi;
 const ASSIGNMENT_PATTERN =
   /\b(password|passwd|passphrase|secret|token|api[-_]?key|x-api-key|client[-_]?secret|access[-_]?key|refresh[-_]?token)\b(\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s,;&#"']+)/gi;
+const RECOGNIZABLE_SECRET_PATTERN =
+  /\b(sk-[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\-_]{30,})\b/;
 
 const MAX_DEPTH = 8;
+
+export const CREDENTIAL_KINDS = [
+  'private_key',
+  'bearer_token',
+  'credential_assignment',
+  'recognizable_secret'
+] as const;
+
+export type CredentialKind = (typeof CREDENTIAL_KINDS)[number];
+
+export function detectCredentials(value: string): CredentialKind[] {
+  const kinds: CredentialKind[] = [];
+  if (value.match(PRIVATE_KEY_PATTERN)) kinds.push('private_key');
+  if (value.match(BEARER_PATTERN)) kinds.push('bearer_token');
+  if (value.match(ASSIGNMENT_PATTERN)) kinds.push('credential_assignment');
+  if (RECOGNIZABLE_SECRET_PATTERN.test(value)) kinds.push('recognizable_secret');
+  return kinds;
+}
+
+export function containsCredentials(value: string): boolean {
+  return detectCredentials(value).length > 0;
+}
+
+export function assertNoCredentials(value: string, field = 'value'): void {
+  const kinds = detectCredentials(value);
+  if (kinds.length > 0) {
+    throw new BrainError({
+      code: 'INVALID_INPUT',
+      message: `${field} rejected because it contains an obvious credential (${kinds.join(', ')})`
+    });
+  }
+}
 
 export function redactString(value: string): string {
   return value

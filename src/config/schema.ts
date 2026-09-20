@@ -38,7 +38,13 @@ const mountPath = z
   .max(512)
   .refine(withoutTraversal, { message: 'path must not contain traversal sequences' });
 
-const relativePath = mountPath.refine((value) => !value.startsWith('/') && !value.startsWith('\\'), {
+const isAbsolutePath = (value: string): boolean =>
+  value.startsWith('/') ||
+  value.startsWith('\\') ||
+  value.startsWith('//') ||
+  /^[A-Za-z]:[\\/]/.test(value);
+
+const relativePath = mountPath.refine((value) => !isAbsolutePath(value), {
   message: 'relative_root must be a relative path'
 });
 
@@ -90,7 +96,15 @@ export const credentialRecordSchema = z.strictObject({
 });
 
 export const credentialsFileSchema = z.strictObject({
-  credentials: z.array(credentialRecordSchema).min(1)
+  credentials: z.array(credentialRecordSchema).min(1).superRefine((records, ctx) => {
+    const digests = new Set<string>();
+    for (const record of records) {
+      if (digests.has(record.token_sha256)) {
+        ctx.addIssue({ code: 'custom', message: 'duplicate credential digest' });
+      }
+      digests.add(record.token_sha256);
+    }
+  })
 });
 
 export const brainMountsSchema = z.strictObject({
@@ -98,7 +112,7 @@ export const brainMountsSchema = z.strictObject({
   state: mountPath
 });
 
-export const brainLimitsSchema = z.object({
+export const brainLimitsSchema = z.strictObject({
   input_body_max_bytes: z.int().positive().optional().default(INPUT_BODY_MAX_BYTES),
   rendered_note_max_bytes: z.int().positive().optional().default(RENDERED_NOTE_MAX_BYTES),
   tool_result_max_bytes: z.int().positive().optional().default(TOOL_RESULT_MAX_BYTES),

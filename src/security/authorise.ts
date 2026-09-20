@@ -46,14 +46,12 @@ export function resolveScopes(
   configured: ScopeConfig[]
 ): ScopeConfig[] {
   const identifier = requireIdentifier(requested);
-  const primary = resolveIdentifier(identifier, configured);
-  if (!permitted(principal, primary.id, operation)) {
-    throw forbidden('scope access is not allowed');
-  }
+  const allowed = configured.filter((scope) => permitted(principal, scope.id, operation));
+  const primary = resolveIdentifier(identifier, allowed);
   const resolved: ScopeConfig[] = [primary];
   if (includeShared && primary.id !== SHARED_SCOPE_ID) {
-    const shared = configured.find((scope) => scope.id === SHARED_SCOPE_ID);
-    if (shared && permitted(principal, shared.id, operation)) {
+    const shared = allowed.find((scope) => scope.id === SHARED_SCOPE_ID);
+    if (shared) {
       resolved.push(shared);
     }
   }
@@ -67,12 +65,10 @@ export function resolveLinkedScopes(
 ): ScopeConfig[] {
   const resolved: ScopeConfig[] = [];
   const seen = new Set<string>();
+  const allowed = configured.filter((scope) => principal.read_scopes.includes(scope.id));
   for (const value of requested) {
     const identifier = requireIdentifier(value);
-    const scope = resolveIdentifier(identifier, configured);
-    if (!principal.read_scopes.includes(scope.id)) {
-      throw forbidden('linked scope access is not allowed');
-    }
+    const scope = resolveIdentifier(identifier, allowed);
     if (!seen.has(scope.id)) {
       seen.add(scope.id);
       resolved.push(scope);

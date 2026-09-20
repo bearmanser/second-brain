@@ -16,13 +16,18 @@ export function authenticate(header: string | undefined, credentials: Credential
   if (typeof header !== 'string') {
     throw unauthenticated('a bearer credential is required');
   }
-  const match = BEARER_PATTERN.exec(header.trim());
+  const match = BEARER_PATTERN.exec(header);
   if (!match) {
     throw unauthenticated('authorization header is malformed');
   }
   const presented = tokenDigest(match[1]);
+  const digests = new Set<string>();
   let matched: Principal | undefined;
   for (const record of credentials) {
+    if (digests.has(record.token_sha256)) {
+      throw unauthenticated('credential store contains duplicate digests');
+    }
+    digests.add(record.token_sha256);
     if (!TOKEN_SHA256_PATTERN.test(record.token_sha256)) continue;
     const expected = Buffer.from(record.token_sha256, 'hex');
     if (expected.length !== presented.length) continue;
