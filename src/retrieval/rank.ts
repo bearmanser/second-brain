@@ -13,7 +13,7 @@ const PHASE_KINDS: Partial<Record<Phase, readonly NoteKind[]>> = {
   handoff: ['session']
 };
 
-const WINDOW_SIZE = 3;
+const MAX_RANK_DISTANCE = 2;
 
 export function phaseKinds(phase: Phase): readonly NoteKind[] {
   return PHASE_KINDS[phase] ?? [];
@@ -27,19 +27,18 @@ export function rankEligible(hits: EligibleHit[], phase: Phase): EligibleHit[] {
   const preferred = phaseKinds(phase);
   if (preferred.length === 0) return ordered;
 
+  const remaining = [...ordered];
   const ranked: EligibleHit[] = [];
-  for (let start = 0; start < ordered.length; start += WINDOW_SIZE) {
-    const bucket = ordered.slice(start, start + WINDOW_SIZE);
-    const first: EligibleHit[] = [];
-    const rest: EligibleHit[] = [];
-    for (const hit of bucket) {
-      if (preferred.includes(hit.head.source.kind)) {
-        first.push(hit);
-      } else {
-        rest.push(hit);
+  while (remaining.length > 0) {
+    const windowSize = Math.min(MAX_RANK_DISTANCE + 1, remaining.length);
+    let pick = 0;
+    for (let index = 1; index < windowSize; index += 1) {
+      if (preferred.includes(remaining[index].head.source.kind)) {
+        pick = index;
+        break;
       }
     }
-    ranked.push(...first, ...rest);
+    ranked.push(remaining.splice(pick, 1)[0]);
   }
   return ranked;
 }

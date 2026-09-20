@@ -139,7 +139,7 @@ test('ranks by backend rank while preserving the phase-relevant kind window', ()
   expect(handoff[0]?.head.source.kind).toBe('session');
 });
 
-test('does not promote a preferred kind beyond its three-position window', () => {
+test('does not promote a preferred kind further than two adjacent backend-rank positions', () => {
   const ranked = rankEligible(
     [
       eligible('note', 10, '0b'),
@@ -149,8 +149,49 @@ test('does not promote a preferred kind beyond its three-position window', () =>
     ],
     'debugging'
   );
-  expect(ranked.map((hit) => hit.head.source.kind)).toEqual(['note', 'note', 'note', 'lesson']);
-  expect(ranked.map((hit) => hit.rank)).toEqual([10, 9, 8, 7]);
+  // position 4 competes with positions 2-3 and moves up exactly two places
+  expect(ranked.map((hit) => hit.head.source.kind)).toEqual(['note', 'lesson', 'note', 'note']);
+  expect(ranked.map((hit) => hit.rank)).toEqual([10, 7, 9, 8]);
+
+  const far = rankEligible(
+    [
+      eligible('note', 10, '0f'),
+      eligible('note', 9, '10'),
+      eligible('note', 8, '11'),
+      eligible('note', 7, '12'),
+      eligible('note', 6, '13'),
+      eligible('lesson', 5, '14')
+    ],
+    'debugging'
+  );
+  const lessonIndex = far.findIndex((hit) => hit.head.source.kind === 'lesson');
+  expect(lessonIndex).toBeGreaterThanOrEqual(3);
+});
+
+test('tie-breaks across the boundary between backend positions three and four', () => {
+  const thirdPosition = rankEligible(
+    [
+      eligible('note', 10, '15'),
+      eligible('note', 9, '16'),
+      eligible('lesson', 8, '17'),
+      eligible('note', 7, '18')
+    ],
+    'debugging'
+  );
+  expect(thirdPosition.map((hit) => hit.head.source.kind)).toEqual(['lesson', 'note', 'note', 'note']);
+  expect(thirdPosition.map((hit) => hit.rank)).toEqual([8, 10, 9, 7]);
+
+  const fourthPosition = rankEligible(
+    [
+      eligible('note', 10, '19'),
+      eligible('note', 9, '1a'),
+      eligible('note', 8, '1b'),
+      eligible('lesson', 7, '1c')
+    ],
+    'debugging'
+  );
+  expect(fourthPosition.map((hit) => hit.head.source.kind)).toEqual(['note', 'lesson', 'note', 'note']);
+  expect(fourthPosition.map((hit) => hit.rank)).toEqual([10, 7, 9, 8]);
 });
 
 test('clamps the requested reference token budget into the validated range', () => {
@@ -204,4 +245,11 @@ test('keeps the serialized result under the hard 128 KiB byte cap', () => {
   const packed = packRecall(items, metadata, 4000);
   expect(packed.budget.used).toBeLessThanOrEqual(4000);
   expect(Buffer.byteLength(JSON.stringify(packed), 'utf8')).toBeLessThanOrEqual(128 * 1024);
+});
+
+test('pre-bounds a pathological excerpt before tokenizing it', () => {
+  const packed = packRecall([item('id-pathological', 'x'.repeat(200000))], metadata, 1500);
+  expect(packed.budget.used).toBeLessThanOrEqual(packed.budget.limit);
+  expect(packed.items[0]?.excerpt.length ?? 0).toBeLessThanOrEqual(1100);
+  expect([...(packed.items[0]?.excerpt ?? '')].join('')).toBe(packed.items[0]?.excerpt ?? '');
 });

@@ -12,9 +12,17 @@ export const BUDGET_EXHAUSTED_WARNING = 'budget_exhausted';
 const encoding = getEncoding('cl100k_base');
 
 const MAX_SETTLE_ATTEMPTS = 12;
+const MAX_EXCERPT_CODE_POINTS = 1100;
 
 export function countReferenceTokens(text: string): number {
   return encoding.encode(text).length;
+}
+
+export function boundExcerpt(excerpt: string): string {
+  const points = [...excerpt];
+  return points.length <= MAX_EXCERPT_CODE_POINTS
+    ? excerpt
+    : points.slice(0, MAX_EXCERPT_CODE_POINTS).join('');
 }
 
 export function clampRecallBudget(value: number | undefined): number {
@@ -108,7 +116,11 @@ export function packRecall(
     partial: metadata.partial,
     warnings: [...metadata.warnings],
     budget: { tokenizer: 'cl100k_base', used: 0, limit },
-    items: items.map((item) => ({ ...item, warnings: [...item.warnings] }))
+    items: items.map((item) => ({
+      ...item,
+      warnings: [...item.warnings],
+      excerpt: boundExcerpt(item.excerpt)
+    }))
   };
 
   enforce(result, limit);

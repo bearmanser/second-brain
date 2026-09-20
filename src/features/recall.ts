@@ -3,6 +3,7 @@ import { recallRequestSchema } from '../contracts/protocol.js';
 import {
   BACKEND_SEARCH_PAGES,
   BACKEND_SEARCH_PAGE_SIZE,
+  BACKEND_TIMEOUT_MS,
   RECALL_LIMIT_DEFAULT,
   RECALL_LIMIT_MAX,
   SESSION_FRESHNESS_DAYS,
@@ -30,13 +31,15 @@ import { phaseKinds, rankEligible, type EligibleHit } from '../retrieval/rank.js
 
 export const RECALL_WARNING_SEARCH_TRUNCATED = 'search_truncated';
 export const RECALL_WARNING_HIT_UNRESOLVED = 'hit_unresolved';
+export const RECALL_WARNING_STALE_HITS_EXCLUDED = 'stale_hits_excluded';
+export const RECALL_WARNING_DEADLINE_EXCEEDED = 'retrieval_deadline_exceeded';
 export const RECALL_WARNING_EMBEDDINGS_FALLBACK = 'embeddings_unavailable_text_fallback';
 export const RECALL_WARNING_CANDIDATE = 'candidate';
 export const RECALL_WARNING_SHARED_SCOPE = 'shared_scope';
 
 const MAX_SEARCH_TERMS = 64;
-const MATCHED_SECTION_MAX_CODE_POINTS = 3000;
-const CONTEXT_SECTION_MAX_CODE_POINTS = 1200;
+const MATCHED_SECTION_MAX_CODE_POINTS = 600;
+const CONTEXT_SECTION_MAX_CODE_POINTS = 200;
 const SESSION_FRESHNESS_MS = SESSION_FRESHNESS_DAYS * 24 * 60 * 60 * 1000;
 
 type SessionContent = Extract<NoteInput['content'], { kind: 'session' }>;
@@ -46,6 +49,7 @@ interface ScopeHits {
   scope: ScopeConfig;
   hits: BackendHit[];
   truncated: boolean;
+  deadlineExceeded: boolean;
 }
 
 interface HitDecision {
@@ -118,12 +122,18 @@ async function searchScope(
   searchText: string,
   kinds: NoteKind[],
   mode: 'hybrid' | 'text',
-  deps: BrainDeps
+  deps: BrainDeps,
+  deadline: number
 ): Promise<ScopeHits> {
   const hits: BackendHit[] = [];
   let page = 1;
+  let deadlineExceeded = false;
   for (; page <= BACKEND_SEARCH_PAGES; page += 1) {
     if (ctx.signal.aborted) throw cancelled();
+    if (Date.now() >= deadline) {
+      deadlineExceeded = true;
+      break;
+    }
     const result = await deps.backend.search({
       project: scope.backend_project,
       query: searchText,
@@ -136,7 +146,12 @@ async function searchScope(
     hits.push(...result.hits);
     if (!result.has_more) break;
   }
-  return { scope, hits, truncated: page > BACKEND_SEARCH_PAGES };
+  return {
+    scope,
+    hits,
+    truncated: !deadlineExceeded && page > BACKEND_SEARCH_PAGES,
+    deadlineExceeded
+  };
 }
 
 async function runSearch(
@@ -145,61 +160,112 @@ async function runSearch(
   searchText: string,
   kinds: NoteKind[],
   mode: 'hybrid' | 'text',
-  deps: BrainDeps
+  deps: BrainDeps,
+  deadline: number
 ): Promise<ScopeHits[]> {
   const collected: ScopeHits[] = [];
   for (const scope of scopes) {
-    collected.push(await searchScope(ctx, scope, searchText, kinds, mode, deps));
+    collected.push(await searchScope(ctx, scope, searchText, kinds, mode, deps, deadline));
   }
   return collected;
 }
+
+type HeadLookup =
+  | { kind: 'head'; head: Head }
+  | { kind: 'stale' }
+  | { kind: 'unresolved' };
 
 type HitResolution =
   | { kind: 'head'; head: Head }
   | { kind: 'stale' }
   | { kind: 'unresolved' };
 
+async function lookupHead(
+  scope: ScopeConfig,
+  logicalId: string,
+  deps: BrainDeps,
+  cache: Map<string, HeadLookup>
+): Promise<HeadLookup> {
+  const key = `${scope.id}:${logicalId}`;
+  const cached = cache.get(key);
+  if (cached !== undefined) return cached;
+  let outcome: HeadLookup;
+  try {
+    outcome = { kind: 'head', head: await deps.catalogue.get(scope.id, logicalId) };
+  } catch (error) {
+    if (
+      isBrainError(error) &&
+      (error.code === 'CONFLICT' || error.code === 'UNSUPPORTED_SCHEMA')
+    ) {
+      outcome = { kind: 'stale' };
+    } else {
+      outcome = { kind: 'unresolved' };
+    }
+  }
+  cache.set(key, outcome);
+  return outcome;
+}
+
 async function resolveHit(
   scope: ScopeConfig,
   hit: BackendHit,
   deps: BrainDeps,
-  cache: Map<string, Head | null>
+  cache: Map<string, HeadLookup>
 ): Promise<HitResolution> {
-  if (hit.relative_path.length === 0) return { kind: 'unresolved' };
-  let read: { raw: string; raw_hash: string; relative_path: string };
-  try {
-    read = await deps.vault.read(scope.id, vaultRelativePath(scope, hit.relative_path));
-  } catch {
+  if (hit.relative_path.length === 0 && hit.logical_id.length === 0) {
     return { kind: 'unresolved' };
   }
-  let revision: StoredRevision;
-  try {
-    revision = decodeRevision(read.raw);
-  } catch {
-    return { kind: 'unresolved' };
-  }
-  if (revision.scope !== scope.id) return { kind: 'stale' };
-  const key = `${scope.id}:${revision.id}`;
-  let head: Head | null;
-  if (cache.has(key)) {
-    head = cache.get(key) ?? null;
-  } else {
+
+  let read: { raw: string; raw_hash: string; relative_path: string } | undefined;
+  let revision: StoredRevision | undefined;
+  if (hit.relative_path.length > 0) {
     try {
-      head = await deps.catalogue.get(scope.id, revision.id);
-    } catch (error) {
-      if (
-        isBrainError(error) &&
-        (error.code === 'CONFLICT' || error.code === 'UNSUPPORTED_SCHEMA')
-      ) {
-        return { kind: 'stale' };
-      }
-      cache.set(key, null);
+      read = await deps.vault.read(scope.id, vaultRelativePath(scope, hit.relative_path));
+    } catch {
       return { kind: 'unresolved' };
     }
-    cache.set(key, head);
+    try {
+      revision = decodeRevision(read.raw);
+    } catch {
+      return { kind: 'unresolved' };
+    }
+    if (revision.scope !== scope.id) return { kind: 'stale' };
+    if (hit.logical_id !== '' && revision.id !== hit.logical_id) return { kind: 'stale' };
+    if (hit.revision_id !== '' && revision.revision_id !== hit.revision_id) {
+      return { kind: 'stale' };
+    }
   }
-  if (head === null) return { kind: 'unresolved' };
+
+  const logicalId = revision?.id ?? hit.logical_id;
+  if (logicalId === '') return { kind: 'unresolved' };
+  const lookup = await lookupHead(scope, logicalId, deps, cache);
+  if (lookup.kind !== 'head') return lookup;
+  const head = lookup.head;
+  if (hit.logical_id !== '' && head.revision.id !== hit.logical_id) return { kind: 'stale' };
   if (head.state !== 'ready' && head.state !== 'manual_unreviewed') return { kind: 'stale' };
+  if (hit.revision_id !== '' && head.revision.revision_id !== hit.revision_id) {
+    return { kind: 'stale' };
+  }
+
+  if (read === undefined || revision === undefined) {
+    try {
+      read = await deps.vault.read(scope.id, head.source.relative_path);
+    } catch {
+      return { kind: 'unresolved' };
+    }
+    try {
+      revision = decodeRevision(read.raw);
+    } catch {
+      return { kind: 'unresolved' };
+    }
+    if (
+      revision.id !== head.revision.id ||
+      revision.revision_id !== head.revision.revision_id
+    ) {
+      return { kind: 'stale' };
+    }
+  }
+
   if (head.revision.revision_id !== revision.revision_id) return { kind: 'stale' };
   if (head.raw_hash !== read.raw_hash) return { kind: 'stale' };
   if (head.source.relative_path !== read.relative_path) return { kind: 'stale' };
@@ -303,7 +369,11 @@ function buildExcerpt(revision: StoredRevision, terms: string[]): { excerpt: str
     );
   }
   const evidence = evidenceSection(note);
-  if (evidence !== undefined) parts.push(`## ${evidence.title}\n\n${evidence.text}`);
+  if (evidence !== undefined) {
+    parts.push(
+      `## ${evidence.title}\n\n${truncateCodePoints(evidence.text, CONTEXT_SECTION_MAX_CODE_POINTS)}`
+    );
+  }
   return { excerpt: parts.join('\n\n'), section: matched?.title ?? '' };
 }
 
@@ -344,10 +414,12 @@ export async function recall(
   const warnings: string[] = [];
   let partial = false;
   let mode: 'hybrid' | 'text' = request.mode ?? 'hybrid';
+  const deadline =
+    Date.now() + (deps.config.limits.backend_timeout_ms ?? BACKEND_TIMEOUT_MS);
 
   let scopeHits: ScopeHits[];
   try {
-    scopeHits = await runSearch(ctx, scopes, searchText, kinds, mode, deps);
+    scopeHits = await runSearch(ctx, scopes, searchText, kinds, mode, deps, deadline);
   } catch (error) {
     if (
       isBrainError(error) &&
@@ -358,7 +430,7 @@ export async function recall(
       mode = 'text';
       partial = true;
       warnings.push(RECALL_WARNING_EMBEDDINGS_FALLBACK);
-      scopeHits = await runSearch(ctx, scopes, searchText, kinds, mode, deps);
+      scopeHits = await runSearch(ctx, scopes, searchText, kinds, mode, deps, deadline);
     } else {
       throw error;
     }
@@ -367,31 +439,37 @@ export async function recall(
   const now = deps.clock.now();
   const eligible: EligibleHit[] = [];
   const seen = new Set<string>();
-  const headCache = new Map<string, Head | null>();
+  const headCache = new Map<string, HeadLookup>();
   let unresolved = false;
+  let staleExcluded = false;
+  let deadlineExceeded = false;
 
-  for (const { scope, hits, truncated } of scopeHits) {
-    if (truncated) {
+  for (const hits of scopeHits) {
+    if (hits.truncated) {
       partial = true;
       if (!warnings.includes(RECALL_WARNING_SEARCH_TRUNCATED)) {
         warnings.push(RECALL_WARNING_SEARCH_TRUNCATED);
       }
     }
-    for (const hit of hits) {
-      const resolution = await resolveHit(scope, hit, deps, headCache);
+    if (hits.deadlineExceeded) deadlineExceeded = true;
+    for (const hit of hits.hits) {
+      const resolution = await resolveHit(hits.scope, hit, deps, headCache);
       if (resolution.kind === 'unresolved') {
         unresolved = true;
         continue;
       }
-      if (resolution.kind === 'stale') continue;
+      if (resolution.kind === 'stale') {
+        staleExcluded = true;
+        continue;
+      }
       const head = resolution.head;
-      const key = `${scope.id}:${head.revision.id}`;
+      const key = `${hits.scope.id}:${head.revision.id}`;
       if (seen.has(key)) continue;
-      const decision = evaluateHit(scope, head, request, kinds, now);
+      const decision = evaluateHit(hits.scope, head, request, kinds, now);
       if (!decision.included) continue;
       seen.add(key);
       const extracted = buildExcerpt(head.revision, terms);
-      const reasons = [...decision.reasons, `scope:${scope.id}`, `backend_rank:${hit.rank}`];
+      const reasons = [...decision.reasons, `scope:${hits.scope.id}`, `backend_rank:${hit.rank}`];
       if (extracted.section.length > 0) reasons.push(`section:${extracted.section}`);
       eligible.push({
         head,
@@ -402,11 +480,20 @@ export async function recall(
     }
   }
 
+  if (deadlineExceeded) {
+    partial = true;
+    if (!warnings.includes(RECALL_WARNING_DEADLINE_EXCEEDED)) {
+      warnings.push(RECALL_WARNING_DEADLINE_EXCEEDED);
+    }
+  }
   if (unresolved) {
     partial = true;
     if (!warnings.includes(RECALL_WARNING_HIT_UNRESOLVED)) {
       warnings.push(RECALL_WARNING_HIT_UNRESOLVED);
     }
+  }
+  if (staleExcluded && !warnings.includes(RECALL_WARNING_STALE_HITS_EXCLUDED)) {
+    warnings.push(RECALL_WARNING_STALE_HITS_EXCLUDED);
   }
 
   const ranked = rankEligible(eligible, request.phase ?? 'general');

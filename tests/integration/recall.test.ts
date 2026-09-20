@@ -10,16 +10,17 @@ import type {
 } from '../../src/core/types.js';
 import {
   RECALL_WARNING_CANDIDATE,
+  RECALL_WARNING_DEADLINE_EXCEEDED,
   RECALL_WARNING_EMBEDDINGS_FALLBACK,
   RECALL_WARNING_HIT_UNRESOLVED,
   RECALL_WARNING_SEARCH_TRUNCATED,
   RECALL_WARNING_SHARED_SCOPE,
+  RECALL_WARNING_STALE_HITS_EXCLUDED,
   recall
 } from '../../src/features/recall.js';
 import { review } from '../../src/features/review.js';
 import { hashRaw, relativePathFor } from '../../src/notes/identity.js';
 import { payloadHash, renderRevision } from '../../src/notes/codec.js';
-import { BUDGET_EXHAUSTED_WARNING } from '../../src/retrieval/budget.js';
 import { lessonFixture } from '../fixtures/content.js';
 import {
   ownerContext,
@@ -555,6 +556,7 @@ test('walks past a first page full of historical revisions to the current head',
   const result = await recall(reviewerContext, { scope: 'freellmapi', query: 'chainquery' }, h.deps);
   expect(result.partial).toBe(false);
   expect(result.warnings).not.toContain(RECALL_WARNING_SEARCH_TRUNCATED);
+  expect(result.warnings).toContain(RECALL_WARNING_STALE_HITS_EXCLUDED);
   expect(result.items).toHaveLength(1);
   expect(result.items[0].revision_id).toBe(chain.headRevisionId);
   expect(result.items[0].excerpt).toContain('chainquery head');
@@ -591,20 +593,170 @@ test('stops at four pages per scope and reports a partial search', async () => {
   await h.close();
 });
 
-test('honors an explicit note limit while keeping the budget bound', async () => {
+test('applies the default note limit, the default budget, and clamps explicit values', async () => {
   const h = await createHarness();
-  for (let index = 0; index < 9; index += 1) {
+  for (let index = 0; index < 15; index += 1) {
     await h.seed(lessonNote(`limitquery note ${index}`), { status: 'active' });
   }
-  const result = await recall(ownerContext, {
+
+  const defaults = await recall(ownerContext, {
+    scope: 'freellmapi',
+    query: 'limitquery',
+    budget_tokens: 4000
+  }, h.deps);
+  expect(defaults.items).toHaveLength(6);
+  expect(defaults.budget.limit).toBe(4000);
+
+  const defaultBudget = await recall(ownerContext, { scope: 'freellmapi', query: 'limitquery' }, h.deps);
+  expect(defaultBudget.budget.limit).toBe(1500);
+  expect(defaultBudget.budget.used).toBeLessThanOrEqual(1500);
+  expect(defaultBudget.items.length).toBeLessThanOrEqual(6);
+
+  const explicit = await recall(ownerContext, {
     scope: 'freellmapi',
     query: 'limitquery',
     limit: 2,
     budget_tokens: 4000
   }, h.deps);
-  expect(result.items.length).toBeLessThanOrEqual(2);
-  expect(result.budget.used).toBeLessThanOrEqual(4000);
-  expect(BUDGET_EXHAUSTED_WARNING).not.toBe('');
+  expect(explicit.items).toHaveLength(2);
+  expect(explicit.budget.limit).toBe(4000);
+  expect(explicit.budget.used).toBeLessThanOrEqual(4000);
+
+  const clampedHigh = await recall(ownerContext, {
+    scope: 'freellmapi',
+    query: 'limitquery',
+    limit: 99,
+    budget_tokens: 999999
+  }, h.deps);
+  expect(clampedHigh.items).toHaveLength(12);
+  expect(clampedHigh.budget.limit).toBe(4000);
+  expect(clampedHigh.budget.used).toBeLessThanOrEqual(4000);
+
+  const clampedLow = await recall(ownerContext, {
+    scope: 'freellmapi',
+    query: 'limitquery',
+    limit: 0,
+    budget_tokens: 10
+  }, h.deps);
+  expect(clampedLow.budget.limit).toBe(256);
+  expect(clampedLow.budget.used).toBeLessThanOrEqual(256);
+  expect(clampedLow.items.length).toBeLessThanOrEqual(1);
+  await h.close();
+});
+
+test('discards adversarial backend hits that do not match their claimed identity', async () => {
+  const h = await createHarness();
+  const noteA = await h.seed(lessonNote('adversarialquery alpha note'), { status: 'active' });
+  const noteB = await h.seed(
+    lessonNote(`adversarialquery beta ${FORBIDDEN_MARKER} secret`),
+    { status: 'active' }
+  );
+  h.backend.search = async (input: BackendSearch) =>
+    input.project === 'freellmapi'
+      ? {
+          hits: [
+            {
+              permalink: 'freellmapi/mismatch',
+              relative_path: noteB.source.relative_path,
+              revision_id: noteA.revision.revision_id,
+              logical_id: noteA.revision.id,
+              rank: 10,
+              matched_text: 'mismatched identity'
+            },
+            {
+              permalink: 'freellmapi/traversal',
+              relative_path: '../profile/Foreign.md',
+              revision_id: '',
+              logical_id: '',
+              rank: 9,
+              matched_text: 'traversal'
+            },
+            {
+              permalink: 'freellmapi/foreign',
+              relative_path: 'shared/Foreign.md',
+              revision_id: '',
+              logical_id: '',
+              rank: 8,
+              matched_text: 'foreign scope'
+            }
+          ],
+          has_more: false
+        }
+      : { hits: [], has_more: false };
+
+  const result = await recall(reviewerContext, {
+    scope: 'freellmapi',
+    query: 'adversarialquery'
+  }, h.deps);
+  expect(result.items.every((item) => item.revision_id !== noteB.revision.revision_id)).toBe(true);
+  expect(result.items.some((item) => item.revision_id === noteB.revision.revision_id)).toBe(false);
+  expect(JSON.stringify(result)).not.toContain(FORBIDDEN_MARKER);
+  await h.close();
+});
+
+test('bounds a pathological huge note and evidence inside the token budget', async () => {
+  const h = await createHarness();
+  await h.seed(
+    {
+      title: 'pathological note',
+      tags: ['fixture'],
+      content: {
+        kind: 'note',
+        summary: 'pathological summary',
+        body_markdown: `pathologicalquery ${'x'.repeat(20000)}`
+      },
+      evidence: Array.from({ length: 10 }, (_value, index) => ({
+        kind: 'observation' as const,
+        ref: `evidence-${index}`,
+        description: 'y'.repeat(2000)
+      })),
+      related_ids: []
+    },
+    { status: 'active' }
+  );
+
+  const result = await recall(reviewerContext, {
+    scope: 'freellmapi',
+    query: 'pathologicalquery',
+    budget_tokens: 400
+  }, h.deps);
+  expect(result.budget.used).toBeLessThanOrEqual(400);
+  expect(result.items).toHaveLength(1);
+  expect(result.items[0].excerpt).toContain('pathologicalquery');
+  expect([...result.items[0].excerpt].join('')).toBe(result.items[0].excerpt);
+  await h.close();
+});
+
+test('returns accumulated results with a deadline warning when retrieval runs out of time', async () => {
+  const h = await createHarness();
+  await h.seed(lessonFixture, { status: 'active' });
+  h.deps.config.limits.backend_timeout_ms = 50;
+  const original = h.backend.search.bind(h.backend);
+  let calls = 0;
+  h.backend.search = async (input: BackendSearch) => {
+    calls += 1;
+    const real = await original(input);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    return { hits: real.hits, has_more: true };
+  };
+
+  const result = await recall(reviewerContext, { scope: 'freellmapi', query: 'streaming' }, h.deps);
+  expect(calls).toBe(1);
+  expect(result.partial).toBe(true);
+  expect(result.warnings).toContain(RECALL_WARNING_DEADLINE_EXCEEDED);
+  expect(result.items).toHaveLength(1);
+  await h.close();
+});
+
+test('throws CANCELLED for a caller-aborted request', async () => {
+  const h = await createHarness();
+  await h.seed(lessonFixture, { status: 'active' });
+  const controller = new AbortController();
+  controller.abort();
+  const aborted = { ...reviewerContext, signal: controller.signal };
+  await expect(
+    recall(aborted, { scope: 'freellmapi', query: 'streaming' }, h.deps)
+  ).rejects.toThrow(/CANCELLED/);
   await h.close();
 });
 
