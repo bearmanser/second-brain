@@ -1,5 +1,12 @@
 import { expect, test } from 'vitest';
-import type { BackendSearch, CaptureRequest, NoteContent, NoteInput } from '../../src/core/types.js';
+import type {
+  BackendSearch,
+  CaptureRequest,
+  NoteContent,
+  NoteInput,
+  Principal,
+  RequestContext
+} from '../../src/core/types.js';
 import { capture } from '../../src/features/capture.js';
 import { fixtureIds, lessonFixture } from '../fixtures/content.js';
 import { ownerContext, reviewerContext, workerContext } from '../fixtures/principals.js';
@@ -407,5 +414,139 @@ test('resolves a configured repository alias for the capture scope', async () =>
   }, h.deps);
   const head = await h.deps.catalogue.get('freellmapi', receipt.id);
   expect(head.revision.scope).toBe('freellmapi');
+  await h.close();
+});
+
+test('keeps the initial duplicate advisory on replay when search availability recovers', async () => {
+  const h = await createHarness();
+  const request: CaptureRequest = {
+    idempotency_key: key(40),
+    scope: 'freellmapi',
+    note: lessonFixture
+  };
+  h.backend.fail_once = 'search_unavailable';
+  const first = await capture(reviewerContext, request, h.deps);
+  expect(first.warnings).toContain('duplicate_check_unavailable');
+
+  const replay = await capture(reviewerContext, request, h.deps);
+  expect(replay).toEqual(first);
+  expect(replay.warnings).toContain('duplicate_check_unavailable');
+  expect(h.backend.create_calls).toHaveLength(1);
+  await h.close();
+});
+
+test('keeps the initial duplicate advisory on replay when new similar notes appear', async () => {
+  const h = await createHarness();
+  const request: CaptureRequest = {
+    idempotency_key: key(41),
+    scope: 'freellmapi',
+    note: lessonFixture
+  };
+  const first = await capture(reviewerContext, request, h.deps);
+  expect(first.possible_duplicates).toEqual([]);
+
+  await capture(reviewerContext, {
+    idempotency_key: key(42),
+    scope: 'freellmapi',
+    note: { ...lessonFixture, content: lessonContent({ lesson: 'A newly added similar claim about proxied TTFT.' }) }
+  }, h.deps);
+
+  const replay = await capture(reviewerContext, request, h.deps);
+  expect(replay).toEqual(first);
+  expect(replay.possible_duplicates).toEqual([]);
+  expect(h.backend.create_calls).toHaveLength(2);
+  await h.close();
+});
+
+test('persists the advisory as durable diagnostic state across a restart', async () => {
+  const h = await createHarness();
+  const request: CaptureRequest = {
+    idempotency_key: key(43),
+    scope: 'freellmapi',
+    note: lessonFixture
+  };
+  h.backend.fail_once = 'search_unavailable';
+  const first = await capture(reviewerContext, request, h.deps);
+  const record = h.deps.journal.get(first.operation_id);
+  expect(record?.payload_json).toContain('duplicate_check_unavailable');
+  expect(record?.receipt_json).toContain('duplicate_check_unavailable');
+
+  await h.restart();
+  const replay = await capture(reviewerContext, request, h.deps);
+  expect(replay).toEqual(first);
+  expect(replay.warnings).toContain('duplicate_check_unavailable');
+  await h.close();
+});
+
+test('marks the duplicate lookup unavailable when a search hit cannot be resolved', async () => {
+  const h = await createHarness();
+  h.backend.search = async () => ({
+    hits: [
+      {
+        permalink: 'freellmapi/unknown',
+        relative_path: '',
+        revision_id: '',
+        logical_id: '',
+        rank: 1,
+        matched_text: 'unresolvable hit'
+      }
+    ],
+    has_more: false
+  });
+
+  const receipt = await capture(reviewerContext, {
+    idempotency_key: key(44),
+    scope: 'freellmapi',
+    note: lessonFixture
+  }, h.deps);
+
+  expect(receipt.outcome).toBe('stored');
+  expect(receipt.warnings).toContain('duplicate_check_unavailable');
+  expect(receipt.possible_duplicates).toEqual([]);
+  expect(h.backend.create_calls).toHaveLength(1);
+  await h.close();
+});
+
+test('does not let a write-only principal probe related ids or duplicate details', async () => {
+  const h = await createHarness();
+  const seeded = await h.seed(lessonFixture, { scope: 'freellmapi', status: 'active' });
+  const writeOnlyPrincipal: Principal = {
+    id: '00000000-0000-4000-8000-0000000000ff',
+    role: 'worker',
+    read_scopes: [],
+    write_scopes: ['freellmapi'],
+    review_scopes: []
+  };
+  const writeOnlyContext: RequestContext = {
+    principal: writeOnlyPrincipal,
+    request_id: key(0xfe),
+    signal: new AbortController().signal
+  };
+
+  let searchCalls = 0;
+  const original = h.backend.search.bind(h.backend);
+  h.backend.search = async (input: BackendSearch) => {
+    searchCalls += 1;
+    return original(input);
+  };
+
+  const receipt = await capture(writeOnlyContext, {
+    idempotency_key: key(45),
+    scope: 'freellmapi',
+    note: { ...lessonFixture, title: 'Write-only capture' }
+  }, h.deps);
+  expect(receipt.outcome).toBe('stored');
+  expect(receipt.possible_duplicates).toEqual([]);
+  expect(receipt.warnings).toContain('duplicate_check_unavailable');
+  expect(searchCalls).toBe(0);
+
+  await expect(
+    capture(writeOnlyContext, {
+      idempotency_key: key(46),
+      scope: 'freellmapi',
+      note: { ...lessonFixture, related_ids: [seeded.source.id] }
+    }, h.deps)
+  ).rejects.toThrow(/FORBIDDEN/);
+  expect(h.backend.create_calls).toHaveLength(1);
   await h.close();
 });

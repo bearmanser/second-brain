@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { BrainError, isBrainError } from '../contracts/errors.js';
 import { captureRequestSchema } from '../contracts/protocol.js';
-import type { BrainDeps, MutationIntent, RevisionBuilder } from '../core/mutation.js';
+import type { BrainDeps, MutationAdvisory, MutationIntent, RevisionBuilder } from '../core/mutation.js';
 import { NOTE_KINDS, LIFECYCLES } from '../core/types.js';
 import type {
   BackendHit,
@@ -19,7 +19,6 @@ import { assertNoCredentials } from '../security/redact.js';
 
 const CAPTURE_TOOL = 'brain_capture';
 const DUPLICATE_PAGE_SIZE = 5;
-const DUPLICATE_MAX_RESULTS = 5;
 export const DUPLICATE_CHECK_UNAVAILABLE = 'duplicate_check_unavailable';
 
 function invalidInput(message: string, cause?: unknown): BrainError {
@@ -127,29 +126,18 @@ function authorizeScope(
   return scope;
 }
 
-function readableScopeOrder(
-  ctx: RequestContext,
-  primary: ScopeConfig,
-  deps: BrainDeps
-): ScopeConfig[] {
-  const ordered: ScopeConfig[] = [primary];
-  for (const scope of deps.config.scopes) {
-    if (scope.id === primary.id) continue;
-    if (!ctx.principal.read_scopes.includes(scope.id)) continue;
-    ordered.push(scope);
-  }
-  return ordered;
+function readableScopes(ctx: RequestContext, deps: BrainDeps): ScopeConfig[] {
+  return deps.config.scopes.filter((scope) => ctx.principal.read_scopes.includes(scope.id));
 }
 
 async function authorizeRelatedIds(
   ctx: RequestContext,
   note: NoteInput,
-  primary: ScopeConfig,
   deps: BrainDeps
 ): Promise<void> {
   const targets = [...new Set(note.related_ids)];
   if (targets.length === 0) return;
-  const scopes = readableScopeOrder(ctx, primary, deps);
+  const scopes = readableScopes(ctx, deps);
   for (const target of targets) {
     let visible = false;
     for (const scope of scopes) {
@@ -228,10 +216,14 @@ interface DuplicateLookup {
 }
 
 async function findPossibleDuplicates(
+  ctx: RequestContext,
   scope: ScopeConfig,
   note: NoteInput,
   deps: BrainDeps
 ): Promise<DuplicateLookup> {
+  if (!ctx.principal.read_scopes.includes(scope.id)) {
+    return { duplicates: [], warnings: [DUPLICATE_CHECK_UNAVAILABLE] };
+  }
   let hits: BackendHit[];
   try {
     const result = await deps.backend.search({
@@ -249,22 +241,18 @@ async function findPossibleDuplicates(
   }
   const duplicates: SourceRef[] = [];
   const seen = new Set<string>();
+  let partial = false;
   for (const hit of hits) {
     const source = await resolveHit(scope, hit, deps);
-    if (source === undefined) continue;
+    if (source === undefined) {
+      partial = true;
+      continue;
+    }
     if (seen.has(source.id)) continue;
     seen.add(source.id);
     duplicates.push(source);
   }
-  return { duplicates, warnings: [] };
-}
-
-function mergeWarnings(existing: string[], added: string[]): string[] {
-  const merged = [...existing];
-  for (const warning of added) {
-    if (!merged.includes(warning)) merged.push(warning);
-  }
-  return merged;
+  return { duplicates, warnings: partial ? [DUPLICATE_CHECK_UNAVAILABLE] : [] };
 }
 
 export async function capture(
@@ -276,17 +264,22 @@ export async function capture(
   const scope = authorizeScope(ctx, request.scope, deps);
   const note = normalizeNote(request.note);
 
-  await authorizeRelatedIds(ctx, note, scope, deps);
+  await authorizeRelatedIds(ctx, note, deps);
   rejectCredentialText(note);
 
-  const lookup = await findPossibleDuplicates(scope, note, deps);
+  const lookup = await findPossibleDuplicates(ctx, scope, note, deps);
+  const advisory: MutationAdvisory = {
+    warnings: lookup.warnings,
+    possible_duplicates: lookup.duplicates
+  };
 
   const intent: MutationIntent = {
     tool: CAPTURE_TOOL,
     scope: scope.id,
     idempotency_key: request.idempotency_key,
     payload: { note, payload_digest: normalizedPayloadDigest(note) },
-    expected_heads: []
+    expected_heads: [],
+    advisory
   };
 
   const build: RevisionBuilder = (identities, heads): StoredRevision => ({
@@ -306,14 +299,5 @@ export async function capture(
     extra_markdown: ''
   });
 
-  const receipt = await deps.mutations.commit(ctx, intent, build);
-  const duplicates = lookup.duplicates
-    .filter((entry) => entry.id !== receipt.id && entry.revision_id !== receipt.revision_id)
-    .slice(0, DUPLICATE_MAX_RESULTS);
-
-  return {
-    ...receipt,
-    possible_duplicates: duplicates,
-    warnings: mergeWarnings(receipt.warnings, lookup.warnings)
-  };
+  return deps.mutations.commit(ctx, intent, build);
 }

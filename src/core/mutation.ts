@@ -14,6 +14,7 @@ import type {
   Principal,
   RequestContext,
   ScopeConfig,
+  SourceRef,
   StoredRevision,
   VaultPort
 } from './types.js';
@@ -39,12 +40,18 @@ export interface ExpectedHead {
   etag: string;
 }
 
+export interface MutationAdvisory {
+  warnings?: string[];
+  possible_duplicates?: SourceRef[];
+}
+
 export interface MutationIntent {
   tool: string;
   scope: string;
   idempotency_key: string;
   payload: unknown;
   expected_heads: ExpectedHead[];
+  advisory?: MutationAdvisory;
 }
 
 export interface AllocatedIdentity {
@@ -168,6 +175,69 @@ function payloadDigest(payload: unknown): { payload_hash: string; payload_json: 
   };
 }
 
+function normalizeAdvisory(advisory: MutationAdvisory | undefined): MutationAdvisory | undefined {
+  if (advisory === undefined || advisory === null) return undefined;
+  const warnings =
+    advisory.warnings === undefined
+      ? undefined
+      : advisory.warnings.filter((warning): warning is string => typeof warning === 'string');
+  const duplicates =
+    advisory.possible_duplicates === undefined
+      ? undefined
+      : advisory.possible_duplicates.filter(
+          (entry): entry is SourceRef => entry !== null && typeof entry === 'object'
+        );
+  if (warnings === undefined && duplicates === undefined) return undefined;
+  return {
+    ...(warnings === undefined ? {} : { warnings }),
+    ...(duplicates === undefined ? {} : { possible_duplicates: duplicates })
+  };
+}
+
+function parseAdvisory(value: unknown): MutationAdvisory | undefined {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value !== 'object' || Array.isArray(value)) return undefined;
+  return normalizeAdvisory(value as MutationAdvisory);
+}
+
+function storedPayloadJson(coreJson: string, advisory: MutationAdvisory | undefined): string {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(coreJson);
+  } catch (cause) {
+    throw invalidInput('mutation payload is not serializable', cause);
+  }
+  return JSON.stringify({ payload, advisory: advisory ?? null });
+}
+
+function advisoryFromRecord(record: OperationRecord): MutationAdvisory | undefined {
+  if (record.payload_json === '') return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(record.payload_json);
+  } catch {
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+  return parseAdvisory((parsed as { advisory?: unknown }).advisory);
+}
+
+function applyAdvisory(
+  receipt: MutationReceipt,
+  advisory: MutationAdvisory | undefined
+): MutationReceipt {
+  if (advisory === undefined) return receipt;
+  const warnings = [...receipt.warnings];
+  for (const warning of advisory.warnings ?? []) {
+    if (!warnings.includes(warning)) warnings.push(warning);
+  }
+  return {
+    ...receipt,
+    warnings,
+    possible_duplicates: advisory.possible_duplicates ?? receipt.possible_duplicates
+  };
+}
+
 function isUncertainWrite(error: unknown): boolean {
   if (!isBrainError(error)) return false;
   return (UNCERTAIN_WRITE_CODES as readonly string[]).includes(error.code);
@@ -215,17 +285,24 @@ function parseReceipt(json: string, operation_id: string): MutationReceipt {
   }
 }
 
-function pendingReceipt(operation_id: string, plan: PlannedWrite): MutationReceipt {
-  return {
-    operation_id,
-    id: plan.revision.id,
-    revision_id: plan.revision.revision_id,
-    outcome: 'pending',
-    materialized: false,
-    indexed: false,
-    possible_duplicates: [],
-    warnings: ['materialization_unconfirmed']
-  };
+function pendingReceipt(
+  operation_id: string,
+  plan: PlannedWrite,
+  advisory: MutationAdvisory | undefined
+): MutationReceipt {
+  return applyAdvisory(
+    {
+      operation_id,
+      id: plan.revision.id,
+      revision_id: plan.revision.revision_id,
+      outcome: 'pending',
+      materialized: false,
+      indexed: false,
+      possible_duplicates: [],
+      warnings: ['materialization_unconfirmed']
+    },
+    advisory
+  );
 }
 
 function expectedRelativePath(scope: ScopeConfig, plan: PlannedWrite): string {
@@ -353,13 +430,14 @@ export class MutationCoordinator {
     const scope = this.authorize(ctx.principal, intent.scope);
     if (ctx.signal.aborted) throw cancelled();
     const digest = payloadDigest(intent.payload);
+    const advisory = normalizeAdvisory(intent.advisory);
     const reservation: OperationReservation = {
       principal_id: ctx.principal.id,
       idempotency_key: intent.idempotency_key,
       tool: intent.tool,
       scope: scope.id,
       payload_hash: digest.payload_hash,
-      payload_json: digest.payload_json
+      payload_json: storedPayloadJson(digest.payload_json, advisory)
     };
     const reserved = this.deps.journal.reserve(reservation);
     return this.drive(ctx, scope, reserved, intent, build);
@@ -378,9 +456,14 @@ export class MutationCoordinator {
     build: RevisionBuilder
   ): Promise<MutationReceipt> {
     const { record } = reserved;
+    const advisory =
+      reserved.kind === 'new' ? normalizeAdvisory(intent.advisory) : advisoryFromRecord(record);
     if (reserved.kind === 'replay') {
       if (record.receipt_json && (record.state === 'complete' || record.state === 'conflict')) {
-        return this.refreshTerminalReceipt(scope, parseReceipt(record.receipt_json, record.operation_id));
+        return applyAdvisory(
+          await this.refreshTerminalReceipt(scope, parseReceipt(record.receipt_json, record.operation_id)),
+          advisory
+        );
       }
       if (record.state === 'conflict') {
         throw conflict('operation ended in conflict', record.operation_id);
@@ -398,23 +481,23 @@ export class MutationCoordinator {
       if (record.state === 'submitted') {
         const wait = await this.awaitMaterialization(scope, persisted);
         if (wait.kind === 'matched') {
-          return this.finalize(scope, persisted, wait.matches, record.operation_id);
+          return this.finalize(scope, persisted, wait.matches, record.operation_id, advisory);
         }
         if (wait.kind === 'absent') {
-          return this.submit(ctx, scope, persisted, record.operation_id);
+          return this.submit(ctx, scope, persisted, record.operation_id, advisory);
         }
-        return this.pending(record.operation_id, persisted);
+        return this.pending(record.operation_id, persisted, advisory);
       }
       if (record.state === 'materialized') {
         const wait = await this.awaitMaterialization(scope, persisted);
         if (wait.kind === 'matched') {
-          return this.finalize(scope, persisted, wait.matches, record.operation_id);
+          return this.finalize(scope, persisted, wait.matches, record.operation_id, advisory);
         }
         if (wait.kind === 'absent') {
           this.markConflict(record.operation_id);
           throw conflict('operation was marked materialized but its file is absent', record.operation_id);
         }
-        return this.pending(record.operation_id, persisted);
+        return this.pending(record.operation_id, persisted, advisory);
       }
       if (record.state !== 'prepared') {
         throw recoveryRequired(`operation is stuck in state ${record.state}`, record.operation_id);
@@ -432,9 +515,9 @@ export class MutationCoordinator {
       this.deps.journal.savePlan(record.operation_id, plan);
     }
 
-    if (ctx.signal.aborted) return this.pending(record.operation_id, plan);
-    this.deps.journal.mark(record.operation_id, 'submitted', pendingReceipt(record.operation_id, plan));
-    return this.submit(ctx, scope, plan, record.operation_id);
+    if (ctx.signal.aborted) return this.pending(record.operation_id, plan, advisory);
+    this.deps.journal.mark(record.operation_id, 'submitted', pendingReceipt(record.operation_id, plan, advisory));
+    return this.submit(ctx, scope, plan, record.operation_id, advisory);
   }
 
   private deriveIdentity(record: OperationRecord, intent: MutationIntent): AllocatedIdentity {
@@ -520,27 +603,28 @@ export class MutationCoordinator {
     ctx: RequestContext,
     scope: ScopeConfig,
     plan: PlannedWrite,
-    operation_id: string
+    operation_id: string,
+    advisory: MutationAdvisory | undefined
   ): Promise<MutationReceipt> {
-    if (ctx.signal.aborted) return this.pending(operation_id, plan);
+    if (ctx.signal.aborted) return this.pending(operation_id, plan, advisory);
     try {
       await this.deps.backend.create(plan);
     } catch (error) {
       if (isBrainError(error) && error.code === 'CONFLICT') {
         const scan = await this.scanMaterializations(scope, plan);
-        if (scan.kind === 'inconclusive') return this.pending(operation_id, plan);
-        if (scan.matches.length > 0) return this.finalize(scope, plan, scan.matches, operation_id);
+        if (scan.kind === 'inconclusive') return this.pending(operation_id, plan, advisory);
+        if (scan.matches.length > 0) return this.finalize(scope, plan, scan.matches, operation_id, advisory);
         this.markConflict(operation_id);
         throw conflict('backend rejected a create that had no materialised file', operation_id);
       }
       if (!isUncertainWrite(error)) throw error;
       const wait = await this.awaitMaterialization(scope, plan);
-      if (wait.kind === 'matched') return this.finalize(scope, plan, wait.matches, operation_id);
-      return this.pending(operation_id, plan);
+      if (wait.kind === 'matched') return this.finalize(scope, plan, wait.matches, operation_id, advisory);
+      return this.pending(operation_id, plan, advisory);
     }
     const wait = await this.awaitMaterialization(scope, plan);
-    if (wait.kind === 'matched') return this.finalize(scope, plan, wait.matches, operation_id);
-    return this.pending(operation_id, plan);
+    if (wait.kind === 'matched') return this.finalize(scope, plan, wait.matches, operation_id, advisory);
+    return this.pending(operation_id, plan, advisory);
   }
 
   private async awaitMaterialization(
@@ -631,7 +715,8 @@ export class MutationCoordinator {
     scope: ScopeConfig,
     plan: PlannedWrite,
     matches: LocatedMaterialization[],
-    operation_id: string
+    operation_id: string,
+    advisory: MutationAdvisory | undefined
   ): Promise<MutationReceipt> {
     const record = this.deps.journal.get(operation_id);
     if (record === undefined) {
@@ -679,17 +764,20 @@ export class MutationCoordinator {
 
     const confirmed = verified[0] ?? matches[0];
     const indexed = await this.checkIndex(scope, plan.revision.revision_id, warnings);
-    const receipt: MutationReceipt = {
-      operation_id,
-      id: plan.revision.id,
-      revision_id: plan.revision.revision_id,
-      outcome: conflicted ? 'stored_conflict' : 'stored',
-      materialized: true,
-      indexed,
-      etag: makeEtag(plan.revision.revision_id, confirmed.raw_hash),
-      possible_duplicates: [],
-      warnings
-    };
+    const receipt = applyAdvisory(
+      {
+        operation_id,
+        id: plan.revision.id,
+        revision_id: plan.revision.revision_id,
+        outcome: conflicted ? 'stored_conflict' : 'stored',
+        materialized: true,
+        indexed,
+        etag: makeEtag(plan.revision.revision_id, confirmed.raw_hash),
+        possible_duplicates: [],
+        warnings
+      },
+      advisory
+    );
 
     try {
       this.deps.journal.mark(operation_id, conflicted ? 'conflict' : 'complete', receipt);
@@ -697,7 +785,7 @@ export class MutationCoordinator {
       const refreshed = this.deps.journal.get(operation_id);
       if (refreshed?.receipt_json !== undefined) {
         const stored = parseReceipt(refreshed.receipt_json, operation_id);
-        if (stored.outcome !== 'pending') return stored;
+        if (stored.outcome !== 'pending') return applyAdvisory(stored, advisory);
       }
     }
     return receipt;
@@ -741,13 +829,17 @@ export class MutationCoordinator {
     }
   }
 
-  private pending(operation_id: string, plan: PlannedWrite): MutationReceipt {
+  private pending(
+    operation_id: string,
+    plan: PlannedWrite,
+    advisory: MutationAdvisory | undefined
+  ): MutationReceipt {
     const record = this.deps.journal.get(operation_id);
     if (record?.receipt_json !== undefined) {
       const stored = parseReceipt(record.receipt_json, operation_id);
-      if (stored.outcome === 'pending') return stored;
+      if (stored.outcome === 'pending') return applyAdvisory(stored, advisory);
     }
-    return pendingReceipt(operation_id, plan);
+    return pendingReceipt(operation_id, plan, advisory);
   }
 
   private markConflict(operation_id: string): void {
@@ -791,6 +883,6 @@ export class MutationCoordinator {
     if (scope === undefined) return;
     const scan = await this.scanMaterializations(scope, plan);
     if (scan.kind !== 'conclusive' || scan.matches.length === 0) return;
-    await this.finalize(scope, plan, scan.matches, record.operation_id);
+    await this.finalize(scope, plan, scan.matches, record.operation_id, advisoryFromRecord(record));
   }
 }

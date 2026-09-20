@@ -11,7 +11,7 @@ import {
 import type { PlannedWrite, RequestContext, StoredRevision } from '../../src/core/types.js';
 import { makeEtag, renderRevision } from '../../src/notes/codec.js';
 import { relativePathFor } from '../../src/notes/identity.js';
-import { lessonFixture } from '../fixtures/content.js';
+import { fixtureIds, lessonFixture } from '../fixtures/content.js';
 import {
   reviewerContext,
   reviewerPrincipal,
@@ -693,5 +693,35 @@ test('does not resend when a materialization appears at the expected path during
   const replay = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
   expect(replay.outcome).toBe('stored');
   expect(h.backend.create_calls).toHaveLength(1);
+  await h.close();
+});
+
+test('persists the intent advisory and replays it without folding it into the digest', async () => {
+  const h = await createHarness();
+  const first = createCandidateIntent(lessonFixture, { idempotency_key: fixtureIds.idempotencyKey });
+  const firstReceipt = await h.deps.mutations.commit(
+    reviewerContext,
+    { ...first.intent, advisory: { warnings: ['duplicate_check_unavailable'] } },
+    first.build
+  );
+  expect(firstReceipt.warnings).toContain('duplicate_check_unavailable');
+
+  const replay = createCandidateIntent(lessonFixture, { idempotency_key: fixtureIds.idempotencyKey });
+  const replayReceipt = await h.deps.mutations.commit(
+    reviewerContext,
+    { ...replay.intent, advisory: { warnings: ['a_different_advisory'] } },
+    replay.build
+  );
+  expect(replayReceipt).toEqual(firstReceipt);
+  expect(replayReceipt.warnings).not.toContain('a_different_advisory');
+  expect(h.backend.create_calls).toHaveLength(1);
+
+  const different = createCandidateIntent(
+    { ...lessonFixture, title: 'A structurally different note' },
+    { idempotency_key: fixtureIds.idempotencyKey }
+  );
+  await expect(
+    h.deps.mutations.commit(reviewerContext, different.intent, different.build)
+  ).rejects.toThrow(/IDEMPOTENCY_CONFLICT/);
   await h.close();
 });
