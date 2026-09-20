@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { expect, test } from 'vitest';
+import { BrainError } from '../../src/contracts/errors.js';
 import {
   InstanceLock,
   type AllocatedIdentity,
@@ -44,6 +45,53 @@ function planPath(harness: MemoryHarness, plan: PlannedWrite): string {
     plan.revision.revision_id
   );
   return join(harness.deps.config.mounts.vault, relative);
+}
+
+function planRelativePath(plan: PlannedWrite): string {
+  const scope = scopeOf(plan.revision.scope);
+  return relativePathFor(
+    scope.relative_root,
+    plan.revision.note.content.kind,
+    plan.revision.id,
+    plan.revision.note.title,
+    plan.revision.revision_id
+  );
+}
+
+function installExpectedPathRace(
+  harness: MemoryHarness,
+  expectedRelative: () => string | undefined
+): void {
+  const originalList = harness.deps.vault.list.bind(harness.deps.vault);
+  const originalRead = harness.deps.vault.read.bind(harness.deps.vault);
+  let listGrant = false;
+  let raceDone = false;
+
+  harness.deps.vault.list = async (scope) => {
+    const result = await originalList(scope);
+    const expected = expectedRelative();
+    if (expected === undefined || !result.includes(expected)) return result;
+    listGrant = true;
+    return [expected, ...result.filter((path) => path !== expected)];
+  };
+
+  harness.deps.vault.read = async (scope, path) => {
+    const expected = expectedRelative();
+    if (!raceDone && expected !== undefined && path === expected) {
+      if (listGrant) {
+        listGrant = false;
+        raceDone = true;
+      } else {
+        throw new BrainError({
+          code: 'NOT_FOUND',
+          message: `expected path ${expected} is not yet visible`
+        });
+      }
+    } else if (expected !== undefined) {
+      listGrant = false;
+    }
+    return originalRead(scope, path);
+  };
 }
 
 test('reconciles a materialized revision after a lost response', async () => {
@@ -605,5 +653,45 @@ test('resends a submitted operation only after a conclusive zero-match window', 
   const replay = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
   expect(replay.outcome).toBe('stored');
   expect(h.backend.create_calls).toHaveLength(2);
+  await h.close();
+});
+
+test('detects a materialization that appears at the expected path during enumeration', async () => {
+  const h = await createHarness();
+  await h.seed(lessonFixture, { status: 'candidate' });
+  const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
+  let expectedRelative: string | undefined;
+  h.backend.on_create = (write) => {
+    expectedRelative = planRelativePath(write);
+  };
+  installExpectedPathRace(h, () => expectedRelative);
+  const receipt = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+  expect(receipt.outcome).toBe('stored');
+  expect(receipt.materialized).toBe(true);
+  expect(h.backend.create_calls).toHaveLength(1);
+  await h.close();
+});
+
+test('does not resend when a materialization appears at the expected path during enumeration', async () => {
+  const h = await createHarness();
+  await h.seed(lessonFixture, { status: 'candidate' });
+  const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
+  h.backend.fail_once = 'before_write';
+  const first = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+  expect(first.outcome).toBe('pending');
+  expect(h.backend.create_calls).toHaveLength(1);
+
+  const record = h.deps.journal.pending()[0];
+  const plan = JSON.parse(record.plan_json ?? '') as PlannedWrite;
+  const scope = scopeOf(plan.revision.scope);
+  const relative = planRelativePath(plan);
+  const absolute = join(h.deps.config.mounts.vault, relative);
+  await mkdir(dirname(absolute), { recursive: true });
+  await writeFile(absolute, renderRevision(plan.revision, scope), 'utf8');
+
+  installExpectedPathRace(h, () => relative);
+  const replay = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+  expect(replay.outcome).toBe('stored');
+  expect(h.backend.create_calls).toHaveLength(1);
   await h.close();
 });

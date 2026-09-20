@@ -577,6 +577,7 @@ export class MutationCoordinator {
       return { kind: 'inconclusive', reason: 'undecodable_materialization' };
     }
     if (direct.kind === 'match') found.set(direct.match.relative_path, direct.match);
+    const expectedResolved = direct.kind === 'match';
 
     let paths: string[];
     try {
@@ -588,7 +589,7 @@ export class MutationCoordinator {
       };
     }
     for (const path of paths) {
-      if (path === expected) continue;
+      if (path === expected && expectedResolved) continue;
       const inspected = await this.inspect(scope, path, plan);
       if (inspected.kind === 'error') return { kind: 'inconclusive', reason: inspected.reason };
       if (inspected.kind === 'match') found.set(inspected.match.relative_path, inspected.match);
