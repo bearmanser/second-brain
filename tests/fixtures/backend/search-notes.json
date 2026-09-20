@@ -1,0 +1,41 @@
+{
+  "_meta": {
+    "fastmcp": {
+      "wrap_result": true
+    }
+  },
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"results\":[{\"title\":\"Probe Revision 1\",\"type\":\"entity\",\"score\":1,\"entity\":\"probe/notes/probe/probe-revision-1\",\"external_id\":\"00000000-0000-4000-8000-000000000001\",\"permalink\":\"probe/notes/probe/probe-revision-1\",\"content\":\"# Probe\\n\\nA searchable synthetic observation.\",\"matched_chunk\":\"# Probe\\n\\nA searchable synthetic observation.\",\"file_path\":\"Notes/probe/Probe Revision 1.md\",\"updated_at\":\"2026-01-01T00:00:00.000000+00:00\",\"metadata\":{\"note_type\":\"note\"},\"entity_id\":12}],\"current_page\":1,\"page_size\":10,\"total\":0,\"total_is_exact\":false,\"has_more\":false}"
+    }
+  ],
+  "structuredContent": {
+    "result": {
+      "results": [
+        {
+          "title": "Probe Revision 1",
+          "type": "entity",
+          "score": 1,
+          "entity": "probe/notes/probe/probe-revision-1",
+          "external_id": "00000000-0000-4000-8000-000000000001",
+          "permalink": "probe/notes/probe/probe-revision-1",
+          "content": "# Probe\n\nA searchable synthetic observation.",
+          "matched_chunk": "# Probe\n\nA searchable synthetic observation.",
+          "file_path": "Notes/probe/Probe Revision 1.md",
+          "updated_at": "2026-01-01T00:00:00.000000+00:00",
+          "metadata": {
+            "note_type": "note"
+          },
+          "entity_id": 12
+        }
+      ],
+      "current_page": 1,
+      "page_size": 10,
+      "total": 0,
+      "total_is_exact": false,
+      "has_more": false
+    }
+  },
+  "isError": false
+}

@@ -1,0 +1,2019 @@
+{
+  "observedToolCount": 21,
+  "tools": [
+    {
+      "name": "basic_memory_diagnostics",
+      "title": "Basic Memory Diagnostics",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "annotations": {
+        "title": "Basic Memory Diagnostics",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "diagnostics"
+          ]
+        }
+      }
+    },
+    {
+      "name": "delete_note",
+      "title": "Delete Note",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "identifier": {
+            "type": "string"
+          },
+          "is_directory": {
+            "default": false,
+            "type": "boolean"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "output_format": {
+            "default": "text",
+            "enum": [
+              "text",
+              "json"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "identifier"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "x-fastmcp-wrap-result": true
+      },
+      "annotations": {
+        "title": "Delete Note",
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "notes"
+          ]
+        }
+      }
+    },
+    {
+      "name": "read_content",
+      "title": "Read Content",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "annotations": {
+        "title": "Read Content",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "notes"
+          ]
+        }
+      }
+    },
+    {
+      "name": "build_context",
+      "title": "Build Context",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "maxLength": 2028,
+            "minLength": 1,
+            "type": "string"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "depth": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": 1
+          },
+          "timeframe": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": "7d"
+          },
+          "page": {
+            "default": 1,
+            "type": "integer"
+          },
+          "page_size": {
+            "default": 10,
+            "type": "integer"
+          },
+          "max_related": {
+            "default": 10,
+            "type": "integer"
+          },
+          "output_format": {
+            "default": "json",
+            "enum": [
+              "json",
+              "text"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "x-fastmcp-wrap-result": true
+      },
+      "annotations": {
+        "title": "Build Context",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "navigation",
+            "notes"
+          ]
+        }
+      }
+    },
+    {
+      "name": "recent_activity",
+      "title": "Recent Activity",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ],
+            "default": ""
+          },
+          "depth": {
+            "default": 1,
+            "type": "integer"
+          },
+          "timeframe": {
+            "default": "7d",
+            "type": "string"
+          },
+          "page": {
+            "default": 1,
+            "type": "integer"
+          },
+          "page_size": {
+            "default": 10,
+            "type": "integer"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "output_format": {
+            "default": "text",
+            "enum": [
+              "text",
+              "json"
+            ],
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "x-fastmcp-wrap-result": true
+      },
+      "annotations": {
+        "title": "Recent Activity",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "navigation",
+            "notes"
+          ]
+        }
+      }
+    },
+    {
+      "name": "search_notes",
+      "title": "Search Notes",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "search_all_projects": {
+            "default": false,
+            "type": "boolean"
+          },
+          "page": {
+            "default": 1,
+            "type": "integer"
+          },
+          "page_size": {
+            "default": 10,
+            "type": "integer"
+          },
+          "search_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "output_format": {
+            "default": "text",
+            "enum": [
+              "text",
+              "json"
+            ],
+            "type": "string"
+          },
+          "note_types": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "entity_types": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "categories": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "after_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "metadata_filters": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "tags": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "min_similarity": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "x-fastmcp-wrap-result": true
+      },
+      "annotations": {
+        "title": "Search Notes",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "search"
+          ]
+        }
+      }
+    },
+    {
+      "name": "read_note",
+      "title": "Read Note",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "identifier": {
+            "type": "string"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "page": {
+            "default": 1,
+            "type": "integer"
+          },
+          "page_size": {
+            "default": 10,
+            "type": "integer"
+          },
+          "output_format": {
+            "default": "text",
+            "enum": [
+              "text",
+              "json"
+            ],
+            "type": "string"
+          },
+          "include_frontmatter": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "identifier"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "x-fastmcp-wrap-result": true
+      },
+      "annotations": {
+        "title": "Read Note",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "notes"
+          ]
+        }
+      }
+    },
+    {
+      "name": "view_note",
+      "title": "View Note",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "identifier": {
+            "type": "string"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "identifier"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "x-fastmcp-wrap-result": true
+      },
+      "annotations": {
+        "title": "View Note",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "notes"
+          ]
+        }
+      }
+    },
+    {
+      "name": "write_note",
+      "title": "Write Note",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "directory": {
+            "type": "string"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "tags": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "note_type": {
+            "default": "note",
+            "type": "string"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "overwrite": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "output_format": {
+            "default": "text",
+            "enum": [
+              "text",
+              "json"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "content",
+          "directory"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "x-fastmcp-wrap-result": true
+      },
+      "annotations": {
+        "title": "Write Note",
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "notes"
+          ]
+        }
+      }
+    },
+    {
+      "name": "list_directory",
+      "title": "List Directory",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "dir_name": {
+            "default": "/",
+            "type": "string"
+          },
+          "depth": {
+            "default": 1,
+            "type": "integer"
+          },
+          "file_name_glob": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "sort": {
+            "anyOf": [
+              {
+                "enum": [
+                  "title_asc",
+                  "title_desc",
+                  "updated_asc",
+                  "updated_desc"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "page": {
+            "default": 1,
+            "type": "integer"
+          },
+          "page_size": {
+            "default": 10,
+            "type": "integer"
+          },
+          "output_format": {
+            "default": "text",
+            "enum": [
+              "text",
+              "json"
+            ],
+            "type": "string"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "x-fastmcp-wrap-result": true
+      },
+      "annotations": {
+        "title": "List Directory",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "navigation",
+            "notes"
+          ]
+        }
+      }
+    },
+    {
+      "name": "edit_note",
+      "title": "Edit Note",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "identifier": {
+            "type": "string"
+          },
+          "operation": {
+            "enum": [
+              "append",
+              "prepend",
+              "find_replace",
+              "replace_section",
+              "insert_before_section",
+              "insert_after_section"
+            ],
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "section": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "find_text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "expected_replacements": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "replace_subsections": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "output_format": {
+            "default": "text",
+            "enum": [
+              "text",
+              "json"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "identifier",
+          "operation",
+          "content"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "x-fastmcp-wrap-result": true
+      },
+      "annotations": {
+        "title": "Edit Note",
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "notes"
+          ]
+        }
+      }
+    },
+    {
+      "name": "move_note",
+      "title": "Move Note",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "identifier": {
+            "type": "string"
+          },
+          "destination_path": {
+            "default": "",
+            "type": "string"
+          },
+          "destination_folder": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "is_directory": {
+            "default": false,
+            "type": "boolean"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "output_format": {
+            "default": "text",
+            "enum": [
+              "text",
+              "json"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "identifier"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "x-fastmcp-wrap-result": true
+      },
+      "annotations": {
+        "title": "Move Note",
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "notes"
+          ]
+        }
+      }
+    },
+    {
+      "name": "list_workspaces",
+      "title": "List Workspaces",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "output_format": {
+            "default": "text",
+            "enum": [
+              "text",
+              "json"
+            ],
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "x-fastmcp-wrap-result": true
+      },
+      "annotations": {
+        "title": "List Workspaces",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "cloud",
+            "projects"
+          ]
+        }
+      }
+    },
+    {
+      "name": "list_memory_projects",
+      "title": "List Memory Projects",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "output_format": {
+            "default": "text",
+            "enum": [
+              "text",
+              "json"
+            ],
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "x-fastmcp-wrap-result": true
+      },
+      "annotations": {
+        "title": "List Memory Projects",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "projects"
+          ]
+        }
+      }
+    },
+    {
+      "name": "create_memory_project",
+      "title": "Create Memory Project",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_name": {
+            "type": "string"
+          },
+          "project_path": {
+            "type": "string"
+          },
+          "set_default": {
+            "default": false,
+            "type": "boolean"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "output_format": {
+            "default": "text",
+            "enum": [
+              "text",
+              "json"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_name",
+          "project_path"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "x-fastmcp-wrap-result": true
+      },
+      "annotations": {
+        "title": "Create Memory Project",
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "projects"
+          ]
+        }
+      }
+    },
+    {
+      "name": "delete_project",
+      "title": "Delete Project",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_name": {
+            "type": "string"
+          },
+          "delete_notes": {
+            "default": false,
+            "type": "boolean"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "project_name"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "x-fastmcp-wrap-result": true
+      },
+      "annotations": {
+        "title": "Delete Project",
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "projects"
+          ]
+        }
+      }
+    },
+    {
+      "name": "search",
+      "title": "Search Knowledge Base",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "x-fastmcp-wrap-result": true
+      },
+      "annotations": {
+        "title": "Search Knowledge Base",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "search"
+          ]
+        }
+      }
+    },
+    {
+      "name": "fetch",
+      "title": "Fetch Document",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "x-fastmcp-wrap-result": true
+      },
+      "annotations": {
+        "title": "Fetch Document",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "notes",
+            "search"
+          ]
+        }
+      }
+    },
+    {
+      "name": "schema_validate",
+      "title": "Validate Schema",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "note_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "output_format": {
+            "default": "text",
+            "enum": [
+              "text",
+              "json"
+            ],
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "anyOf": [
+              {
+                "properties": {
+                  "note_type": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "default": null
+                  },
+                  "total_notes": {
+                    "default": 0,
+                    "type": "integer"
+                  },
+                  "total_entities": {
+                    "default": 0,
+                    "type": "integer"
+                  },
+                  "valid_count": {
+                    "default": 0,
+                    "type": "integer"
+                  },
+                  "warning_count": {
+                    "default": 0,
+                    "type": "integer"
+                  },
+                  "error_count": {
+                    "default": 0,
+                    "type": "integer"
+                  },
+                  "results": {
+                    "items": {
+                      "properties": {
+                        "note_identifier": {
+                          "type": "string"
+                        },
+                        "schema_entity": {
+                          "type": "string"
+                        },
+                        "passed": {
+                          "type": "boolean"
+                        },
+                        "field_results": {
+                          "items": {
+                            "properties": {
+                              "field_name": {
+                                "type": "string"
+                              },
+                              "field_type": {
+                                "type": "string"
+                              },
+                              "required": {
+                                "type": "boolean"
+                              },
+                              "status": {
+                                "type": "string"
+                              },
+                              "values": {
+                                "items": {
+                                  "type": "string"
+                                },
+                                "type": "array"
+                              },
+                              "message": {
+                                "anyOf": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ],
+                                "default": null
+                              }
+                            },
+                            "required": [
+                              "field_name",
+                              "field_type",
+                              "required",
+                              "status"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "unmatched_observations": {
+                          "additionalProperties": {
+                            "type": "integer"
+                          },
+                          "type": "object"
+                        },
+                        "unmatched_relations": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "warnings": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "errors": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "required": [
+                        "note_identifier",
+                        "schema_entity",
+                        "passed"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "type_summaries": {
+                    "items": {
+                      "properties": {
+                        "note_type": {
+                          "type": "string"
+                        },
+                        "total_notes": {
+                          "default": 0,
+                          "type": "integer"
+                        },
+                        "total_entities": {
+                          "default": 0,
+                          "type": "integer"
+                        },
+                        "valid_count": {
+                          "default": 0,
+                          "type": "integer"
+                        },
+                        "warning_count": {
+                          "default": 0,
+                          "type": "integer"
+                        },
+                        "error_count": {
+                          "default": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "note_type"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  }
+                },
+                "type": "object"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "x-fastmcp-wrap-result": true
+      },
+      "annotations": {
+        "title": "Validate Schema",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "schema"
+          ]
+        }
+      }
+    },
+    {
+      "name": "schema_infer",
+      "title": "Infer Schema",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "note_type": {
+            "type": "string"
+          },
+          "threshold": {
+            "default": 0.25,
+            "type": "number"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "output_format": {
+            "default": "text",
+            "enum": [
+              "text",
+              "json"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "note_type"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "x-fastmcp-wrap-result": true
+      },
+      "annotations": {
+        "title": "Infer Schema",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "schema"
+          ]
+        }
+      }
+    },
+    {
+      "name": "schema_diff",
+      "title": "Schema Diff",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "note_type": {
+            "type": "string"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "output_format": {
+            "default": "text",
+            "enum": [
+              "text",
+              "json"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "note_type"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "x-fastmcp-wrap-result": true
+      },
+      "annotations": {
+        "title": "Schema Diff",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "_meta": {
+        "fastmcp": {
+          "tags": [
+            "schema"
+          ]
+        }
+      }
+    }
+  ]
+}

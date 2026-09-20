@@ -1,0 +1,82 @@
+{
+  "_meta": {
+    "fastmcp": {
+      "wrap_result": true
+    }
+  },
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"projects\":[{\"name\":\"main\",\"external_id\":\"00000000-0000-4000-8000-000000000001\",\"path\":\"/data/basic-memory\",\"local_path\":\"/data/basic-memory\",\"cloud_path\":null,\"source\":\"local\",\"is_default\":false,\"is_private\":false,\"display_name\":null,\"workspace_name\":null,\"workspace_type\":null,\"workspace_tenant_id\":null,\"workspace_slug\":null,\"workspace_is_default\":false,\"sync_supported\":true,\"sync_reason\":null,\"local_usage\":\"sync-supported\",\"qualified_name\":null},{\"name\":\"probe\",\"external_id\":\"00000000-0000-4000-8000-000000000002\",\"path\":\"/data/probe\",\"local_path\":\"/data/probe\",\"cloud_path\":null,\"source\":\"local\",\"is_default\":true,\"is_private\":false,\"display_name\":null,\"workspace_name\":null,\"workspace_type\":null,\"workspace_tenant_id\":null,\"workspace_slug\":null,\"workspace_is_default\":false,\"sync_supported\":true,\"sync_reason\":null,\"local_usage\":\"sync-supported\",\"qualified_name\":null},{\"name\":\"probe-b\",\"external_id\":\"00000000-0000-4000-8000-000000000003\",\"path\":\"/data/probe-b\",\"local_path\":\"/data/probe-b\",\"cloud_path\":null,\"source\":\"local\",\"is_default\":false,\"is_private\":false,\"display_name\":null,\"workspace_name\":null,\"workspace_type\":null,\"workspace_tenant_id\":null,\"workspace_slug\":null,\"workspace_is_default\":false,\"sync_supported\":true,\"sync_reason\":null,\"local_usage\":\"sync-supported\",\"qualified_name\":null}],\"default_project\":\"probe\",\"constrained_project\":null}"
+    }
+  ],
+  "structuredContent": {
+    "result": {
+      "projects": [
+        {
+          "name": "main",
+          "external_id": "00000000-0000-4000-8000-000000000001",
+          "path": "/data/basic-memory",
+          "local_path": "/data/basic-memory",
+          "cloud_path": null,
+          "source": "local",
+          "is_default": false,
+          "is_private": false,
+          "display_name": null,
+          "workspace_name": null,
+          "workspace_type": null,
+          "workspace_tenant_id": null,
+          "workspace_slug": null,
+          "workspace_is_default": false,
+          "sync_supported": true,
+          "sync_reason": null,
+          "local_usage": "sync-supported",
+          "qualified_name": null
+        },
+        {
+          "name": "probe",
+          "external_id": "00000000-0000-4000-8000-000000000002",
+          "path": "/data/probe",
+          "local_path": "/data/probe",
+          "cloud_path": null,
+          "source": "local",
+          "is_default": true,
+          "is_private": false,
+          "display_name": null,
+          "workspace_name": null,
+          "workspace_type": null,
+          "workspace_tenant_id": null,
+          "workspace_slug": null,
+          "workspace_is_default": false,
+          "sync_supported": true,
+          "sync_reason": null,
+          "local_usage": "sync-supported",
+          "qualified_name": null
+        },
+        {
+          "name": "probe-b",
+          "external_id": "00000000-0000-4000-8000-000000000003",
+          "path": "/data/probe-b",
+          "local_path": "/data/probe-b",
+          "cloud_path": null,
+          "source": "local",
+          "is_default": false,
+          "is_private": false,
+          "display_name": null,
+          "workspace_name": null,
+          "workspace_type": null,
+          "workspace_tenant_id": null,
+          "workspace_slug": null,
+          "workspace_is_default": false,
+          "sync_supported": true,
+          "sync_reason": null,
+          "local_usage": "sync-supported",
+          "qualified_name": null
+        }
+      ],
+      "default_project": "probe",
+      "constrained_project": null
+    }
+  },
+  "isError": false
+}
