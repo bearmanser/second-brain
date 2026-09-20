@@ -183,7 +183,7 @@ interface FeedbackRow {
   verdict: string;
   reason: string;
   warning: string | null;
-  payload_hash: string;
+  payload_hash: string | null;
   created_at: string;
 }
 
@@ -572,6 +572,22 @@ function normalizeFeedback(input: FeedbackWrite): NormalizedFeedback {
   };
 }
 
+function feedbackMatches(row: FeedbackRow, normalized: NormalizedFeedback): boolean {
+  if (row.payload_hash !== null) {
+    return row.payload_hash === normalized.payload_hash;
+  }
+  return (
+    row.scope === normalized.scope &&
+    row.logical_id === normalized.logical_id &&
+    row.revision_id === normalized.revision_id &&
+    row.retrieval_id === normalized.retrieval_id &&
+    row.related_id === normalized.related_id &&
+    row.verdict === normalized.verdict &&
+    row.reason === normalized.reason &&
+    row.warning === normalized.warning
+  );
+}
+
 function toRecord(row: OperationRow): OperationRecord {
   return {
     operation_id: row.operation_id,
@@ -853,7 +869,7 @@ export class Journal {
     const normalized = normalizeFeedback(input);
     const existing = this.selectFeedbackRowByKey(normalized.principal_id, normalized.idempotency_key);
     if (existing === undefined) return undefined;
-    if (existing.payload_hash !== normalized.payload_hash) {
+    if (!feedbackMatches(existing, normalized)) {
       throw new BrainError({
         code: 'IDEMPOTENCY_CONFLICT',
         message: `idempotency key ${normalized.idempotency_key} was used for different feedback`
@@ -871,7 +887,7 @@ export class Journal {
         normalized.idempotency_key
       );
       if (existing !== undefined) {
-        if (existing.payload_hash !== normalized.payload_hash) {
+        if (!feedbackMatches(existing, normalized)) {
           throw new BrainError({
             code: 'IDEMPOTENCY_CONFLICT',
             message: `idempotency key ${normalized.idempotency_key} was used for different feedback`

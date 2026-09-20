@@ -100,6 +100,67 @@ test('rejects the same key with a different verdict', async () => {
   await h.close();
 });
 
+test('replays a pre-004 feedback row that has no payload digest', async () => {
+  const h = await createHarness();
+  const head = await h.seed(lessonFixture, { status: 'active' });
+  const feedbackId = uuid();
+  const key = uuid();
+  const reason = 'Prevented repeating the proxy-only benchmark';
+  const database = new Database(join(h.deps.config.mounts.state, 'journal.db'));
+  try {
+    database
+      .prepare(
+        `INSERT INTO feedback_records (
+           feedback_id, principal_id, idempotency_key, scope, logical_id, revision_id,
+           retrieval_id, related_id, verdict, reason, warning, payload_hash, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, NULL, ?)`
+      )
+      .run(
+        feedbackId,
+        reviewerContext.principal.id,
+        key,
+        'freellmapi',
+        head.source.id,
+        head.source.revision_id,
+        'useful',
+        reason,
+        '2026-09-01T00:00:00.000Z'
+      );
+  } finally {
+    database.close();
+  }
+
+  const retry = await feedback(
+    reviewerContext,
+    {
+      idempotency_key: key,
+      scope: 'freellmapi',
+      id: head.source.id,
+      revision_id: head.source.revision_id,
+      verdict: 'useful',
+      reason
+    },
+    h.deps
+  );
+  expect(retry.feedback_id).toBe(feedbackId);
+
+  await expect(
+    feedback(
+      reviewerContext,
+      {
+        idempotency_key: key,
+        scope: 'freellmapi',
+        id: head.source.id,
+        revision_id: head.source.revision_id,
+        verdict: 'stale',
+        reason
+      },
+      h.deps
+    )
+  ).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+  await h.close();
+});
+
 test('accepts a retrieval reference that belongs to the caller and returned the revision', async () => {
   const h = await createHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });

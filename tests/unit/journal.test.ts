@@ -8,6 +8,7 @@ import {
   Journal,
   applyMigrations,
   loadMigrations,
+  type FeedbackWrite,
   type RetrievalEventInput
 } from '../../src/storage/journal.js';
 import { fixtureIds, lessonFixture } from '../fixtures/content.js';
@@ -653,6 +654,79 @@ test('prunes retrieval metadata only past the thirty-day cutoff', () => {
   expect(journal.pruneRetrievalEvents(now)).toBe(1);
   expect(journal.getRetrieval('66666666-6666-4666-8666-666666666666')).toBeUndefined();
   expect(journal.getRetrieval('77777777-7777-4777-8777-777777777777')).toBeDefined();
+  journal.close();
+});
+
+test('replays pre-004 feedback rows by their bounded stored payload', () => {
+  const path = join(temporaryDirectory(), 'journal.sqlite');
+  const journal = Journal.open(path, { ids: new SequenceIds('fb') });
+  const feedbackId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const principalId = '00000000-0000-4000-8000-000000000002';
+  const idempotencyKey = '99999999-9999-4999-8999-999999999999';
+  const logicalId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const revisionId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const legacyReason = 'Prevented repeating the proxy-only benchmark';
+
+  const database = new Database(path);
+  database
+    .prepare(
+      `INSERT INTO feedback_records (
+         feedback_id, principal_id, idempotency_key, scope, logical_id, revision_id,
+         retrieval_id, related_id, verdict, reason, warning, payload_hash, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, NULL, ?)`
+    )
+    .run(
+      feedbackId,
+      principalId,
+      idempotencyKey,
+      'freellmapi',
+      logicalId,
+      revisionId,
+      'useful',
+      legacyReason,
+      '2026-09-01T00:00:00.000Z'
+    );
+  const legacyRow = database
+    .prepare('SELECT payload_hash FROM feedback_records WHERE feedback_id = ?')
+    .get(feedbackId) as { payload_hash: string | null };
+  expect(legacyRow.payload_hash).toBeNull();
+  database.close();
+
+  const legacy: FeedbackWrite = {
+    principal_id: principalId,
+    idempotency_key: idempotencyKey,
+    scope: 'freellmapi',
+    logical_id: logicalId,
+    revision_id: revisionId,
+    verdict: 'useful',
+    reason: legacyReason
+  };
+
+  const replay = journal.replayFeedback(legacy);
+  expect(replay?.kind).toBe('replay');
+  expect(replay?.entry.feedback_id).toBe(feedbackId);
+
+  const stored = journal.recordFeedback(legacy);
+  expect(stored.kind).toBe('replay');
+  expect(stored.entry.feedback_id).toBe(feedbackId);
+  expect(journal.listFeedback('freellmapi')).toHaveLength(1);
+
+  expect(errorFrom(() => journal.replayFeedback({ ...legacy, verdict: 'stale' })).code).toBe(
+    'IDEMPOTENCY_CONFLICT'
+  );
+  expect(errorFrom(() => journal.recordFeedback({ ...legacy, reason: 'other reason' })).code).toBe(
+    'IDEMPOTENCY_CONFLICT'
+  );
+
+  const freshKey = '88888888-8888-4888-8888-888888888888';
+  const fresh = journal.recordFeedback({ ...legacy, idempotency_key: freshKey });
+  expect(fresh.kind).toBe('new');
+  const probe = new Database(path);
+  const freshRow = probe
+    .prepare('SELECT payload_hash FROM feedback_records WHERE feedback_id = ?')
+    .get(fresh.entry.feedback_id) as { payload_hash: string | null };
+  probe.close();
+  expect(freshRow.payload_hash).toMatch(/^[a-f0-9]{64}$/);
   journal.close();
 });
 
