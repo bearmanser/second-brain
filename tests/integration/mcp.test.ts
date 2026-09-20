@@ -75,16 +75,17 @@ test('lists the six tools and completes a status call with structured content', 
     for (const tool of tools) {
       expect(tool.inputSchema).toBeTruthy();
       expect(tool.description).toBeTruthy();
+      expect(tool.outputSchema).toBeTruthy();
     }
     const captureTool = tools.find((tool) => tool.name === 'brain_capture');
-    expect(captureTool?.outputSchema).toBeTruthy();
-    const meta = captureTool?._meta as Record<string, unknown> | undefined;
-    expect(meta?.['second-brain/outputSchema']).toBeTruthy();
+    const captureMeta = captureTool?._meta as Record<string, unknown> | undefined;
+    expect(captureMeta?.['second-brain/outputSchema']).toBeTruthy();
 
     const reviewTool = tools.find((tool) => tool.name === 'brain_review');
-    expect(reviewTool?.outputSchema).toBeUndefined();
-    const reviewMeta = reviewTool?._meta as Record<string, unknown> | undefined;
-    expect(reviewMeta?.['second-brain/outputSchema']).toBeTruthy();
+    const reviewProperties = (reviewTool?.outputSchema as { properties?: Record<string, unknown> })
+      ?.properties;
+    expect(reviewProperties?.items).toBeTruthy();
+    expect(reviewProperties?.operation_id).toBeTruthy();
 
     const result = await call(client, 'brain_status', {});
     expect(result.isError).toBeFalsy();
@@ -155,27 +156,43 @@ test('schema-invalid arguments are rejected before any service call', async () =
   }
 });
 
-test('read and review results survive output validation', async () => {
+test('read and both review result branches survive output validation', async () => {
   const h = await startHttpHarness();
-  const client = await h.connect(h.token);
+  const worker = await h.connect(h.token, 'read-worker');
+  const reviewer = await h.connect(h.reviewerToken, 'review-approver');
   try {
-    const capture = await call(client, 'brain_capture', captureArgs(randomUUID()));
+    const capture = await call(worker, 'brain_capture', captureArgs(randomUUID()));
     const receipt = record(capture.structuredContent);
-    const read = await call(client, 'brain_read', {
+    const read = await call(worker, 'brain_read', {
       scope: 'freellmapi',
       id: receipt.id as string
     });
     expect(read.isError).toBeFalsy();
+    const source = record(record(read.structuredContent).source);
     expect(typeof record(read.structuredContent).markdown).toBe('string');
 
-    const review = await call(client, 'brain_review', {
+    const listing = await call(reviewer, 'brain_review', {
       scope: 'freellmapi',
       operation: { action: 'list', filter: 'candidate' }
     });
-    expect(review.isError).toBeFalsy();
-    expect(Array.isArray(record(review.structuredContent).items)).toBe(true);
+    expect(listing.isError).toBeFalsy();
+    expect(Array.isArray(record(listing.structuredContent).items)).toBe(true);
+
+    const approval = await call(reviewer, 'brain_review', {
+      scope: 'freellmapi',
+      operation: {
+        action: 'approve',
+        idempotency_key: randomUUID(),
+        id: receipt.id as string,
+        expected_etag: source.etag as string,
+        rationale: 'Reviewed during the HTTP contract test'
+      }
+    });
+    expect(approval.isError).toBeFalsy();
+    expect(record(approval.structuredContent).outcome).toBe('stored');
   } finally {
-    await client.close();
+    await worker.close();
+    await reviewer.close();
     await h.close();
   }
 });

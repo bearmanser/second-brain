@@ -283,7 +283,37 @@ test('a malicious Host header is rejected', async () => {
 
 test('a Host header with prohibited authority syntax is rejected', async () => {
   const h = await startHttpHarness();
-  const malformed = ['attacker@localhost', 'localhost/path', 'localhost?x=1', 'localhost:80:90'];
+  const malformed = [
+    'attacker@localhost',
+    'localhost/path',
+    'localhost?x=1',
+    'localhost:80:90',
+    'local host'
+  ];
+  try {
+    for (const host of malformed) {
+      const response = await raw(h, {
+        headers: authenticated(h, { host }),
+        body: rpc
+      });
+      expect(response.status, `host=${host}`).toBe(403);
+    }
+  } finally {
+    await h.close();
+  }
+});
+
+test('a Host header with an invalid port is rejected', async () => {
+  const h = await startHttpHarness();
+  const malformed = [
+    'localhost:',
+    'localhost:+80',
+    'localhost:08x',
+    'localhost:0',
+    'localhost:08',
+    'localhost:99999',
+    'localhost:65536'
+  ];
   try {
     for (const host of malformed) {
       const response = await raw(h, {

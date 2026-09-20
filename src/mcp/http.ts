@@ -14,8 +14,34 @@ import { internalDiagnostic } from './tools.js';
 export const MCP_PATH = '/mcp';
 export const OVERFLOW_DRAIN_MS = 1000;
 
-const HOST_AUTHORITY = /^[A-Za-z0-9.-]+(?::\d{1,5})?$/;
+const HOST_NAME = /^[A-Za-z0-9.-]+$/;
+const HOST_PORT = /^[1-9]\d{0,4}$/;
 const MAX_HOST_LENGTH = 255;
+const MAX_PORT = 65535;
+
+interface Authority {
+  hostname: string;
+  port?: number;
+}
+
+function parseAuthority(header: string): Authority | undefined {
+  if (header.length === 0 || header.length > MAX_HOST_LENGTH) return undefined;
+  if (/[@/?#\s]/.test(header)) return undefined;
+  const separator = header.lastIndexOf(':');
+  let hostname = header;
+  let port: number | undefined;
+  if (separator !== -1) {
+    if (header.indexOf(':') !== separator) return undefined;
+    const portText = header.slice(separator + 1);
+    if (!HOST_PORT.test(portText)) return undefined;
+    const parsedPort = Number.parseInt(portText, 10);
+    if (!Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > MAX_PORT) return undefined;
+    port = parsedPort;
+    hostname = header.slice(0, separator);
+  }
+  if (hostname.length === 0 || !HOST_NAME.test(hostname)) return undefined;
+  return port === undefined ? { hostname: hostname.toLowerCase() } : { hostname: hostname.toLowerCase(), port };
+}
 
 interface JsonRpcErrorBody {
   jsonrpc: '2.0';
@@ -38,12 +64,10 @@ function sendJsonRpcError(
 }
 
 function hostAllowed(header: string | undefined, allowed: readonly string[]): boolean {
-  if (typeof header !== 'string' || header.length === 0 || header.length > MAX_HOST_LENGTH) {
-    return false;
-  }
-  if (!HOST_AUTHORITY.test(header)) return false;
-  const hostname = header.split(':')[0].toLowerCase();
-  return allowed.some((entry) => entry.toLowerCase() === hostname);
+  if (typeof header !== 'string') return false;
+  const authority = parseAuthority(header);
+  if (authority === undefined) return false;
+  return allowed.some((entry) => entry.toLowerCase() === authority.hostname);
 }
 
 function originAllowed(header: string | undefined, allowed: readonly string[]): boolean {

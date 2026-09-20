@@ -80,10 +80,23 @@ const mutationReceiptOutputSchema = z.strictObject({
   warnings: stringListOutputSchema
 });
 
-const reviewListOutputSchema = z.strictObject({
-  items: z.array(sourceRefOutputSchema),
-  next_cursor: z.string().optional()
-});
+const reviewOutputSchema = z
+  .strictObject({
+    operation_id: uuidOutputSchema.optional(),
+    id: uuidOutputSchema.optional(),
+    revision_id: uuidOutputSchema.optional(),
+    outcome: z.enum(['stored', 'stored_conflict', 'pending']).optional(),
+    materialized: z.boolean().optional(),
+    indexed: z.boolean().optional(),
+    etag: etagOutputSchema.optional(),
+    possible_duplicates: z.array(sourceRefOutputSchema).optional(),
+    warnings: stringListOutputSchema.optional(),
+    items: z.array(sourceRefOutputSchema).optional(),
+    next_cursor: z.string().optional()
+  })
+  .describe(
+    'A MutationReceipt for a review mutation or a ReviewListResult for a review listing; the two branches are distinguished by items versus operation_id'
+  );
 
 const readOutputSchema = z.strictObject({
   source: sourceRefOutputSchema,
@@ -135,6 +148,7 @@ const TOOL_OUTPUT_SCHEMAS: Partial<Record<ToolName, z.ZodType>> = {
   brain_feedback: feedbackOutputSchema,
   brain_read: readOutputSchema,
   brain_recall: recallOutputSchema,
+  brain_review: reviewOutputSchema,
   brain_status: statusOutputSchema
 };
 
