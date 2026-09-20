@@ -1,0 +1,427 @@
+import { BrainError, isBrainError } from '../contracts/errors.js';
+import { recallRequestSchema } from '../contracts/protocol.js';
+import {
+  BACKEND_SEARCH_PAGES,
+  BACKEND_SEARCH_PAGE_SIZE,
+  RECALL_LIMIT_DEFAULT,
+  RECALL_LIMIT_MAX,
+  SESSION_FRESHNESS_DAYS,
+  TEXTS_MAX_ITEMS
+} from '../core/limits.js';
+import type { BrainDeps } from '../core/mutation.js';
+import { LIFECYCLES, NOTE_KINDS } from '../core/types.js';
+import type {
+  BackendHit,
+  Head,
+  NoteInput,
+  NoteKind,
+  RecallRequest,
+  RecallResult,
+  RequestContext,
+  ScopeConfig,
+  SourceRef,
+  StoredRevision
+} from '../core/types.js';
+import { decodeRevision } from '../notes/codec.js';
+import { NOTE_REGISTRY } from '../notes/registry.js';
+import { SHARED_SCOPE_ID, resolveScopes } from '../security/authorise.js';
+import { clampRecallBudget, packRecall } from '../retrieval/budget.js';
+import { phaseKinds, rankEligible, type EligibleHit } from '../retrieval/rank.js';
+
+export const RECALL_WARNING_SEARCH_TRUNCATED = 'search_truncated';
+export const RECALL_WARNING_HIT_UNRESOLVED = 'hit_unresolved';
+export const RECALL_WARNING_EMBEDDINGS_FALLBACK = 'embeddings_unavailable_text_fallback';
+export const RECALL_WARNING_CANDIDATE = 'candidate';
+export const RECALL_WARNING_SHARED_SCOPE = 'shared_scope';
+
+const MAX_SEARCH_TERMS = 64;
+const MATCHED_SECTION_MAX_CODE_POINTS = 3000;
+const CONTEXT_SECTION_MAX_CODE_POINTS = 1200;
+const SESSION_FRESHNESS_MS = SESSION_FRESHNESS_DAYS * 24 * 60 * 60 * 1000;
+
+type SessionContent = Extract<NoteInput['content'], { kind: 'session' }>;
+type FactContent = Extract<NoteInput['content'], { kind: 'fact' }>;
+
+interface ScopeHits {
+  scope: ScopeConfig;
+  hits: BackendHit[];
+  truncated: boolean;
+}
+
+interface HitDecision {
+  included: boolean;
+  reasons: string[];
+}
+
+function invalidInput(message: string, cause?: unknown): BrainError {
+  return new BrainError({ code: 'INVALID_INPUT', message, cause });
+}
+
+function cancelled(): BrainError {
+  return new BrainError({ code: 'CANCELLED', message: 'the caller cancelled the recall' });
+}
+
+function resolveLimit(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return RECALL_LIMIT_DEFAULT;
+  const rounded = Math.trunc(value);
+  if (rounded < 1) return 1;
+  if (rounded > RECALL_LIMIT_MAX) return RECALL_LIMIT_MAX;
+  return rounded;
+}
+
+function parseRequest(input: RecallRequest): RecallRequest {
+  const candidate: RecallRequest = {
+    ...input,
+    budget_tokens: clampRecallBudget(input.budget_tokens),
+    limit: resolveLimit(input.limit)
+  };
+  const parsed = recallRequestSchema.safeParse(candidate);
+  if (!parsed.success) {
+    const detail = parsed.error.issues
+      .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
+      .join('; ');
+    throw invalidInput(`recall request is invalid: ${detail}`);
+  }
+  return parsed.data as RecallRequest;
+}
+
+function buildSearchText(query: string, topics: string[] | undefined): string {
+  const parts = [query, ...(topics ?? [])]
+    .map((part) => part.replace(/\s+/gu, ' ').trim())
+    .filter((part) => part.length > 0);
+  return parts.slice(0, 1 + TEXTS_MAX_ITEMS).join(' ');
+}
+
+function searchTerms(searchText: string): string[] {
+  const terms: string[] = [];
+  for (const raw of searchText.toLowerCase().split(/[^\p{L}\p{N}]+/u)) {
+    if (raw.length < 2) continue;
+    if (!terms.includes(raw)) terms.push(raw);
+    if (terms.length >= MAX_SEARCH_TERMS) break;
+  }
+  return terms;
+}
+
+function requestedKinds(request: RecallRequest): NoteKind[] {
+  if (request.kinds !== undefined && request.kinds.length > 0) return [...request.kinds];
+  return [...NOTE_KINDS];
+}
+
+function vaultRelativePath(scope: ScopeConfig, relativePath: string): string {
+  const prefix = `${scope.relative_root}/`;
+  return relativePath.startsWith(prefix) ? relativePath : `${prefix}${relativePath}`;
+}
+
+async function searchScope(
+  ctx: RequestContext,
+  scope: ScopeConfig,
+  searchText: string,
+  kinds: NoteKind[],
+  mode: 'hybrid' | 'text',
+  deps: BrainDeps
+): Promise<ScopeHits> {
+  const hits: BackendHit[] = [];
+  let page = 1;
+  for (; page <= BACKEND_SEARCH_PAGES; page += 1) {
+    if (ctx.signal.aborted) throw cancelled();
+    const result = await deps.backend.search({
+      project: scope.backend_project,
+      query: searchText,
+      mode,
+      kinds,
+      statuses: [...LIFECYCLES],
+      page,
+      page_size: BACKEND_SEARCH_PAGE_SIZE
+    });
+    hits.push(...result.hits);
+    if (!result.has_more) break;
+  }
+  return { scope, hits, truncated: page > BACKEND_SEARCH_PAGES };
+}
+
+async function runSearch(
+  ctx: RequestContext,
+  scopes: ScopeConfig[],
+  searchText: string,
+  kinds: NoteKind[],
+  mode: 'hybrid' | 'text',
+  deps: BrainDeps
+): Promise<ScopeHits[]> {
+  const collected: ScopeHits[] = [];
+  for (const scope of scopes) {
+    collected.push(await searchScope(ctx, scope, searchText, kinds, mode, deps));
+  }
+  return collected;
+}
+
+type HitResolution =
+  | { kind: 'head'; head: Head }
+  | { kind: 'stale' }
+  | { kind: 'unresolved' };
+
+async function resolveHit(
+  scope: ScopeConfig,
+  hit: BackendHit,
+  deps: BrainDeps,
+  cache: Map<string, Head | null>
+): Promise<HitResolution> {
+  if (hit.relative_path.length === 0) return { kind: 'unresolved' };
+  let read: { raw: string; raw_hash: string; relative_path: string };
+  try {
+    read = await deps.vault.read(scope.id, vaultRelativePath(scope, hit.relative_path));
+  } catch {
+    return { kind: 'unresolved' };
+  }
+  let revision: StoredRevision;
+  try {
+    revision = decodeRevision(read.raw);
+  } catch {
+    return { kind: 'unresolved' };
+  }
+  if (revision.scope !== scope.id) return { kind: 'stale' };
+  const key = `${scope.id}:${revision.id}`;
+  let head: Head | null;
+  if (cache.has(key)) {
+    head = cache.get(key) ?? null;
+  } else {
+    try {
+      head = await deps.catalogue.get(scope.id, revision.id);
+    } catch (error) {
+      if (
+        isBrainError(error) &&
+        (error.code === 'CONFLICT' || error.code === 'UNSUPPORTED_SCHEMA')
+      ) {
+        return { kind: 'stale' };
+      }
+      cache.set(key, null);
+      return { kind: 'unresolved' };
+    }
+    cache.set(key, head);
+  }
+  if (head === null) return { kind: 'unresolved' };
+  if (head.state !== 'ready' && head.state !== 'manual_unreviewed') return { kind: 'stale' };
+  if (head.revision.revision_id !== revision.revision_id) return { kind: 'stale' };
+  if (head.raw_hash !== read.raw_hash) return { kind: 'stale' };
+  if (head.source.relative_path !== read.relative_path) return { kind: 'stale' };
+  return { kind: 'head', head };
+}
+
+function isFresh(modifiedAt: string, now: Date): boolean {
+  const modified = Date.parse(modifiedAt);
+  if (!Number.isFinite(modified)) return false;
+  return now.getTime() - modified <= SESSION_FRESHNESS_MS;
+}
+
+function evaluateHit(
+  scope: ScopeConfig,
+  head: Head,
+  request: RecallRequest,
+  kinds: NoteKind[],
+  now: Date
+): HitDecision {
+  const reasons: string[] = [];
+  const kind = head.source.kind;
+  const status = head.source.status;
+  if (!kinds.includes(kind)) return { included: false, reasons };
+  if (status === 'archived' || status === 'superseded') return { included: false, reasons };
+  if (status === 'candidate' && request.include_candidates !== true) {
+    return { included: false, reasons };
+  }
+  if (kind === 'session') {
+    const content = head.revision.note.content as SessionContent;
+    if (request.session_id === undefined || request.session_id !== content.session_id) {
+      return { included: false, reasons };
+    }
+    if (!isFresh(head.revision.modified_at, now)) return { included: false, reasons };
+    reasons.push('session_match');
+  }
+  if (kind === 'fact') {
+    const content = head.revision.note.content as FactContent;
+    if (typeof content.valid_until === 'string') {
+      const expiry = Date.parse(content.valid_until);
+      if (Number.isFinite(expiry) && expiry <= now.getTime()) return { included: false, reasons };
+    }
+  }
+  if (status === 'candidate') reasons.push('candidate');
+  if (scope.id === SHARED_SCOPE_ID) reasons.push(RECALL_WARNING_SHARED_SCOPE);
+  if (request.phase !== undefined && phaseKinds(request.phase).includes(kind)) {
+    reasons.push(`phase_relevant:${request.phase}`);
+  }
+  return { included: true, reasons };
+}
+
+interface Section {
+  title: string;
+  text: string;
+}
+
+function sectionText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.map((entry) => `- ${String(entry)}`).join('\n');
+  return '';
+}
+
+function truncateCodePoints(value: string, max: number): string {
+  const points = [...value];
+  return points.length <= max ? value : points.slice(0, max).join('');
+}
+
+function contentSections(kind: NoteKind, content: NoteInput['content']): Section[] {
+  const record = content as unknown as Record<string, unknown>;
+  const sections: Section[] = [];
+  for (const spec of NOTE_REGISTRY[kind].sections) {
+    const text = sectionText(record[spec.field]);
+    if (text.trim().length === 0) continue;
+    sections.push({ title: spec.title, text });
+  }
+  return sections;
+}
+
+function evidenceSection(note: NoteInput): Section | undefined {
+  if (note.evidence.length === 0) return undefined;
+  const lines = note.evidence.map((entry) => {
+    const ref = entry.ref.length > 0 ? ` (${entry.ref})` : '';
+    return `- [${entry.kind}] ${entry.description}${ref}`;
+  });
+  return { title: 'Evidence', text: lines.join('\n') };
+}
+
+function buildExcerpt(revision: StoredRevision, terms: string[]): { excerpt: string; section: string } {
+  const note = revision.note;
+  const sections = contentSections(note.content.kind, note.content);
+  const matched =
+    sections.find((section) => terms.some((term) => section.text.toLowerCase().includes(term))) ??
+    sections[0];
+  const parts: string[] = [];
+  if (matched !== undefined) {
+    parts.push(`## ${matched.title}\n\n${truncateCodePoints(matched.text, MATCHED_SECTION_MAX_CODE_POINTS)}`);
+  }
+  const applicability = sections.find((section) => section.title === 'Applicability');
+  if (applicability !== undefined && applicability !== matched) {
+    parts.push(
+      `## ${applicability.title}\n\n${truncateCodePoints(applicability.text, CONTEXT_SECTION_MAX_CODE_POINTS)}`
+    );
+  }
+  const evidence = evidenceSection(note);
+  if (evidence !== undefined) parts.push(`## ${evidence.title}\n\n${evidence.text}`);
+  return { excerpt: parts.join('\n\n'), section: matched?.title ?? '' };
+}
+
+function toItem(hit: EligibleHit, mode: 'hybrid' | 'text'): RecallResult['items'][number] {
+  const warnings = [...hit.head.source.warnings];
+  if (hit.head.source.status === 'candidate' && !warnings.includes(RECALL_WARNING_CANDIDATE)) {
+    warnings.push(RECALL_WARNING_CANDIDATE);
+  }
+  if (hit.head.source.scope === SHARED_SCOPE_ID && !warnings.includes(RECALL_WARNING_SHARED_SCOPE)) {
+    warnings.push(RECALL_WARNING_SHARED_SCOPE);
+  }
+  const source: SourceRef = { ...hit.head.source, warnings };
+  return {
+    ...source,
+    excerpt: hit.matched_section,
+    reasons: [...hit.reasons, mode === 'text' ? 'text_mode' : 'hybrid_mode']
+  };
+}
+
+export async function recall(
+  ctx: RequestContext,
+  input: RecallRequest,
+  deps: BrainDeps
+): Promise<RecallResult> {
+  if (ctx.signal.aborted) throw cancelled();
+  const request = parseRequest(input);
+  const scopes = resolveScopes(
+    ctx.principal,
+    request.scope,
+    request.include_shared === true,
+    'read',
+    deps.config.scopes
+  );
+  const kinds = requestedKinds(request);
+  const searchText = buildSearchText(request.query, request.topics);
+  const terms = searchTerms(searchText);
+
+  const warnings: string[] = [];
+  let partial = false;
+  let mode: 'hybrid' | 'text' = request.mode ?? 'hybrid';
+
+  let scopeHits: ScopeHits[];
+  try {
+    scopeHits = await runSearch(ctx, scopes, searchText, kinds, mode, deps);
+  } catch (error) {
+    if (
+      isBrainError(error) &&
+      error.code === 'EMBEDDINGS_UNAVAILABLE' &&
+      mode === 'hybrid' &&
+      request.allow_text_fallback === true
+    ) {
+      mode = 'text';
+      partial = true;
+      warnings.push(RECALL_WARNING_EMBEDDINGS_FALLBACK);
+      scopeHits = await runSearch(ctx, scopes, searchText, kinds, mode, deps);
+    } else {
+      throw error;
+    }
+  }
+
+  const now = deps.clock.now();
+  const eligible: EligibleHit[] = [];
+  const seen = new Set<string>();
+  const headCache = new Map<string, Head | null>();
+  let unresolved = false;
+
+  for (const { scope, hits, truncated } of scopeHits) {
+    if (truncated) {
+      partial = true;
+      if (!warnings.includes(RECALL_WARNING_SEARCH_TRUNCATED)) {
+        warnings.push(RECALL_WARNING_SEARCH_TRUNCATED);
+      }
+    }
+    for (const hit of hits) {
+      const resolution = await resolveHit(scope, hit, deps, headCache);
+      if (resolution.kind === 'unresolved') {
+        unresolved = true;
+        continue;
+      }
+      if (resolution.kind === 'stale') continue;
+      const head = resolution.head;
+      const key = `${scope.id}:${head.revision.id}`;
+      if (seen.has(key)) continue;
+      const decision = evaluateHit(scope, head, request, kinds, now);
+      if (!decision.included) continue;
+      seen.add(key);
+      const extracted = buildExcerpt(head.revision, terms);
+      const reasons = [...decision.reasons, `scope:${scope.id}`, `backend_rank:${hit.rank}`];
+      if (extracted.section.length > 0) reasons.push(`section:${extracted.section}`);
+      eligible.push({
+        head,
+        rank: hit.rank,
+        matched_section: extracted.excerpt,
+        reasons
+      });
+    }
+  }
+
+  if (unresolved) {
+    partial = true;
+    if (!warnings.includes(RECALL_WARNING_HIT_UNRESOLVED)) {
+      warnings.push(RECALL_WARNING_HIT_UNRESOLVED);
+    }
+  }
+
+  const ranked = rankEligible(eligible, request.phase ?? 'general');
+  const limit = resolveLimit(request.limit);
+  const items = ranked.slice(0, limit).map((hit) => toItem(hit, mode));
+  const budget = clampRecallBudget(request.budget_tokens);
+
+  return packRecall(
+    items,
+    {
+      retrieval_id: deps.ids.next(),
+      mode,
+      partial,
+      warnings
+    },
+    budget
+  );
+}
