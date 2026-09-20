@@ -30,7 +30,7 @@ const ALLOWED_TRANSITIONS: Record<OperationState, readonly OperationState[]> = {
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const MIGRATION_FILE_PATTERN = /^(\d+)-[a-z0-9-]+\.sql$/;
 
-const MIGRATIONS_DIRECTORY = fileURLToPath(new URL('./migrations/', import.meta.url));
+export const MIGRATIONS_DIRECTORY = fileURLToPath(new URL('./migrations/', import.meta.url));
 
 const systemClock: Clock = { now: () => new Date() };
 const systemIds: IdSource = { next: () => randomUUID() };

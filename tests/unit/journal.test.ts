@@ -334,9 +334,9 @@ test('applies versioned migrations in order and reruns them idempotently', () =>
   const second = Journal.open(journalPath);
   const probe = new Database(journalPath);
   const versionsAfterRerun = probe
-    .prepare('SELECT COUNT(*) AS count FROM schema_migrations')
-    .get() as { count: number };
-  expect(versionsAfterRerun.count).toBe(1);
+    .prepare('SELECT version FROM schema_migrations ORDER BY version')
+    .all() as { version: number }[];
+  expect(versionsAfterRerun).toEqual([{ version: 1 }, { version: 2 }]);
   expect(second.get(record.record.operation_id)?.idempotency_key).toBe('c1');
   probe.close();
   second.close();
