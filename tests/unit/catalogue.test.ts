@@ -637,6 +637,143 @@ test('normalizes a legacy persisted cross-scope duplicate marker once the duplic
   await expectBrain(catalogue.get(scopeConfig.id, noteId), 'NOT_FOUND');
 });
 
+test('restores manual_unreviewed after normalizing a legacy cross-scope duplicate marker', async () => {
+  const root = makeVaultRoot();
+  const noteId = nextUuid();
+  const revisionId = nextUuid();
+  const inScope = makeRevision({ id: noteId, revision_id: revisionId, scope: scopeConfig.id });
+  const sharedBase = makeRevision({
+    id: noteId,
+    revision_id: revisionId,
+    scope: sharedScope.id,
+    status: 'active'
+  });
+  const shared: StoredRevision = {
+    ...sharedBase,
+    approval: {
+      principal_id: nextUuid(),
+      rationale: 'Approval no longer matches the payload.',
+      payload_hash: '0'.repeat(64)
+    }
+  };
+  const inScopeFile = writeRevision(root, inScope);
+  writeRaw(
+    root,
+    relativePathFor(
+      sharedScope.relative_root,
+      shared.note.content.kind,
+      shared.id,
+      shared.note.title,
+      shared.revision_id
+    ),
+    renderRevision(shared, sharedScope)
+  );
+
+  const { catalogue } = openCatalogue(root);
+  const databasePath = join(root, 'catalogue.sqlite');
+  await catalogue.reconcile(scopeConfig.id);
+  await catalogue.reconcile(sharedScope.id);
+
+  const seed = new Database(databasePath);
+  seed
+    .prepare(
+      `UPDATE catalogue_revisions
+       SET state = 'conflict', is_head = 0,
+           warnings_json = '["duplicate_identity","conflict","manual_unreviewed"]'
+       WHERE scope = ?`
+    )
+    .run(sharedScope.id);
+  seed.close();
+
+  rmSync(join(root, inScopeFile.path), { force: true });
+  await catalogue.reconcile(scopeConfig.id);
+  await catalogue.reconcile(scopeConfig.id);
+
+  const normalized = new Database(databasePath);
+  expect(
+    normalized
+      .prepare('SELECT state, is_head, warnings_json FROM catalogue_revisions WHERE scope = ?')
+      .get(sharedScope.id)
+  ).toEqual({
+    state: 'manual_unreviewed',
+    is_head: 1,
+    warnings_json: '["manual_unreviewed"]'
+  });
+  normalized.close();
+
+  const survived = await catalogue.get(sharedScope.id, noteId);
+  expect(survived.state).toBe('manual_unreviewed');
+  expect(survived.source.status).toBe('candidate');
+  expect(survived.source.warnings).toEqual(['manual_unreviewed']);
+  expect((await catalogue.list(sharedScope.id, 'candidate')).items).toHaveLength(1);
+  expect(await catalogue.list(sharedScope.id, 'conflict')).toEqual({ items: [] });
+});
+
+test('recomputes a normalized head within its persisted logical-id graph', async () => {
+  const root = makeVaultRoot();
+  const noteId = nextUuid();
+  const revisionId = nextUuid();
+  const inScope = makeRevision({ id: noteId, revision_id: revisionId, scope: scopeConfig.id });
+  const shared = makeRevision({ id: noteId, revision_id: revisionId, scope: sharedScope.id });
+  const inScopeFile = writeRevision(root, inScope);
+  const sharedRaw = renderRevision(shared, sharedScope);
+  writeRaw(
+    root,
+    relativePathFor(
+      sharedScope.relative_root,
+      shared.note.content.kind,
+      shared.id,
+      shared.note.title,
+      shared.revision_id
+    ),
+    sharedRaw
+  );
+  const unrelatedChild = makeRevision({
+    scope: sharedScope.id,
+    parents: [{ revision_id: revisionId, raw_hash: hashRaw(sharedRaw) }]
+  });
+  writeRaw(
+    root,
+    relativePathFor(
+      sharedScope.relative_root,
+      unrelatedChild.note.content.kind,
+      unrelatedChild.id,
+      unrelatedChild.note.title,
+      unrelatedChild.revision_id
+    ),
+    renderRevision(unrelatedChild, sharedScope)
+  );
+
+  const { catalogue } = openCatalogue(root);
+  const databasePath = join(root, 'catalogue.sqlite');
+  await catalogue.reconcile(scopeConfig.id);
+  await catalogue.reconcile(sharedScope.id);
+
+  const seed = new Database(databasePath);
+  seed
+    .prepare(
+      `UPDATE catalogue_revisions
+       SET state = 'conflict', is_head = 0, warnings_json = '["duplicate_identity","conflict"]'
+       WHERE scope = ? AND revision_id = ?`
+    )
+    .run(sharedScope.id, revisionId);
+  seed.close();
+
+  rmSync(join(root, inScopeFile.path), { force: true });
+  await catalogue.reconcile(scopeConfig.id);
+  await catalogue.reconcile(scopeConfig.id);
+
+  const normalized = new Database(databasePath);
+  expect(
+    normalized
+      .prepare(
+        'SELECT state, is_head, warnings_json FROM catalogue_revisions WHERE scope = ? AND revision_id = ?'
+      )
+      .get(sharedScope.id, revisionId)
+  ).toEqual({ state: 'ready', is_head: 1, warnings_json: '[]' });
+  normalized.close();
+});
+
 test('keeps a genuine cross-scope duplicate marker conflicted while both scopes hold it', async () => {
   const root = makeVaultRoot();
   const noteId = nextUuid();

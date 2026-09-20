@@ -742,13 +742,19 @@ export class RevisionCatalogue implements CataloguePort {
         if (!warnings.includes('duplicate_identity')) continue;
         const other = warnings.filter((warning) => warning !== 'duplicate_identity');
         const nonConflict = other.filter((warning) => warning !== 'conflict');
+        const hasStructuralConflict = nonConflict.some(
+          (warning) => warning !== 'manual_unreviewed'
+        );
         let state: CatalogueState;
         let nextWarnings: string[];
         if (nonConflict.length === 0) {
           state = 'ready';
           nextWarnings = [];
+        } else if (!hasStructuralConflict) {
+          state = 'manual_unreviewed';
+          nextWarnings = unique(nonConflict);
         } else {
-          state = row.state as CatalogueState;
+          state = 'conflict';
           nextWarnings = unique([...nonConflict, 'conflict']);
         }
         const isHead = this.isPersistedHead(row) && (state === 'ready' || state === 'manual_unreviewed');
@@ -759,12 +765,17 @@ export class RevisionCatalogue implements CataloguePort {
   }
 
   private isPersistedHead(row: RevisionRow): boolean {
-    if (row.revision_id === null) return false;
+    if (row.revision_id === null || row.logical_id === null) return false;
     const child = this.database
       .prepare(
-        'SELECT 1 AS present FROM catalogue_parents WHERE scope = ? AND parent_revision_id = ? LIMIT 1'
+        `SELECT 1 AS present
+         FROM catalogue_parents AS parent
+         JOIN catalogue_revisions AS child
+           ON child.scope = parent.scope AND child.revision_id = parent.revision_id
+         WHERE parent.scope = ? AND parent.parent_revision_id = ? AND child.logical_id = ?
+         LIMIT 1`
       )
-      .get(row.scope, row.revision_id) as { present: number } | undefined;
+      .get(row.scope, row.revision_id, row.logical_id) as { present: number } | undefined;
     return child === undefined;
   }
 
