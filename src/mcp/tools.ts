@@ -19,6 +19,7 @@ export const APPLICATION_VERSION = '0.1.0';
 export const PROTOCOL_VERSION = LATEST_PROTOCOL_VERSION;
 export const SCHEMA_VERSION = 1;
 export const INTERNAL_ERROR_CODE = 'INTERNAL_ERROR';
+export const INTERNAL_ERROR_MESSAGE = 'the gateway could not complete the request';
 
 export const TOOL_NAMES = [
   'brain_capture',
@@ -368,13 +369,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function assertPayloadWithinLimit(label: string, bytes: number): void {
-  if (bytes > TOOL_RESULT_MAX_BYTES) {
-    throw new BrainError({
-      code: 'LIMIT_EXCEEDED',
-      message: `the ${label} tool result exceeds the hard payload limit`
-    });
-  }
+function transmittedBytes(result: ToolCallResult): number {
+  return Buffer.byteLength(JSON.stringify(result), 'utf8');
 }
 
 export function toToolResult(
@@ -385,15 +381,21 @@ export function toToolResult(
   if (!isRecord(result)) {
     throw new Error('the tool result is not a structured object');
   }
-  const structuredContent = result;
   const text =
     delivery === 'text-json' ? JSON.stringify(result) : JSON.stringify(pointerFor(tool, result));
-  assertPayloadWithinLimit(`${tool} text`, Buffer.byteLength(text, 'utf8'));
-  assertPayloadWithinLimit(
-    `${tool} structured`,
-    Buffer.byteLength(JSON.stringify(structuredContent), 'utf8')
-  );
-  return { content: [{ type: 'text', text }], structuredContent };
+  const call: ToolCallResult = { content: [{ type: 'text', text }], structuredContent: result };
+  if (transmittedBytes(call) > TOOL_RESULT_MAX_BYTES) {
+    throw new BrainError({
+      code: 'LIMIT_EXCEEDED',
+      message: `the ${tool} result exceeds the ${TOOL_RESULT_MAX_BYTES} byte MCP payload limit`
+    });
+  }
+  return call;
+}
+
+export function internalDiagnostic(error: unknown): string {
+  if (error instanceof Error) return sanitizeDiagnostic(error.message);
+  return sanitizeDiagnostic(typeof error === 'string' ? error : String(error));
 }
 
 export function errorPayload(error: unknown): ToolErrorPayload {
@@ -410,17 +412,9 @@ export function errorPayload(error: unknown): ToolErrorPayload {
     if (error.operation_id !== undefined) payload.operation_id = error.operation_id;
     return payload;
   }
-  if (error instanceof Error) {
-    const message = sanitizeDiagnostic(error.message);
-    return {
-      code: INTERNAL_ERROR_CODE,
-      message: message.length > 0 ? message : 'the gateway could not complete the request',
-      retryable: false
-    };
-  }
   return {
     code: INTERNAL_ERROR_CODE,
-    message: 'the gateway could not complete the request',
+    message: INTERNAL_ERROR_MESSAGE,
     retryable: false
   };
 }

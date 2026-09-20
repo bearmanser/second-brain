@@ -465,7 +465,7 @@ export interface CataloguePort {
 }
 ```
 
-`Journal`, `MutationCoordinator`, and `BrainServices` are defined by Tasks 5, 8, and 15 respectively. `BrainError` is a typed error with `code`, `message`, `retryable`, and optional `operation_id`. Codes are: `INVALID_INPUT`, `UNAUTHENTICATED`, `FORBIDDEN`, `SCOPE_REQUIRED`, `NOT_FOUND`, `CONFLICT`, `IDEMPOTENCY_CONFLICT`, `UNSUPPORTED_SCHEMA`, `BACKEND_UNAVAILABLE`, `BACKEND_PROTOCOL_ERROR`, `EMBEDDINGS_UNAVAILABLE`, `LIMIT_EXCEEDED`, `RECOVERY_REQUIRED`, and `CANCELLED`.
+`Journal`, `MutationCoordinator`, and `BrainServices` are defined by Tasks 5, 8, and 15 respectively. `BrainError` is a typed error with `code`, `message`, `retryable`, and optional `operation_id`. Codes are: `INVALID_INPUT`, `UNAUTHENTICATED`, `FORBIDDEN`, `SCOPE_REQUIRED`, `NOT_FOUND`, `CONFLICT`, `IDEMPOTENCY_CONFLICT`, `UNSUPPORTED_SCHEMA`, `BACKEND_UNAVAILABLE`, `BACKEND_PROTOCOL_ERROR`, `EMBEDDINGS_UNAVAILABLE`, `LIMIT_EXCEEDED`, `RECOVERY_REQUIRED`, `CANCELLED`, and `INTERNAL_ERROR`.
 
 ### C3. Concrete defaults
 

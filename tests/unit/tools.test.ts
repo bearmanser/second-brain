@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { expect, test } from 'vitest';
 import { z } from 'zod';
-import { BrainError } from '../../src/contracts/errors.js';
+import { BrainError, BRAIN_ERROR_CODES } from '../../src/contracts/errors.js';
 import { brainConfigSchema } from '../../src/config/schema.js';
 import {
   captureRequestSchema,
@@ -16,8 +16,10 @@ import { TOOL_RESULT_MAX_BYTES } from '../../src/core/limits.js';
 import type {
   FeedbackResult,
   MutationReceipt,
+  Principal,
   RecallResult,
   ReadResult,
+  RequestContext,
   ReviewListResult,
   SourceRef,
   StatusResult
@@ -29,12 +31,14 @@ import {
   APPLICATION_VERSION,
   PROTOCOL_VERSION,
   SCHEMA_VERSION,
+  internalDiagnostic,
   sanitizeDiagnostic,
   toToolError,
   toToolResult,
   toolDefinitions
 } from '../../src/mcp/tools.js';
-import type { ToolName } from '../../src/mcp/tools.js';
+import type { ToolCallResult, ToolName } from '../../src/mcp/tools.js';
+import type { ResultDelivery } from '../../src/config/schema.js';
 import { fixtureIds, lessonFixture } from '../fixtures/content.js';
 import {
   ownerContext,
@@ -43,6 +47,7 @@ import {
   workerContext
 } from '../fixtures/principals.js';
 import { createHarness } from '../support/harness.js';
+import type { Journal, OperationRecord } from '../../src/storage/journal.js';
 
 const key = (n: number): string => `00000000-0000-4000-8000-${n.toString(16).padStart(12, '0')}`;
 
@@ -621,6 +626,59 @@ test('text-json delivery sends the complete result once in text', () => {
   expect(call.structuredContent).toEqual(readSample);
 });
 
+const readWith = (length: number): ReadResult => ({ source, markdown: 'x'.repeat(length) });
+
+const transmitted = (call: ToolCallResult): number =>
+  Buffer.byteLength(JSON.stringify(call), 'utf8');
+
+function largestAccepted(
+  delivery: ResultDelivery
+): { length: number; call: ToolCallResult } | undefined {
+  let low = 0;
+  let high = TOOL_RESULT_MAX_BYTES * 2 + 8192;
+  let best: { length: number; call: ToolCallResult } | undefined;
+  while (low <= high) {
+    const middle = (low + high) >> 1;
+    try {
+      best = { length: middle, call: toToolResult('brain_read', readWith(middle), delivery) };
+      low = middle + 1;
+    } catch {
+      high = middle - 1;
+    }
+  }
+  return best;
+}
+
+test('bounds the complete transmitted payload for structured delivery', () => {
+  const best = largestAccepted('structured');
+  expect(best).toBeDefined();
+  expect(transmitted(best!.call)).toBeLessThanOrEqual(TOOL_RESULT_MAX_BYTES);
+  expect(best!.call.structuredContent).toEqual(readWith(best!.length));
+
+  const next = readWith(best!.length + 1);
+  expect(Buffer.byteLength(JSON.stringify(next), 'utf8')).toBeLessThan(TOOL_RESULT_MAX_BYTES);
+  expect(() => toToolResult('brain_read', next, 'structured')).toThrow(/LIMIT_EXCEEDED/);
+});
+
+test('bounds the complete transmitted payload for text-json delivery', () => {
+  const best = largestAccepted('text-json');
+  expect(best).toBeDefined();
+  expect(transmitted(best!.call)).toBeLessThanOrEqual(TOOL_RESULT_MAX_BYTES);
+  expect(best!.call.content[0].text).toBe(JSON.stringify(readWith(best!.length)));
+
+  const next = readWith(best!.length + 1);
+  expect(Buffer.byteLength(JSON.stringify(next), 'utf8')).toBeLessThan(TOOL_RESULT_MAX_BYTES);
+  expect(() => toToolResult('brain_read', next, 'text-json')).toThrow(/LIMIT_EXCEEDED/);
+});
+
+test('a text-json result cannot approach twice the hard payload limit', () => {
+  const oversized = readWith(TOOL_RESULT_MAX_BYTES);
+  expect(() => toToolResult('brain_read', oversized, 'text-json')).toThrow(/LIMIT_EXCEEDED/);
+  expect(() => toToolResult('brain_read', oversized, 'structured')).toThrow(/LIMIT_EXCEEDED/);
+  const boundary = largestAccepted('text-json');
+  expect(boundary!.length).toBeLessThan(TOOL_RESULT_MAX_BYTES / 2 + 4096);
+});
+
 test('failures use isError, stable codes, retryability, and a sanitized message', () => {
   const call = toToolError(
     new BrainError({
@@ -641,18 +699,43 @@ test('failures use isError, stable codes, retryability, and a sanitized message'
   expect(call.content[0].text).not.toContain('backend at /');
 });
 
-test('unknown failures expose no stack trace and no secret path', () => {
+test('unknown failures expose a fixed generic message and no internal detail', () => {
   const error = new Error('the journal at /var/lib/second-brain/journal.db is locked');
   error.stack = `Error: ${error.message}\n    at /srv/app/src/storage/journal.ts:10:5`;
   const call = toToolError(error);
   const payload = JSON.parse(call.content[0].text).error;
-  expect(payload.code).toBe('INTERNAL_ERROR');
-  expect(payload.retryable).toBe(false);
+  expect(payload).toEqual({
+    code: 'INTERNAL_ERROR',
+    message: 'the gateway could not complete the request',
+    retryable: false
+  });
+  expect(call.content[0].text).not.toContain('journal');
+  expect(call.content[0].text).not.toContain('locked');
   expect(call.content[0].text).not.toContain('/var/lib');
   expect(call.content[0].text).not.toContain('/srv/app');
   expect(call.content[0].text).not.toContain('at /');
+  expect(internalDiagnostic(error)).toBe('the journal at [path] is locked');
+  expect(internalDiagnostic('token=sk-abcdefghijklmnopqrstuvwxyz')).not.toContain(
+    'sk-abcdefghijklmnopqrstuvwxyz'
+  );
   expect(sanitizeDiagnostic('see /a/b/c')).toBe('see [path]');
   expect(toToolError(undefined).content[0].text).toContain('INTERNAL_ERROR');
+});
+
+test('INTERNAL_ERROR is a published BrainError code producing a fixed safe result', () => {
+  expect(BRAIN_ERROR_CODES).toContain('INTERNAL_ERROR');
+  const internalError = new BrainError({
+    code: 'INTERNAL_ERROR',
+    message: 'the gateway could not complete the request'
+  });
+  expect(internalError.retryable).toBe(false);
+  const call = toToolError(internalError);
+  const payload = JSON.parse(call.content[0].text).error;
+  expect(payload).toEqual({
+    code: 'INTERNAL_ERROR',
+    message: 'the gateway could not complete the request',
+    retryable: false
+  });
 });
 
 test('status reports authorization-filtered scopes for each principal', async () => {
@@ -807,6 +890,97 @@ test('status rejects malformed input with a stable code', async () => {
     await expect(
       status(workerContext, { operation_id: 'not-a-uuid' } as unknown as Record<string, never>, harness.deps)
     ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+  } finally {
+    await harness.close();
+  }
+});
+
+test('an owner with review permission can inspect an operation in that scope', async () => {
+  const harness = await createHarness();
+  try {
+    const receipt = await capture(
+      ownerContext,
+      { idempotency_key: key(4), scope: 'profile', note: lessonFixture },
+      harness.deps
+    );
+    const reviewOnlyOwner: Principal = {
+      id: '00000000-0000-4000-8000-0000000000f1',
+      role: 'owner',
+      read_scopes: ['freellmapi'],
+      write_scopes: [],
+      review_scopes: ['profile']
+    };
+    const context: RequestContext = {
+      principal: reviewOnlyOwner,
+      request_id: key(5),
+      signal: new AbortController().signal
+    };
+    const view = await status(context, { operation_id: receipt.operation_id }, harness.deps);
+    expect(view.operation?.revision_id).toBe(receipt.revision_id);
+  } finally {
+    await harness.close();
+  }
+});
+
+function recordWith(overrides: Partial<OperationRecord>): OperationRecord {
+  return {
+    operation_id: fixtureIds.idempotencyKey,
+    principal_id: workerContext.principal.id,
+    idempotency_key: key(6),
+    tool: 'brain_capture',
+    scope: 'freellmapi',
+    payload_hash: 'a'.repeat(64),
+    payload_json: '{}',
+    state: 'complete',
+    created_at: '2026-09-20T00:00:00.000Z',
+    updated_at: '2026-09-20T00:00:00.000Z',
+    ...overrides
+  };
+}
+
+test('status rejects corrupt or inconsistent persisted receipts with RECOVERY_REQUIRED', async () => {
+  const harness = await createHarness();
+  try {
+    const mismatchedPlan = JSON.stringify({
+      revision: { id: fixtureIds.note, revision_id: fixtureIds.replacement }
+    });
+    const mismatchedIdentity = { ...receiptSample, id: fixtureIds.replacement };
+    const cases: OperationRecord[] = [
+      recordWith({ receipt_json: '{not json' }),
+      recordWith({ receipt_json: JSON.stringify({ ...receiptSample, outcome: 'bogus' }) }),
+      recordWith({
+        receipt_json: JSON.stringify({ ...receiptSample, operation_id: fixtureIds.revision })
+      }),
+      recordWith({ receipt_json: JSON.stringify(mismatchedIdentity), plan_json: mismatchedPlan }),
+      recordWith({ receipt_json: JSON.stringify(receiptSample), plan_json: '{bad plan' })
+    ];
+    for (const record of cases) {
+      const deps = {
+        ...harness.deps,
+        journal: { get: () => record, pending: () => [] } as unknown as Journal
+      };
+      await expect(
+        status(workerContext, { operation_id: record.operation_id }, deps)
+      ).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    }
+
+    const pendingPlan = recordWith({
+      receipt_json: undefined,
+      state: 'submitted',
+      plan_json: JSON.stringify({
+        revision: { id: fixtureIds.note, revision_id: fixtureIds.revision }
+      })
+    });
+    const deps = {
+      ...harness.deps,
+      journal: { get: () => pendingPlan, pending: () => [] } as unknown as Journal
+    };
+    const view = await status(workerContext, { operation_id: pendingPlan.operation_id }, deps);
+    expect(view.operation).toMatchObject({
+      outcome: 'pending',
+      id: fixtureIds.note,
+      revision_id: fixtureIds.revision
+    });
   } finally {
     await harness.close();
   }

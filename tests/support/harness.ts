@@ -141,7 +141,8 @@ class MemoryHarnessImpl implements MemoryHarness {
         concurrent_reads: CONCURRENT_READS
       },
       allowed_hosts: ['127.0.0.1'],
-      allowed_origins: []
+      allowed_origins: [],
+      result_delivery: 'structured'
     };
     this.backend = new FakeBackend({
       root: this.vaultRoot,

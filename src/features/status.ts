@@ -1,13 +1,17 @@
+import { z } from 'zod';
 import { BrainError, isBrainError } from '../contracts/errors.js';
+import { etagSchema, scopeIdSchema, uuidSchema } from '../contracts/content.js';
 import { statusRequestSchema } from '../contracts/protocol.js';
 import type { BrainDeps } from '../core/mutation.js';
-import type {
-  MutationReceipt,
-  Principal,
-  RequestContext,
-  ScopeConfig,
-  StatusRequest,
-  StatusResult
+import {
+  LIFECYCLES,
+  NOTE_KINDS,
+  type MutationReceipt,
+  type Principal,
+  type RequestContext,
+  type ScopeConfig,
+  type StatusRequest,
+  type StatusResult
 } from '../core/types.js';
 import { DUPLICATE_DETAILS_WITHHELD } from './capture.js';
 import {
@@ -20,6 +24,30 @@ import { resolveScopes } from '../security/authorise.js';
 import type { OperationRecord } from '../storage/journal.js';
 
 const MATERIALIZATION_UNCONFIRMED = 'materialization_unconfirmed';
+
+const sourceRefSchema = z.strictObject({
+  id: uuidSchema,
+  revision_id: uuidSchema,
+  scope: scopeIdSchema,
+  title: z.string(),
+  kind: z.enum(NOTE_KINDS),
+  status: z.enum(LIFECYCLES),
+  etag: etagSchema,
+  relative_path: z.string(),
+  warnings: z.array(z.string())
+});
+
+const mutationReceiptSchema = z.strictObject({
+  operation_id: uuidSchema,
+  id: uuidSchema,
+  revision_id: uuidSchema,
+  outcome: z.enum(['stored', 'stored_conflict', 'pending']),
+  materialized: z.boolean(),
+  indexed: z.boolean(),
+  etag: etagSchema.optional(),
+  possible_duplicates: z.array(sourceRefSchema),
+  warnings: z.array(z.string())
+});
 
 function invalidInput(message: string, cause?: unknown): BrainError {
   return new BrainError({ code: 'INVALID_INPUT', message, cause });
@@ -75,47 +103,71 @@ function canInspect(principal: Principal, record: OperationRecord): boolean {
   if (record.principal_id === principal.id) return true;
   if (principal.role !== 'owner') return false;
   return (
-    principal.read_scopes.includes(record.scope) || principal.write_scopes.includes(record.scope)
+    principal.read_scopes.includes(record.scope) ||
+    principal.write_scopes.includes(record.scope) ||
+    principal.review_scopes.includes(record.scope)
   );
 }
 
+interface PlannedIdentity {
+  id: string;
+  revision_id: string;
+}
+
+function plannedIdentity(record: OperationRecord): PlannedIdentity | undefined {
+  if (record.plan_json === undefined) return undefined;
+  let plan: unknown;
+  try {
+    plan = JSON.parse(record.plan_json);
+  } catch (cause) {
+    throw recoveryRequired(record.operation_id, cause);
+  }
+  const revision =
+    plan !== null && typeof plan === 'object'
+      ? (plan as { revision?: { id?: unknown; revision_id?: unknown } }).revision
+      : undefined;
+  if (
+    revision === undefined ||
+    typeof revision.id !== 'string' ||
+    typeof revision.revision_id !== 'string'
+  ) {
+    throw recoveryRequired(record.operation_id);
+  }
+  return { id: revision.id, revision_id: revision.revision_id };
+}
+
 function receiptFromRecord(record: OperationRecord): MutationReceipt | undefined {
+  const plan = plannedIdentity(record);
   if (record.receipt_json !== undefined) {
-    let receipt: MutationReceipt;
+    let parsed: unknown;
     try {
-      receipt = JSON.parse(record.receipt_json) as MutationReceipt;
+      parsed = JSON.parse(record.receipt_json);
     } catch (cause) {
       throw recoveryRequired(record.operation_id, cause);
+    }
+    const result = mutationReceiptSchema.safeParse(parsed);
+    if (!result.success) throw recoveryRequired(record.operation_id);
+    const receipt = result.data as MutationReceipt;
+    if (receipt.operation_id !== record.operation_id) throw recoveryRequired(record.operation_id);
+    if (
+      plan !== undefined &&
+      (receipt.id !== plan.id || receipt.revision_id !== plan.revision_id)
+    ) {
+      throw recoveryRequired(record.operation_id);
     }
     return receipt;
   }
-  if (record.plan_json !== undefined) {
-    let plan: unknown;
-    try {
-      plan = JSON.parse(record.plan_json);
-    } catch (cause) {
-      throw recoveryRequired(record.operation_id, cause);
-    }
-    const revision =
-      plan !== null && typeof plan === 'object'
-        ? (plan as { revision?: { id?: unknown; revision_id?: unknown } }).revision
-        : undefined;
-    if (
-      revision !== undefined &&
-      typeof revision.id === 'string' &&
-      typeof revision.revision_id === 'string'
-    ) {
-      return {
-        operation_id: record.operation_id,
-        id: revision.id,
-        revision_id: revision.revision_id,
-        outcome: 'pending',
-        materialized: false,
-        indexed: false,
-        possible_duplicates: [],
-        warnings: [MATERIALIZATION_UNCONFIRMED]
-      };
-    }
+  if (plan !== undefined) {
+    return {
+      operation_id: record.operation_id,
+      id: plan.id,
+      revision_id: plan.revision_id,
+      outcome: 'pending',
+      materialized: false,
+      indexed: false,
+      possible_duplicates: [],
+      warnings: [MATERIALIZATION_UNCONFIRMED]
+    };
   }
   return undefined;
 }

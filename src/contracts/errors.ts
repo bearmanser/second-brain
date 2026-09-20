@@ -12,7 +12,8 @@ export const BRAIN_ERROR_CODES = [
   'EMBEDDINGS_UNAVAILABLE',
   'LIMIT_EXCEEDED',
   'RECOVERY_REQUIRED',
-  'CANCELLED'
+  'CANCELLED',
+  'INTERNAL_ERROR'
 ] as const;
 
 export type BrainErrorCode = (typeof BRAIN_ERROR_CODES)[number];

@@ -122,22 +122,28 @@ task.
 - `gateway`: `ready`, `recovering` (authorized pending work remains), or
   `degraded` (the backend is unreachable).
 - `backend`: `ready` or `unavailable`.
-- `embeddings`: `ready`, `unavailable`, or `unknown`. This gateway cannot prove
-  embedding readiness from a health probe alone, so it reports `unknown` unless
-  a retrieval path has already reported otherwise.
+- `embeddings`: `ready`, `unavailable`, or `unknown`. A health probe cannot
+  prove embedding readiness, so this gateway currently always reports `unknown`.
 
 A requested `operation_id` is returned only to its submitting principal or to an
-owner allowed that scope. An unauthorized request is reported as `NOT_FOUND` so
-the gateway does not confirm that another principal's operation exists.
+owner allowed that scope (read, write, or review permission). An unauthorized
+request is reported as `NOT_FOUND` so the gateway does not confirm that another
+principal's operation exists. A persisted operation record that fails runtime
+validation, or whose identities disagree with the operation's own plan, is
+reported as `RECOVERY_REQUIRED` instead of being returned.
 
 ## Errors
 
 Tool failures return `isError: true` with:
 
-- a stable `code` (the `BrainError` code set, or `INTERNAL_ERROR` for an
-  unexpected gateway fault),
+- a stable `code` from the published `BrainError` code set, which includes
+  `INTERNAL_ERROR` for an unexpected gateway fault,
 - a `retryable` boolean,
 - a bounded, sanitized `message` and, when known, an `operation_id`.
+
+An unexpected (non-`BrainError`) fault always returns the fixed message
+"the gateway could not complete the request"; its redacted detail is kept on a
+server-side diagnostic channel and is never placed in a tool result.
 
 Messages never include raw stack traces, credentials, or absolute filesystem
 paths. The same error object is present in the text block so a client that

@@ -175,7 +175,7 @@ export interface BrainConfig {
   limits: BrainLimits;
   allowed_hosts: string[];
   allowed_origins: string[];
-  result_delivery?: ResultDelivery;
+  result_delivery: ResultDelivery;
 }
 
 export interface CredentialRecord {

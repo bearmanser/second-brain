@@ -474,7 +474,13 @@ test('defines the Section C types with stable fixture values', () => {
 });
 
 test('BrainError carries a stable code, retryability, and optional operation id', () => {
-  expect(BRAIN_ERROR_CODES).toHaveLength(14);
+  expect(BRAIN_ERROR_CODES).toHaveLength(15);
+  expect(BRAIN_ERROR_CODES).toContain('INTERNAL_ERROR');
+  const internal = new BrainError({
+    code: 'INTERNAL_ERROR',
+    message: 'the gateway could not complete the request'
+  });
+  expect(internal.retryable).toBe(false);
   const forbidden = new BrainError({ code: 'FORBIDDEN', message: 'worker cannot approve' });
   expect(forbidden).toBeInstanceOf(Error);
   expect(forbidden).toBeInstanceOf(BrainError);
