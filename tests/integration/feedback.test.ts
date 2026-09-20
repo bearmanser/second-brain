@@ -145,6 +145,57 @@ test('rejects a retrieval reference that did not return the target revision', as
   await h.close();
 });
 
+test('rejects a retrieval reference recorded for another scope', async () => {
+  const h = await createHarness();
+  const head = await h.seed(lessonFixture, { status: 'active' });
+  const retrieval = recordRetrieval(h, {
+    scope: 'shared',
+    scope_ids: ['shared'],
+    returned_ids: [{ id: head.source.id, revision_id: head.source.revision_id }],
+    item_count: 1
+  });
+  await expect(
+    feedback(reviewerContext, requestFor(head, { retrieval_id: retrieval.retrieval_id }), h.deps)
+  ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+  await h.close();
+});
+
+test('treats reasons that differ only after the storage bound as different payloads', async () => {
+  const h = await createHarness();
+  const head = await h.seed(lessonFixture, { status: 'active' });
+  const base = requestFor(head);
+  await feedback(
+    reviewerContext,
+    { ...base, reason: `${'a'.repeat(300)}one` },
+    h.deps
+  );
+  const stored = h.deps.journal.listFeedback('freellmapi')[0];
+  expect(stored?.reason).toBe('a'.repeat(240));
+  await expect(
+    feedback(reviewerContext, { ...base, reason: `${'a'.repeat(300)}two` }, h.deps)
+  ).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+  expect(h.deps.journal.listFeedback('freellmapi')).toHaveLength(1);
+  await h.close();
+});
+
+test('replays an exact retry after its retrieval metadata has been pruned', async () => {
+  const h = await createHarness();
+  const head = await h.seed(lessonFixture, { status: 'active' });
+  const retrieval = recordRetrieval(h, {
+    returned_ids: [{ id: head.source.id, revision_id: head.source.revision_id }],
+    item_count: 1,
+    created_at: '2000-01-01T00:00:00.000Z'
+  });
+  const request = requestFor(head, { retrieval_id: retrieval.retrieval_id });
+  const first = await feedback(reviewerContext, request, h.deps);
+  expect(h.deps.journal.pruneRetrievalEvents(new Date())).toBe(1);
+  expect(h.deps.journal.getRetrieval(retrieval.retrieval_id)).toBeUndefined();
+  const second = await feedback(reviewerContext, request, h.deps);
+  expect(second.feedback_id).toBe(first.feedback_id);
+  expect(h.deps.journal.listFeedback('freellmapi')).toHaveLength(1);
+  await h.close();
+});
+
 test('rejects a feedback request that names a stale revision', async () => {
   const h = await createHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
@@ -385,19 +436,36 @@ test('prunes retrieval metadata after thirty days but keeps the feedback record'
   await h.close();
 });
 
-test('prunes audit events after thirty days and keeps feedback until an explicit purge', async () => {
+test('prunes audit events after thirty days at the cutoff and keeps feedback until an explicit purge', async () => {
   const h = await createHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
-  h.deps.journal.appendAudit({
-    request_id: 'old-request',
-    tool: 'brain_recall',
-    outcome: 'ok',
-    duration_ms: 1,
-    note_count: 0
-  });
-  expect(h.deps.journal.pruneAuditEvents(new Date())).toBe(0);
+  const now = new Date();
+  const cutoff = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+  const database = new Database(join(h.deps.config.mounts.state, 'journal.db'));
+  try {
+    const insert = database.prepare(
+      'INSERT INTO audit_events (request_id, tool, outcome, duration_ms, note_count, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+    );
+    insert.run(
+      'ancient-request',
+      'brain_recall',
+      'ok',
+      1,
+      0,
+      new Date(cutoff.getTime() - 1000).toISOString()
+    );
+    insert.run('boundary-request', 'brain_recall', 'ok', 1, 0, cutoff.toISOString());
+  } finally {
+    database.close();
+  }
+
   const result = await feedback(reviewerContext, requestFor(head), h.deps);
   expect(h.deps.journal.getFeedback(result.feedback_id)).toBeDefined();
+
+  expect(h.deps.journal.pruneAuditEvents(now)).toBe(1);
+  const remaining = h.deps.journal.listAudit().map((event) => event.request_id);
+  expect(remaining).not.toContain('ancient-request');
+  expect(remaining).toContain('boundary-request');
 
   h.deps.journal.purgeFeedback('shared');
   expect(h.deps.journal.getFeedback(result.feedback_id)).toBeDefined();
@@ -412,6 +480,7 @@ test('rejects feedback against another caller retrieval even after it is pruned'
   const retrieval = recordRetrieval(h, {
     principal_id: workerPrincipal.id,
     returned_ids: [{ id: head.source.id, revision_id: head.source.revision_id }],
+    item_count: 1,
     created_at: '2000-01-01T00:00:00.000Z'
   });
   h.deps.journal.pruneRetrievalEvents(new Date());

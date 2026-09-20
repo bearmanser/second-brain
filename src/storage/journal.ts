@@ -1,16 +1,20 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
+import { uuidSchema } from '../contracts/content.js';
 import { BrainError, isBrainError } from '../contracts/errors.js';
-import type {
-  Clock,
-  FeedbackVerdict,
-  IdSource,
-  MutationReceipt,
-  PlannedWrite,
-  RecallMode
+import { RECALL_MAX_SCOPES, RECALL_LIMIT_MAX, SCOPE_ID_PATTERN } from '../core/limits.js';
+import {
+  FEEDBACK_VERDICTS,
+  RECALL_MODES,
+  type Clock,
+  type FeedbackVerdict,
+  type IdSource,
+  type MutationReceipt,
+  type PlannedWrite,
+  type RecallMode
 } from '../core/types.js';
 import { containsCredentials } from '../security/redact.js';
 
@@ -47,6 +51,10 @@ export const RETRIEVAL_OUTCOMES = ['ok', 'partial', 'error'] as const;
 export type RetrievalOutcome = (typeof RETRIEVAL_OUTCOMES)[number];
 
 export const FEEDBACK_REASON_MAX_LENGTH = 240;
+export const FEEDBACK_REASON_INPUT_MAX_LENGTH = 8000;
+
+const RFC3339_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+const FEEDBACK_WARNING_MAX_LENGTH = 128;
 
 export const MIGRATIONS_DIRECTORY = fileURLToPath(new URL('./migrations/', import.meta.url));
 
@@ -175,6 +183,7 @@ interface FeedbackRow {
   verdict: string;
   reason: string;
   warning: string | null;
+  payload_hash: string;
   created_at: string;
 }
 
@@ -390,6 +399,177 @@ function requireAuditText(value: string, field: string): string {
     throw invalidInput(`${field} rejected because it contains an obvious credential`);
   }
   return value;
+}
+
+function requireUuid(value: unknown, field: string): string {
+  if (typeof value !== 'string' || !uuidSchema.safeParse(value).success) {
+    throw invalidInput(`${field} must be a UUID string`);
+  }
+  return value;
+}
+
+function requireScopeId(value: unknown, field: string): string {
+  if (typeof value !== 'string' || !SCOPE_ID_PATTERN.test(value)) {
+    throw invalidInput(`${field} must match the scope identifier pattern`);
+  }
+  return value;
+}
+
+function requireTimestamp(value: unknown, field: string): string {
+  if (typeof value !== 'string' || !RFC3339_PATTERN.test(value) || !Number.isFinite(Date.parse(value))) {
+    throw invalidInput(`${field} must be an RFC3339 timestamp`);
+  }
+  return new Date(value).toISOString();
+}
+
+function normalizeRetrieval(input: RetrievalEventInput, defaultTimestamp: string): RetrievalEvent {
+  if (input === null || typeof input !== 'object') {
+    throw invalidInput('retrieval metadata must be an object');
+  }
+  const retrieval_id = requireUuid(input.retrieval_id, 'retrieval_id');
+  const principal_id = requireUuid(input.principal_id, 'principal_id');
+  const scope = requireScopeId(input.scope, 'scope');
+  if (!Array.isArray(input.scope_ids) || input.scope_ids.length === 0) {
+    throw invalidInput('scope_ids must be a non-empty array');
+  }
+  if (input.scope_ids.length > RECALL_MAX_SCOPES) {
+    throw invalidInput('scope_ids exceeds the maximum number of retrieval scopes');
+  }
+  const scope_ids = [...new Set(input.scope_ids.map((value) => requireScopeId(value, 'scope_ids')))];
+  if (!scope_ids.includes(scope)) {
+    throw invalidInput('scope_ids must include the primary scope');
+  }
+  if (!Array.isArray(input.returned_ids) || input.returned_ids.length > RECALL_LIMIT_MAX) {
+    throw invalidInput('returned_ids must be a bounded array');
+  }
+  const returned_ids = input.returned_ids.map((entry, index) => {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw invalidInput(`returned_ids[${index}] must be an object`);
+    }
+    const keys = Object.keys(entry).sort();
+    if (keys.length !== 2 || keys[0] !== 'id' || keys[1] !== 'revision_id') {
+      throw invalidInput(`returned_ids[${index}] must contain only id and revision_id`);
+    }
+    return {
+      id: requireUuid(entry.id, `returned_ids[${index}].id`),
+      revision_id: requireUuid(entry.revision_id, `returned_ids[${index}].revision_id`)
+    };
+  });
+  if (!(RECALL_MODES as readonly string[]).includes(input.mode)) {
+    throw invalidInput(`unknown retrieval mode ${String(input.mode)}`);
+  }
+  if (!(RETRIEVAL_OUTCOMES as readonly string[]).includes(input.outcome)) {
+    throw invalidInput(`unknown retrieval outcome ${String(input.outcome)}`);
+  }
+  if (typeof input.partial !== 'boolean') {
+    throw invalidInput('partial must be a boolean');
+  }
+  const item_count = requireFiniteCount(input.item_count, 'item_count');
+  if (item_count !== returned_ids.length) {
+    throw invalidInput('item_count must match the number of returned ids');
+  }
+  const token_used = requireFiniteCount(input.token_used, 'token_used');
+  const token_limit = requireFiniteCount(input.token_limit, 'token_limit');
+  if (token_limit <= 0 || token_used > token_limit) {
+    throw invalidInput('token accounting must satisfy 0 <= token_used <= token_limit');
+  }
+  const duration_ms = requireFiniteCount(input.duration_ms, 'duration_ms');
+  const created_at =
+    input.created_at === undefined
+      ? defaultTimestamp
+      : requireTimestamp(input.created_at, 'created_at');
+  return {
+    retrieval_id,
+    principal_id,
+    scope,
+    scope_ids,
+    returned_ids,
+    item_count,
+    token_used,
+    token_limit,
+    mode: input.mode,
+    outcome: input.outcome,
+    partial: input.partial,
+    duration_ms,
+    created_at
+  };
+}
+
+interface NormalizedFeedback {
+  principal_id: string;
+  idempotency_key: string;
+  scope: string;
+  logical_id: string;
+  revision_id: string;
+  retrieval_id: string | null;
+  related_id: string | null;
+  verdict: FeedbackVerdict;
+  reason: string;
+  warning: string | null;
+  payload_hash: string;
+}
+
+function normalizeFeedback(input: FeedbackWrite): NormalizedFeedback {
+  if (input === null || typeof input !== 'object') {
+    throw invalidInput('feedback metadata must be an object');
+  }
+  const principal_id = requireUuid(input.principal_id, 'principal_id');
+  const idempotency_key = requireUuid(input.idempotency_key, 'idempotency_key');
+  const scope = requireScopeId(input.scope, 'scope');
+  const logical_id = requireUuid(input.logical_id, 'logical_id');
+  const revision_id = requireUuid(input.revision_id, 'revision_id');
+  const retrieval_id =
+    input.retrieval_id === undefined ? null : requireUuid(input.retrieval_id, 'retrieval_id');
+  const related_id =
+    input.related_id === undefined ? null : requireUuid(input.related_id, 'related_id');
+  if (!(FEEDBACK_VERDICTS as readonly string[]).includes(input.verdict)) {
+    throw invalidInput(`unknown feedback verdict ${String(input.verdict)}`);
+  }
+  if (typeof input.reason !== 'string' || input.reason.trim().length === 0) {
+    throw invalidInput('reason must be a non-empty string');
+  }
+  if ([...input.reason].length > FEEDBACK_REASON_INPUT_MAX_LENGTH) {
+    throw invalidInput('reason exceeds the feedback reason limit');
+  }
+  let warning: string | null = null;
+  if (input.warning !== undefined) {
+    if (
+      typeof input.warning !== 'string' ||
+      input.warning.trim().length === 0 ||
+      input.warning.length > FEEDBACK_WARNING_MAX_LENGTH
+    ) {
+      throw invalidInput('warning must be a bounded non-empty string');
+    }
+    warning = input.warning;
+  }
+  const payload = {
+    principal_id,
+    idempotency_key,
+    scope,
+    logical_id,
+    revision_id,
+    retrieval_id,
+    related_id,
+    verdict: input.verdict,
+    reason: input.reason,
+    warning
+  };
+  const payload_hash = createHash('sha256')
+    .update(JSON.stringify(payload), 'utf8')
+    .digest('hex');
+  return {
+    principal_id,
+    idempotency_key,
+    scope,
+    logical_id,
+    revision_id,
+    retrieval_id,
+    related_id,
+    verdict: input.verdict,
+    reason: boundReason(input.reason),
+    warning,
+    payload_hash
+  };
 }
 
 function toRecord(row: OperationRow): OperationRecord {
@@ -623,19 +803,9 @@ export class Journal {
 
   recordRetrieval(input: RetrievalEventInput): RetrievalEvent {
     this.assertOpen();
-    if (!(RETRIEVAL_OUTCOMES as readonly string[]).includes(input.outcome)) {
-      throw invalidInput(`unknown retrieval outcome ${String(input.outcome)}`);
-    }
-    if (!Array.isArray(input.scope_ids) || !Array.isArray(input.returned_ids)) {
-      throw invalidInput('retrieval metadata must use arrays');
-    }
-    const created_at = input.created_at ?? this.timestamp();
-    requireFiniteCount(input.item_count, 'item_count');
-    requireFiniteCount(input.token_used, 'token_used');
-    requireFiniteCount(input.token_limit, 'token_limit');
-    requireFiniteCount(input.duration_ms, 'duration_ms');
+    const record = normalizeRetrieval(input, this.timestamp());
     const run = this.database.transaction((): RetrievalEvent => {
-      const existing = this.selectRetrieval(input.retrieval_id);
+      const existing = this.selectRetrieval(record.retrieval_id);
       if (existing !== undefined) return existing;
       this.database
         .prepare(
@@ -645,25 +815,21 @@ export class Journal {
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
-          input.retrieval_id,
-          input.principal_id,
-          input.scope,
-          JSON.stringify([...new Set(input.scope_ids)]),
-          JSON.stringify(input.returned_ids),
-          Math.trunc(input.item_count),
-          Math.trunc(input.token_used),
-          Math.trunc(input.token_limit),
-          input.mode,
-          input.outcome,
-          input.partial ? 1 : 0,
-          Math.trunc(input.duration_ms),
-          created_at
+          record.retrieval_id,
+          record.principal_id,
+          record.scope,
+          JSON.stringify(record.scope_ids),
+          JSON.stringify(record.returned_ids),
+          record.item_count,
+          record.token_used,
+          record.token_limit,
+          record.mode,
+          record.outcome,
+          record.partial ? 1 : 0,
+          record.duration_ms,
+          record.created_at
         );
-      return {
-        ...input,
-        scope_ids: [...new Set(input.scope_ids)],
-        created_at
-      };
+      return record;
     });
     return run.immediate();
   }
@@ -682,28 +848,36 @@ export class Journal {
     return result.changes;
   }
 
+  replayFeedback(input: FeedbackWrite): FeedbackWriteResult | undefined {
+    this.assertOpen();
+    const normalized = normalizeFeedback(input);
+    const existing = this.selectFeedbackRowByKey(normalized.principal_id, normalized.idempotency_key);
+    if (existing === undefined) return undefined;
+    if (existing.payload_hash !== normalized.payload_hash) {
+      throw new BrainError({
+        code: 'IDEMPOTENCY_CONFLICT',
+        message: `idempotency key ${normalized.idempotency_key} was used for different feedback`
+      });
+    }
+    return { kind: 'replay', entry: toFeedback(existing) };
+  }
+
   recordFeedback(input: FeedbackWrite): FeedbackWriteResult {
     this.assertOpen();
-    const reason = boundReason(input.reason);
+    const normalized = normalizeFeedback(input);
     const run = this.database.transaction((): FeedbackWriteResult => {
-      const existing = this.selectFeedbackByKey(input.principal_id, input.idempotency_key);
+      const existing = this.selectFeedbackRowByKey(
+        normalized.principal_id,
+        normalized.idempotency_key
+      );
       if (existing !== undefined) {
-        const same =
-          existing.scope === input.scope &&
-          existing.logical_id === input.logical_id &&
-          existing.revision_id === input.revision_id &&
-          existing.retrieval_id === input.retrieval_id &&
-          existing.related_id === input.related_id &&
-          existing.verdict === input.verdict &&
-          existing.reason === reason &&
-          existing.warning === input.warning;
-        if (!same) {
+        if (existing.payload_hash !== normalized.payload_hash) {
           throw new BrainError({
             code: 'IDEMPOTENCY_CONFLICT',
-            message: `idempotency key ${input.idempotency_key} was used for different feedback`
+            message: `idempotency key ${normalized.idempotency_key} was used for different feedback`
           });
         }
-        return { kind: 'replay', entry: existing };
+        return { kind: 'replay', entry: toFeedback(existing) };
       }
       const feedback_id = this.ids.next();
       const created_at = this.timestamp();
@@ -711,21 +885,22 @@ export class Journal {
         .prepare(
           `INSERT INTO feedback_records (
             feedback_id, principal_id, idempotency_key, scope, logical_id, revision_id,
-            retrieval_id, related_id, verdict, reason, warning, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            retrieval_id, related_id, verdict, reason, warning, payload_hash, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           feedback_id,
-          input.principal_id,
-          input.idempotency_key,
-          input.scope,
-          input.logical_id,
-          input.revision_id,
-          input.retrieval_id ?? null,
-          input.related_id ?? null,
-          input.verdict,
-          reason,
-          input.warning ?? null,
+          normalized.principal_id,
+          normalized.idempotency_key,
+          normalized.scope,
+          normalized.logical_id,
+          normalized.revision_id,
+          normalized.retrieval_id,
+          normalized.related_id,
+          normalized.verdict,
+          normalized.reason,
+          normalized.warning,
+          normalized.payload_hash,
           created_at
         );
       const stored = this.selectFeedbackById(feedback_id);
@@ -839,22 +1014,25 @@ export class Journal {
   }
 
   private selectFeedbackById(feedback_id: string): FeedbackEntry | undefined {
-    const row = this.database
-      .prepare('SELECT * FROM feedback_records WHERE feedback_id = ?')
-      .get(feedback_id) as FeedbackRow | undefined;
+    const row = this.selectFeedbackRowById(feedback_id);
     return row === undefined ? undefined : toFeedback(row);
   }
 
-  private selectFeedbackByKey(
+  private selectFeedbackRowById(feedback_id: string): FeedbackRow | undefined {
+    return this.database
+      .prepare('SELECT * FROM feedback_records WHERE feedback_id = ?')
+      .get(feedback_id) as FeedbackRow | undefined;
+  }
+
+  private selectFeedbackRowByKey(
     principal_id: string,
     idempotency_key: string
-  ): FeedbackEntry | undefined {
-    const row = this.database
+  ): FeedbackRow | undefined {
+    return this.database
       .prepare(
         'SELECT * FROM feedback_records WHERE principal_id = ? AND idempotency_key = ?'
       )
       .get(principal_id, idempotency_key) as FeedbackRow | undefined;
-    return row === undefined ? undefined : toFeedback(row);
   }
 
   private requireRow(id: string): OperationRow {

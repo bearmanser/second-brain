@@ -4,7 +4,12 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { join } from 'node:path';
 import { BrainError } from '../../src/contracts/errors.js';
 import type { Clock, IdSource, MutationReceipt, PlannedWrite } from '../../src/core/types.js';
-import { Journal, applyMigrations, loadMigrations } from '../../src/storage/journal.js';
+import {
+  Journal,
+  applyMigrations,
+  loadMigrations,
+  type RetrievalEventInput
+} from '../../src/storage/journal.js';
 import { fixtureIds, lessonFixture } from '../fixtures/content.js';
 
 const temporaryRoot = join('/tmp/opencode', 'brain-journal-tests');
@@ -336,7 +341,12 @@ test('applies versioned migrations in order and reruns them idempotently', () =>
   const versionsAfterRerun = probe
     .prepare('SELECT version FROM schema_migrations ORDER BY version')
     .all() as { version: number }[];
-  expect(versionsAfterRerun).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+  expect(versionsAfterRerun).toEqual([
+    { version: 1 },
+    { version: 2 },
+    { version: 3 },
+    { version: 4 }
+  ]);
   expect(second.get(record.record.operation_id)?.idempotency_key).toBe('c1');
   probe.close();
   second.close();
@@ -532,5 +542,133 @@ test('refreshes only the availability flags of a durable terminal receipt', () =
     errorFrom(() => journal.refreshReceiptAvailability(conflict.record.operation_id, { indexed: true }))
       .code
   ).toBe('CONFLICT');
+  journal.close();
+});
+
+const retrievalInput = (overrides: Partial<RetrievalEventInput> = {}): RetrievalEventInput => ({
+  retrieval_id: '11111111-1111-4111-8111-111111111111',
+  principal_id: '00000000-0000-4000-8000-000000000001',
+  scope: 'freellmapi',
+  scope_ids: ['freellmapi'],
+  returned_ids: [],
+  item_count: 0,
+  token_used: 0,
+  token_limit: 1500,
+  mode: 'hybrid',
+  outcome: 'ok',
+  partial: false,
+  duration_ms: 1,
+  ...overrides
+});
+
+test('projects retrieval metadata onto declared fields only', () => {
+  const journal = Journal.open(':memory:');
+  const polluted = {
+    ...retrievalInput(),
+    returned_ids: [
+      {
+        id: '22222222-2222-4222-8222-222222222222',
+        revision_id: '33333333-3333-4333-8333-333333333333',
+        title: 'private title',
+        excerpt: 'private excerpt',
+        reasons: ['internal']
+      }
+    ],
+    item_count: 1
+  } as unknown as RetrievalEventInput;
+  expect(errorFrom(() => journal.recordRetrieval(polluted)).code).toBe('INVALID_INPUT');
+
+  const input = retrievalInput({
+    returned_ids: [
+      {
+        id: '22222222-2222-4222-8222-222222222222',
+        revision_id: '33333333-3333-4333-8333-333333333333'
+      }
+    ],
+    item_count: 1
+  });
+  const stored = journal.recordRetrieval(input);
+  input.returned_ids.push({
+    id: '44444444-4444-4444-8444-444444444444',
+    revision_id: '55555555-5555-4555-8555-555555555555'
+  });
+  input.scope_ids.push('shared');
+  const reread = journal.getRetrieval(stored.retrieval_id);
+  expect(reread?.returned_ids).toEqual([
+    {
+      id: '22222222-2222-4222-8222-222222222222',
+      revision_id: '33333333-3333-4333-8333-333333333333'
+    }
+  ]);
+  expect(reread?.scope_ids).toEqual(['freellmapi']);
+  expect(reread).not.toHaveProperty('title');
+  expect(reread).not.toHaveProperty('excerpt');
+  journal.close();
+});
+
+test('rejects malformed retrieval metadata', () => {
+  const journal = Journal.open(':memory:');
+  const failure = (overrides: Partial<RetrievalEventInput>): string => {
+    try {
+      journal.recordRetrieval(retrievalInput(overrides));
+    } catch (error) {
+      if (error instanceof BrainError) return error.code;
+      throw error;
+    }
+    throw new Error('expected the retrieval record to be rejected');
+  };
+  expect(failure({ retrieval_id: 'not-a-uuid' })).toBe('INVALID_INPUT');
+  expect(failure({ principal_id: 'not-a-uuid' })).toBe('INVALID_INPUT');
+  expect(failure({ scope: 'Bad Scope' })).toBe('INVALID_INPUT');
+  expect(failure({ scope_ids: ['shared'] })).toBe('INVALID_INPUT');
+  expect(failure({ scope_ids: ['freellmapi', 'shared', 'profile'] })).toBe('INVALID_INPUT');
+  expect(failure({ mode: 'semantic' as never })).toBe('INVALID_INPUT');
+  expect(failure({ outcome: 'maybe' as never })).toBe('INVALID_INPUT');
+  expect(failure({ partial: 'yes' as never })).toBe('INVALID_INPUT');
+  expect(failure({ item_count: 2 })).toBe('INVALID_INPUT');
+  expect(failure({ token_used: 2000, token_limit: 1500 })).toBe('INVALID_INPUT');
+  expect(failure({ created_at: 'yesterday' })).toBe('INVALID_INPUT');
+  expect(
+    failure({ returned_ids: [{ id: 'x', revision_id: 'y' }] as never, item_count: 1 })
+  ).toBe('INVALID_INPUT');
+  journal.close();
+});
+
+test('prunes retrieval metadata only past the thirty-day cutoff', () => {
+  const journal = Journal.open(':memory:');
+  const now = new Date('2030-01-31T00:00:00.000Z');
+  const cutoff = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  journal.recordRetrieval(
+    retrievalInput({
+      retrieval_id: '66666666-6666-4666-8666-666666666666',
+      created_at: '2029-12-31T23:59:59.000Z'
+    })
+  );
+  journal.recordRetrieval(
+    retrievalInput({
+      retrieval_id: '77777777-7777-4777-8777-777777777777',
+      created_at: cutoff
+    })
+  );
+  expect(journal.pruneRetrievalEvents(now)).toBe(1);
+  expect(journal.getRetrieval('66666666-6666-4666-8666-666666666666')).toBeUndefined();
+  expect(journal.getRetrieval('77777777-7777-4777-8777-777777777777')).toBeDefined();
+  journal.close();
+});
+
+test('prunes audit events only past the thirty-day cutoff', () => {
+  const clock = new TestClock('2030-01-01T00:00:00.000Z');
+  const journal = Journal.open(':memory:', { clock });
+  journal.appendAudit({
+    request_id: 'req-1',
+    tool: 'brain_recall',
+    outcome: 'ok',
+    duration_ms: 1,
+    note_count: 0
+  });
+  clock.advance(30 * 24 * 60 * 60 * 1000);
+  expect(journal.pruneAuditEvents(clock.now())).toBe(0);
+  clock.advance(1);
+  expect(journal.pruneAuditEvents(clock.now())).toBe(1);
   journal.close();
 });

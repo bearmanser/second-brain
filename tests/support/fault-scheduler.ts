@@ -98,6 +98,9 @@ export function wrapJournal(journal: Journal, scheduler: FaultScheduler): Journa
     pruneRetrievalEvents(now: Date): number {
       return journal.pruneRetrievalEvents(now);
     },
+    replayFeedback(input: FeedbackWrite): FeedbackWriteResult | undefined {
+      return journal.replayFeedback(input);
+    },
     recordFeedback(input: FeedbackWrite): FeedbackWriteResult {
       return journal.recordFeedback(input);
     },

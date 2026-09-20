@@ -10,11 +10,10 @@ import type {
 } from '../core/types.js';
 import { resolveScopes } from '../security/authorise.js';
 import { assertNoCredentials } from '../security/redact.js';
-import {
-  FEEDBACK_REASON_MAX_LENGTH,
-  type AuditEvent,
-  type RetrievalEventInput,
-  type RetrievalOutcome
+import type {
+  AuditEvent,
+  RetrievalEventInput,
+  RetrievalOutcome
 } from '../storage/journal.js';
 
 export { AUDIT_FIELDS, FEEDBACK_REASON_MAX_LENGTH } from '../storage/journal.js';
@@ -55,14 +54,16 @@ function parseRequest(input: FeedbackRequest): FeedbackRequest {
   return parsed.data as FeedbackRequest;
 }
 
-function boundReason(reason: string): string {
-  const points = [...reason];
-  if (points.length <= FEEDBACK_REASON_MAX_LENGTH) return reason;
-  return points.slice(0, FEEDBACK_REASON_MAX_LENGTH).join('');
+function authorizeTarget(ctx: RequestContext, requested: string, deps: BrainDeps): ScopeConfig {
+  const [scope] = resolveScopes(ctx.principal, requested, false, 'read', deps.config.scopes);
+  return scope;
 }
 
-async function requireTarget(ctx: RequestContext, request: FeedbackRequest, deps: BrainDeps): Promise<ScopeConfig> {
-  const [scope] = resolveScopes(ctx.principal, request.scope, false, 'read', deps.config.scopes);
+async function requireTargetRevision(
+  scope: ScopeConfig,
+  request: FeedbackRequest,
+  deps: BrainDeps
+): Promise<void> {
   try {
     await deps.catalogue.getRevision(scope.id, request.id, request.revision_id);
   } catch (error) {
@@ -73,7 +74,6 @@ async function requireTarget(ctx: RequestContext, request: FeedbackRequest, deps
     }
     throw error;
   }
-  return scope;
 }
 
 async function authorizeRelated(ctx: RequestContext, relatedId: string, deps: BrainDeps): Promise<void> {
@@ -95,6 +95,7 @@ async function authorizeRelated(ctx: RequestContext, relatedId: string, deps: Br
 function assertRetrievalBinding(
   ctx: RequestContext,
   request: FeedbackRequest,
+  scopeId: string,
   deps: BrainDeps
 ): void {
   const retrieval_id = request.retrieval_id;
@@ -103,11 +104,12 @@ function assertRetrievalBinding(
   const valid =
     event !== undefined &&
     event.principal_id === ctx.principal.id &&
+    event.scope_ids.includes(scopeId) &&
     event.returned_ids.some(
       (entry) => entry.id === request.id && entry.revision_id === request.revision_id
     );
   if (!valid) {
-    throw invalidInput('the retrieval reference is not valid for this caller and revision');
+    throw invalidInput('the retrieval reference is not valid for this caller, scope, and revision');
   }
 }
 
@@ -208,16 +210,15 @@ export async function feedback(
     throw error;
   }
   try {
-    const scope = await requireTarget(ctx, request, deps);
+    const scope = authorizeTarget(ctx, request.scope, deps);
     if (request.related_id !== undefined) {
       await authorizeRelated(ctx, request.related_id, deps);
     }
     assertNoCredentials(request.reason, 'reason');
-    assertRetrievalBinding(ctx, request, deps);
     const warning = UNRESOLVED_VERDICTS.includes(request.verdict)
       ? FEEDBACK_WARNING_UNRESOLVED
       : undefined;
-    const write = deps.journal.recordFeedback({
+    const write = {
       principal_id: ctx.principal.id,
       idempotency_key: request.idempotency_key,
       scope: scope.id,
@@ -226,11 +227,19 @@ export async function feedback(
       ...(request.retrieval_id === undefined ? {} : { retrieval_id: request.retrieval_id }),
       ...(request.related_id === undefined ? {} : { related_id: request.related_id }),
       verdict: request.verdict,
-      reason: boundReason(request.reason),
+      reason: request.reason,
       ...(warning === undefined ? {} : { warning })
-    });
+    };
+    const replay = deps.journal.replayFeedback(write);
+    if (replay !== undefined) {
+      recordAudit(deps, ctx, 'recorded', started, 1);
+      return { feedback_id: replay.entry.feedback_id, recorded: true };
+    }
+    await requireTargetRevision(scope, request, deps);
+    assertRetrievalBinding(ctx, request, scope.id, deps);
+    const stored = deps.journal.recordFeedback(write);
     recordAudit(deps, ctx, 'recorded', started, 1);
-    return { feedback_id: write.entry.feedback_id, recorded: true };
+    return { feedback_id: stored.entry.feedback_id, recorded: true };
   } catch (error) {
     recordAudit(deps, ctx, 'rejected', started);
     throw error;
