@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { BrainError } from '../contracts/errors.js';
+import { BACKEND_SEARCH_PAGE_SIZE, BACKEND_SEARCH_PAGES } from '../core/limits.js';
 import type {
   BackendHit,
   BackendSearch,
@@ -75,13 +76,14 @@ export function argumentsForCreate(write: PlannedWrite): WriteNoteArguments {
     directory: write.directory,
     note_type: write.revision.note.content.kind,
     content: write.body,
-    metadata: write.metadata,
+    metadata: { ...write.metadata, permalink: write.permalink },
     overwrite: false,
     output_format: 'json'
   };
 }
 
 export function argumentsForSearch(input: BackendSearch): SearchNotesArguments {
+  assertSearchPagination(input.page, input.page_size);
   return {
     project: input.project,
     query: input.query,
@@ -93,6 +95,17 @@ export function argumentsForSearch(input: BackendSearch): SearchNotesArguments {
     search_all_projects: false,
     output_format: 'json'
   };
+}
+
+export function assertSearchPagination(page: number, page_size: number): void {
+  if (!Number.isInteger(page) || page < 1 || page > BACKEND_SEARCH_PAGES) {
+    throw invalidInput(`backend search page must be an integer in 1..${BACKEND_SEARCH_PAGES}`);
+  }
+  if (!Number.isInteger(page_size) || page_size < 1 || page_size > BACKEND_SEARCH_PAGE_SIZE) {
+    throw invalidInput(
+      `backend search page_size must be an integer in 1..${BACKEND_SEARCH_PAGE_SIZE}`
+    );
+  }
 }
 
 export function argumentsForIndexedLookup(
@@ -169,8 +182,8 @@ export function toBackendHit(hit: SearchHit): BackendHit {
   return {
     permalink: hit.permalink,
     relative_path: hit.file_path,
-    revision_id: metadataString(hit.metadata, BRAIN_REVISION_ID_KEY) ?? hit.external_id,
-    logical_id: metadataString(hit.metadata, BRAIN_ID_KEY) ?? hit.external_id,
+    revision_id: metadataString(hit.metadata, BRAIN_REVISION_ID_KEY) ?? '',
+    logical_id: metadataString(hit.metadata, BRAIN_ID_KEY) ?? '',
     rank: hit.score,
     matched_text: hit.matched_chunk ?? hit.content
   };

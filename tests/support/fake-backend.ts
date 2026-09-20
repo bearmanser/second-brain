@@ -149,6 +149,9 @@ export class FakeBackend implements BackendPort {
   }
 
   private record(): void {
+    if (!this.connected) {
+      throw unavailable('fake backend is not connected');
+    }
     this.call_count += 1;
   }
 

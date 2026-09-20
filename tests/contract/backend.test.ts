@@ -235,18 +235,21 @@ test('separates an unavailable embedding model from generic backend failure', ()
   ).toThrow(/EMBEDDINGS_UNAVAILABLE/);
 });
 
-test('create forwards only the configured write_note arguments with overwrite disabled', () => {
+test('create forwards the generated permalink through metadata with overwrite disabled', () => {
   const write = plannedWrite();
-  expect(argumentsForCreate(write)).toEqual({
+  const args = argumentsForCreate(write);
+  expect(args).toEqual({
     project: 'probe',
     title: write.storage_title,
     directory: write.directory,
     note_type: 'lesson',
     content: write.body,
-    metadata: write.metadata,
+    metadata: { ...write.metadata, permalink: write.permalink },
     overwrite: false,
     output_format: 'json'
   });
+  expect(args.metadata.permalink).toBe(write.permalink);
+  expect(args.overwrite).toBe(false);
 });
 
 test('search forwards the gateway-generated filters and never a caller-supplied backend argument', () => {
@@ -261,6 +264,32 @@ test('search forwards the gateway-generated filters and never a caller-supplied 
     search_all_projects: false,
     output_format: 'json'
   });
+});
+
+test('bounds backend search to four pages of forty candidates', () => {
+  for (const page of [1, 4]) {
+    expect(() => argumentsForSearch(search({ page, page_size: 40 }))).not.toThrow();
+  }
+  for (const page of [0, 5]) {
+    expect(() => argumentsForSearch(search({ page }))).toThrow(/INVALID_INPUT/);
+  }
+  for (const page_size of [1, 40]) {
+    expect(() => argumentsForSearch(search({ page_size }))).not.toThrow();
+  }
+  for (const page_size of [0, 41]) {
+    expect(() => argumentsForSearch(search({ page_size }))).toThrow(/INVALID_INPUT/);
+  }
+  for (const page of [1.5, Number.NaN]) {
+    expect(() => argumentsForSearch(search({ page }))).toThrow(/INVALID_INPUT/);
+  }
+});
+
+test('rejects an out-of-bounds page before touching the transport', async () => {
+  const { backend, connections } = scriptedBackend(async () => fixtureEnvelope('search-notes'));
+  await backend.connect();
+  const error = await captureAsync(() => backend.search(search({ page_size: 41 })));
+  expect(error.code).toBe('INVALID_INPUT');
+  expect(connections[0].calls).toHaveLength(0);
 });
 
 test('isIndexed issues a metadata-only lookup for the revision identity', () => {
@@ -289,6 +318,7 @@ test('create sends write_note to the configured project and maps the created res
   expect(connections[0].calls[0].args).toEqual(argumentsForCreate(write));
   expect(connections[0].calls[0].args.overwrite).toBe(false);
   expect(connections[0].calls[0].args.project).toBe('probe');
+  expect(connections[0].calls[0].args.metadata).toMatchObject({ permalink: write.permalink });
 });
 
 test('create surfaces a create-only conflict as a typed CONFLICT', async () => {
@@ -321,8 +351,8 @@ test('search maps hits and forwards the exact request arguments', async () => {
       {
         permalink: 'probe/notes/probe/probe-revision-1',
         relative_path: 'Notes/probe/Probe Revision 1.md',
-        revision_id: '00000000-0000-4000-8000-000000000001',
-        logical_id: '00000000-0000-4000-8000-000000000001',
+        revision_id: '',
+        logical_id: '',
         rank: 1,
         matched_text: '# Probe\n\nA searchable synthetic observation.'
       }
@@ -331,6 +361,43 @@ test('search maps hits and forwards the exact request arguments', async () => {
   });
   expect(connections[0].calls[0].name).toBe('search_notes');
   expect(connections[0].calls[0].args).toEqual(argumentsForSearch(search()));
+});
+
+test('search leaves gateway identity empty when metadata omits brain fields', async () => {
+  const { backend } = scriptedBackend(async () => fixtureEnvelope('search-notes'));
+  await backend.connect();
+  const { hits } = await backend.search(search());
+  expect(hits[0].logical_id).toBe('');
+  expect(hits[0].revision_id).toBe('');
+  expect(hits[0].logical_id).not.toBe('00000000-0000-4000-8000-000000000001');
+});
+
+test('search uses brain_id and brain_revision_id metadata when the backend supplies them', async () => {
+  const hit = {
+    title: 'Probe Revision 1',
+    type: 'entity',
+    score: 1,
+    entity: 'probe/notes/probe/probe-revision-1',
+    external_id: '00000000-0000-4000-8000-000000000001',
+    permalink: 'probe/notes/probe/probe-revision-1',
+    content: '# Probe\n\nA searchable synthetic observation.',
+    matched_chunk: '# Probe\n\nA searchable synthetic observation.',
+    file_path: 'Notes/probe/Probe Revision 1.md',
+    updated_at: '2026-01-01T00:00:00.000000+00:00',
+    metadata: {
+      note_type: 'note',
+      brain_id: '0b8f1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d',
+      brain_revision_id: '1c9f2d3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e'
+    },
+    entity_id: 12
+  };
+  const { backend } = scriptedBackend(async () =>
+    envelope({ results: [hit], current_page: 1, page_size: 10, has_more: false })
+  );
+  await backend.connect();
+  const { hits } = await backend.search(search());
+  expect(hits[0].logical_id).toBe('0b8f1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d');
+  expect(hits[0].revision_id).toBe('1c9f2d3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e');
 });
 
 test('search returns empty hits for a genuine empty result without failing', async () => {
@@ -578,4 +645,22 @@ test('FakeBackend distinguishes a lost request from a lost response', async () =
   expect(after.materialisedPaths('probe')).toEqual([
     `${write.directory}/${slugify(write.storage_title)}.md`
   ]);
+});
+
+test('FakeBackend refuses operations while disconnected', async () => {
+  const root = temporaryDirectory();
+  const fake = new FakeBackend({ root, projects: ['probe'] });
+  const disconnected = await captureAsync(() => fake.search(search()));
+  expect(disconnected.code).toBe('BACKEND_UNAVAILABLE');
+
+  await fake.connect();
+  await fake.create(plannedWrite());
+  const callsBeforeClose = fake.call_count;
+  await fake.close();
+
+  const searchAfterClose = await captureAsync(() => fake.search(search()));
+  expect(searchAfterClose.code).toBe('BACKEND_UNAVAILABLE');
+  const writeAfterClose = await captureAsync(() => fake.create(plannedWrite()));
+  expect(writeAfterClose.code).toBe('BACKEND_UNAVAILABLE');
+  expect(fake.call_count).toBe(callsBeforeClose);
 });

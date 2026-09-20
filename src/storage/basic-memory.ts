@@ -234,12 +234,9 @@ export class BasicMemoryBackend implements BackendPort {
 
   async search(input: BackendSearch): Promise<{ hits: BackendHit[]; has_more: boolean }> {
     this.assertProject(input.project);
+    const argumentsForRequest = argumentsForSearch(input);
     return this.read(SEARCH_NOTES_TOOL, async (connection) => {
-      const raw = await connection.call(
-        SEARCH_NOTES_TOOL,
-        argumentsForSearch(input),
-        this.timeoutMs
-      );
+      const raw = await connection.call(SEARCH_NOTES_TOOL, argumentsForRequest, this.timeoutMs);
       return decodeSearchResponse(normalizeToolResponse(raw));
     });
   }
