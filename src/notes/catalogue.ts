@@ -438,6 +438,7 @@ export class RevisionCatalogue implements CataloguePort {
     }
 
     this.persist(scope, rows, parents);
+    this.normalizeDuplicateConflicts();
   }
 
   async get(scope: string, id: string): Promise<Head> {
@@ -718,6 +719,53 @@ export class RevisionCatalogue implements CataloguePort {
       )
       .all() as { revision_id: string }[];
     return new Set(rows.map((row) => row.revision_id));
+  }
+
+  private normalizeDuplicateConflicts(): void {
+    const duplicates = this.duplicateRevisionIds();
+    const candidates = this.database
+      .prepare(
+        `SELECT * FROM catalogue_revisions
+         WHERE revision_id IS NOT NULL AND warnings_json LIKE '%duplicate_identity%'`
+      )
+      .all() as RevisionRow[];
+    if (candidates.length === 0) return;
+    const update = this.database.prepare(
+      `UPDATE catalogue_revisions
+       SET state = ?, is_head = ?, warnings_json = ?
+       WHERE scope = ? AND relative_path = ?`
+    );
+    const run = this.database.transaction((): void => {
+      for (const row of candidates) {
+        if (row.revision_id === null || duplicates.has(row.revision_id)) continue;
+        const warnings = parseWarnings(row.warnings_json);
+        if (!warnings.includes('duplicate_identity')) continue;
+        const other = warnings.filter((warning) => warning !== 'duplicate_identity');
+        const nonConflict = other.filter((warning) => warning !== 'conflict');
+        let state: CatalogueState;
+        let nextWarnings: string[];
+        if (nonConflict.length === 0) {
+          state = 'ready';
+          nextWarnings = [];
+        } else {
+          state = row.state as CatalogueState;
+          nextWarnings = unique([...nonConflict, 'conflict']);
+        }
+        const isHead = this.isPersistedHead(row) && (state === 'ready' || state === 'manual_unreviewed');
+        update.run(state, isHead ? 1 : 0, JSON.stringify(nextWarnings), row.scope, row.relative_path);
+      }
+    });
+    run.immediate();
+  }
+
+  private isPersistedHead(row: RevisionRow): boolean {
+    if (row.revision_id === null) return false;
+    const child = this.database
+      .prepare(
+        'SELECT 1 AS present FROM catalogue_parents WHERE scope = ? AND parent_revision_id = ? LIMIT 1'
+      )
+      .get(row.scope, row.revision_id) as { present: number } | undefined;
+    return child === undefined;
   }
 
   private foreignRowsFor(scope: string, revisionIds: string[]): RevisionRow[] {

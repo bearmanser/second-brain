@@ -577,6 +577,116 @@ test('clears a cross-scope duplicate conflict after the duplicate is removed and
   database.close();
 });
 
+test('normalizes a legacy persisted cross-scope duplicate marker once the duplicate is gone', async () => {
+  const root = makeVaultRoot();
+  const noteId = nextUuid();
+  const revisionId = nextUuid();
+  const inScope = makeRevision({ id: noteId, revision_id: revisionId, scope: scopeConfig.id });
+  const shared = makeRevision({ id: noteId, revision_id: revisionId, scope: sharedScope.id });
+  const inScopeFile = writeRevision(root, inScope);
+  writeRaw(
+    root,
+    relativePathFor(
+      sharedScope.relative_root,
+      shared.note.content.kind,
+      shared.id,
+      shared.note.title,
+      shared.revision_id
+    ),
+    renderRevision(shared, sharedScope)
+  );
+
+  const { catalogue } = openCatalogue(root);
+  const databasePath = join(root, 'catalogue.sqlite');
+  await catalogue.reconcile(scopeConfig.id);
+  await catalogue.reconcile(sharedScope.id);
+
+  const seed = new Database(databasePath);
+  seed
+    .prepare(
+      `UPDATE catalogue_revisions
+       SET state = 'conflict', is_head = 0, warnings_json = '["duplicate_identity","conflict"]'
+       WHERE scope = ?`
+    )
+    .run(sharedScope.id);
+  seed.close();
+  const seeded = new Database(databasePath);
+  expect(
+    seeded.prepare('SELECT state, is_head FROM catalogue_revisions WHERE scope = ?').get(sharedScope.id)
+  ).toEqual({ state: 'conflict', is_head: 0 });
+  seeded.close();
+
+  rmSync(join(root, inScopeFile.path), { force: true });
+  await catalogue.reconcile(scopeConfig.id);
+  await catalogue.reconcile(scopeConfig.id);
+
+  const normalized = new Database(databasePath);
+  expect(
+    normalized
+      .prepare('SELECT state, is_head, warnings_json FROM catalogue_revisions WHERE scope = ?')
+      .get(sharedScope.id)
+  ).toEqual({ state: 'ready', is_head: 1, warnings_json: '[]' });
+  normalized.close();
+
+  const survived = await catalogue.get(sharedScope.id, noteId);
+  expect(survived.state).toBe('ready');
+  expect(survived.source.status).toBe('candidate');
+  const candidates = await catalogue.list(sharedScope.id, 'candidate');
+  expect(candidates.items.map((item) => item.revision_id)).toEqual([revisionId]);
+  expect(await catalogue.list(sharedScope.id, 'conflict')).toEqual({ items: [] });
+  await expectBrain(catalogue.get(scopeConfig.id, noteId), 'NOT_FOUND');
+});
+
+test('keeps a genuine cross-scope duplicate marker conflicted while both scopes hold it', async () => {
+  const root = makeVaultRoot();
+  const noteId = nextUuid();
+  const revisionId = nextUuid();
+  const inScope = makeRevision({ id: noteId, revision_id: revisionId, scope: scopeConfig.id });
+  const shared = makeRevision({ id: noteId, revision_id: revisionId, scope: sharedScope.id });
+  writeRevision(root, inScope);
+  writeRaw(
+    root,
+    relativePathFor(
+      sharedScope.relative_root,
+      shared.note.content.kind,
+      shared.id,
+      shared.note.title,
+      shared.revision_id
+    ),
+    renderRevision(shared, sharedScope)
+  );
+
+  const { catalogue } = openCatalogue(root);
+  const databasePath = join(root, 'catalogue.sqlite');
+  await catalogue.reconcile(scopeConfig.id);
+  await catalogue.reconcile(sharedScope.id);
+
+  const seed = new Database(databasePath);
+  seed
+    .prepare(
+      `UPDATE catalogue_revisions
+       SET state = 'conflict', is_head = 0, warnings_json = '["duplicate_identity","conflict"]'
+       WHERE scope = ?`
+    )
+    .run(sharedScope.id);
+  seed.close();
+
+  await catalogue.reconcile(scopeConfig.id);
+  await catalogue.reconcile(scopeConfig.id);
+
+  const kept = new Database(databasePath);
+  expect(
+    kept.prepare('SELECT state, is_head FROM catalogue_revisions WHERE scope = ?').get(sharedScope.id)
+  ).toEqual({ state: 'conflict', is_head: 0 });
+  kept.close();
+
+  await expectBrain(catalogue.get(sharedScope.id, noteId), 'CONFLICT');
+  const conflicts = await catalogue.list(sharedScope.id, 'conflict');
+  expect(conflicts.items).toHaveLength(1);
+  expect(conflicts.items[0].warnings).toContain('duplicate_identity');
+  expect((await catalogue.list(sharedScope.id, 'candidate')).items).toHaveLength(0);
+});
+
 test('returns a conflicted head when a parseable revision has a malformed duplicate', async () => {
   const root = makeVaultRoot();
   const noteId = nextUuid();
