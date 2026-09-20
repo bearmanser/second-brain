@@ -94,6 +94,16 @@ const receiptFor = (operationId: string): MutationReceipt => ({
   warnings: []
 });
 
+const errorFrom = (action: () => unknown): BrainError => {
+  try {
+    action();
+  } catch (error) {
+    if (error instanceof BrainError) return error;
+    throw error;
+  }
+  throw new Error('expected the action to throw a BrainError');
+};
+
 test('rejects different payloads under the same idempotency key', () => {
   const journal = Journal.open(':memory:');
   const input = {
@@ -127,6 +137,8 @@ test('replays an identical reservation and reuses the durable receipt', () => {
   expect(first.record.state).toBe('prepared');
 
   const receipt = receiptFor(first.record.operation_id);
+  journal.savePlan(first.record.operation_id, samplePlan(fixtureIds.revision));
+  journal.mark(first.record.operation_id, 'submitted');
   journal.mark(first.record.operation_id, 'complete', receipt);
 
   const replay = journal.reserve(reservation());
@@ -212,8 +224,15 @@ test('recovers submitted records but excludes terminal states from pending', () 
   const conflict = journal.reserve(reservation({ idempotency_key: 'conflict' }));
   const failed = journal.reserve(reservation({ idempotency_key: 'failed' }));
 
+  const plan = samplePlan(fixtureIds.revision);
+
+  journal.savePlan(submitted.record.operation_id, plan);
   journal.mark(submitted.record.operation_id, 'submitted');
+  journal.savePlan(materialized.record.operation_id, plan);
+  journal.mark(materialized.record.operation_id, 'submitted');
   journal.mark(materialized.record.operation_id, 'materialized');
+  journal.savePlan(complete.record.operation_id, plan);
+  journal.mark(complete.record.operation_id, 'submitted');
   journal.mark(complete.record.operation_id, 'complete', receiptFor(complete.record.operation_id));
   journal.mark(conflict.record.operation_id, 'conflict');
   journal.mark(failed.record.operation_id, 'failed');
@@ -234,6 +253,7 @@ test('prunes only terminal payloads older than seven days', () => {
 
   const oldComplete = journal.reserve(reservation({ idempotency_key: 'old-complete' }));
   journal.savePlan(oldComplete.record.operation_id, plan);
+  journal.mark(oldComplete.record.operation_id, 'submitted');
   journal.mark(oldComplete.record.operation_id, 'complete', receiptFor(oldComplete.record.operation_id));
 
   const oldFailed = journal.reserve(reservation({ idempotency_key: 'old-failed' }));
@@ -248,6 +268,7 @@ test('prunes only terminal payloads older than seven days', () => {
 
   const youngComplete = journal.reserve(reservation({ idempotency_key: 'young-complete' }));
   journal.savePlan(youngComplete.record.operation_id, plan);
+  journal.mark(youngComplete.record.operation_id, 'submitted');
   journal.mark(youngComplete.record.operation_id, 'complete', receiptFor(youngComplete.record.operation_id));
 
   const active = journal.reserve(reservation({ idempotency_key: 'active' }));
@@ -380,5 +401,136 @@ test('rejects writes to unknown operations and unknown states', () => {
   expect(() =>
     journal.mark(record.record.operation_id, 'unknown' as never)
   ).toThrow(/INVALID_INPUT/);
+  journal.close();
+});
+
+test('rejects submission before a plan has been saved', () => {
+  const journal = Journal.open(':memory:', { ids: new SequenceIds() });
+  const created = journal.reserve(reservation());
+  const failure = errorFrom(() => journal.mark(created.record.operation_id, 'submitted'));
+  expect(failure.code).toBe('CONFLICT');
+  expect(journal.get(created.record.operation_id)?.state).toBe('prepared');
+  journal.close();
+});
+
+test('stores the first plan, no-ops an identical plan, and rejects a different plan', () => {
+  const journal = Journal.open(':memory:', { ids: new SequenceIds() });
+  const created = journal.reserve(reservation());
+  const operationId = created.record.operation_id;
+  const plan = samplePlan(fixtureIds.revision);
+
+  journal.savePlan(operationId, plan);
+  expect(journal.get(operationId)?.plan_json).toBe(JSON.stringify(plan));
+
+  journal.savePlan(operationId, plan);
+  expect(journal.get(operationId)?.plan_json).toBe(JSON.stringify(plan));
+
+  const replacement = samplePlan('3a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d');
+  const failure = errorFrom(() => journal.savePlan(operationId, replacement));
+  expect(failure.code).toBe('CONFLICT');
+  expect(journal.get(operationId)?.plan_json).toBe(JSON.stringify(plan));
+  journal.close();
+});
+
+test('rejects non-monotonic transitions and terminal regressions', () => {
+  const journal = Journal.open(':memory:', { ids: new SequenceIds() });
+  const plan = samplePlan(fixtureIds.revision);
+
+  const skipped = journal.reserve(reservation({ idempotency_key: 'skipped' }));
+  journal.savePlan(skipped.record.operation_id, plan);
+  expect(errorFrom(() => journal.mark(skipped.record.operation_id, 'materialized')).code).toBe(
+    'CONFLICT'
+  );
+  expect(errorFrom(() => journal.mark(skipped.record.operation_id, 'complete')).code).toBe(
+    'CONFLICT'
+  );
+
+  const complete = journal.reserve(reservation({ idempotency_key: 'terminal' }));
+  journal.savePlan(complete.record.operation_id, plan);
+  journal.mark(complete.record.operation_id, 'submitted');
+  journal.mark(complete.record.operation_id, 'complete', receiptFor(complete.record.operation_id));
+
+  expect(errorFrom(() => journal.mark(complete.record.operation_id, 'submitted')).code).toBe(
+    'CONFLICT'
+  );
+  expect(errorFrom(() => journal.mark(complete.record.operation_id, 'materialized')).code).toBe(
+    'CONFLICT'
+  );
+  expect(journal.get(complete.record.operation_id)?.state).toBe('complete');
+
+  const differentPlan = samplePlan('4b2c3d4e-5f6a-4b7c-8d9e-0f1a2b3c4d5e');
+  expect(errorFrom(() => journal.savePlan(complete.record.operation_id, differentPlan)).code).toBe(
+    'CONFLICT'
+  );
+  expect(journal.get(complete.record.operation_id)?.plan_json).toBe(JSON.stringify(plan));
+
+  const conflicted = journal.reserve(reservation({ idempotency_key: 'conflicted' }));
+  journal.mark(conflicted.record.operation_id, 'conflict');
+  expect(errorFrom(() => journal.savePlan(conflicted.record.operation_id, plan)).code).toBe(
+    'CONFLICT'
+  );
+  journal.close();
+});
+
+test('rejects replacement of a durable terminal receipt', () => {
+  const journal = Journal.open(':memory:', { ids: new SequenceIds() });
+  const created = journal.reserve(reservation());
+  const operationId = created.record.operation_id;
+  journal.savePlan(operationId, samplePlan(fixtureIds.revision));
+  journal.mark(operationId, 'submitted');
+  const receipt = receiptFor(operationId);
+  journal.mark(operationId, 'complete', receipt);
+
+  const replacement = { ...receipt, indexed: true, warnings: ['mutated'] };
+  const failure = errorFrom(() => journal.mark(operationId, 'complete', replacement));
+  expect(failure.code).toBe('CONFLICT');
+  expect(journal.get(operationId)?.receipt_json).toBe(JSON.stringify(receipt));
+  journal.close();
+});
+
+test('refreshes only the availability flags of a durable terminal receipt', () => {
+  const journal = Journal.open(':memory:', { ids: new SequenceIds() });
+  const created = journal.reserve(reservation());
+  const operationId = created.record.operation_id;
+  const plan = samplePlan(fixtureIds.revision);
+  journal.savePlan(operationId, plan);
+  journal.mark(operationId, 'submitted');
+  journal.mark(operationId, 'complete', receiptFor(operationId));
+
+  const refreshed = journal.refreshReceiptAvailability(operationId, { indexed: true });
+  expect(refreshed.state).toBe('complete');
+  const stored = JSON.parse(refreshed.receipt_json ?? '{}') as MutationReceipt;
+  expect(stored.indexed).toBe(true);
+  expect(stored.materialized).toBe(true);
+  expect(stored.operation_id).toBe(operationId);
+  expect(stored.id).toBe(fixtureIds.note);
+  expect(stored.revision_id).toBe(fixtureIds.revision);
+  expect(stored.outcome).toBe('stored');
+  expect(stored.possible_duplicates).toEqual([]);
+  expect(stored.warnings).toEqual([]);
+
+  const second = journal.refreshReceiptAvailability(operationId, { materialized: false });
+  const secondStored = JSON.parse(second.receipt_json ?? '{}') as MutationReceipt;
+  expect(secondStored.materialized).toBe(false);
+  expect(secondStored.indexed).toBe(true);
+  expect(second.state).toBe('complete');
+
+  const persisted = journal.get(operationId);
+  expect(persisted?.state).toBe('complete');
+  expect(persisted?.plan_json).toBe(JSON.stringify(plan));
+  expect(persisted?.payload_hash).toBe('a'.repeat(64));
+
+  const notTerminal = journal.reserve(reservation({ idempotency_key: 'not-terminal' }));
+  expect(
+    errorFrom(() => journal.refreshReceiptAvailability(notTerminal.record.operation_id, { indexed: true }))
+      .code
+  ).toBe('CONFLICT');
+
+  const conflict = journal.reserve(reservation({ idempotency_key: 'terminal-no-receipt' }));
+  journal.mark(conflict.record.operation_id, 'conflict');
+  expect(
+    errorFrom(() => journal.refreshReceiptAvailability(conflict.record.operation_id, { indexed: true }))
+      .code
+  ).toBe('CONFLICT');
   journal.close();
 });

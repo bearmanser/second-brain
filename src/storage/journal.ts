@@ -19,6 +19,14 @@ export type OperationState = (typeof OPERATION_STATES)[number];
 
 const TERMINAL_STATES: readonly OperationState[] = ['complete', 'conflict', 'failed'];
 const PRUNABLE_STATES: readonly OperationState[] = ['complete', 'failed'];
+const ALLOWED_TRANSITIONS: Record<OperationState, readonly OperationState[]> = {
+  prepared: ['submitted', 'failed', 'conflict'],
+  submitted: ['materialized', 'complete', 'failed', 'conflict'],
+  materialized: ['complete', 'failed', 'conflict'],
+  complete: [],
+  conflict: [],
+  failed: []
+};
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const MIGRATION_FILE_PATTERN = /^(\d+)-[a-z0-9-]+\.sql$/;
 
@@ -61,6 +69,11 @@ export interface Migration {
   sql: string;
 }
 
+export interface ReceiptAvailability {
+  materialized?: boolean;
+  indexed?: boolean;
+}
+
 interface OperationRow {
   operation_id: string;
   principal_id: string;
@@ -82,6 +95,27 @@ function recoveryRequired(message: string, cause?: unknown): BrainError {
 
 function invalidInput(message: string): BrainError {
   return new BrainError({ code: 'INVALID_INPUT', message });
+}
+
+function conflict(message: string, operation_id: string): BrainError {
+  return new BrainError({ code: 'CONFLICT', message, operation_id });
+}
+
+function notFound(operation_id: string): BrainError {
+  return new BrainError({
+    code: 'NOT_FOUND',
+    message: `operation ${operation_id} was not found`,
+    operation_id
+  });
+}
+
+function isTerminal(state: OperationState): boolean {
+  return TERMINAL_STATES.includes(state);
+}
+
+function requireState(value: string, operation_id: string): OperationState {
+  if ((OPERATION_STATES as readonly string[]).includes(value)) return value as OperationState;
+  throw recoveryRequired(`operation ${operation_id} has an unknown stored state`);
 }
 
 function hasTable(database: Database.Database, name: string): boolean {
@@ -261,16 +295,23 @@ export class Journal {
 
   savePlan(id: string, plan: PlannedWrite): void {
     this.assertOpen();
-    const result = this.database
-      .prepare('UPDATE operations SET plan_json = ?, updated_at = ? WHERE operation_id = ?')
-      .run(JSON.stringify(plan), this.timestamp(), id);
-    if (result.changes === 0) {
-      throw new BrainError({
-        code: 'NOT_FOUND',
-        message: `operation ${id} was not found`,
-        operation_id: id
-      });
-    }
+    const payload = JSON.stringify(plan);
+    const timestamp = this.timestamp();
+    const run = this.database.transaction((): void => {
+      const row = this.requireRow(id);
+      const current = requireState(row.state, id);
+      if (row.plan_json !== null) {
+        if (row.plan_json === payload) return;
+        throw conflict(`operation ${id} already has a different persisted plan`, id);
+      }
+      if (isTerminal(current)) {
+        throw conflict(`operation ${id} is terminal; its plan is immutable`, id);
+      }
+      this.database
+        .prepare('UPDATE operations SET plan_json = ?, updated_at = ? WHERE operation_id = ?')
+        .run(payload, timestamp, id);
+    });
+    run.immediate();
   }
 
   mark(id: string, state: OperationState, receipt?: MutationReceipt): void {
@@ -279,23 +320,60 @@ export class Journal {
       throw invalidInput(`unknown operation state ${String(state)}`);
     }
     const timestamp = this.timestamp();
-    const result =
-      receipt === undefined
-        ? this.database
-            .prepare('UPDATE operations SET state = ?, updated_at = ? WHERE operation_id = ?')
-            .run(state, timestamp, id)
-        : this.database
-            .prepare(
-              'UPDATE operations SET state = ?, receipt_json = ?, updated_at = ? WHERE operation_id = ?'
-            )
-            .run(state, JSON.stringify(receipt), timestamp, id);
-    if (result.changes === 0) {
-      throw new BrainError({
-        code: 'NOT_FOUND',
-        message: `operation ${id} was not found`,
-        operation_id: id
-      });
-    }
+    const run = this.database.transaction((): void => {
+      const row = this.requireRow(id);
+      const current = requireState(row.state, id);
+      if (!ALLOWED_TRANSITIONS[current].includes(state)) {
+        throw conflict(`operation ${id} cannot move from ${current} to ${state}`, id);
+      }
+      if (state === 'submitted' && row.plan_json === null) {
+        throw conflict(`operation ${id} requires a saved plan before submission`, id);
+      }
+      if (receipt === undefined) {
+        this.database
+          .prepare('UPDATE operations SET state = ?, updated_at = ? WHERE operation_id = ?')
+          .run(state, timestamp, id);
+      } else {
+        this.database
+          .prepare(
+            'UPDATE operations SET state = ?, receipt_json = ?, updated_at = ? WHERE operation_id = ?'
+          )
+          .run(state, JSON.stringify(receipt), timestamp, id);
+      }
+    });
+    run.immediate();
+  }
+
+  refreshReceiptAvailability(id: string, availability: ReceiptAvailability): OperationRecord {
+    this.assertOpen();
+    const run = this.database.transaction((): OperationRecord => {
+      const row = this.requireRow(id);
+      const current = requireState(row.state, id);
+      if (!isTerminal(current)) {
+        throw conflict(`operation ${id} is not terminal; its receipt is not durable`, id);
+      }
+      if (row.receipt_json === null) {
+        throw conflict(`operation ${id} has no receipt to refresh`, id);
+      }
+      let receipt: MutationReceipt;
+      try {
+        receipt = JSON.parse(row.receipt_json) as MutationReceipt;
+      } catch (cause) {
+        throw recoveryRequired(`operation ${id} has an unreadable receipt`, cause);
+      }
+      if (availability.materialized !== undefined) {
+        receipt.materialized = availability.materialized;
+      }
+      if (availability.indexed !== undefined) {
+        receipt.indexed = availability.indexed;
+      }
+      const updated = JSON.stringify(receipt);
+      this.database
+        .prepare('UPDATE operations SET receipt_json = ? WHERE operation_id = ?')
+        .run(updated, id);
+      return toRecord({ ...row, receipt_json: updated });
+    });
+    return run.immediate();
   }
 
   get(id: string): OperationRecord | undefined {
@@ -356,6 +434,14 @@ export class Journal {
       .prepare('SELECT * FROM operations WHERE principal_id = ? AND idempotency_key = ?')
       .get(principal_id, idempotency_key) as OperationRow | undefined;
     return row === undefined ? undefined : toRecord(row);
+  }
+
+  private requireRow(id: string): OperationRow {
+    const row = this.database
+      .prepare('SELECT * FROM operations WHERE operation_id = ?')
+      .get(id) as OperationRow | undefined;
+    if (row === undefined) throw notFound(id);
+    return row;
   }
 
   private timestamp(): string {
