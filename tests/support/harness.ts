@@ -33,6 +33,12 @@ import type {
   VaultPort
 } from '../../src/core/types.js';
 import type { BrainServices } from '../../src/mcp/server.js';
+import {
+  buildManifest,
+  resolveBackupPath,
+  type BackupManifest,
+  type ManifestFile
+} from '../../src/operations/backup.js';
 import { RevisionCatalogue } from '../../src/notes/catalogue.js';
 import { encodeRevision, payloadHash, renderRevision } from '../../src/notes/codec.js';
 import { hashRaw, relativePathFor } from '../../src/notes/identity.js';
@@ -321,6 +327,71 @@ export async function createHarness(): Promise<MemoryHarness> {
   const harness = new MemoryHarnessImpl(root);
   await harness.start();
   return harness;
+}
+
+export interface BackupFixture {
+  root: string;
+  manifest: BackupManifest;
+  corrupt(relativePath: string): Promise<void>;
+  close(): Promise<void>;
+}
+
+export async function makeBackupFixture(): Promise<BackupFixture> {
+  const root = await mkdtemp(join(tmpdir(), 'brain-backup-'));
+  const notePath = join(root, 'vault', 'Projects', 'freellmapi', 'Notes', 'test.md');
+  await mkdir(dirname(notePath), { recursive: true });
+  await writeFile(
+    notePath,
+    [
+      '---',
+      'brain_schema_version: 1',
+      'brain_id: 0b8f1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d',
+      'brain_revision_id: 1c9f2d3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e',
+      'brain_scope: freellmapi',
+      '---',
+      '',
+      '# Synthetic backup note',
+      ''
+    ].join('\n'),
+    'utf8'
+  );
+  const statePath = join(root, 'state', 'journal.db');
+  await mkdir(dirname(statePath), { recursive: true });
+  await writeFile(statePath, 'synthetic-operational-database', 'utf8');
+  const files: ManifestFile[] = [];
+  for (const relativePath of [
+    'vault/Projects/freellmapi/Notes/test.md',
+    'state/journal.db'
+  ]) {
+    const buffer = await readFile(join(root, relativePath));
+    files.push({
+      path: relativePath,
+      size: buffer.byteLength,
+      sha256: createHash('sha256').update(buffer).digest('hex')
+    });
+  }
+  const manifest = buildManifest(files, {
+    application: 'second-brain',
+    schema: 1,
+    images: { brain: 'second-brain:test', memory: 'basic-memory:test' },
+    stores: ['vault', 'brain-state'],
+    created_at: '2026-09-20T00:00:00.000Z'
+  });
+  let closed = false;
+  return {
+    root,
+    manifest,
+    corrupt: async (relativePath: string) => {
+      const absolute = resolveBackupPath(root, relativePath);
+      const existing = await readFile(absolute);
+      await writeFile(absolute, Buffer.concat([existing, Buffer.from('\ncorrupted\n')]));
+    },
+    close: async () => {
+      if (closed) return;
+      closed = true;
+      await rm(root, { recursive: true, force: true });
+    }
+  };
 }
 
 export function armFault(harness: MemoryHarness, point: FaultPoint, options?: FaultOptions): void {

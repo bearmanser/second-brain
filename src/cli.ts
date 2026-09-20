@@ -1,25 +1,48 @@
 import { randomUUID } from 'node:crypto';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { loadCredentials } from './config/load.js';
 import { BrainError, isBrainError } from './contracts/errors.js';
 import type { Clock, IdSource } from './core/types.js';
-import { MutationCoordinator, InstanceLock } from './core/mutation.js';
+import { MutationCoordinator, InstanceLock, type BrainDeps } from './core/mutation.js';
 import { installShutdownHandlers, main, resolveConfig } from './main.js';
+import { APPLICATION_VERSION, SCHEMA_VERSION } from './mcp/tools.js';
 import { RevisionCatalogue } from './notes/catalogue.js';
+import { JournalApprovalProvenance } from './notes/reconcile.js';
+import {
+  assertCompatibleStateSchema,
+  buildManifest,
+  collectManifestFiles,
+  readManifestFile,
+  verifyManifest,
+  writeManifestFile
+} from './operations/backup.js';
 import { bootstrap } from './operations/bootstrap.js';
 import { health } from './operations/health.js';
+import { assertRecoveryMode, authenticateOwner, recoverPending, summariseRecovery } from './operations/recovery.js';
 import { BasicMemoryBackend } from './storage/basic-memory.js';
 import { Journal } from './storage/journal.js';
 import { FileVault } from './storage/vault.js';
 
-export type CliCommand = 'serve' | 'setup' | 'health' | 'recover' | 'rebuild-catalogue';
+export type CliCommand =
+  | 'serve'
+  | 'setup'
+  | 'health'
+  | 'recover'
+  | 'recover-state'
+  | 'rebuild-catalogue'
+  | 'backup-manifest'
+  | 'verify-backup';
 
 export const CLI_COMMANDS: readonly CliCommand[] = [
   'serve',
   'setup',
   'health',
   'recover',
-  'rebuild-catalogue'
+  'recover-state',
+  'rebuild-catalogue',
+  'backup-manifest',
+  'verify-backup'
 ];
 
 export interface ParsedArguments {
@@ -33,8 +56,12 @@ const systemIds: IdSource = { next: () => randomUUID() };
 
 const USAGE = [
   'usage: node dist/cli.js <command> [options]',
-  'commands: serve | setup | health | recover | rebuild-catalogue'
+  'commands: serve | setup | health | recover | recover-state | rebuild-catalogue | backup-manifest | verify-backup'
 ].join('\n');
+
+function invalidInput(message: string): BrainError {
+  return new BrainError({ code: 'INVALID_INPUT', message });
+}
 
 function isCommand(value: string): value is CliCommand {
   return (CLI_COMMANDS as readonly string[]).includes(value);
@@ -91,6 +118,25 @@ function flagBoolean(flags: Map<string, string | boolean>, name: string): boolea
   return flags.get(name) === true || flags.get(name) === 'true';
 }
 
+function flagList(flags: Map<string, string | boolean>, name: string): string[] {
+  const value = flagString(flags, name);
+  if (value === undefined) return [];
+  return value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
+
+function flagPairs(flags: Map<string, string | boolean>, name: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const entry of flagList(flags, name)) {
+    const separator = entry.indexOf('=');
+    if (separator <= 0) throw invalidInput(`--${name} entries must look like name=value`);
+    result[entry.slice(0, separator)] = entry.slice(separator + 1);
+  }
+  return result;
+}
+
 async function runSetup(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promise<number> {
   const root = flagString(parsed.flags, 'root') ?? env.BRAIN_SETUP_ROOT ?? process.cwd();
   const scope = flagString(parsed.flags, 'scope') ?? env.BRAIN_SETUP_SCOPE ?? 'freellmapi';
@@ -138,7 +184,8 @@ async function runRecover(_parsed: ParsedArguments, env: NodeJS.ProcessEnv): Pro
     catalogue = RevisionCatalogue.open(join(config.mounts.state, 'catalogue.db'), {
       vault,
       scopes: config.scopes,
-      clock: systemClock
+      clock: systemClock,
+      approval_provenance: new JournalApprovalProvenance(journal)
     });
     backend = new BasicMemoryBackend({
       url: config.backend_endpoint,
@@ -169,23 +216,151 @@ async function runRecover(_parsed: ParsedArguments, env: NodeJS.ProcessEnv): Pro
 async function runRebuildCatalogue(_parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promise<number> {
   const config = resolveConfig(env);
   const lock = InstanceLock.acquire(config.mounts.state);
+  let journal: Journal | undefined;
   let catalogue: RevisionCatalogue | undefined;
   try {
+    journal = Journal.open(join(config.mounts.state, 'journal.db'), { requireExisting: true });
     const vault = new FileVault(config.mounts.vault, config.scopes);
     catalogue = RevisionCatalogue.open(join(config.mounts.state, 'catalogue.db'), {
       vault,
       scopes: config.scopes,
-      clock: systemClock
+      clock: systemClock,
+      approval_provenance: new JournalApprovalProvenance(journal)
     });
+    let scanned = 0;
+    let conflicted = 0;
+    let malformed = 0;
+    let unsupported = 0;
     for (const scope of config.scopes) {
-      await catalogue.reconcile(scope.id);
+      const report = await catalogue.reconcileReport(scope.id);
+      scanned += report.scanned;
+      conflicted += report.conflicted;
+      malformed += report.malformed;
+      unsupported += report.unsupported_schema;
     }
-    process.stdout.write(`catalogue rebuilt for ${config.scopes.map((scope) => scope.id).join(', ')}\n`);
+    process.stdout.write(
+      `catalogue rebuilt for ${config.scopes.map((scope) => scope.id).join(', ')}; ` +
+        `scanned ${scanned}, conflicts ${conflicted}, malformed ${malformed}, unsupported ${unsupported}\n`
+    );
     return 0;
   } finally {
     catalogue?.close();
+    journal?.close();
     lock.release();
   }
+}
+
+function resolveAuthorization(
+  parsed: ParsedArguments,
+  env: NodeJS.ProcessEnv
+): string | undefined {
+  const token =
+    flagString(parsed.flags, 'token') ?? env.BRAIN_TOKEN ?? env.BRAIN_HEALTH_TOKEN;
+  if (token === undefined || token.length === 0) return undefined;
+  return `Bearer ${token}`;
+}
+
+async function runRecoverState(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promise<number> {
+  assertRecoveryMode(flagString(parsed.flags, 'mode'));
+  const config = resolveConfig(env);
+  const credentials = loadCredentials(config.credentials_file);
+  authenticateOwner(resolveAuthorization(parsed, env), credentials);
+  const lock = InstanceLock.acquire(config.mounts.state);
+  let journal: Journal | undefined;
+  let catalogue: RevisionCatalogue | undefined;
+  let backend: BasicMemoryBackend | undefined;
+  try {
+    journal = Journal.open(join(config.mounts.state, 'journal.db'), { requireExisting: true });
+    const vault = new FileVault(config.mounts.vault, config.scopes);
+    catalogue = RevisionCatalogue.open(join(config.mounts.state, 'catalogue.db'), {
+      vault,
+      scopes: config.scopes,
+      clock: systemClock,
+      approval_provenance: new JournalApprovalProvenance(journal)
+    });
+    backend = new BasicMemoryBackend({
+      url: config.backend_endpoint,
+      projects: config.scopes.map((scope) => scope.backend_project),
+      timeout_ms: config.limits.backend_timeout_ms
+    });
+    await backend.connect();
+    const mutations = new MutationCoordinator({
+      config,
+      backend,
+      vault,
+      catalogue,
+      journal,
+      clock: systemClock,
+      ids: systemIds
+    });
+    const deps: BrainDeps = {
+      config,
+      backend,
+      vault,
+      catalogue,
+      journal,
+      clock: systemClock,
+      ids: systemIds,
+      mutations
+    };
+    const report = await recoverPending(deps);
+    process.stdout.write(`${summariseRecovery(report)}\n`);
+    for (const operation of report.operations) {
+      process.stdout.write(
+        `  ${operation.operation_id} ${operation.previous_state}->${operation.state} ` +
+          `${operation.outcome}${operation.reason === undefined ? '' : ` (${operation.reason})`}\n`
+      );
+    }
+    return report.blocking_operations.length > 0 ? 1 : 0;
+  } finally {
+    await backend?.close().catch(() => undefined);
+    catalogue?.close();
+    journal?.close();
+    lock.release();
+  }
+}
+
+async function runBackupManifest(parsed: ParsedArguments): Promise<number> {
+  const root = flagString(parsed.flags, 'root') ?? '.';
+  const out = flagString(parsed.flags, 'out');
+  const stores = flagList(parsed.flags, 'store');
+  const images = flagPairs(parsed.flags, 'image');
+  const sensitive = flagBoolean(parsed.flags, 'sensitive');
+  const createdAt = flagString(parsed.flags, 'created-at');
+  let files = await collectManifestFiles(root);
+  if (out !== undefined && out !== '-') {
+    const base = resolve(root);
+    const target = resolve(out);
+    files = files.filter((file) => resolve(base, file.path) !== target);
+  }
+  const manifest = buildManifest(files, {
+    application: APPLICATION_VERSION,
+    schema: SCHEMA_VERSION,
+    images,
+    stores,
+    sensitive,
+    ...(createdAt === undefined ? {} : { created_at: createdAt })
+  });
+  if (out === undefined || out === '-') {
+    process.stdout.write(`${JSON.stringify(manifest, null, 2)}\n`);
+  } else {
+    await writeManifestFile(out, manifest);
+  }
+  process.stderr.write(`backup manifest: ${files.length} files\n`);
+  return 0;
+}
+
+async function runVerifyBackup(parsed: ParsedArguments): Promise<number> {
+  const root = flagString(parsed.flags, 'root') ?? '.';
+  const manifestPath = flagString(parsed.flags, 'manifest');
+  if (manifestPath === undefined) throw invalidInput('verify-backup requires --manifest');
+  const manifest = await readManifestFile(manifestPath);
+  assertCompatibleStateSchema(manifest, SCHEMA_VERSION);
+  await verifyManifest(root, manifest);
+  process.stdout.write(
+    `verified ${manifest.files.length} files (format ${manifest.format_version}, schema ${manifest.software.schema})\n`
+  );
+  return 0;
 }
 
 export async function runCli(
@@ -206,8 +381,14 @@ export async function runCli(
       return runHealth(parsed, env);
     case 'recover':
       return runRecover(parsed, env);
+    case 'recover-state':
+      return runRecoverState(parsed, env);
     case 'rebuild-catalogue':
       return runRebuildCatalogue(parsed, env);
+    case 'backup-manifest':
+      return runBackupManifest(parsed);
+    case 'verify-backup':
+      return runVerifyBackup(parsed);
   }
 }
 

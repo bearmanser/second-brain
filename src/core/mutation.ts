@@ -91,6 +91,33 @@ export interface BrainDeps {
   mutations: MutationCoordinator;
 }
 
+export type RecoveryOutcome = 'finalized' | 'conflicted' | 'failed' | 'released' | 'pending';
+
+export interface RecoveryOperationReport {
+  operation_id: string;
+  scope: string;
+  tool: string;
+  previous_state: OperationState;
+  state: OperationState;
+  outcome: RecoveryOutcome;
+  blocking: boolean;
+  warnings: string[];
+  reason?: string;
+  receipt?: MutationReceipt;
+}
+
+export interface RecoveryReport {
+  inspected: number;
+  finalized: number;
+  conflicted: number;
+  failed: number;
+  released: number;
+  pending: number;
+  blocking_operations: string[];
+  operations: RecoveryOperationReport[];
+  scopes: string[];
+}
+
 export interface MutationDeps {
   config: BrainConfig;
   backend: BackendPort;
@@ -396,6 +423,7 @@ export class InstanceLock {
 export class MutationCoordinator {
   private readonly deps: MutationDeps;
   private tail: Promise<unknown> = Promise.resolve();
+  private recoveryBlockers = new Set<string>();
 
   constructor(deps: MutationDeps) {
     this.deps = deps;
@@ -410,14 +438,46 @@ export class MutationCoordinator {
   }
 
   async recover(): Promise<void> {
-    await this.withLock(async () => {
+    await this.recoverDetailed();
+  }
+
+  setRecoveryBlockers(ids: readonly string[]): void {
+    this.recoveryBlockers = new Set(ids);
+  }
+
+  hasRecoveryBlockers(): boolean {
+    return this.recoveryBlockers.size > 0;
+  }
+
+  async recoverDetailed(): Promise<RecoveryReport> {
+    return this.withLock(async () => {
+      const operations: RecoveryOperationReport[] = [];
       for (const record of this.deps.journal.pending()) {
+        let operation: RecoveryOperationReport;
         try {
-          await this.recoverRecord(record);
+          operation = await this.recoverOne(record);
         } catch {
-          continue;
+          operation = this.failDefinitively(record, 'recovery_error');
         }
+        operations.push(operation);
       }
+      const blocking = operations
+        .filter((operation) => operation.blocking)
+        .map((operation) => operation.operation_id);
+      this.recoveryBlockers = new Set(blocking);
+      const count = (outcome: RecoveryOutcome): number =>
+        operations.filter((operation) => operation.outcome === outcome).length;
+      return {
+        inspected: operations.length,
+        finalized: count('finalized'),
+        conflicted: count('conflicted'),
+        failed: count('failed'),
+        released: count('released'),
+        pending: count('pending'),
+        blocking_operations: blocking,
+        operations,
+        scopes: this.deps.config.scopes.map((scope) => scope.id)
+      };
     });
   }
 
@@ -452,6 +512,17 @@ export class MutationCoordinator {
       payload_json: storedPayloadJson(digest.payload_json, advisory)
     };
     const reserved = this.deps.journal.reserve(reservation);
+    if (reserved.kind === 'new' && this.recoveryBlockers.size > 0) {
+      try {
+        this.deps.journal.abort(reserved.record.operation_id);
+      } catch {
+        this.recoveryBlockers.delete(reserved.record.operation_id);
+      }
+      throw recoveryRequired(
+        'an unresolved write requires recovery before new mutations are accepted',
+        reserved.record.operation_id
+      );
+    }
     return this.drive(ctx, scope, reserved, intent, build);
   }
 
@@ -826,9 +897,13 @@ export class MutationCoordinator {
       const refreshed = this.deps.journal.get(operation_id);
       if (refreshed?.receipt_json !== undefined) {
         const stored = parseReceipt(refreshed.receipt_json, operation_id);
-        if (stored.outcome !== 'pending') return applyAdvisory(stored, advisory);
+        if (stored.outcome !== 'pending') {
+          this.recoveryBlockers.delete(operation_id);
+          return applyAdvisory(stored, advisory);
+        }
       }
     }
+    this.recoveryBlockers.delete(operation_id);
     return receipt;
   }
 
@@ -886,8 +961,12 @@ export class MutationCoordinator {
   private markConflict(operation_id: string): void {
     const record = this.deps.journal.get(operation_id);
     if (record === undefined) return;
-    if (record.state === 'conflict' || record.state === 'complete' || record.state === 'failed') return;
+    if (record.state === 'conflict' || record.state === 'complete' || record.state === 'failed') {
+      this.recoveryBlockers.delete(operation_id);
+      return;
+    }
     this.deps.journal.mark(operation_id, 'conflict');
+    this.recoveryBlockers.delete(operation_id);
   }
 
   private loadPlan(record: OperationRecord): PlannedWrite | undefined {
@@ -916,14 +995,131 @@ export class MutationCoordinator {
     return plan as PlannedWrite;
   }
 
-  private async recoverRecord(record: OperationRecord): Promise<void> {
-    if (record.state === 'prepared') return;
-    const plan = this.loadPlan(record);
-    if (plan === undefined) return;
+  private async recoverOne(record: OperationRecord): Promise<RecoveryOperationReport> {
+    let plan: PlannedWrite | undefined;
+    try {
+      plan = this.loadPlan(record);
+    } catch {
+      return this.failDefinitively(record, 'unreadable_plan', ['plan_unreadable']);
+    }
+    if (plan === undefined) {
+      if (record.state === 'prepared') {
+        try {
+          this.deps.journal.abort(record.operation_id);
+          this.recoveryBlockers.delete(record.operation_id);
+          return this.operationReport(record, { outcome: 'released', reason: 'no_plan' });
+        } catch {
+          return this.failDefinitively(record, 'unreleasable_reservation');
+        }
+      }
+      return this.failDefinitively(record, 'missing_plan');
+    }
     const scope = this.deps.config.scopes.find((candidate) => candidate.id === record.scope);
-    if (scope === undefined) return;
+    if (scope === undefined) return this.failDefinitively(record, 'unknown_scope');
+    if (plan.revision.scope !== scope.id) return this.failDefinitively(record, 'plan_scope_mismatch');
+
     const scan = await this.scanMaterializations(scope, plan);
-    if (scan.kind !== 'conclusive' || scan.matches.length === 0) return;
-    await this.finalize(scope, plan, scan.matches, record.operation_id, advisoryFromRecord(record));
+    if (scan.kind === 'inconclusive') {
+      const blocking = record.state === 'submitted' || record.state === 'materialized';
+      return this.operationReport(record, {
+        outcome: 'pending',
+        reason: 'inconclusive_materialization',
+        blocking,
+        warnings: ['materialization_inconclusive']
+      });
+    }
+    if (scan.matches.length === 0) {
+      if (record.state === 'materialized') {
+        this.markConflict(record.operation_id);
+        return this.operationReport(record, {
+          outcome: 'conflicted',
+          reason: 'materialization_absent',
+          warnings: ['materialization_absent']
+        });
+      }
+      return this.operationReport(record, {
+        outcome: 'pending',
+        reason: 'not_materialized',
+        warnings: ['materialization_unconfirmed']
+      });
+    }
+
+    try {
+      if (record.state === 'prepared') this.deps.journal.mark(record.operation_id, 'submitted');
+      const receipt = await this.finalize(
+        scope,
+        plan,
+        scan.matches,
+        record.operation_id,
+        advisoryFromRecord(record)
+      );
+      this.recoveryBlockers.delete(record.operation_id);
+      const conflicted = receipt.outcome === 'stored_conflict';
+      return this.operationReport(record, {
+        outcome: conflicted ? 'conflicted' : 'finalized',
+        reason: conflicted ? 'materialization_conflict' : 'materialization_verified',
+        receipt,
+        warnings: receipt.warnings
+      });
+    } catch {
+      const current = this.deps.journal.get(record.operation_id);
+      const state = current?.state ?? record.state;
+      if (state === 'conflict' || state === 'complete') {
+        this.recoveryBlockers.delete(record.operation_id);
+        return this.operationReport(record, {
+          outcome: state === 'conflict' ? 'conflicted' : 'finalized',
+          reason: 'finalized_on_retry'
+        });
+      }
+      if (state === 'failed') {
+        this.recoveryBlockers.delete(record.operation_id);
+        return this.operationReport(record, { outcome: 'failed', reason: 'finalize_failed' });
+      }
+      return this.operationReport(record, {
+        outcome: 'pending',
+        reason: 'finalize_failed',
+        blocking: state === 'submitted' || state === 'materialized',
+        warnings: ['finalize_unconfirmed']
+      });
+    }
+  }
+
+  private operationReport(
+    record: OperationRecord,
+    input: {
+      outcome: RecoveryOutcome;
+      reason?: string;
+      blocking?: boolean;
+      warnings?: string[];
+      receipt?: MutationReceipt;
+    }
+  ): RecoveryOperationReport {
+    const report: RecoveryOperationReport = {
+      operation_id: record.operation_id,
+      scope: record.scope,
+      tool: record.tool,
+      previous_state: record.state,
+      state: this.deps.journal.get(record.operation_id)?.state ?? record.state,
+      outcome: input.outcome,
+      blocking: input.blocking === true,
+      warnings: input.warnings ?? []
+    };
+    if (input.reason !== undefined) report.reason = input.reason;
+    if (input.receipt !== undefined) report.receipt = input.receipt;
+    return report;
+  }
+
+  private failDefinitively(
+    record: OperationRecord,
+    reason: string,
+    warnings: string[] = []
+  ): RecoveryOperationReport {
+    try {
+      this.deps.journal.mark(record.operation_id, 'failed');
+    } catch {
+      this.recoveryBlockers.delete(record.operation_id);
+    }
+    this.recoveryBlockers.delete(record.operation_id);
+    return this.operationReport(record, { outcome: 'failed', reason, warnings });
   }
 }

@@ -30,6 +30,7 @@ import type { BrainServices } from './mcp/server.js';
 import { internalDiagnostic } from './mcp/tools.js';
 import { RevisionCatalogue } from './notes/catalogue.js';
 import { JournalApprovalProvenance, reconcileVault } from './notes/reconcile.js';
+import { recoverPending } from './operations/recovery.js';
 import { resolveScopes } from './security/authorise.js';
 import { BasicMemoryBackend } from './storage/basic-memory.js';
 import { Journal } from './storage/journal.js';
@@ -242,9 +243,10 @@ class BrainRuntimeImpl implements BrainRuntime {
       };
       this.deps = deps;
 
-      await mutations.recover();
+      await recoverPending(deps).then((report) => {
+        this.logRecovery(report);
+      });
       await this.startupReconcile();
-
       this.credentials = loadCredentials(this.config.credentials_file);
       await loadCursorSecret(this.config);
       this.startCredentialWatch();
@@ -388,6 +390,22 @@ class BrainRuntimeImpl implements BrainRuntime {
       }
     };
     void this.trackOperation(work());
+  }
+
+  private logRecovery(report: {
+    inspected: number;
+    finalized: number;
+    conflicted: number;
+    failed: number;
+    released: number;
+    pending: number;
+    blocking_operations: string[];
+  }): void {
+    this.log(
+      `recovery inspected ${report.inspected} operations; finalized ${report.finalized}, ` +
+        `conflicted ${report.conflicted}, failed ${report.failed}, released ${report.released}, ` +
+        `pending ${report.pending}, blocking ${report.blocking_operations.length}`
+    );
   }
 
   private logReconcile(report: {
