@@ -1,0 +1,230 @@
+import { z } from 'zod';
+import { BrainError } from '../contracts/errors.js';
+import type {
+  BackendHit,
+  BackendSearch,
+  Lifecycle,
+  NoteKind,
+  PlannedWrite,
+  RecallMode
+} from '../core/types.js';
+
+export const WRITE_NOTE_TOOL = 'write_note';
+export const SEARCH_NOTES_TOOL = 'search_notes';
+export const READ_NOTE_TOOL = 'read_note';
+export const LIST_MEMORY_PROJECTS_TOOL = 'list_memory_projects';
+
+export const REQUIRED_BACKEND_TOOLS = [
+  WRITE_NOTE_TOOL,
+  SEARCH_NOTES_TOOL,
+  READ_NOTE_TOOL,
+  LIST_MEMORY_PROJECTS_TOOL
+] as const;
+
+export const BRAIN_STATUS_KEY = 'brain_status';
+export const BRAIN_ID_KEY = 'brain_id';
+export const BRAIN_REVISION_ID_KEY = 'brain_revision_id';
+
+export const protocolError = (message: string, cause?: unknown): BrainError =>
+  new BrainError({ code: 'BACKEND_PROTOCOL_ERROR', message, cause });
+
+export const invalidInput = (message: string, cause?: unknown): BrainError =>
+  new BrainError({ code: 'INVALID_INPUT', message, cause });
+
+export interface WriteNoteArguments {
+  project: string;
+  title: string;
+  directory: string;
+  note_type: NoteKind;
+  content: string;
+  metadata: Record<string, unknown>;
+  overwrite: false;
+  output_format: 'json';
+}
+
+export interface MetadataInFilter<T> {
+  $in: T[];
+}
+
+export interface SearchNotesArguments {
+  project: string;
+  query: string;
+  search_type: RecallMode;
+  note_types: NoteKind[];
+  metadata_filters: { brain_status: MetadataInFilter<Lifecycle> };
+  page: number;
+  page_size: number;
+  search_all_projects: false;
+  output_format: 'json';
+}
+
+export interface IndexedLookupArguments {
+  project: string;
+  query: null;
+  search_all_projects: false;
+  output_format: 'json';
+  page: 1;
+  page_size: 1;
+  metadata_filters: { brain_revision_id: string };
+}
+
+export function argumentsForCreate(write: PlannedWrite): WriteNoteArguments {
+  return {
+    project: write.backend_project,
+    title: write.storage_title,
+    directory: write.directory,
+    note_type: write.revision.note.content.kind,
+    content: write.body,
+    metadata: write.metadata,
+    overwrite: false,
+    output_format: 'json'
+  };
+}
+
+export function argumentsForSearch(input: BackendSearch): SearchNotesArguments {
+  return {
+    project: input.project,
+    query: input.query,
+    search_type: input.mode,
+    note_types: [...input.kinds],
+    metadata_filters: { [BRAIN_STATUS_KEY]: { $in: [...input.statuses] } },
+    page: input.page,
+    page_size: input.page_size,
+    search_all_projects: false,
+    output_format: 'json'
+  };
+}
+
+export function argumentsForIndexedLookup(
+  project: string,
+  revision_id: string
+): IndexedLookupArguments {
+  return {
+    project,
+    query: null,
+    search_all_projects: false,
+    output_format: 'json',
+    page: 1,
+    page_size: 1,
+    metadata_filters: { [BRAIN_REVISION_ID_KEY]: revision_id }
+  };
+}
+
+export const createResponseSchema = z.object({
+  title: z.string(),
+  permalink: z.string(),
+  file_path: z.string().nullable().optional(),
+  checksum: z.string().nullable().optional(),
+  action: z.string(),
+  error: z.string().optional()
+});
+
+export type CreateResponse = z.infer<typeof createResponseSchema>;
+
+export const searchHitSchema = z.object({
+  title: z.string(),
+  type: z.string(),
+  score: z.number(),
+  entity: z.string(),
+  external_id: z.string(),
+  permalink: z.string(),
+  content: z.string(),
+  matched_chunk: z.string().optional(),
+  file_path: z.string(),
+  updated_at: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  entity_id: z.number().optional()
+});
+
+export type SearchHit = z.infer<typeof searchHitSchema>;
+
+export const searchResponseSchema = z.object({
+  results: z.array(searchHitSchema),
+  current_page: z.number().optional(),
+  page_size: z.number().optional(),
+  total: z.number().optional(),
+  total_is_exact: z.boolean().optional(),
+  has_more: z.boolean()
+});
+
+export type SearchResponse = z.infer<typeof searchResponseSchema>;
+
+export const projectSchema = z.object({
+  name: z.string()
+});
+
+export const projectsResponseSchema = z.object({
+  projects: z.array(projectSchema)
+});
+
+const metadataString = (
+  metadata: Record<string, unknown> | undefined,
+  key: string
+): string | undefined => {
+  const value = metadata?.[key];
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+};
+
+export function toBackendHit(hit: SearchHit): BackendHit {
+  return {
+    permalink: hit.permalink,
+    relative_path: hit.file_path,
+    revision_id: metadataString(hit.metadata, BRAIN_REVISION_ID_KEY) ?? hit.external_id,
+    logical_id: metadataString(hit.metadata, BRAIN_ID_KEY) ?? hit.external_id,
+    rank: hit.score,
+    matched_text: hit.matched_chunk ?? hit.content
+  };
+}
+
+export function decodeCreateResponse(value: unknown): {
+  permalink: string;
+  relative_path?: string;
+} {
+  const parsed = createResponseSchema.safeParse(value);
+  if (!parsed.success) {
+    throw protocolError('write_note response did not match the observed backend shape');
+  }
+  if (parsed.data.action === 'conflict') {
+    throw new BrainError({
+      code: 'CONFLICT',
+      message: `write_note refused to overwrite an existing note (${parsed.data.error ?? 'conflict'})`
+    });
+  }
+  if (parsed.data.action !== 'created') {
+    throw protocolError(`write_note returned an unknown action: ${parsed.data.action}`);
+  }
+  return parsed.data.file_path === null || parsed.data.file_path === undefined
+    ? { permalink: parsed.data.permalink }
+    : { permalink: parsed.data.permalink, relative_path: parsed.data.file_path };
+}
+
+export function decodeSearchResponse(value: unknown): {
+  hits: BackendHit[];
+  has_more: boolean;
+} {
+  const parsed = searchResponseSchema.safeParse(value);
+  if (!parsed.success) {
+    throw protocolError('search_notes response did not match the observed backend shape');
+  }
+  return {
+    hits: parsed.data.results.map(toBackendHit),
+    has_more: parsed.data.has_more
+  };
+}
+
+export function decodeProjectNames(value: unknown): string[] {
+  const parsed = projectsResponseSchema.safeParse(value);
+  if (!parsed.success) {
+    throw protocolError('list_memory_projects response did not match the observed backend shape');
+  }
+  return parsed.data.projects.map((project) => project.name);
+}
+
+export function assertRequiredBackendTools(tools: readonly string[]): void {
+  const observed = new Set(tools);
+  for (const name of REQUIRED_BACKEND_TOOLS) {
+    if (!observed.has(name)) {
+      throw protocolError(`backend is missing the required tool ${name}`);
+    }
+  }
+}
