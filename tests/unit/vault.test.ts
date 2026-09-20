@@ -7,7 +7,7 @@ import { RENDERED_NOTE_MAX_BYTES } from '../../src/core/limits.js';
 import type { ScopeConfig, StoredRevision } from '../../src/core/types.js';
 import { renderRevision } from '../../src/notes/codec.js';
 import { hashRaw, relativePathFor } from '../../src/notes/identity.js';
-import { FileVault, readBoundedBytes } from '../../src/storage/vault.js';
+import { FileVault, readBoundedBytes, type ByteReader } from '../../src/storage/vault.js';
 import { fixtureIds, lessonFixture } from '../fixtures/content.js';
 
 const temporaryRoot = join('/tmp/opencode', 'brain-vault-tests');
@@ -184,6 +184,44 @@ test('revalidates the scope directory chain after construction', async () => {
     vault.read(scopeConfig.id, 'freellmapi/Lessons/linked/secret.md'),
     'FORBIDDEN'
   );
+});
+
+test('rejects an intermediate configured-root component replaced by a symlink', async () => {
+  const root = makeVaultRoot();
+  const outside = makeVaultRoot();
+  const nestedScope: ScopeConfig = {
+    id: 'nested',
+    backend_project: 'nested',
+    relative_root: 'freellmapi/team/scope',
+    repository_aliases: []
+  };
+  const revision = makeRevision();
+  const filePath = 'freellmapi/team/scope/Lessons/x/note.md';
+  writeFile(root, filePath, renderRevision(revision, scopeConfig));
+  const vault = new FileVault(root, [nestedScope]);
+  expect(await vault.list('nested')).toEqual([filePath]);
+
+  rmSync(join(root, 'freellmapi', 'team'), { recursive: true, force: true });
+  mkdirSync(join(outside, 'scope', 'Lessons', 'x'), { recursive: true });
+  writeFileSync(join(outside, 'scope', 'Lessons', 'x', 'note.md'), renderRevision(revision, scopeConfig), 'utf8');
+  symlinkSync(outside, join(root, 'freellmapi', 'team'), 'dir');
+
+  await expectBrain(vault.list('nested'), 'FORBIDDEN');
+  await expectBrain(vault.read('nested', filePath), 'FORBIDDEN');
+});
+
+test('rejects a read that overflows the byte budget after the size check', async () => {
+  let allocated = 0;
+  const growing: ByteReader = {
+    read: async (buffer, _offset, length) => {
+      allocated = buffer.length;
+      buffer.fill(0x61, 0, length);
+      return { bytesRead: length };
+    }
+  };
+  const result = await readBoundedBytes(growing, RENDERED_NOTE_MAX_BYTES);
+  expect(result).toEqual({ kind: 'overflow' });
+  expect(allocated).toBe(RENDERED_NOTE_MAX_BYTES + 1);
 });
 
 test('bounds the file size at the rendered-note limit', async () => {

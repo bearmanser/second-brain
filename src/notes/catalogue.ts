@@ -115,6 +115,12 @@ function unique(values: string[]): string[] {
   return [...new Set(values)];
 }
 
+function compareText(left: string | null, right: string | null): number {
+  const a = left ?? '';
+  const b = right ?? '';
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 export function resolveHead(revisions: ParsedRevision[]): HeadResolution {
   if (revisions.length === 0) {
     return { state: 'conflict', reasons: ['empty'], heads: [] };
@@ -329,12 +335,6 @@ export class RevisionCatalogue implements CataloguePort {
         (globalRevisionLocations.get(item.revision.revision_id) ?? 0) + 1
       );
     }
-    const scannedRevisionIds = parsed.map((item) => item.revision.revision_id);
-    const duplicateAcrossScopes = new Set(
-      this.foreignRowsFor(scope, scannedRevisionIds)
-        .map((row) => row.revision_id)
-        .filter((id): id is string => id !== null)
-    );
 
     const groups = new Map<string, (Observation & { revision: StoredRevision })[]>();
     for (const item of parsed) {
@@ -350,10 +350,7 @@ export class RevisionCatalogue implements CataloguePort {
         if (seen.has(item.revision.revision_id)) groupWarnings.push('duplicate_identity');
         seen.add(item.revision.revision_id);
         if (item.revision.scope !== scope) groupWarnings.push('scope_mismatch');
-        if (
-          (globalRevisionLocations.get(item.revision.revision_id) ?? 0) > 1 ||
-          duplicateAcrossScopes.has(item.revision.revision_id)
-        ) {
+        if ((globalRevisionLocations.get(item.revision.revision_id) ?? 0) > 1) {
           groupWarnings.push('duplicate_identity');
         }
       }
@@ -440,7 +437,7 @@ export class RevisionCatalogue implements CataloguePort {
       });
     }
 
-    this.persist(scope, rows, parents, this.foreignRowsFor(scope, scannedRevisionIds));
+    this.persist(scope, rows, parents);
   }
 
   async get(scope: string, id: string): Promise<Head> {
@@ -505,25 +502,10 @@ export class RevisionCatalogue implements CataloguePort {
       throw invalidInput(`unknown catalogue filter ${String(filter)}`);
     }
     const offset = this.decodeCursor(cursor, scope, filter);
-    const rows =
-      filter === 'candidate'
-        ? (this.database
-            .prepare(
-              `SELECT * FROM catalogue_revisions
-               WHERE scope = ? AND state IN ('ready', 'manual_unreviewed')
-                 AND effective_status = 'candidate' AND is_head = 1
-               ORDER BY logical_id ASC, revision_id ASC, relative_path ASC`
-            )
-            .all(scope) as RevisionRow[])
-        : (this.database
-            .prepare(
-              `SELECT * FROM catalogue_revisions
-               WHERE scope = ? AND state = 'conflict'
-               ORDER BY logical_id ASC, revision_id ASC, relative_path ASC`
-            )
-            .all(scope) as RevisionRow[]);
+    const duplicates = this.duplicateRevisionIds();
+    const rows = filter === 'candidate' ? this.candidateRows(scope, duplicates) : this.conflictRows(scope, duplicates);
     const items = rows
-      .map((row) => this.sourceRefFromRow(row))
+      .map((row) => this.sourceRefFromRow(row, duplicates))
       .filter((item): item is SourceRef => item !== undefined);
     const page = items.slice(offset, offset + LIST_PAGE_SIZE);
     const next = offset + LIST_PAGE_SIZE < items.length ? this.encodeCursor(offset + LIST_PAGE_SIZE, scope, filter) : undefined;
@@ -665,13 +647,17 @@ export class RevisionCatalogue implements CataloguePort {
     };
   }
 
-  private sourceRefFromRow(row: RevisionRow): SourceRef | undefined {
+  private sourceRefFromRow(row: RevisionRow, duplicates?: Set<string>): SourceRef | undefined {
     if (row.logical_id === null || row.revision_id === null) return undefined;
     if (row.title === null || row.kind === null || row.effective_status === null) return undefined;
     if (!uuidSchema.safeParse(row.logical_id).success) return undefined;
     if (!uuidSchema.safeParse(row.revision_id).success) return undefined;
     if (!(NOTE_KINDS as readonly string[]).includes(row.kind)) return undefined;
     if (!(LIFECYCLES as readonly string[]).includes(row.effective_status)) return undefined;
+    const warnings = parseWarnings(row.warnings_json);
+    if (duplicates !== undefined && duplicates.has(row.revision_id) && !warnings.includes('duplicate_identity')) {
+      warnings.push('duplicate_identity');
+    }
     return {
       id: row.logical_id,
       revision_id: row.revision_id,
@@ -681,8 +667,57 @@ export class RevisionCatalogue implements CataloguePort {
       status: row.effective_status as Lifecycle,
       etag: makeEtag(row.revision_id, row.raw_hash),
       relative_path: row.relative_path,
-      warnings: parseWarnings(row.warnings_json)
+      warnings
     };
+  }
+
+  private candidateRows(scope: string, duplicates: Set<string>): RevisionRow[] {
+    const rows = this.database
+      .prepare(
+        `SELECT * FROM catalogue_revisions
+         WHERE scope = ? AND state IN ('ready', 'manual_unreviewed')
+           AND effective_status = 'candidate' AND is_head = 1
+         ORDER BY logical_id ASC, revision_id ASC, relative_path ASC`
+      )
+      .all(scope) as RevisionRow[];
+    return rows.filter((row) => row.revision_id === null || !duplicates.has(row.revision_id));
+  }
+
+  private conflictRows(scope: string, duplicates: Set<string>): RevisionRow[] {
+    const stored = this.database
+      .prepare(
+        `SELECT * FROM catalogue_revisions
+         WHERE scope = ? AND state = 'conflict'
+         ORDER BY logical_id ASC, revision_id ASC, relative_path ASC`
+      )
+      .all(scope) as RevisionRow[];
+    const ids = [...duplicates];
+    const dynamic =
+      ids.length === 0
+        ? []
+        : (this.database
+            .prepare(
+              `SELECT * FROM catalogue_revisions
+               WHERE scope = ? AND revision_id IN (${ids.map(() => '?').join(', ')})
+               ORDER BY logical_id ASC, revision_id ASC, relative_path ASC`
+            )
+            .all(scope, ...ids) as RevisionRow[]);
+    const merged = new Map<string, RevisionRow>();
+    for (const row of [...stored, ...dynamic]) merged.set(row.relative_path, row);
+    return [...merged.values()].sort((left, right) => compareText(left.logical_id, right.logical_id)
+      || compareText(left.revision_id, right.revision_id)
+      || compareText(left.relative_path, right.relative_path));
+  }
+
+  private duplicateRevisionIds(): Set<string> {
+    const rows = this.database
+      .prepare(
+        `SELECT revision_id FROM catalogue_revisions
+         WHERE revision_id IS NOT NULL
+         GROUP BY revision_id HAVING COUNT(*) > 1`
+      )
+      .all() as { revision_id: string }[];
+    return new Set(rows.map((row) => row.revision_id));
   }
 
   private foreignRowsFor(scope: string, revisionIds: string[]): RevisionRow[] {
@@ -716,12 +751,7 @@ export class RevisionCatalogue implements CataloguePort {
       .all(scope, id, revisionId) as RevisionRow[];
   }
 
-  private persist(
-    scope: string,
-    rows: RevisionRow[],
-    parents: ParentRow[],
-    foreignDuplicates: RevisionRow[]
-  ): void {
+  private persist(scope: string, rows: RevisionRow[], parents: ParentRow[]): void {
     const run = this.database.transaction((): void => {
       this.database.prepare('DELETE FROM catalogue_parents WHERE scope = ?').run(scope);
       this.database.prepare('DELETE FROM catalogue_revisions WHERE scope = ?').run(scope);
@@ -754,15 +784,6 @@ export class RevisionCatalogue implements CataloguePort {
       );
       for (const parent of parents) {
         insertParent.run(parent.scope, parent.revision_id, parent.parent_revision_id, parent.parent_raw_hash);
-      }
-      const markDuplicate = this.database.prepare(
-        `UPDATE catalogue_revisions
-         SET state = 'conflict', is_head = 0, warnings_json = ?
-         WHERE scope = ? AND relative_path = ?`
-      );
-      for (const row of foreignDuplicates) {
-        const warnings = unique([...parseWarnings(row.warnings_json), 'duplicate_identity', 'conflict']);
-        markDuplicate.run(JSON.stringify(warnings), row.scope, row.relative_path);
       }
     });
     run.immediate();
