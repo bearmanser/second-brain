@@ -66,6 +66,17 @@ function cancelled(): BrainError {
   return new BrainError({ code: 'CANCELLED', message: 'the caller cancelled the recall' });
 }
 
+function normalizeBackendFailure(error: unknown): unknown {
+  if (isBrainError(error) && error.code === 'CANCELLED') {
+    return new BrainError({
+      code: 'BACKEND_UNAVAILABLE',
+      message: 'the backend cancelled the search',
+      cause: error
+    });
+  }
+  return error;
+}
+
 function resolveLimit(value: number | undefined): number {
   if (value === undefined || !Number.isFinite(value)) return RECALL_LIMIT_DEFAULT;
   const rounded = Math.trunc(value);
@@ -170,10 +181,12 @@ async function collectScopes(
           page_size: BACKEND_SEARCH_PAGE_SIZE
         });
       } catch (error) {
+        if (ctx.signal.aborted) throw cancelled();
         accumulator.failure = error;
         accumulator.scopeHits.push(result);
         return accumulator;
       }
+      if (ctx.signal.aborted) throw cancelled();
       accumulator.processedPages += 1;
       result.hits.push(...pageResult.hits);
       accumulator.hits += pageResult.hits.length;
@@ -450,22 +463,24 @@ export async function recall(
     mode === 'hybrid' &&
     request.allow_text_fallback === true
   ) {
+    const hybridHasState = accumulator.processedPages > 0 || accumulator.hits > 0;
     const fallback = await collectScopes(ctx, scopes, searchText, kinds, 'text', deps, deadline);
-    mode = 'text';
-    partial = true;
-    if (!warnings.includes(RECALL_WARNING_EMBEDDINGS_FALLBACK)) {
-      warnings.push(RECALL_WARNING_EMBEDDINGS_FALLBACK);
-    }
-    if (fallback.failure === undefined) {
+    const fallbackUsable = fallback.failure === undefined && fallback.hits > 0;
+    if (fallbackUsable || (!hybridHasState && fallback.failure === undefined)) {
       accumulator = fallback;
-    } else if (accumulator.processedPages === 0 && accumulator.hits === 0) {
-      throw fallback.failure;
+      mode = 'text';
+      partial = true;
+      if (!warnings.includes(RECALL_WARNING_EMBEDDINGS_FALLBACK)) {
+        warnings.push(RECALL_WARNING_EMBEDDINGS_FALLBACK);
+      }
+    } else if (!hybridHasState) {
+      throw normalizeBackendFailure(fallback.failure);
     }
   }
 
   if (accumulator.failure !== undefined) {
     if (accumulator.processedPages === 0 && accumulator.hits === 0) {
-      throw accumulator.failure;
+      throw normalizeBackendFailure(accumulator.failure);
     }
     partial = true;
     if (!warnings.includes(RECALL_WARNING_BACKEND_PARTIAL)) {

@@ -495,6 +495,7 @@ test('separates embedding failure from a degraded text fallback', async () => {
   expect(degraded.partial).toBe(true);
   expect(degraded.warnings).toContain(RECALL_WARNING_EMBEDDINGS_FALLBACK);
   expect(degraded.items).toHaveLength(1);
+  expect(degraded.items[0].reasons).toContain('text_mode');
   await h.close();
 });
 
@@ -833,6 +834,102 @@ test('throws CANCELLED for a caller-aborted request', async () => {
   await expect(
     recall(aborted, { scope: 'freellmapi', query: 'streaming' }, h.deps)
   ).rejects.toThrow(/CANCELLED/);
+  await h.close();
+});
+
+test('throws CANCELLED when the caller aborts during an in-flight backend call', async () => {
+  const h = await createHarness();
+  await h.seed(lessonFixture, { status: 'active' });
+  const controller = new AbortController();
+  const aborted = { ...reviewerContext, signal: controller.signal };
+  const original = h.backend.search.bind(h.backend);
+  h.backend.search = async (input: BackendSearch) => {
+    controller.abort();
+    return original(input);
+  };
+  await expect(
+    recall(aborted, { scope: 'freellmapi', query: 'streaming' }, h.deps)
+  ).rejects.toThrow(/CANCELLED/);
+  await h.close();
+});
+
+test('throws CANCELLED when the caller aborts and the in-flight call fails', async () => {
+  const h = await createHarness();
+  await h.seed(lessonFixture, { status: 'active' });
+  const controller = new AbortController();
+  const aborted = { ...reviewerContext, signal: controller.signal };
+  h.backend.search = async () => {
+    controller.abort();
+    throw new BrainError({ code: 'BACKEND_UNAVAILABLE', message: 'in-flight failure' });
+  };
+  await expect(
+    recall(aborted, { scope: 'freellmapi', query: 'streaming' }, h.deps)
+  ).rejects.toThrow(/CANCELLED/);
+  await h.close();
+});
+
+test('normalizes a first-call backend CANCELLED to BACKEND_UNAVAILABLE', async () => {
+  const h = await createHarness();
+  await h.seed(lessonFixture, { status: 'active' });
+  h.backend.search = async () => {
+    throw new BrainError({ code: 'CANCELLED', message: 'the backend cancelled the search' });
+  };
+  await expect(
+    recall(reviewerContext, { scope: 'freellmapi', query: 'streaming' }, h.deps)
+  ).rejects.toThrow(/BACKEND_UNAVAILABLE/);
+  await h.close();
+});
+
+test('retains hybrid hits when the text fallback also fails', async () => {
+  const h = await createHarness();
+  await h.seed(lessonFixture, { status: 'active' });
+  const original = h.backend.search.bind(h.backend);
+  h.backend.search = async (input: BackendSearch) => {
+    if (input.mode === 'hybrid') {
+      if (input.page === 1) {
+        const real = await original(input);
+        return { hits: real.hits, has_more: true };
+      }
+      throw new BrainError({ code: 'EMBEDDINGS_UNAVAILABLE', message: 'hybrid page two failed' });
+    }
+    throw new BrainError({ code: 'BACKEND_UNAVAILABLE', message: 'text fallback failed' });
+  };
+  const result = await recall(reviewerContext, {
+    scope: 'freellmapi',
+    query: 'streaming',
+    allow_text_fallback: true
+  }, h.deps);
+  expect(result.partial).toBe(true);
+  expect(result.mode).toBe('hybrid');
+  expect(result.items).toHaveLength(1);
+  expect(result.items[0].reasons).toContain('hybrid_mode');
+  expect(result.items[0].reasons).not.toContain('text_mode');
+  expect(result.warnings).toContain(RECALL_WARNING_BACKEND_PARTIAL);
+  await h.close();
+});
+
+test('does not replace retained hybrid hits with an empty text fallback', async () => {
+  const h = await createHarness();
+  await h.seed(lessonFixture, { status: 'active' });
+  const original = h.backend.search.bind(h.backend);
+  h.backend.search = async (input: BackendSearch) => {
+    if (input.mode === 'hybrid') {
+      if (input.page === 1) {
+        const real = await original(input);
+        return { hits: real.hits, has_more: true };
+      }
+      throw new BrainError({ code: 'EMBEDDINGS_UNAVAILABLE', message: 'hybrid page two failed' });
+    }
+    return { hits: [], has_more: false };
+  };
+  const result = await recall(reviewerContext, {
+    scope: 'freellmapi',
+    query: 'streaming',
+    allow_text_fallback: true
+  }, h.deps);
+  expect(result.partial).toBe(true);
+  expect(result.mode).toBe('hybrid');
+  expect(result.items).toHaveLength(1);
   await h.close();
 });
 
