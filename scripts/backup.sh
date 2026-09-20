@@ -7,10 +7,11 @@ cd "$ROOT_DIR"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-second-brain}"
 INCLUDE_SECRETS=0
 NOTES_ONLY=0
+INCLUDE_MODEL_CACHE=0
 ASSUME_YES=0
 DESTINATION=""
 POSITIONALS=()
-USAGE="usage: backup.sh DESTINATION [--yes] [--notes-only] [--include-secrets] [--project NAME]"
+USAGE="usage: backup.sh DESTINATION [--yes] [--notes-only] [--include-secrets] [--include-model-cache] [--project NAME]"
 
 fail() {
   printf 'backup: %s\n' "$1" >&2
@@ -26,6 +27,7 @@ while [ $# -gt 0 ]; do
     --yes | -y) ASSUME_YES=1 ;;
     --notes-only) NOTES_ONLY=1 ;;
     --include-secrets) INCLUDE_SECRETS=1 ;;
+    --include-model-cache) INCLUDE_MODEL_CACHE=1 ;;
     --project) shift; COMPOSE_PROJECT_NAME="${1:-}"; [ -n "$COMPOSE_PROJECT_NAME" ] || fail "--project requires a value" ;;
     --project=*) COMPOSE_PROJECT_NAME="${1#*=}" ;;
     -h | --help) printf '%s\n' "$USAGE"; exit 0 ;;
@@ -84,6 +86,53 @@ VAULT_PATH="${VAULT_PATH:-./vault}"
 [ -d "$VAULT_PATH" ] || fail "vault path does not exist: $VAULT_PATH"
 VAULT_ABS="$(cd "$VAULT_PATH" && pwd -P)"
 
+resolve_compose_volumes() {
+  local key name
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    name="$(docker volume ls -q \
+      --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
+      --filter "label=com.docker.compose.volume=$key" | head -n1)"
+    [ -n "$name" ] || fail "could not resolve the Compose volume for key '$key' in project $COMPOSE_PROJECT_NAME"
+    printf '%s\t%s\n' "$key" "$name"
+  done < <(docker compose -p "$COMPOSE_PROJECT_NAME" config --volumes)
+}
+
+SELECTED_VOLUMES=()
+if [ "$NOTES_ONLY" = "0" ]; then
+  while IFS=$'\t' read -r key volume; do
+    [ -n "$key" ] || continue
+    if [ "$key" = "model-cache" ] && [ "$INCLUDE_MODEL_CACHE" != "1" ]; then
+      note "skipping the derived model-cache volume (rebuildable; pass --include-model-cache to archive it)"
+      continue
+    fi
+    SELECTED_VOLUMES+=("$key"$'\t'"$volume")
+  done < <(resolve_compose_volumes)
+fi
+
+find_vault_symlink() {
+  find "$VAULT_ABS" -type l -print 2>/dev/null | LC_ALL=C sort | head -n1
+}
+
+find_volume_symlink() {
+  docker run --rm --user 0:0 -v "$1":/volume:ro --entrypoint sh "$NODE_IMAGE" \
+    -c 'find /volume -type l -print 2>/dev/null | sort | head -n1'
+}
+
+note "checking the vault and selected volumes for symbolic links"
+VAULT_SYMLINK="$(find_vault_symlink)"
+if [ -n "$VAULT_SYMLINK" ]; then
+  fail "the vault contains a symbolic link and cannot be archived without following it outside the source boundary: $VAULT_SYMLINK"
+fi
+for entry in ${SELECTED_VOLUMES[@]+"${SELECTED_VOLUMES[@]}"}; do
+  key="${entry%%$'\t'*}"
+  volume="${entry#*$'\t'}"
+  VOLUME_SYMLINK="$(find_volume_symlink "$volume")"
+  if [ -n "$VOLUME_SYMLINK" ]; then
+    fail "volume $key ($volume) contains a symbolic link and cannot be archived without following it outside the source boundary: $VOLUME_SYMLINK"
+  fi
+done
+
 DESTINATION_PARENT="$(dirname "$DESTINATION")"
 [ -d "$DESTINATION_PARENT" ] || fail "destination parent does not exist: $DESTINATION_PARENT"
 mkdir -p "$DESTINATION"
@@ -117,43 +166,32 @@ snapshot_volume() {
     -c 'cd /volume 2>/dev/null || exit 0; find . -type f -print0 | sort -z | xargs -0 -r sha256sum'
 }
 
-resolve_compose_volumes() {
-  local key name
-  while IFS= read -r key; do
-    [ -n "$key" ] || continue
-    name="$(docker volume ls -q \
-      --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
-      --filter "label=com.docker.compose.volume=$key" | head -n1)"
-    [ -n "$name" ] || fail "could not resolve the Compose volume for key '$key' in project $COMPOSE_PROJECT_NAME"
-    printf '%s\t%s\n' "$key" "$name"
-  done < <(docker compose -p "$COMPOSE_PROJECT_NAME" config --volumes)
-}
-
 STORES=("vault")
 VOLUME_MAP=""
 
 note "archiving the host vault"
 BEFORE_VAULT="$(snapshot_dir "$VAULT_ABS")"
-tar -h -cf "$DESTINATION/vault.tar" -C "$VAULT_ABS" .
+tar -cf "$DESTINATION/vault.tar" -C "$VAULT_ABS" .
 AFTER_VAULT="$(snapshot_dir "$VAULT_ABS")"
 if [ "$BEFORE_VAULT" != "$AFTER_VAULT" ]; then
   fail "the vault changed while it was being copied; aborting because the backup is inconsistent (is Obsidian/sync really paused?)"
 fi
 
 if [ "$NOTES_ONLY" = "0" ]; then
-  while IFS=$'\t' read -r key volume; do
-    [ -n "$key" ] || continue
+  for entry in ${SELECTED_VOLUMES[@]+"${SELECTED_VOLUMES[@]}"}; do
+    key="${entry%%$'\t'*}"
+    volume="${entry#*$'\t'}"
     note "archiving Compose volume $key ($volume)"
     BEFORE="$(snapshot_volume "$volume")"
     docker run --rm --user 0:0 -v "$volume":/volume:ro -v "$DESTINATION/volumes":/backup \
-      --entrypoint tar "$NODE_IMAGE" -h -C /volume -cf "/backup/$key.tar" .
+      --entrypoint tar "$NODE_IMAGE" -C /volume -cf "/backup/$key.tar" .
     AFTER="$(snapshot_volume "$volume")"
     if [ "$BEFORE" != "$AFTER" ]; then
       fail "volume $volume changed while it was being copied; aborting because the backup is inconsistent"
     fi
     STORES+=("$key")
     VOLUME_MAP="${VOLUME_MAP:+$VOLUME_MAP,}$key=$volume"
-  done < <(resolve_compose_volumes)
+  done
 fi
 
 SENSITIVE=0

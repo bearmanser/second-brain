@@ -1094,12 +1094,18 @@ export class MutationCoordinator {
       receipt?: MutationReceipt;
     }
   ): RecoveryOperationReport {
+    let state = record.state;
+    try {
+      state = this.deps.journal.get(record.operation_id)?.state ?? record.state;
+    } catch {
+      state = record.state;
+    }
     const report: RecoveryOperationReport = {
       operation_id: record.operation_id,
       scope: record.scope,
       tool: record.tool,
       previous_state: record.state,
-      state: this.deps.journal.get(record.operation_id)?.state ?? record.state,
+      state,
       outcome: input.outcome,
       blocking: input.blocking === true,
       warnings: input.warnings ?? []
@@ -1109,22 +1115,28 @@ export class MutationCoordinator {
     return report;
   }
 
+  private confirmedFailed(record: OperationRecord): boolean {
+    try {
+      return this.deps.journal.get(record.operation_id)?.state === 'failed';
+    } catch {
+      return false;
+    }
+  }
+
   private failDefinitively(
     record: OperationRecord,
     reason: string,
     warnings: string[] = []
   ): RecoveryOperationReport {
-    let marked = false;
+    let persistedFailed = false;
     try {
       this.deps.journal.mark(record.operation_id, 'failed');
-      marked = true;
+      persistedFailed = this.confirmedFailed(record);
     } catch {
-      marked = false;
+      persistedFailed = false;
     }
-    const persisted = marked
-      ? 'failed'
-      : (this.deps.journal.get(record.operation_id)?.state ?? record.state);
-    if (persisted !== 'failed') {
+    if (!persistedFailed && this.confirmedFailed(record)) persistedFailed = true;
+    if (!persistedFailed) {
       this.recoveryBlockers.add(record.operation_id);
       return this.operationReport(record, {
         outcome: 'pending',

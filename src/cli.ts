@@ -213,13 +213,22 @@ async function runRecover(_parsed: ParsedArguments, env: NodeJS.ProcessEnv): Pro
   }
 }
 
-async function runRebuildCatalogue(_parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promise<number> {
+async function runRebuildCatalogue(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promise<number> {
   const config = resolveConfig(env);
+  const acceptLoss = flagBoolean(parsed.flags, 'accept-operational-loss');
   const lock = InstanceLock.acquire(config.mounts.state);
   let journal: Journal | undefined;
   let catalogue: RevisionCatalogue | undefined;
   try {
-    journal = Journal.open(join(config.mounts.state, 'journal.db'), { requireExisting: true });
+    if (acceptLoss) {
+      journal = Journal.open(join(config.mounts.state, 'journal.db'));
+      process.stdout.write(
+        'catalogue rebuild acknowledged operational loss: journal.db was initialized fresh; ' +
+          'retry and feedback history is gone and this is not full operational recovery\n'
+      );
+    } else {
+      journal = Journal.open(join(config.mounts.state, 'journal.db'), { requireExisting: true });
+    }
     const vault = new FileVault(config.mounts.vault, config.scopes);
     catalogue = RevisionCatalogue.open(join(config.mounts.state, 'catalogue.db'), {
       vault,

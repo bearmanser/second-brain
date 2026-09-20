@@ -1,6 +1,6 @@
 import { spawnSync, type SpawnSyncOptions } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -226,15 +226,17 @@ describe('disposable Compose operations', () => {
     const manifest = manifestOf(backupDir);
     expect(manifest.format_version).toBe(1);
     expect(manifest.stores).toEqual(
-      expect.arrayContaining(['vault', 'brain-state', 'memory-state', 'model-cache'])
+      expect.arrayContaining(['vault', 'brain-state', 'memory-state'])
     );
+    expect(manifest.stores).not.toContain('model-cache');
     expect(manifest.volumes['brain-state']).toBe(`${project}_brain-state`);
     expect(manifest.volumes['memory-state']).toBe(`${project}_memory-state`);
-    expect(manifest.volumes['model-cache']).toBe(`${project}_model-cache`);
+    expect(manifest.volumes['model-cache']).toBeUndefined();
     expect(manifest.sensitive).toBe(false);
     const paths = manifest.files.map((file) => file.path);
     expect(paths).toContain('vault.tar');
     expect(paths).toContain('volumes/brain-state.tar');
+    expect(paths).not.toContain('volumes/model-cache.tar');
     expect(paths).not.toContain('secrets.tar');
     expect(existsSync(join(backupDir, 'checksums.sha256'))).toBe(true);
 
@@ -285,12 +287,13 @@ describe('disposable Compose operations', () => {
     });
     expect(rebuilt.status).toBe(0);
     expect(`${rebuilt.stdout}${rebuilt.stderr}`).toMatch(/rebuilding the gateway catalogue/);
-    expect(`${rebuilt.stdout}${rebuilt.stderr}`).toMatch(/operation journal and feedback records are intact/);
+    expect(`${rebuilt.stdout}${rebuilt.stderr}`).toMatch(/capturing the pre-rebuild journal and feedback state/);
+    expect(`${rebuilt.stdout}${rebuilt.stderr}`).toMatch(/rows are byte-for-byte unchanged/);
     expect(`${rebuilt.stdout}${rebuilt.stderr}`).toMatch(/NOT full operational recovery/);
     await waitForHealth(300_000);
   }, 900_000);
 
-  test('rebuild.sh refuses without acknowledgment and refuses a missing journal', () => {
+  test('rebuild.sh refuses without acknowledgment, refuses a missing journal, and completes an acknowledged loss', async () => {
     const noAck = run('bash', ['scripts/rebuild.sh', '--search'], {
       cwd: workDir,
       env: env({ VAULT_PATH: vaultPath }),
@@ -317,20 +320,49 @@ describe('disposable Compose operations', () => {
     expect(missing.status).not.toBe(0);
     expect(`${missing.stdout}${missing.stderr}`).toMatch(/restore it from a backup/);
 
+    compose(['stop', 'brain']);
+    run('docker', [
+      'run',
+      '--rm',
+      '--user',
+      '0:0',
+      '-v',
+      `${project}_brain-state:/state`,
+      nodeImage,
+      'sh',
+      '-c',
+      'rm -f /state/journal.db /state/journal.db-wal /state/journal.db-shm'
+    ]);
     const accepted = run(
       'bash',
-      [
-        'scripts/rebuild.sh',
-        '--project',
-        fakeProject,
-        '--acknowledge',
-        '--accept-operational-loss',
-        '--search'
-      ],
+      ['scripts/rebuild.sh', '--acknowledge', '--accept-operational-loss', '--search'],
       { cwd: workDir, env: env({ VAULT_PATH: vaultPath }), allowFailure: true }
     );
-    expect(accepted.status).not.toBe(0);
+    expect(accepted.status, `${accepted.stdout}${accepted.stderr}`).toBe(0);
     expect(`${accepted.stdout}${accepted.stderr}`).toMatch(/operational loss was explicitly accepted/);
+    expect(`${accepted.stdout}${accepted.stderr}`).toMatch(/freshly initialized operation journal/);
+    expect(`${accepted.stdout}${accepted.stderr}`).toMatch(/not full operational recovery/);
+
+    compose(['up', '-d', 'brain']);
+    await waitForHealth(300_000);
+  }, 900_000);
+
+  test('backup.sh refuses to archive a vault containing a symbolic link', async () => {
+    const symlink = join(vaultPath, 'outside-link');
+    symlinkSync('/etc', symlink);
+    try {
+      const result = run(
+        'bash',
+        ['scripts/backup.sh', join(workDir, 'symlink-backup'), '--yes'],
+        { cwd: workDir, env: env({ VAULT_PATH: vaultPath }), allowFailure: true }
+      );
+      expect(result.status).not.toBe(0);
+      expect(`${result.stdout}${result.stderr}`).toMatch(/symbolic link/);
+      expect(`${result.stdout}${result.stderr}`).toContain('outside-link');
+    } finally {
+      rmSync(symlink, { force: true });
+    }
+    await waitForHealth(300_000);
   }, 300_000);
 
   test('a corrupt cold backup is rejected', () => {

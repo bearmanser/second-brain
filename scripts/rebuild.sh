@@ -61,6 +61,30 @@ resolve_volume() {
   printf '%s' "$name"
 }
 
+journal_state() {
+  docker run --rm -i --user 0:0 -v "$state_volume":/state:ro --entrypoint node second-brain:local - <<'JOURNAL_STATE'
+const fs = require('node:fs');
+const crypto = require('node:crypto');
+const Database = require('/app/node_modules/better-sqlite3');
+const directory = '/tmp/journal-state';
+fs.mkdirSync(directory, { recursive: true });
+for (const name of ['journal.db', 'journal.db-wal', 'journal.db-shm']) {
+  const source = `/state/${name}`;
+  if (fs.existsSync(source)) fs.copyFileSync(source, `${directory}/${name}`);
+}
+const db = new Database(`${directory}/journal.db`, { readonly: true });
+const parts = [];
+for (const table of ['operations', 'feedback_records']) {
+  const rows = db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all();
+  const hash = crypto.createHash('sha256');
+  for (const row of rows) hash.update(JSON.stringify(row));
+  parts.push(`${table}=${rows.length}:${hash.digest('hex')}`);
+}
+db.close();
+process.stdout.write(parts.join(';'));
+JOURNAL_STATE
+}
+
 state_volume="$(resolve_volume brain-state)"
 
 JOURNAL_LOST=0
@@ -103,6 +127,13 @@ else
   note "the gateway is not running; no pause needed"
 fi
 
+BEFORE_STATE=""
+if [ "$JOURNAL_LOST" = "0" ]; then
+  note "capturing the pre-rebuild journal and feedback state"
+  BEFORE_STATE="$(journal_state)" || fail "could not read the journal before the rebuild"
+  note "pre-rebuild state: $BEFORE_STATE"
+fi
+
 note "running the supported Basic Memory reindex inside its container"
 if ! REINDEX_OUTPUT="$(docker compose -p "$COMPOSE_PROJECT_NAME" exec -T memory basic-memory reindex ${REINDEX_ARGS[@]+"${REINDEX_ARGS[@]}"} 2>&1)"; then
   fail "the Basic Memory reindex failed: $REINDEX_OUTPUT"
@@ -125,8 +156,14 @@ else
   note "no Markdown revisions are present; skipping the Basic Memory status inspection"
 fi
 
-note "rebuilding the gateway catalogue from Markdown (operation journal and feedback are preserved)"
-if ! REBUILD_OUTPUT="$(docker compose -p "$COMPOSE_PROJECT_NAME" run --rm --no-deps brain rebuild-catalogue 2>&1)"; then
+REBUILD_ARGS=(rebuild-catalogue)
+if [ "$JOURNAL_LOST" = "1" ]; then
+  REBUILD_ARGS+=(--accept-operational-loss)
+  note "rebuilding the gateway catalogue from Markdown with a freshly initialized operation journal (retry and feedback history is lost)"
+else
+  note "rebuilding the gateway catalogue from Markdown (operation journal and feedback are preserved)"
+fi
+if ! REBUILD_OUTPUT="$(docker compose -p "$COMPOSE_PROJECT_NAME" run --rm --no-deps brain "${REBUILD_ARGS[@]}" 2>&1)"; then
   fail "the gateway catalogue rebuild failed: $REBUILD_OUTPUT"
 fi
 printf '%s\n' "$REBUILD_OUTPUT" >&2
@@ -148,31 +185,13 @@ if [ "$CONFLICTS" != "0" ] || [ "$MALFORMED" != "0" ] || [ "$UNSUPPORTED" != "0"
 fi
 
 if [ "$JOURNAL_LOST" = "0" ]; then
-  note "confirming the operation journal and feedback tables were preserved"
-  if ! PRESERVE_OUTPUT="$(docker run --rm -i --user 0:0 -v "$state_volume":/state:ro --entrypoint node second-brain:local - <<'JOURNAL_CHECK'
-const fs = require('node:fs');
-const Database = require('/app/node_modules/better-sqlite3');
-const directory = '/tmp/journal-check';
-fs.mkdirSync(directory, { recursive: true });
-for (const name of ['journal.db', 'journal.db-wal', 'journal.db-shm']) {
-  const source = `/state/${name}`;
-  if (fs.existsSync(source)) fs.copyFileSync(source, `${directory}/${name}`);
-}
-const db = new Database(`${directory}/journal.db`, { readonly: true });
-const tables = db
-  .prepare('SELECT name FROM sqlite_master WHERE type = ? AND name IN (?, ?)')
-  .all('table', 'operations', 'feedback_records')
-  .map((row) => row.name);
-db.close();
-process.stdout.write(tables.sort().join(','));
-JOURNAL_CHECK
-  )"; then
-    fail "could not confirm the operation journal and feedback records survived the rebuild: $PRESERVE_OUTPUT"
-  fi
-  [ "$PRESERVE_OUTPUT" = "feedback_records,operations" ] || fail "the operation journal and feedback tables are incomplete after the rebuild: $PRESERVE_OUTPUT"
-  note "operation journal and feedback records are intact"
+  note "confirming the operation journal and feedback rows were preserved"
+  AFTER_STATE="$(journal_state)" || fail "could not read the journal after the rebuild"
+  note "post-rebuild state: $AFTER_STATE"
+  [ "$BEFORE_STATE" = "$AFTER_STATE" ] || fail "the operation journal or feedback records changed across the rebuild (before '$BEFORE_STATE', after '$AFTER_STATE')"
+  note "operation journal and feedback rows are byte-for-byte unchanged ($AFTER_STATE)"
 else
-  note "WARNING: journal.db was missing; retry and feedback history is gone, and this rebuild is not full operational recovery"
+  note "WARNING: journal.db was missing and a fresh one was initialized; retry and feedback history is gone, and this rebuild is not full operational recovery"
 fi
 
 note "rebuild complete; the catalogue was rebuilt from Markdown, not restored from backup"

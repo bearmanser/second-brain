@@ -312,6 +312,45 @@ test('does not report failed when the terminal journal transition fails', async 
   await h.close();
 });
 
+test('keeps a blocker when both the terminal transition and its verification fail', async () => {
+  const h = await createHarness();
+  const ghost = h.deps.journal.reserve({
+    principal_id: reviewerPrincipal.id,
+    idempotency_key: randomUUID(),
+    tool: 'brain_capture',
+    scope: 'ghost',
+    payload_hash: 'd'.repeat(64),
+    payload_json: '{}'
+  }).record;
+  h.deps.journal.savePlan(ghost.operation_id, {
+    revision: {
+      id: randomUUID(),
+      revision_id: randomUUID(),
+      operation_id: ghost.operation_id,
+      scope: 'ghost'
+    }
+  } as unknown as PlannedWrite);
+  armFault(h, 'mark', { state: 'failed' });
+  const originalGet = h.deps.journal.get.bind(h.deps.journal);
+  h.deps.journal.get = () => {
+    throw new Error('journal is unreadable');
+  };
+
+  const report = await recoverPending(h.deps);
+  const operation = report.operations.find((entry) => entry.operation_id === ghost.operation_id);
+  expect(operation?.outcome).toBe('pending');
+  expect(operation?.blocking).toBe(true);
+  expect(report.blocking_operations).toContain(ghost.operation_id);
+  expect(h.deps.mutations.hasRecoveryBlockers()).toBe(true);
+
+  h.deps.journal.get = originalGet;
+  const next = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
+  await expect(
+    h.deps.mutations.commit(reviewerContext, next.intent, next.build)
+  ).rejects.toThrow(/RECOVERY_REQUIRED/);
+  await h.close();
+});
+
 test('restores a valid cold backup and rejects a corrupt one', async () => {
   const fixture = await makeBackupFixture();
   await expect(verifyManifest(fixture.root, fixture.manifest)).resolves.toBeUndefined();

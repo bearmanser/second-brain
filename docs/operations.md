@@ -71,7 +71,7 @@ empty) so an operator can investigate instead of assuming success.
 
 ## Cold backup
 
-`scripts/backup.sh DESTINATION [--yes] [--notes-only] [--include-secrets]`
+`scripts/backup.sh DESTINATION [--yes] [--notes-only] [--include-secrets] [--include-model-cache]`
 
 ```sh
 # Stop editing in Obsidian and pause external sync first, then:
@@ -83,27 +83,32 @@ The script:
 1. refuses a destination that already exists and is not empty;
 2. requires the operator to confirm that Obsidian edits and external synchronization
    are paused (`--yes` for non-interactive runs);
-3. stops **both** services before reading anything;
-4. resolves the real named-volume names from Compose — it asks
+3. resolves the real named-volume names from Compose — it asks
    `docker compose config --volumes` for the volume keys and then resolves each key to
    the actual Docker volume by its `com.docker.compose.project`/`com.docker.compose.volume`
    labels. It never hard-codes the project prefix;
-5. archives the host vault to `vault.tar` and each named volume to
-   `volumes/<volume>.tar`;
-6. computes a source snapshot before and after each copy and **aborts the backup as
+4. scans the vault and the selected volumes for symbolic links and fails with the
+   precise path if any is found (no dereferencing, no silent skipping);
+5. stops **both** services before reading anything;
+6. archives the host vault to `vault.tar` and each selected volume under its **stable
+   logical key** (for example `volumes/brain-state.tar`), recording the resolved
+   Compose-key-to-actual-volume-name mapping in the manifest's `volumes` object (for
+   example `{"brain-state": "second-brain_brain-state"}`). The derived `model-cache`
+   volume is excluded unless `--include-model-cache` is given;
+7. computes a source snapshot before and after each copy and **aborts the backup as
    inconsistent** if any file changed (stopping the containers does not stop an
    external editor or sync client);
-7. archives each Compose volume under its **stable logical key** (for example
-   `volumes/brain-state.tar`) and records the resolved Compose-key-to-actual-volume-name
-   mapping in the manifest's `volumes` object (for example
-   `{"brain-state": "second-brain_brain-state"}`);
 8. writes `checksums.sha256` and a versioned `manifest.json` (format version, creation
    time, software/image versions, included stores, the volume mapping, sensitivity, and
    file entries) via `node dist/cli.js backup-manifest`;
 9. restarts both services from an `EXIT` trap **even if backup creation fails**.
 
-Symlinks are dereferenced when archiving, so a cold backup never contains symlink
-members; restore still rejects any it finds.
+Symlinks are **not** dereferenced. Before stopping anything the script scans the vault
+and every selected volume for symbolic links and **fails with the precise offending
+path** if any is found, so a backup can never follow a link outside the source boundary
+or silently skip linked content. The derived `model-cache` volume is excluded by default
+because it is rebuildable and populated with cache symlinks; pass `--include-model-cache`
+to archive it anyway (which then also requires it to be symlink-free).
 
 Stores and secrets:
 
@@ -123,7 +128,7 @@ Compose-key-to-actual-name object, and `--image` entries are comma-separated):
 ```sh
 node dist/cli.js backup-manifest \
   --root /srv/backups/… --out /srv/backups/…/manifest.json \
-  --store vault,brain-state,memory-state,model-cache \
+  --store vault,brain-state,memory-state \
   --volume brain-state=second-brain_brain-state,memory-state=second-brain_memory-state \
   --image brain=node@sha256:…,basic-memory=ghcr.io/…@sha256:…
 ```
@@ -184,8 +189,10 @@ The script:
 1. checks for `journal.db` in the `brain-state` volume. If it is missing it **fails**
    and tells you to restore it from a backup. Only an explicit
    `--accept-operational-loss` (or `BRAIN_REBUILD_ACCEPT_OPERATIONAL_LOSS=yes`) proceeds
-   without it, and that path prints a loud warning that retry and feedback history is
-   permanently discarded and that the result is **not** full operational recovery;
+   without it: the script prints a loud warning, and `rebuild-catalogue` is invoked with
+   `--accept-operational-loss`, which initializes a fresh operation journal and labels
+   the result as lossy. Retry and feedback history is permanently discarded and the
+   result is **not** full operational recovery;
 2. requires explicit owner acknowledgment (`--acknowledge` /
    `BRAIN_REBUILD_ACKNOWLEDGE=yes`) so nobody mistakes an index rebuild for operational
    recovery;
@@ -200,9 +207,10 @@ The script:
 6. compares the catalogue's `scanned` count against the Markdown revision count and
    **fails loudly** unless they match and `conflicts`/`malformed`/`unsupported_schema`
    are all zero (a head-graph problem is never silently accepted);
-7. leaves the operation journal and feedback untouched, and **fails** if it cannot
-   confirm the `operations` and `feedback_records` tables are still present (the check
-   copies the SQLite files to a writable temporary directory and opens them read-only);
+7. captures the pre-rebuild `operations`/`feedback_records` row counts and content
+   digest and repeats the measurement after the rebuild, **failing** unless they are
+   byte-for-byte identical (in the acknowledged-loss mode there is no pre-state to
+   compare, and the lossy label is printed instead);
 8. restarts the gateway from an `EXIT` trap.
 
 Rebuilding never revives an archived or superseded head: the catalogue marks heads by
