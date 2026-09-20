@@ -20,6 +20,7 @@ import { assertNoCredentials } from '../security/redact.js';
 const CAPTURE_TOOL = 'brain_capture';
 const DUPLICATE_PAGE_SIZE = 5;
 export const DUPLICATE_CHECK_UNAVAILABLE = 'duplicate_check_unavailable';
+export const DUPLICATE_DETAILS_WITHHELD = 'duplicate_details_withheld';
 
 function invalidInput(message: string, cause?: unknown): BrainError {
   return new BrainError({ code: 'INVALID_INPUT', message, cause });
@@ -255,6 +256,19 @@ async function findPossibleDuplicates(
   return { duplicates, warnings: partial ? [DUPLICATE_CHECK_UNAVAILABLE] : [] };
 }
 
+function filterReadableDuplicates(
+  ctx: RequestContext,
+  receipt: MutationReceipt
+): MutationReceipt {
+  if (receipt.possible_duplicates.length === 0) return receipt;
+  const readable = new Set(ctx.principal.read_scopes);
+  const visible = receipt.possible_duplicates.filter((entry) => readable.has(entry.scope));
+  if (visible.length === receipt.possible_duplicates.length) return receipt;
+  const warnings = [...receipt.warnings];
+  if (!warnings.includes(DUPLICATE_DETAILS_WITHHELD)) warnings.push(DUPLICATE_DETAILS_WITHHELD);
+  return { ...receipt, possible_duplicates: visible, warnings };
+}
+
 export async function capture(
   ctx: RequestContext,
   input: CaptureRequest,
@@ -299,5 +313,5 @@ export async function capture(
     extra_markdown: ''
   });
 
-  return deps.mutations.commit(ctx, intent, build);
+  return filterReadableDuplicates(ctx, await deps.mutations.commit(ctx, intent, build));
 }

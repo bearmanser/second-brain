@@ -9,7 +9,7 @@ import type {
 } from '../../src/core/types.js';
 import { capture } from '../../src/features/capture.js';
 import { fixtureIds, lessonFixture } from '../fixtures/content.js';
-import { ownerContext, reviewerContext, workerContext } from '../fixtures/principals.js';
+import { ownerContext, reviewerContext, reviewerPrincipal, workerContext } from '../fixtures/principals.js';
 import { createHarness } from '../support/harness.js';
 
 const key = (n: number): string => `00000000-0000-4000-8000-${n.toString(16).padStart(12, '0')}`;
@@ -548,5 +548,41 @@ test('does not let a write-only principal probe related ids or duplicate details
     }, h.deps)
   ).rejects.toThrow(/FORBIDDEN/);
   expect(h.backend.create_calls).toHaveLength(1);
+  await h.close();
+});
+
+test('withholds persisted duplicate details after read access is revoked', async () => {
+  const h = await createHarness();
+  const first = await capture(reviewerContext, {
+    idempotency_key: key(50),
+    scope: 'freellmapi',
+    note: lessonFixture
+  }, h.deps);
+
+  const secondRequest: CaptureRequest = {
+    idempotency_key: key(51),
+    scope: 'freellmapi',
+    note: { ...lessonFixture, content: lessonContent({ lesson: 'A similar but distinct claim about TTFT.' }) }
+  };
+  const second = await capture(reviewerContext, secondRequest, h.deps);
+  expect(second.possible_duplicates.map((entry) => entry.id)).toContain(first.id);
+
+  const revokedPrincipal: Principal = { ...reviewerPrincipal, read_scopes: ['shared'] };
+  const revokedContext: RequestContext = {
+    principal: revokedPrincipal,
+    request_id: key(0xfd),
+    signal: new AbortController().signal
+  };
+  const replay = await capture(revokedContext, secondRequest, h.deps);
+
+  expect(replay.operation_id).toBe(second.operation_id);
+  expect(replay.id).toBe(second.id);
+  expect(replay.revision_id).toBe(second.revision_id);
+  expect(replay.outcome).toBe(second.outcome);
+  expect(replay.possible_duplicates).toEqual([]);
+  expect(replay.warnings).toContain('duplicate_details_withheld');
+  expect(JSON.stringify(replay)).not.toContain(first.id);
+  expect(JSON.stringify(replay)).not.toContain(lessonFixture.title);
+  expect(h.backend.create_calls).toHaveLength(2);
   await h.close();
 });
