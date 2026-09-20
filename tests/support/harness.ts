@@ -1,8 +1,10 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash, randomBytes } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import type { BrainConfig } from '../../src/config/schema.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import type { BrainConfig, CredentialRecord, ResultDelivery } from '../../src/config/schema.js';
 import {
   BACKEND_TIMEOUT_MS,
   CONCURRENT_READS,
@@ -25,15 +27,24 @@ import type {
   IdSource,
   Lifecycle,
   NoteInput,
+  Principal,
+  RequestContext,
   StoredRevision
 } from '../../src/core/types.js';
+import type { BrainServices } from '../../src/mcp/server.js';
 import { RevisionCatalogue } from '../../src/notes/catalogue.js';
 import { payloadHash, renderRevision } from '../../src/notes/codec.js';
 import { relativePathFor } from '../../src/notes/identity.js';
-import { Journal } from '../../src/storage/journal.js';
+import { createRuntime, type BrainRuntime } from '../../src/runtime.js';
+import { Journal, type AuditEventRecord } from '../../src/storage/journal.js';
 import { FileVault } from '../../src/storage/vault.js';
 import { fixtureIds } from '../fixtures/content.js';
-import { reviewerPrincipal, scopeFixtures } from '../fixtures/principals.js';
+import {
+  ownerPrincipal,
+  reviewerPrincipal,
+  scopeFixtures,
+  workerPrincipal
+} from '../fixtures/principals.js';
 import { FakeBackend } from './fake-backend.js';
 import { FaultScheduler, wrapJournal, type FaultOptions, type FaultPoint } from './fault-scheduler.js';
 
@@ -287,4 +298,181 @@ export async function createHarness(): Promise<MemoryHarness> {
 
 export function armFault(harness: MemoryHarness, point: FaultPoint, options?: FaultOptions): void {
   (harness as unknown as MemoryHarnessImpl).scheduler.arm(point, options);
+}
+
+export interface RecordedToolCall {
+  tool: string;
+  principal_id: string;
+  request_id: string;
+}
+
+export interface HttpHarnessOptions {
+  result_delivery?: ResultDelivery;
+  allowed_hosts?: string[];
+  allowed_origins?: string[];
+}
+
+export interface HttpHarness {
+  url: string;
+  origin: string;
+  port: number;
+  token: string;
+  rotatedToken: string;
+  reviewerToken: string;
+  ownerToken: string;
+  credentialsFile: string;
+  config: BrainConfig;
+  runtime: BrainRuntime;
+  backend: FakeBackend;
+  recordedToolCalls(): RecordedToolCall[];
+  auditedEvents(): AuditEventRecord[];
+  loggedDiagnostics(): string[];
+  connect(token: string, name?: string): Promise<Client>;
+  close(): Promise<void>;
+}
+
+function newToken(): string {
+  return randomBytes(32).toString('base64url');
+}
+
+function tokenDigest(token: string): string {
+  return createHash('sha256').update(token, 'utf8').digest('hex');
+}
+
+function recordingServices(
+  services: BrainServices,
+  calls: RecordedToolCall[]
+): BrainServices {
+  const track =
+    <A, R>(tool: string, invoke: (ctx: RequestContext, argument: A) => Promise<R>) =>
+    (ctx: RequestContext, argument: A): Promise<R> => {
+      calls.push({
+        tool,
+        principal_id: ctx.principal.id,
+        request_id: ctx.request_id
+      });
+      return invoke(ctx, argument);
+    };
+  return {
+    ...services,
+    capture: track('brain_capture', services.capture),
+    review: track('brain_review', services.review),
+    recall: track('brain_recall', services.recall),
+    read: track('brain_read', services.read),
+    feedback: track('brain_feedback', services.feedback),
+    status: track('brain_status', services.status)
+  };
+}
+
+async function seedHttpCredentials(
+  path: string,
+  tokens: { worker: string; rotated: string; reviewer: string; owner: string },
+  principals: { worker: Principal; reviewer: Principal; owner: Principal }
+): Promise<void> {
+  const records: CredentialRecord[] = [
+    { token_sha256: tokenDigest(tokens.worker), principal: principals.worker },
+    { token_sha256: tokenDigest(tokens.rotated), principal: principals.worker },
+    { token_sha256: tokenDigest(tokens.reviewer), principal: principals.reviewer },
+    { token_sha256: tokenDigest(tokens.owner), principal: principals.owner }
+  ];
+  await writeFile(path, `${JSON.stringify({ credentials: records }, null, 2)}\n`, 'utf8');
+}
+
+export async function startHttpHarness(options: HttpHarnessOptions = {}): Promise<HttpHarness> {
+  const root = await mkdtemp(join(tmpdir(), 'brain-http-'));
+  const vaultRoot = join(root, 'vault');
+  const stateDir = join(root, 'state');
+  await mkdir(vaultRoot, { recursive: true });
+  for (const scope of scopeFixtures) {
+    await mkdir(join(vaultRoot, scope.relative_root), { recursive: true });
+  }
+  await mkdir(stateDir, { recursive: true });
+
+  const tokens = {
+    worker: newToken(),
+    rotated: newToken(),
+    reviewer: newToken(),
+    owner: newToken()
+  };
+  const credentialsFile = join(root, 'credentials.json');
+  await seedHttpCredentials(
+    credentialsFile,
+    tokens,
+    { worker: workerPrincipal, reviewer: reviewerPrincipal, owner: ownerPrincipal }
+  );
+  const cursorSecretFile = join(root, 'cursor.key');
+  await writeFile(cursorSecretFile, randomBytes(48));
+
+  const config: BrainConfig = {
+    endpoint: 'http://127.0.0.1:7331/mcp',
+    backend_endpoint: 'http://127.0.0.1:1/mcp',
+    port: 0,
+    mounts: { vault: vaultRoot, state: stateDir },
+    credentials_file: credentialsFile,
+    cursor_secret_file: cursorSecretFile,
+    scopes: scopeFixtures.map((scope) => ({ ...scope })),
+    limits: {
+      input_body_max_bytes: INPUT_BODY_MAX_BYTES,
+      rendered_note_max_bytes: RENDERED_NOTE_MAX_BYTES,
+      tool_result_max_bytes: TOOL_RESULT_MAX_BYTES,
+      backend_timeout_ms: BACKEND_TIMEOUT_MS,
+      materialization_timeout_ms: MATERIALIZATION_TIMEOUT_MS,
+      reconcile_interval_ms: RECONCILE_INTERVAL_MS,
+      concurrent_reads: CONCURRENT_READS
+    },
+    allowed_hosts: options.allowed_hosts ?? ['127.0.0.1', 'localhost'],
+    allowed_origins: options.allowed_origins ?? [],
+    result_delivery: options.result_delivery ?? 'structured'
+  };
+
+  const backend = new FakeBackend({
+    root: vaultRoot,
+    projects: scopeFixtures.map((scope) => scope.backend_project)
+  });
+  const calls: RecordedToolCall[] = [];
+  const diagnostics: string[] = [];
+
+  let runtime: BrainRuntime;
+  try {
+    runtime = await createRuntime(config, {
+      backend,
+      logger: (line) => {
+        diagnostics.push(line);
+      },
+      wrapServices: (services) => recordingServices(services, calls)
+    });
+  } catch (error) {
+    await rm(root, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
+
+  return {
+    url: runtime.url,
+    origin: `http://127.0.0.1:${runtime.port}`,
+    port: runtime.port,
+    token: tokens.worker,
+    rotatedToken: tokens.rotated,
+    reviewerToken: tokens.reviewer,
+    ownerToken: tokens.owner,
+    credentialsFile,
+    config,
+    runtime,
+    backend,
+    recordedToolCalls: () => calls.map((call) => ({ ...call })),
+    auditedEvents: () => runtime.deps.journal.listAudit(),
+    loggedDiagnostics: () => [...diagnostics],
+    connect: async (token: string, name = 'brain-http-test') => {
+      const client = new Client({ name, version: '1.0.0' });
+      await client.connect(
+        new StreamableHTTPClientTransport(new URL(runtime.url), {
+          requestInit: { headers: { Authorization: `Bearer ${token}` } }
+        })
+      );
+      return client;
+    },
+    close: async () => {
+      await runtime.close();
+      await rm(root, { recursive: true, force: true }).catch(() => undefined);
+    }
+  };
 }
