@@ -113,8 +113,8 @@ class MemoryHarnessImpl implements MemoryHarness {
   private readonly config: BrainConfig;
   private readonly clock: Clock = { now: () => new Date() };
   private readonly ids: IdSource = { next: () => randomUUID() };
-  private lock!: InstanceLock;
-  private vaultLock!: InstanceLock;
+  private lock: InstanceLock | undefined;
+  private vaultLock: InstanceLock | undefined;
   private journal!: Journal;
   private catalogue!: RevisionCatalogue;
   private closed = false;
@@ -150,14 +150,22 @@ class MemoryHarnessImpl implements MemoryHarness {
   }
 
   async start(): Promise<void> {
-    await mkdir(this.vaultRoot, { recursive: true });
-    for (const scope of this.config.scopes) {
-      await mkdir(join(this.vaultRoot, scope.relative_root), { recursive: true });
+    try {
+      await mkdir(this.vaultRoot, { recursive: true });
+      for (const scope of this.config.scopes) {
+        await mkdir(join(this.vaultRoot, scope.relative_root), { recursive: true });
+      }
+      this.lock = InstanceLock.acquire(this.stateDir);
+      this.vaultLock = InstanceLock.acquire(this.vaultRoot, VAULT_LOCK_NAME);
+      await this.backend.connect();
+      this.openServices();
+    } catch (error) {
+      this.vaultLock?.release();
+      this.lock?.release();
+      await this.backend.close().catch(() => undefined);
+      await rm(this.root, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
     }
-    this.lock = InstanceLock.acquire(this.stateDir);
-    this.vaultLock = InstanceLock.acquire(this.vaultRoot, VAULT_LOCK_NAME);
-    await this.backend.connect();
-    this.openServices();
   }
 
   private openServices(): void {
@@ -243,11 +251,17 @@ class MemoryHarnessImpl implements MemoryHarness {
   async restart(): Promise<void> {
     this.journal.close();
     this.catalogue.close();
-    this.vaultLock.release();
-    this.lock.release();
-    this.lock = InstanceLock.acquire(this.stateDir);
-    this.vaultLock = InstanceLock.acquire(this.vaultRoot, VAULT_LOCK_NAME);
-    this.openServices();
+    this.vaultLock?.release();
+    this.lock?.release();
+    try {
+      this.lock = InstanceLock.acquire(this.stateDir);
+      this.vaultLock = InstanceLock.acquire(this.vaultRoot, VAULT_LOCK_NAME);
+      this.openServices();
+    } catch (error) {
+      this.vaultLock?.release();
+      this.lock?.release();
+      throw error;
+    }
     await this.deps.mutations.recover();
   }
 
@@ -257,8 +271,8 @@ class MemoryHarnessImpl implements MemoryHarness {
     this.catalogue.close();
     this.journal.close();
     await this.backend.close();
-    this.vaultLock.release();
-    this.lock.release();
+    this.vaultLock?.release();
+    this.lock?.release();
     await rm(this.root, { recursive: true, force: true });
   }
 }

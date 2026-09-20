@@ -18,7 +18,7 @@ import type {
   VaultPort
 } from './types.js';
 import type { BrainConfig } from '../config/schema.js';
-import { decodeRevision, encodeRevision, makeEtag } from '../notes/codec.js';
+import { decodeRevision, encodeRevision, makeEtag, payloadHash } from '../notes/codec.js';
 import { slugify } from '../notes/identity.js';
 import { resolveScopes } from '../security/authorise.js';
 import type {
@@ -31,6 +31,7 @@ import type {
 } from '../storage/journal.js';
 
 const POLL_INTERVAL_MS = 20;
+const UNCERTAIN_WRITE_CODES = ['BACKEND_UNAVAILABLE', 'EMBEDDINGS_UNAVAILABLE', 'BACKEND_PROTOCOL_ERROR'] as const;
 
 export interface ExpectedHead {
   id: string;
@@ -89,6 +90,7 @@ interface LocatedMaterialization {
   raw: string;
   raw_hash: string;
   relative_path: string;
+  revision: StoredRevision;
 }
 
 function invalidInput(message: string, cause?: unknown): BrainError {
@@ -128,6 +130,15 @@ function canonicalize(value: unknown): unknown {
   return value;
 }
 
+function deriveUuid(namespace: string): string {
+  const digest = createHash('sha256').update(namespace, 'utf8').digest('hex');
+  const chars = digest.slice(0, 32).split('');
+  chars[12] = '4';
+  chars[16] = ((Number.parseInt(chars[16], 16) & 0x3) | 0x8).toString(16);
+  const value = chars.join('');
+  return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
+}
+
 function payloadDigest(payload: unknown): { payload_hash: string; payload_json: string } {
   let json: string;
   try {
@@ -136,7 +147,49 @@ function payloadDigest(payload: unknown): { payload_hash: string; payload_json: 
     throw invalidInput('mutation payload is not serializable', cause);
   }
   if (json === undefined) throw invalidInput('mutation payload is not serializable');
-  return { payload_hash: createHash('sha256').update(json, 'utf8').digest('hex'), payload_json: json };
+  return {
+    payload_hash: createHash('sha256').update(json, 'utf8').digest('hex'),
+    payload_json: json
+  };
+}
+
+function isUncertainWrite(error: unknown): boolean {
+  if (!isBrainError(error)) return false;
+  return (UNCERTAIN_WRITE_CODES as readonly string[]).includes(error.code);
+}
+
+function sameParents(left: StoredRevision['parents'], right: StoredRevision['parents']): boolean {
+  if (left.length !== right.length) return false;
+  return left.every(
+    (parent, index) =>
+      parent.revision_id === right[index].revision_id && parent.raw_hash === right[index].raw_hash
+  );
+}
+
+function sameApproval(
+  left: StoredRevision['approval'],
+  right: StoredRevision['approval']
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return (
+    left.principal_id === right.principal_id &&
+    left.rationale === right.rationale &&
+    left.payload_hash === right.payload_hash
+  );
+}
+
+function matchesPlan(actual: StoredRevision, expected: StoredRevision): boolean {
+  return (
+    actual.id === expected.id &&
+    actual.revision_id === expected.revision_id &&
+    actual.operation_id === expected.operation_id &&
+    actual.scope === expected.scope &&
+    actual.status === expected.status &&
+    actual.replacement_id === expected.replacement_id &&
+    sameParents(actual.parents, expected.parents) &&
+    sameApproval(actual.approval, expected.approval) &&
+    payloadHash(actual) === payloadHash(expected)
+  );
 }
 
 function parseReceipt(json: string, operation_id: string): MutationReceipt {
@@ -312,7 +365,7 @@ export class MutationCoordinator {
     const { record } = reserved;
     if (reserved.kind === 'replay') {
       if (record.receipt_json && (record.state === 'complete' || record.state === 'conflict')) {
-        return parseReceipt(record.receipt_json, record.operation_id);
+        return this.refreshTerminalReceipt(scope, parseReceipt(record.receipt_json, record.operation_id));
       }
       if (record.state === 'conflict') {
         throw conflict('operation ended in conflict', record.operation_id);
@@ -327,13 +380,17 @@ export class MutationCoordinator {
       if (persisted.revision.scope !== scope.id) {
         throw recoveryRequired('persisted plan does not match the authorized scope', record.operation_id);
       }
-      const located = await this.locate(scope, persisted);
-      if (located !== undefined) return this.finalize(scope, persisted, located, record.operation_id);
+      const immediate = await this.findMaterializations(scope, persisted);
+      if (immediate.length > 0) return this.finalize(scope, persisted, immediate, record.operation_id);
       if (record.state === 'materialized') {
         this.markConflict(record.operation_id);
         throw conflict('operation was marked materialized but its file is absent', record.operation_id);
       }
       if (record.state === 'submitted') {
+        const settled = await this.awaitMaterialization(scope, persisted);
+        if (settled !== undefined && settled.length > 0) {
+          return this.finalize(scope, persisted, settled, record.operation_id);
+        }
         return this.submit(ctx, scope, persisted, record.operation_id);
       }
     }
@@ -343,7 +400,7 @@ export class MutationCoordinator {
 
     let plan = persisted;
     if (plan === undefined) {
-      const identities = this.allocate(record.operation_id, intent);
+      const identities = this.deriveIdentity(record, intent);
       const revision = this.buildRevision(build, identities, heads, scope);
       plan = encodeRevision(revision, scope);
       this.deps.journal.savePlan(record.operation_id, plan);
@@ -354,17 +411,18 @@ export class MutationCoordinator {
     return this.submit(ctx, scope, plan, record.operation_id);
   }
 
-  private allocate(operation_id: string, intent: MutationIntent): AllocatedIdentity {
+  private deriveIdentity(record: OperationRecord, intent: MutationIntent): AllocatedIdentity {
     const targets = [...new Set(intent.expected_heads.map((head) => head.id))];
     if (targets.length > 1) {
       throw invalidInput('a mutation may target only one logical note');
     }
-    const note_id = targets[0] ?? this.deps.ids.next();
+    const namespace = `${record.operation_id}:${record.tool}:${record.scope}`;
+    const noteId = targets[0] ?? deriveUuid(`${namespace}:note`);
     return {
-      operation_id,
-      note_id,
-      revision_id: this.deps.ids.next(),
-      timestamp: this.deps.clock.now().toISOString()
+      operation_id: record.operation_id,
+      note_id: noteId,
+      revision_id: deriveUuid(`${namespace}:revision:${noteId}`),
+      timestamp: record.created_at
     };
   }
 
@@ -443,53 +501,59 @@ export class MutationCoordinator {
       await this.deps.backend.create(plan);
     } catch (error) {
       if (isBrainError(error) && error.code === 'CONFLICT') {
-        const located = await this.locate(scope, plan);
-        if (located === undefined) {
+        const matches = await this.findMaterializations(scope, plan);
+        if (matches.length === 0) {
           this.markConflict(operation_id);
           throw conflict('backend rejected a create that had no materialised file', operation_id);
         }
-        return this.finalize(scope, plan, located, operation_id);
+        return this.finalize(scope, plan, matches, operation_id);
       }
+      if (!isUncertainWrite(error)) throw error;
+      const matches = await this.awaitMaterialization(scope, plan);
+      if (matches === undefined || matches.length === 0) return this.pending(operation_id, plan);
+      return this.finalize(scope, plan, matches, operation_id);
     }
-    const located = await this.awaitMaterialization(scope, plan);
-    if (located === undefined) return this.pending(operation_id, plan);
-    return this.finalize(scope, plan, located, operation_id);
+    const matches = await this.awaitMaterialization(scope, plan);
+    if (matches === undefined || matches.length === 0) return this.pending(operation_id, plan);
+    return this.finalize(scope, plan, matches, operation_id);
   }
 
   private async awaitMaterialization(
     scope: ScopeConfig,
     plan: PlannedWrite
-  ): Promise<LocatedMaterialization | undefined> {
+  ): Promise<LocatedMaterialization[] | undefined> {
     const timeout = this.deps.config.limits.materialization_timeout_ms ?? MATERIALIZATION_TIMEOUT_MS;
     const deadline = Date.now() + timeout;
     for (;;) {
-      const located = await this.locate(scope, plan);
-      if (located !== undefined) return located;
+      const matches = await this.findMaterializations(scope, plan);
+      if (matches.length > 0) return matches;
       const remaining = deadline - Date.now();
       if (remaining <= 0) return undefined;
       await delay(Math.min(POLL_INTERVAL_MS, remaining));
     }
   }
 
-  private async locate(scope: ScopeConfig, plan: PlannedWrite): Promise<LocatedMaterialization | undefined> {
-    const expected = expectedRelativePath(scope, plan);
-    const direct = await this.readMaterialized(scope, expected, plan);
-    if (direct !== undefined) return direct;
+  private async findMaterializations(
+    scope: ScopeConfig,
+    plan: PlannedWrite
+  ): Promise<LocatedMaterialization[]> {
+    const found = new Map<string, LocatedMaterialization>();
+    const consider = async (relativePath: string): Promise<void> => {
+      const candidate = await this.readCandidate(scope, relativePath, plan);
+      if (candidate !== undefined) found.set(candidate.relative_path, candidate);
+    };
+    await consider(expectedRelativePath(scope, plan));
     let paths: string[];
     try {
       paths = await this.deps.vault.list(scope.id);
     } catch {
-      return undefined;
+      return [...found.values()];
     }
-    for (const path of paths) {
-      if (path === expected) continue;
-      const found = await this.readMaterialized(scope, path, plan);
-      if (found !== undefined) return found;
-    }
-    return undefined;
+    for (const path of paths) await consider(path);
+    return [...found.values()];
   }
 
-  private async readMaterialized(
+  private async readCandidate(
     scope: ScopeConfig,
     relativePath: string,
     plan: PlannedWrite
@@ -507,14 +571,18 @@ export class MutationCoordinator {
       return undefined;
     }
     if (revision.revision_id !== plan.revision.revision_id) return undefined;
-    if (revision.operation_id !== plan.revision.operation_id) return undefined;
-    return { raw: read.raw, raw_hash: read.raw_hash, relative_path: read.relative_path };
+    return {
+      raw: read.raw,
+      raw_hash: read.raw_hash,
+      relative_path: read.relative_path,
+      revision
+    };
   }
 
   private async finalize(
     scope: ScopeConfig,
     plan: PlannedWrite,
-    located: LocatedMaterialization,
+    matches: LocatedMaterialization[],
     operation_id: string
   ): Promise<MutationReceipt> {
     const record = this.deps.journal.get(operation_id);
@@ -529,6 +597,15 @@ export class MutationCoordinator {
 
     const warnings: string[] = [];
     let conflicted = false;
+    const verified = matches.filter((candidate) => matchesPlan(candidate.revision, plan.revision));
+    if (matches.length > 1) {
+      conflicted = true;
+      warnings.push('duplicate_materialization');
+    } else if (verified.length !== 1) {
+      conflicted = true;
+      warnings.push('materialization_mismatch');
+    }
+
     for (const parent of plan.revision.parents) {
       try {
         const parentHead = await this.deps.catalogue.getRevision(
@@ -552,6 +629,7 @@ export class MutationCoordinator {
       warnings.push('revision_conflict');
     }
 
+    const confirmed = verified[0] ?? matches[0];
     const indexed = await this.checkIndex(scope, plan.revision.revision_id, warnings);
     const receipt: MutationReceipt = {
       operation_id,
@@ -560,7 +638,7 @@ export class MutationCoordinator {
       outcome: conflicted ? 'stored_conflict' : 'stored',
       materialized: true,
       indexed,
-      etag: makeEtag(plan.revision.revision_id, located.raw_hash),
+      etag: makeEtag(plan.revision.revision_id, confirmed.raw_hash),
       possible_duplicates: [],
       warnings
     };
@@ -575,6 +653,31 @@ export class MutationCoordinator {
       }
     }
     return receipt;
+  }
+
+  private async refreshTerminalReceipt(
+    scope: ScopeConfig,
+    receipt: MutationReceipt
+  ): Promise<MutationReceipt> {
+    if (receipt.indexed || !receipt.materialized) return receipt;
+    let indexed: boolean;
+    try {
+      indexed = await this.deps.backend.isIndexed(scope.backend_project, receipt.revision_id);
+    } catch {
+      return receipt;
+    }
+    if (!indexed) return receipt;
+    try {
+      const updated = this.deps.journal.refreshReceiptAvailability(receipt.operation_id, {
+        indexed: true
+      });
+      if (updated.receipt_json !== undefined) {
+        return parseReceipt(updated.receipt_json, receipt.operation_id);
+      }
+    } catch {
+      return { ...receipt, indexed: true };
+    }
+    return { ...receipt, indexed: true };
   }
 
   private async checkIndex(
@@ -638,8 +741,8 @@ export class MutationCoordinator {
     if (plan === undefined) return;
     const scope = this.deps.config.scopes.find((candidate) => candidate.id === record.scope);
     if (scope === undefined) return;
-    const located = await this.locate(scope, plan);
-    if (located === undefined) return;
-    await this.finalize(scope, plan, located, record.operation_id);
+    const matches = await this.findMaterializations(scope, plan);
+    if (matches.length === 0) return;
+    await this.finalize(scope, plan, matches, record.operation_id);
   }
 }

@@ -1,9 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { expect, test } from 'vitest';
-import { InstanceLock, type RevisionBuilder } from '../../src/core/mutation.js';
-import type { RequestContext, StoredRevision } from '../../src/core/types.js';
+import {
+  InstanceLock,
+  type AllocatedIdentity,
+  type RevisionBuilder
+} from '../../src/core/mutation.js';
+import type { PlannedWrite, RequestContext, StoredRevision } from '../../src/core/types.js';
 import { makeEtag, renderRevision } from '../../src/notes/codec.js';
 import { relativePathFor } from '../../src/notes/identity.js';
 import { lessonFixture } from '../fixtures/content.js';
@@ -13,10 +17,33 @@ import {
   scopeFixtures,
   workerPrincipal
 } from '../fixtures/principals.js';
-import { armFault, createCandidateIntent, createHarness } from '../support/harness.js';
+import {
+  armFault,
+  createCandidateIntent,
+  createHarness,
+  type MemoryHarness
+} from '../support/harness.js';
 
 function contextWith(signal: AbortSignal): RequestContext {
   return { principal: reviewerPrincipal, request_id: randomUUID(), signal };
+}
+
+function scopeOf(scopeId: string) {
+  const scope = scopeFixtures.find((candidate) => candidate.id === scopeId);
+  if (scope === undefined) throw new Error(`no configured scope ${scopeId}`);
+  return scope;
+}
+
+function planPath(harness: MemoryHarness, plan: PlannedWrite): string {
+  const scope = scopeOf(plan.revision.scope);
+  const relative = relativePathFor(
+    scope.relative_root,
+    plan.revision.note.content.kind,
+    plan.revision.id,
+    plan.revision.note.title,
+    plan.revision.revision_id
+  );
+  return join(harness.deps.config.mounts.vault, relative);
 }
 
 test('reconciles a materialized revision after a lost response', async () => {
@@ -369,4 +396,165 @@ test('releases the instance locks when the gateway closes', async () => {
   const vaultLock = InstanceLock.acquire(vaultDir, '.brain-instance.lock');
   stateLock.release();
   vaultLock.release();
+});
+
+test('reuses deterministic identities across a save-plan fault', async () => {
+  const h = await createHarness();
+  const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
+  const seen: AllocatedIdentity[] = [];
+  const spy: RevisionBuilder = (identities, heads) => {
+    seen.push(identities);
+    return request.build(identities, heads);
+  };
+  armFault(h, 'save_plan');
+  await expect(h.deps.mutations.commit(reviewerContext, request.intent, spy)).rejects.toThrow(
+    /injected fault at save_plan/
+  );
+  const receipt = await h.deps.mutations.commit(reviewerContext, request.intent, spy);
+  expect(seen).toHaveLength(2);
+  expect(seen[1]).toEqual(seen[0]);
+  expect(seen[1].timestamp).toBe(seen[0].timestamp);
+  expect(receipt.id).toBe(seen[0].note_id);
+  expect(receipt.revision_id).toBe(seen[0].revision_id);
+  expect(h.backend.create_calls).toHaveLength(1);
+  await h.close();
+});
+
+test('polls the materialization window before resending a submitted operation', async () => {
+  const h = await createHarness();
+  const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
+  h.backend.fail_once = 'before_write';
+  const first = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+  expect(first.outcome).toBe('pending');
+  expect(h.backend.create_calls).toHaveLength(1);
+  const record = h.deps.journal.pending()[0];
+  const plan = JSON.parse(record.plan_json ?? '') as PlannedWrite;
+  const scope = scopeOf(plan.revision.scope);
+  const relative = relativePathFor(
+    scope.relative_root,
+    plan.revision.note.content.kind,
+    plan.revision.id,
+    plan.revision.note.title,
+    plan.revision.revision_id
+  );
+  const timer = setTimeout(() => {
+    void (async () => {
+      const absolute = join(h.deps.config.mounts.vault, relative);
+      await mkdir(dirname(absolute), { recursive: true });
+      await writeFile(absolute, renderRevision(plan.revision, scope), 'utf8');
+    })();
+  }, 50);
+  const replay = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+  clearTimeout(timer);
+  expect(replay.outcome).toBe('stored');
+  expect(h.backend.create_calls).toHaveLength(1);
+  await h.close();
+});
+
+test('refreshes a terminal receipt when indexing becomes available', async () => {
+  const h = await createHarness();
+  h.backend.fail_once = 'search_unavailable';
+  const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
+  const first = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+  expect(first.indexed).toBe(false);
+  const replay = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+  expect(replay.indexed).toBe(true);
+  expect(replay.operation_id).toBe(first.operation_id);
+  expect(replay.revision_id).toBe(first.revision_id);
+  const record = h.deps.journal.get(first.operation_id);
+  expect((JSON.parse(record?.receipt_json ?? '{}') as { indexed?: boolean }).indexed).toBe(true);
+  expect(h.backend.create_calls).toHaveLength(1);
+  await h.close();
+});
+
+test('rethrows an unexpected backend create error and leaves durable state', async () => {
+  const h = await createHarness();
+  h.backend.on_create = () => {
+    throw new Error('unexpected adapter failure');
+  };
+  const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
+  await expect(
+    h.deps.mutations.commit(reviewerContext, request.intent, request.build)
+  ).rejects.toThrow(/unexpected adapter failure/);
+  expect(h.deps.journal.pending()).toHaveLength(1);
+  expect(h.deps.journal.pending()[0].state).toBe('submitted');
+  const replay = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+  expect(replay.outcome).toBe('stored');
+  expect(h.backend.create_calls).toHaveLength(1);
+  await h.close();
+});
+
+test('does not report stored for a tampered approval fingerprint', async () => {
+  const h = await createHarness();
+  h.backend.on_create = async (write) => {
+    const absolute = planPath(h, write);
+    const raw = await readFile(absolute, 'utf8');
+    await writeFile(
+      absolute,
+      raw.replace(
+        /brain_approval_payload_hash: [a-f0-9]+/,
+        `brain_approval_payload_hash: ${'a'.repeat(64)}`
+      ),
+      'utf8'
+    );
+  };
+  const request = createCandidateIntent(lessonFixture, {
+    idempotency_key: randomUUID(),
+    status: 'active'
+  });
+  const receipt = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+  expect(receipt.outcome).toBe('stored_conflict');
+  expect(receipt.warnings).toContain('materialization_mismatch');
+  await h.close();
+});
+
+test('does not report stored when the materialised logical id differs', async () => {
+  const h = await createHarness();
+  h.backend.on_create = async (write) => {
+    const absolute = planPath(h, write);
+    const raw = await readFile(absolute, 'utf8');
+    await writeFile(absolute, raw.replace(/brain_id: [0-9a-f-]{36}/, `brain_id: ${randomUUID()}`), 'utf8');
+  };
+  const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
+  const receipt = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+  expect(receipt.outcome).toBe('stored_conflict');
+  expect(receipt.warnings).toContain('materialization_mismatch');
+  await h.close();
+});
+
+test('reports a conflict when two files claim the same revision identity', async () => {
+  const h = await createHarness();
+  h.backend.on_create = async (write) => {
+    const source = planPath(h, write);
+    const raw = await readFile(source, 'utf8');
+    const scope = scopeOf(write.revision.scope);
+    const relative = `${scope.relative_root}/Lessons/${write.revision.id}/copy/duplicate.md`;
+    const absolute = join(h.deps.config.mounts.vault, relative);
+    await mkdir(dirname(absolute), { recursive: true });
+    await writeFile(absolute, raw, 'utf8');
+  };
+  const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
+  const receipt = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+  expect(receipt.outcome).toBe('stored_conflict');
+  expect(receipt.warnings).toContain('duplicate_materialization');
+  await h.close();
+});
+
+test('never reports stored for a foreign revision id', async () => {
+  const h = await createHarness();
+  h.backend.on_create = async (write) => {
+    const absolute = planPath(h, write);
+    const raw = await readFile(absolute, 'utf8');
+    await writeFile(
+      absolute,
+      raw.replace(/brain_revision_id: [0-9a-f-]{36}/, `brain_revision_id: ${randomUUID()}`),
+      'utf8'
+    );
+  };
+  const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
+  const receipt = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+  expect(receipt.outcome).toBe('pending');
+  expect(receipt.materialized).toBe(false);
+  expect(h.backend.create_calls).toHaveLength(1);
+  await h.close();
 });
