@@ -14,6 +14,9 @@ import type { Principal, ScopeConfig } from '../core/types.js';
 export const PRINCIPAL_ROLES = ['worker', 'reviewer', 'owner'] as const;
 export type PrincipalRole = (typeof PRINCIPAL_ROLES)[number];
 
+export const RESULT_DELIVERY_MODES = ['structured', 'text-json'] as const;
+export type ResultDelivery = (typeof RESULT_DELIVERY_MODES)[number];
+
 export const TOKEN_SHA256_PATTERN = /^[a-f0-9]{64}$/;
 
 const TRAVERSAL_PATTERN = /(^|[\\/])\.\.([\\/]|$)|%2e|%2f|%5c|\u0000/i;
@@ -142,7 +145,8 @@ export const brainConfigSchema = z.strictObject({
   scopes: scopeListSchema,
   limits: brainLimitsSchema.default(() => ({ ...DEFAULT_LIMITS })),
   allowed_hosts: z.array(safeName).min(1),
-  allowed_origins: z.array(httpEndpoint).default([])
+  allowed_origins: z.array(httpEndpoint).default([]),
+  result_delivery: z.enum(RESULT_DELIVERY_MODES).default('structured')
 });
 
 export interface BrainMounts {
@@ -171,6 +175,7 @@ export interface BrainConfig {
   limits: BrainLimits;
   allowed_hosts: string[];
   allowed_origins: string[];
+  result_delivery?: ResultDelivery;
 }
 
 export interface CredentialRecord {

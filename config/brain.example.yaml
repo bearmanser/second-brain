@@ -73,3 +73,12 @@ limits:
   materialization_timeout_ms: 10000
   reconcile_interval_ms: 30000
   concurrent_reads: 8
+
+# Tool-result delivery for MCP clients. `structured` (the default) sends the
+# complete result in MCP structuredContent plus a compact text pointer. The
+# `text-json` mode also carries the complete JSON result in the text block for
+# clients that ignore structuredContent; the canonical structured payload is
+# still present so the published output schemas stay valid. Choose `text-json`
+# only after confirming with the installed client which representation it
+# actually injects into the model context.
+result_delivery: structured
