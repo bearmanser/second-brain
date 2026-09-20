@@ -5,6 +5,9 @@ import { join, relative, resolve, sep } from 'node:path';
 export const BACKUP_FORMAT_VERSION = 1;
 export const SUPPORTED_BACKUP_FORMATS: readonly number[] = [1];
 
+const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+const RFC3339_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+
 export interface ManifestFile {
   path: string;
   size: number;
@@ -18,6 +21,7 @@ export interface VersionManifest {
   stores?: string[];
   sensitive?: boolean;
   created_at?: string;
+  volumes?: Record<string, string>;
 }
 
 export interface BackupSoftwareVersion {
@@ -32,6 +36,7 @@ export interface BackupManifest {
   software: BackupSoftwareVersion;
   stores: string[];
   sensitive: boolean;
+  volumes: Record<string, string>;
   files: ManifestFile[];
 }
 
@@ -41,6 +46,24 @@ function sha256(buffer: Buffer): string {
 
 function backupError(message: string): Error {
   return new Error(message);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function requireNonEmptyString(value: unknown, label: string): string {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw backupError(`${label} must be a non-empty string`);
+  }
+  return value;
+}
+
+function requireTimestamp(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !RFC3339_PATTERN.test(value) || !Number.isFinite(Date.parse(value))) {
+    throw backupError(`${label} must be an RFC3339 timestamp`);
+  }
+  return value;
 }
 
 export function requireRelativeBackupPath(value: string): string {
@@ -75,37 +98,100 @@ export function resolveBackupPath(root: string, relativePath: string): string {
   return target;
 }
 
-function assertManifestShape(manifest: BackupManifest): void {
-  if (manifest === null || typeof manifest !== 'object') {
-    throw backupError('backup manifest is not an object');
+function validateVolumeMap(value: unknown): Record<string, string> {
+  if (!isRecord(value)) throw backupError('backup manifest volumes must be an object');
+  const volumes: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    requireRelativeBackupPath(key);
+    volumes[key] = requireNonEmptyString(entry, `backup manifest volumes.${key}`);
   }
-  if (!SUPPORTED_BACKUP_FORMATS.includes(manifest.format_version)) {
-    throw backupError(`unsupported backup format version ${String(manifest.format_version)}`);
+  return volumes;
+}
+
+export function validateManifest(manifest: unknown): BackupManifest {
+  if (!isRecord(manifest)) throw backupError('backup manifest is not an object');
+  const format = manifest.format_version;
+  if (typeof format !== 'number' || !Number.isInteger(format)) {
+    throw backupError('backup manifest format_version must be an integer');
   }
-  if (!Array.isArray(manifest.files)) {
-    throw backupError('backup manifest has no file entries');
+  if (!SUPPORTED_BACKUP_FORMATS.includes(format)) {
+    throw backupError(`unsupported backup format version ${String(format)}`);
+  }
+  requireTimestamp(manifest.created_at, 'backup manifest created_at');
+  if (!isRecord(manifest.software)) {
+    throw backupError('backup manifest has no software version block');
+  }
+  requireNonEmptyString(manifest.software.application, 'backup manifest software.application');
+  const schema = manifest.software.schema;
+  if (typeof schema !== 'number' || !Number.isInteger(schema) || schema < 1) {
+    throw backupError('backup manifest software.schema must be a positive integer');
+  }
+  if (!isRecord(manifest.software.images)) {
+    throw backupError('backup manifest software.images must be an object');
+  }
+  for (const [name, reference] of Object.entries(manifest.software.images)) {
+    requireNonEmptyString(name, 'backup manifest software.images key');
+    requireNonEmptyString(reference, `backup manifest software.images.${name}`);
   }
   if (!Array.isArray(manifest.stores)) {
     throw backupError('backup manifest has no store list');
   }
-  if (
-    manifest.software === null ||
-    typeof manifest.software !== 'object' ||
-    Array.isArray(manifest.software)
-  ) {
-    throw backupError('backup manifest has no software version block');
+  const stores = manifest.stores.map((store, index) =>
+    requireNonEmptyString(store, `backup manifest stores[${index}]`)
+  );
+  if (new Set(stores).size !== stores.length) {
+    throw backupError('backup manifest store list contains duplicates');
   }
+  if (typeof manifest.sensitive !== 'boolean') {
+    throw backupError('backup manifest sensitive must be a boolean');
+  }
+  const volumes = validateVolumeMap(manifest.volumes ?? {});
+  if (!Array.isArray(manifest.files)) {
+    throw backupError('backup manifest has no file entries');
+  }
+  const files: ManifestFile[] = manifest.files.map((entry, index) => {
+    if (!isRecord(entry)) {
+      throw backupError(`backup manifest files[${index}] is not an object`);
+    }
+    const path = requireRelativeBackupPath(
+      requireNonEmptyString(entry.path, `backup manifest files[${index}].path`)
+    );
+    const size = entry.size;
+    if (typeof size !== 'number' || !Number.isFinite(size) || !Number.isInteger(size) || size < 0) {
+      throw backupError(`backup manifest files[${index}].size must be a non-negative finite integer`);
+    }
+    if (typeof entry.sha256 !== 'string' || !SHA256_PATTERN.test(entry.sha256)) {
+      throw backupError(`backup manifest files[${index}].sha256 must be a lowercase sha256 digest`);
+    }
+    return { path, size, sha256: entry.sha256 };
+  });
+  const seen = new Set<string>();
+  for (const file of files) {
+    if (seen.has(file.path)) {
+      throw backupError(`backup manifest contains a duplicate entry: ${file.path}`);
+    }
+    seen.add(file.path);
+  }
+  return {
+    format_version: format,
+    created_at: new Date(manifest.created_at as string).toISOString(),
+    software: {
+      application: manifest.software.application as string,
+      schema,
+      images: { ...(manifest.software.images as Record<string, string>) }
+    },
+    stores,
+    sensitive: manifest.sensitive as boolean,
+    volumes,
+    files
+  };
 }
 
 export function assertCompatibleStateSchema(manifest: BackupManifest, current: number): void {
-  assertManifestShape(manifest);
-  const schema = manifest.software.schema;
-  if (typeof schema !== 'number' || !Number.isInteger(schema) || schema < 1) {
-    throw backupError('backup manifest has an invalid application-state schema version');
-  }
-  if (schema > current) {
+  const validated = validateManifest(manifest);
+  if (validated.software.schema > current) {
     throw backupError(
-      `backup state schema version ${schema} is newer than this release supports (${current})`
+      `backup state schema version ${validated.software.schema} is newer than this release supports (${current})`
     );
   }
 }
@@ -121,6 +207,7 @@ export function buildManifest(files: ManifestFile[], versions: VersionManifest):
     },
     stores: [...(versions.stores ?? [])],
     sensitive: versions.sensitive === true,
+    volumes: { ...(versions.volumes ?? {}) },
     files: files.map((file) => ({ path: file.path, size: file.size, sha256: file.sha256 }))
   };
 }
@@ -165,22 +252,8 @@ export async function collectManifestFiles(root: string): Promise<ManifestFile[]
 }
 
 export async function verifyManifest(root: string, manifest: BackupManifest): Promise<void> {
-  assertManifestShape(manifest);
-  const seen = new Set<string>();
-  for (const entry of manifest.files) {
-    if (
-      entry === null ||
-      typeof entry !== 'object' ||
-      typeof entry.path !== 'string' ||
-      typeof entry.size !== 'number' ||
-      typeof entry.sha256 !== 'string'
-    ) {
-      throw backupError('backup manifest contains an invalid file entry');
-    }
-    if (seen.has(entry.path)) {
-      throw backupError(`backup manifest contains a duplicate entry: ${entry.path}`);
-    }
-    seen.add(entry.path);
+  const validated = validateManifest(manifest);
+  for (const entry of validated.files) {
     const absolute = resolveBackupPath(root, entry.path);
     let buffer: Buffer;
     try {
@@ -203,7 +276,7 @@ export async function readManifestFile(path: string): Promise<BackupManifest> {
   let raw: string;
   try {
     raw = await readFile(path, 'utf8');
-  } catch (cause) {
+  } catch {
     throw backupError(`backup manifest cannot be read: ${path}`);
   }
   let parsed: unknown;
@@ -212,12 +285,7 @@ export async function readManifestFile(path: string): Promise<BackupManifest> {
   } catch {
     throw backupError('backup manifest is not valid JSON');
   }
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw backupError('backup manifest is not an object');
-  }
-  const manifest = parsed as BackupManifest;
-  assertManifestShape(manifest);
-  return manifest;
+  return validateManifest(parsed);
 }
 
 export async function writeManifestFile(path: string, manifest: BackupManifest): Promise<void> {

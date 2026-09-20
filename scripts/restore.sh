@@ -29,7 +29,6 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --check) CHECK=1 ;;
     --acknowledge) ACKNOWLEDGE=1 ;;
-    --no-start) START_STACK=0 ;;
     --start) START_STACK=1 ;;
     --project) shift; PROJECT="${1:-}"; [ -n "$PROJECT" ] || fail "--project requires a value" ;;
     --project=*) PROJECT="${1#*=}" ;;
@@ -52,16 +51,45 @@ NEW_ROOT="${POSITIONALS[1]}"
 PROJECT="${PROJECT:-${COMPOSE_PROJECT_NAME}-restore}"
 PORT="${PORT:-17551}"
 
+if [ -f "$ROOT_DIR/.env" ]; then
+  set -a
+  . "$ROOT_DIR/.env"
+  set +a
+fi
+BRAIN_UID="${BRAIN_UID:-1000}"
+BRAIN_GID="${BRAIN_GID:-1000}"
+
 [ -d "$BACKUP" ] || fail "backup directory does not exist: $BACKUP"
 BACKUP="$(cd "$BACKUP" && pwd -P)"
 [ -f "$BACKUP/manifest.json" ] || fail "backup has no manifest.json: $BACKUP"
-[ -f "$BACKUP/checksums.sha256" ] || fail "backup has no checksums.sha256: $BACKUP"
 
 read_number_field() {
   local file="$1" key="$2" value
   value="$(grep -o "\"$key\"[[:space:]]*:[[:space:]]*[0-9]\+" "$file" | head -n1 | grep -o '[0-9]\+$' || true)"
   [ -n "$value" ] || return 1
   printf '%s' "$value"
+}
+
+run_verifier() {
+  local manifest="$1" root="$2"
+  if [ -n "${BRAIN_VERIFY_COMMAND:-}" ]; then
+    ( cd "$ROOT_DIR" && $BRAIN_VERIFY_COMMAND verify-backup --root "$root" --manifest "$manifest" )
+    return
+  fi
+  if [ -f "$ROOT_DIR/dist/cli.js" ] && command -v node >/dev/null 2>&1; then
+    node "$ROOT_DIR/dist/cli.js" verify-backup --root "$root" --manifest "$manifest"
+    return
+  fi
+  if command -v npx >/dev/null 2>&1 && [ -d "$ROOT_DIR/node_modules/tsx" ]; then
+    ( cd "$ROOT_DIR" && npx --no-install tsx src/cli.ts verify-backup --root "$root" --manifest "$manifest" )
+    return
+  fi
+  if command -v docker >/dev/null 2>&1 && docker image inspect second-brain:local >/dev/null 2>&1; then
+    docker run --rm -v "$root":/backup --entrypoint node second-brain:local \
+      /app/dist/cli.js verify-backup --root /backup --manifest "/backup/$(basename "$manifest")"
+    return
+  fi
+  fail "no manifest verifier is available; run npm run build or set BRAIN_VERIFY_COMMAND"
 }
 
 FORMAT_VERSION="$(read_number_field "$BACKUP/manifest.json" format_version || true)"
@@ -72,9 +100,15 @@ STATE_SCHEMA="$(grep -o '"schema"[[:space:]]*:[[:space:]]*[0-9]\+' "$BACKUP/mani
 [ -n "$STATE_SCHEMA" ] || fail "backup manifest.json has no readable application-state schema version"
 [ "$STATE_SCHEMA" -le "$CURRENT_STATE_SCHEMA" ] || fail "backup state schema version $STATE_SCHEMA is newer than this release supports ($CURRENT_STATE_SCHEMA)"
 
-note "verifying stored file hashes"
-if ! (cd "$BACKUP" && sha256sum --strict -c checksums.sha256 >/dev/null 2>&1); then
-  fail "checksum verification failed; the backup is corrupt or incomplete"
+note "verifying every file declared in the manifest"
+if ! VERIFY_OUTPUT="$(run_verifier "$BACKUP/manifest.json" "$BACKUP" 2>&1)"; then
+  fail "the TypeScript backup verifier rejected the manifest or its files: $VERIFY_OUTPUT"
+fi
+
+if [ -f "$BACKUP/checksums.sha256" ]; then
+  if ! (cd "$BACKUP" && sha256sum --strict -c checksums.sha256 >/dev/null 2>&1); then
+    fail "checksum verification failed; the backup is corrupt or incomplete"
+  fi
 fi
 
 verify_archive() {
@@ -94,18 +128,31 @@ verify_archive() {
   fi
 }
 
+declared_archive() {
+  local relative="$1"
+  grep -F '"path"' "$BACKUP/manifest.json" | grep -Fq "\"$relative\""
+}
+
 shopt -s nullglob
 ARCHIVES=("$BACKUP"/*.tar "$BACKUP"/volumes/*.tar)
 shopt -u nullglob
 [ "${#ARCHIVES[@]}" -gt 0 ] || fail "backup contains no archives"
 
 for archive in "${ARCHIVES[@]}"; do
+  relative="${archive#"$BACKUP"/}"
+  declared_archive "$relative" || fail "backup contains an undeclared archive: $relative"
   verify_archive "$archive"
 done
 
-if [ -e "$NEW_ROOT" ] && [ -n "$(ls -A "$NEW_ROOT" 2>/dev/null || true)" ]; then
-  fail "destination already exists and is not empty: $NEW_ROOT"
+if [ -e "$NEW_ROOT" ] || [ -L "$NEW_ROOT" ]; then
+  fail "destination already exists; restore extracts only into a fresh root: $NEW_ROOT"
 fi
+NEW_ROOT_PARENT="$(dirname "$NEW_ROOT")"
+[ -d "$NEW_ROOT_PARENT" ] || fail "destination parent does not exist: $NEW_ROOT_PARENT"
+if [ -L "$NEW_ROOT_PARENT" ]; then
+  fail "destination parent is a symbolic link: $NEW_ROOT_PARENT"
+fi
+[ -w "$NEW_ROOT_PARENT" ] || fail "destination parent is not writable: $NEW_ROOT_PARENT"
 
 FILE_COUNT="$(grep -c '"path"' "$BACKUP/manifest.json" || true)"
 note "backup is valid (format=$FORMAT_VERSION schema=$STATE_SCHEMA files=$FILE_COUNT)"
@@ -118,21 +165,27 @@ fi
 [ "$ACKNOWLEDGE" = "1" ] || fail "restoring writes a new root; re-run with --acknowledge to proceed"
 
 note "extracting into fresh root $NEW_ROOT"
-mkdir -p "$NEW_ROOT"
+mkdir "$NEW_ROOT"
 if [ -f "$BACKUP/vault.tar" ]; then
   mkdir -p "$NEW_ROOT/vault"
   tar -xf "$BACKUP/vault.tar" -C "$NEW_ROOT/vault" --no-same-owner --no-same-permissions
 fi
 for archive in "$BACKUP"/volumes/*.tar; do
   [ -e "$archive" ] || continue
-  name="$(basename "$archive" .tar)"
-  mkdir -p "$NEW_ROOT/volumes/$name"
-  tar -xf "$archive" -C "$NEW_ROOT/volumes/$name" --no-same-owner --no-same-permissions
+  key="$(basename "$archive" .tar)"
+  mkdir -p "$NEW_ROOT/volumes/$key"
+  tar -xf "$archive" -C "$NEW_ROOT/volumes/$key" --no-same-owner --no-same-permissions
 done
 if [ -f "$BACKUP/secrets.tar" ]; then
   mkdir -p "$NEW_ROOT/secrets"
   tar -xf "$BACKUP/secrets.tar" -C "$NEW_ROOT/secrets" --no-same-owner --no-same-permissions
   chmod 700 "$NEW_ROOT/secrets" 2>/dev/null || true
+fi
+
+if [ "$(id -u)" = "0" ]; then
+  chown -R "$BRAIN_UID:$BRAIN_GID" "$NEW_ROOT"
+else
+  note "not running as root; ensure $NEW_ROOT is writable by uid $BRAIN_UID before starting the restored stack"
 fi
 
 if [ "$START_STACK" != "1" ]; then
@@ -150,13 +203,14 @@ OVERRIDE="$(mktemp)"
 {
   printf 'services:\n'
   printf '  brain:\n'
-  printf '    ports:\n      - "127.0.0.1:%s:7331"\n' "$PORT"
-  printf '    volumes: !reset\n'
+  printf '    ports: !override\n'
+  printf '      - "127.0.0.1:%s:7331"\n' "$PORT"
+  printf '    volumes: !override\n'
   printf '      - %s:/vault:ro\n' "$NEW_ROOT/vault"
   printf '      - %s:/var/lib/second-brain\n' "$NEW_ROOT/volumes/brain-state"
-  printf '      - ./config/brain.yaml:/run/brain/brain.yaml:ro\n'
+  printf '      - %s/config/brain.yaml:/run/brain/brain.yaml:ro\n' "$ROOT_DIR"
   printf '  memory:\n'
-  printf '    volumes: !reset\n'
+  printf '    volumes: !override\n'
   printf '      - %s:/app/data\n' "$NEW_ROOT/vault"
   if [ -d "$NEW_ROOT/volumes/memory-state" ]; then
     printf '      - %s:/home/appuser/.basic-memory\n' "$NEW_ROOT/volumes/memory-state"
@@ -164,7 +218,6 @@ OVERRIDE="$(mktemp)"
   if [ -d "$NEW_ROOT/volumes/model-cache" ]; then
     printf '      - %s:/home/appuser/.basic-memory/fastembed_cache\n' "$NEW_ROOT/volumes/model-cache"
   fi
-  printf 'volumes: !reset []\n'
 } > "$OVERRIDE"
 
 cleanup_stack() {
@@ -186,6 +239,9 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 if [ "$healthy" != "1" ]; then
+  note "the restored stack is not healthy; recent service state and logs follow"
+  docker compose -p "$PROJECT" -f compose.yaml -f "$OVERRIDE" ps >&2 || true
+  docker compose -p "$PROJECT" -f compose.yaml -f "$OVERRIDE" logs --no-color --tail 120 >&2 || true
   fail "the restored stack did not become healthy; the working deployment was not switched"
 fi
 

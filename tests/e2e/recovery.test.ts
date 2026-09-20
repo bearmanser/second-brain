@@ -28,6 +28,7 @@ import {
   createCandidateIntent,
   createHarness,
   makeBackupFixture,
+  startHttpHarness,
   type MemoryHarness
 } from '../support/harness.js';
 
@@ -276,6 +277,41 @@ test('marks unrecoverable operations as definitively failed', async () => {
   await h.close();
 });
 
+test('does not report failed when the terminal journal transition fails', async () => {
+  const h = await createHarness();
+  const ghost = h.deps.journal.reserve({
+    principal_id: reviewerPrincipal.id,
+    idempotency_key: randomUUID(),
+    tool: 'brain_capture',
+    scope: 'ghost',
+    payload_hash: 'c'.repeat(64),
+    payload_json: '{}'
+  }).record;
+  h.deps.journal.savePlan(ghost.operation_id, {
+    revision: {
+      id: randomUUID(),
+      revision_id: randomUUID(),
+      operation_id: ghost.operation_id,
+      scope: 'ghost'
+    }
+  } as unknown as PlannedWrite);
+  armFault(h, 'mark', { state: 'failed' });
+
+  const report = await recoverPending(h.deps);
+  const operation = report.operations.find((entry) => entry.operation_id === ghost.operation_id);
+  expect(operation?.outcome).toBe('pending');
+  expect(operation?.blocking).toBe(true);
+  expect(operation?.warnings).toContain('terminal_transition_failed');
+  expect(report.blocking_operations).toContain(ghost.operation_id);
+  expect(h.deps.journal.get(ghost.operation_id)?.state).not.toBe('failed');
+
+  const next = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
+  await expect(
+    h.deps.mutations.commit(reviewerContext, next.intent, next.build)
+  ).rejects.toThrow(/RECOVERY_REQUIRED/);
+  await h.close();
+});
+
 test('restores a valid cold backup and rejects a corrupt one', async () => {
   const fixture = await makeBackupFixture();
   await expect(verifyManifest(fixture.root, fixture.manifest)).resolves.toBeUndefined();
@@ -311,6 +347,93 @@ test('recover-state is owner-only and requires explicit recovery mode', () => {
   expect(() => authenticateOwner('Bearer worker-token', credentials)).toThrow(/FORBIDDEN/);
   expect(() => authenticateOwner(undefined, credentials)).toThrow(/UNAUTHENTICATED/);
   expect(reviewerPrincipal.role).toBe('reviewer');
+});
+
+function structured(result: unknown): Record<string, unknown> {
+  if (typeof result !== 'object' || result === null) return {};
+  const content = (result as { structuredContent?: unknown }).structuredContent;
+  return typeof content === 'object' && content !== null
+    ? (content as Record<string, unknown>)
+    : {};
+}
+
+function captureArguments(idempotency_key: string): Record<string, unknown> {
+  return {
+    idempotency_key,
+    scope: 'freellmapi',
+    note: {
+      title: 'Runtime blocking note',
+      tags: [],
+      content: {
+        kind: 'lesson',
+        situation: 'A runtime-level recovery test needs a materialized read target.',
+        lesson: 'Reads stay available while an ambiguous write blocks new mutations.',
+        applicability: 'Runtime recovery behaviour'
+      },
+      evidence: [],
+      related_ids: []
+    }
+  };
+}
+
+test('brain_status exposes recovering health, blocked writes, and available reads', async () => {
+  const h = await startHttpHarness();
+  const owner = await h.connect(h.ownerToken, 'owner-recovery');
+  try {
+    const first = await owner.callTool({
+      name: 'brain_capture',
+      arguments: captureArguments(randomUUID())
+    });
+    const firstId = structured(first).id as string;
+    expect(typeof firstId).toBe('string');
+
+    h.backend.fail_once = 'before_write';
+    const pending = await owner.callTool({
+      name: 'brain_capture',
+      arguments: captureArguments(randomUUID())
+    });
+    expect(structured(pending).outcome).toBe('pending');
+
+    const originalList = h.runtime.deps.vault.list.bind(h.runtime.deps.vault);
+    h.runtime.deps.vault.list = async () => {
+      throw new Error('vault unavailable');
+    };
+    const report = await recoverPending(h.runtime.deps);
+    expect(report.blocking_operations).toHaveLength(1);
+
+    const status = await owner.callTool({ name: 'brain_status', arguments: {} });
+    const health = structured(status).health as { gateway?: string } | undefined;
+    expect(health?.gateway).toBe('recovering');
+    expect(structured(status).pending_operations).toBeGreaterThanOrEqual(1);
+
+    const operationStatus = await owner.callTool({
+      name: 'brain_status',
+      arguments: { operation_id: report.blocking_operations[0] }
+    });
+    const operation = structured(operationStatus).operation as { outcome?: string } | undefined;
+    expect(operation?.outcome).toBe('pending');
+
+    const read = await owner.callTool({
+      name: 'brain_read',
+      arguments: { scope: 'freellmapi', id: firstId }
+    });
+    expect((read as { isError?: boolean }).isError ?? false).toBe(false);
+    expect(structured(read).markdown).toBeTruthy();
+
+    const blocked = await owner.callTool({
+      name: 'brain_capture',
+      arguments: captureArguments(randomUUID())
+    });
+    expect((blocked as { isError?: boolean }).isError).toBe(true);
+    expect(JSON.stringify(blocked)).toMatch(/RECOVERY_REQUIRED/);
+
+    h.runtime.deps.vault.list = originalList;
+    const cleared = await recoverPending(h.runtime.deps);
+    expect(cleared.blocking_operations).toHaveLength(0);
+  } finally {
+    await owner.close().catch(() => undefined);
+    await h.close();
+  }
 });
 
 async function buildColdBackup(): Promise<{ root: string; close(): Promise<void> }> {

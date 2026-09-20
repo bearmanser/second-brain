@@ -39,6 +39,9 @@ done
 DESTINATION="${POSITIONALS[0]}"
 [ -n "$DESTINATION" ] || fail "a destination directory is required"
 
+if [ -L "$DESTINATION" ]; then
+  fail "destination must not be a symbolic link: $DESTINATION"
+fi
 if [ -e "$DESTINATION" ]; then
   [ -d "$DESTINATION" ] || fail "destination exists and is not a directory: $DESTINATION"
   [ -z "$(ls -A "$DESTINATION" 2>/dev/null || true)" ] || fail "destination is not new/empty: $DESTINATION"
@@ -46,7 +49,6 @@ fi
 
 if [ -f "$ROOT_DIR/.env" ]; then
   set -a
-  # shellcheck disable=SC1091
   . "$ROOT_DIR/.env"
   set +a
 fi
@@ -82,6 +84,8 @@ VAULT_PATH="${VAULT_PATH:-./vault}"
 [ -d "$VAULT_PATH" ] || fail "vault path does not exist: $VAULT_PATH"
 VAULT_ABS="$(cd "$VAULT_PATH" && pwd -P)"
 
+DESTINATION_PARENT="$(dirname "$DESTINATION")"
+[ -d "$DESTINATION_PARENT" ] || fail "destination parent does not exist: $DESTINATION_PARENT"
 mkdir -p "$DESTINATION"
 DESTINATION="$(cd "$DESTINATION" && pwd -P)"
 mkdir -p "$DESTINATION/volumes"
@@ -95,9 +99,14 @@ restart_services() {
 }
 trap restart_services EXIT
 
-note "stopping both services (project $COMPOSE_PROJECT_NAME)"
-docker compose -p "$COMPOSE_PROJECT_NAME" stop brain memory
-STACK_STOPPED=1
+RUNNING_SERVICES="$(docker compose -p "$COMPOSE_PROJECT_NAME" ps -q 2>/dev/null || true)"
+if [ -n "$RUNNING_SERVICES" ]; then
+  note "stopping both services (project $COMPOSE_PROJECT_NAME)"
+  STACK_STOPPED=1
+  docker compose -p "$COMPOSE_PROJECT_NAME" stop brain memory
+else
+  note "no running services in project $COMPOSE_PROJECT_NAME; nothing to stop"
+fi
 
 snapshot_dir() {
   ( cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum )
@@ -116,32 +125,34 @@ resolve_compose_volumes() {
       --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
       --filter "label=com.docker.compose.volume=$key" | head -n1)"
     [ -n "$name" ] || fail "could not resolve the Compose volume for key '$key' in project $COMPOSE_PROJECT_NAME"
-    printf '%s\n' "$name"
+    printf '%s\t%s\n' "$key" "$name"
   done < <(docker compose -p "$COMPOSE_PROJECT_NAME" config --volumes)
 }
 
 STORES=("vault")
+VOLUME_MAP=""
 
 note "archiving the host vault"
 BEFORE_VAULT="$(snapshot_dir "$VAULT_ABS")"
-tar -cf "$DESTINATION/vault.tar" -C "$VAULT_ABS" .
+tar -h -cf "$DESTINATION/vault.tar" -C "$VAULT_ABS" .
 AFTER_VAULT="$(snapshot_dir "$VAULT_ABS")"
 if [ "$BEFORE_VAULT" != "$AFTER_VAULT" ]; then
   fail "the vault changed while it was being copied; aborting because the backup is inconsistent (is Obsidian/sync really paused?)"
 fi
 
 if [ "$NOTES_ONLY" = "0" ]; then
-  while IFS= read -r volume; do
-    [ -n "$volume" ] || continue
-    note "archiving named volume $volume"
+  while IFS=$'\t' read -r key volume; do
+    [ -n "$key" ] || continue
+    note "archiving Compose volume $key ($volume)"
     BEFORE="$(snapshot_volume "$volume")"
     docker run --rm --user 0:0 -v "$volume":/volume:ro -v "$DESTINATION/volumes":/backup \
-      --entrypoint tar "$NODE_IMAGE" -C /volume -cf "/backup/$volume.tar" .
+      --entrypoint tar "$NODE_IMAGE" -h -C /volume -cf "/backup/$key.tar" .
     AFTER="$(snapshot_volume "$volume")"
     if [ "$BEFORE" != "$AFTER" ]; then
       fail "volume $volume changed while it was being copied; aborting because the backup is inconsistent"
     fi
-    STORES+=("$volume")
+    STORES+=("$key")
+    VOLUME_MAP="${VOLUME_MAP:+$VOLUME_MAP,}$key=$volume"
   done < <(resolve_compose_volumes)
 fi
 
@@ -167,15 +178,17 @@ MANIFEST_ARGS=(
   --root /backup
   --out /backup/manifest.json
   --store "$STORE_ARG"
-  --image "brain=$NODE_IMAGE"
-  --image "basic-memory=$BASIC_MEMORY_IMAGE"
+  --image "brain=$NODE_IMAGE,basic-memory=$BASIC_MEMORY_IMAGE"
 )
+if [ -n "$VOLUME_MAP" ]; then
+  MANIFEST_ARGS+=(--volume "$VOLUME_MAP")
+fi
 if [ "$SENSITIVE" = "1" ]; then
   MANIFEST_ARGS+=(--sensitive)
 fi
 
 note "writing the versioned manifest"
-docker run --rm -v "$DESTINATION":/backup --entrypoint node second-brain:local \
+docker run --rm --user 0:0 -v "$DESTINATION":/backup --entrypoint node second-brain:local \
   /app/dist/cli.js backup-manifest "${MANIFEST_ARGS[@]}"
 
 note "backup complete: $DESTINATION ($(IFS=,; printf '%s' "${STORES[*]}"))"

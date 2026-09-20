@@ -1114,10 +1114,24 @@ export class MutationCoordinator {
     reason: string,
     warnings: string[] = []
   ): RecoveryOperationReport {
+    let marked = false;
     try {
       this.deps.journal.mark(record.operation_id, 'failed');
+      marked = true;
     } catch {
-      this.recoveryBlockers.delete(record.operation_id);
+      marked = false;
+    }
+    const persisted = marked
+      ? 'failed'
+      : (this.deps.journal.get(record.operation_id)?.state ?? record.state);
+    if (persisted !== 'failed') {
+      this.recoveryBlockers.add(record.operation_id);
+      return this.operationReport(record, {
+        outcome: 'pending',
+        reason: `${reason}_unconfirmed`,
+        blocking: true,
+        warnings: [...warnings, 'terminal_transition_failed']
+      });
     }
     this.recoveryBlockers.delete(record.operation_id);
     return this.operationReport(record, { outcome: 'failed', reason, warnings });

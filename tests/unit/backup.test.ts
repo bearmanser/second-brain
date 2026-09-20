@@ -9,6 +9,7 @@ import {
   buildManifest,
   collectManifestFiles,
   resolveBackupPath,
+  validateManifest,
   verifyManifest,
   type BackupManifest,
   type VersionManifest
@@ -57,6 +58,98 @@ test('records format version, creation time, versions, stores and file entries',
   expect(manifest.stores).toEqual(['vault', 'brain-state']);
   expect(manifest.sensitive).toBe(false);
   expect(manifest.files).toEqual(files);
+});
+
+test('records the Compose-key to actual-volume-name mapping', () => {
+  const manifest = buildManifest([], {
+    ...versions,
+    volumes: { 'brain-state': 'second-brain_brain-state' }
+  });
+  expect(manifest.volumes).toEqual({ 'brain-state': 'second-brain_brain-state' });
+  expect(validateManifest(manifest).volumes).toEqual({
+    'brain-state': 'second-brain_brain-state'
+  });
+  expect(() =>
+    buildManifest([], { ...versions, volumes: { '../escape': 'x' } })
+  ).not.toThrow();
+  expect(() => validateManifest(buildManifest([], { ...versions, volumes: { '../escape': 'x' } }))).toThrow(
+    /traversal/
+  );
+});
+
+test('rejects manifests with invalid sizes, hashes, times, stores, images, or sensitivity', () => {
+  const base = buildManifest([], versions);
+  const sha = createHash('sha256').update('abc').digest('hex');
+  const cases: [string, (manifest: BackupManifest) => void, RegExp][] = [
+    [
+      'size',
+      (manifest) => {
+        manifest.files = [{ path: 'a.md', size: -1, sha256: sha }];
+      },
+      /size/
+    ],
+    [
+      'fractional size',
+      (manifest) => {
+        manifest.files = [{ path: 'a.md', size: 1.5, sha256: sha }];
+      },
+      /size/
+    ],
+    [
+      'sha256',
+      (manifest) => {
+        manifest.files = [{ path: 'a.md', size: 1, sha256: 'short' }];
+      },
+      /sha256/
+    ],
+    [
+      'created_at',
+      (manifest) => {
+        (manifest as { created_at: unknown }).created_at = 'yesterday';
+      },
+      /created_at/
+    ],
+    [
+      'application',
+      (manifest) => {
+        (manifest.software as { application: unknown }).application = '';
+      },
+      /application/
+    ],
+    [
+      'schema',
+      (manifest) => {
+        (manifest.software as { schema: unknown }).schema = 0;
+      },
+      /schema/
+    ],
+    [
+      'image',
+      (manifest) => {
+        manifest.software.images = { brain: '' };
+      },
+      /images/
+    ],
+    [
+      'store',
+      (manifest) => {
+        manifest.stores = [''];
+      },
+      /stores/
+    ],
+    [
+      'sensitive',
+      (manifest) => {
+        (manifest as { sensitive: unknown }).sensitive = 'yes';
+      },
+      /sensitive/
+    ]
+  ];
+  for (const [label, mutate, pattern] of cases) {
+    const manifest = JSON.parse(JSON.stringify(base)) as BackupManifest;
+    mutate(manifest);
+    expect(() => validateManifest(manifest), label).toThrow(pattern);
+  }
 });
 
 test('defaults the creation time and treats a manifest as not sensitive', () => {

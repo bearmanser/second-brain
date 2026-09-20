@@ -325,6 +325,7 @@ async function runBackupManifest(parsed: ParsedArguments): Promise<number> {
   const out = flagString(parsed.flags, 'out');
   const stores = flagList(parsed.flags, 'store');
   const images = flagPairs(parsed.flags, 'image');
+  const volumes = flagPairs(parsed.flags, 'volume');
   const sensitive = flagBoolean(parsed.flags, 'sensitive');
   const createdAt = flagString(parsed.flags, 'created-at');
   let files = await collectManifestFiles(root);
@@ -339,6 +340,7 @@ async function runBackupManifest(parsed: ParsedArguments): Promise<number> {
     images,
     stores,
     sensitive,
+    volumes,
     ...(createdAt === undefined ? {} : { created_at: createdAt })
   });
   if (out === undefined || out === '-') {
