@@ -1,10 +1,14 @@
 import { expect, test } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import {
+  CURRENT_SCHEMA_VERSION,
+  SchemaVersionRegistry,
   decodeRevision,
   encodeRevision,
   makeEtag,
   payloadHash,
+  planSchemaMigration,
   renderRevision
 } from '../../src/notes/codec.js';
 import {
@@ -463,4 +467,111 @@ test('exposes a stable registry of section titles and folders', () => {
   }
   expect(sectionTitle('lesson', 'evidence')).toBe(EVIDENCE_SECTION_TITLE);
   expect(sectionTitle('lesson', 'related_ids')).toBe(RELATED_SECTION_TITLE);
+});
+
+const migratedRevisionId = '00000000-0000-4000-8000-0000000000aa';
+const migratedOperationId = '00000000-0000-4000-8000-0000000000bb';
+
+const versionZeroTransform = {
+  from: 0,
+  to: CURRENT_SCHEMA_VERSION,
+  apply: ({
+    frontmatter,
+    body
+  }: {
+    frontmatter: Record<string, unknown>;
+    body: string;
+  }): { frontmatter: Record<string, unknown>; body: string } => ({
+    frontmatter: { ...frontmatter, brain_schema_version: CURRENT_SCHEMA_VERSION },
+    body
+  })
+};
+
+const versionZeroRaw = (): string =>
+  renderRevision(lessonRevision, scope).replace(
+    `brain_schema_version: ${CURRENT_SCHEMA_VERSION}`,
+    'brain_schema_version: 0'
+  );
+
+test('the schema version registry rejects duplicate registration and supports scoped cleanup', () => {
+  const registry = new SchemaVersionRegistry();
+  registry.register(versionZeroTransform);
+  expect(() => registry.register(versionZeroTransform)).toThrow(/already registered/);
+  expect(() => registry.register({ ...versionZeroTransform, to: 2 })).toThrow(
+    /target the current schema version/
+  );
+  expect(registry.support()).toEqual({ current: CURRENT_SCHEMA_VERSION, transforms: [0] });
+  expect(registry.get(0)).toBe(versionZeroTransform);
+  registry.clear();
+  expect(registry.support()).toEqual({ current: CURRENT_SCHEMA_VERSION, transforms: [] });
+  expect(registry.get(0)).toBeUndefined();
+});
+
+test('ordinary decode never reinterprets an old schema version, even with a registered transform', () => {
+  const registry = new SchemaVersionRegistry();
+  registry.register(versionZeroTransform);
+  expectBrainCode(() => decodeRevision(versionZeroRaw()), 'INVALID_INPUT');
+});
+
+test('an explicit migration applies the transform and produces a new revision', () => {
+  const raw = versionZeroRaw();
+  const registry = new SchemaVersionRegistry();
+  registry.register(versionZeroTransform);
+  const plan = planSchemaMigration({
+    raw,
+    scope,
+    revision_id: migratedRevisionId,
+    operation_id: migratedOperationId,
+    timestamp: '2026-09-21T00:00:00Z',
+    registry
+  });
+  expect(plan.from_version).toBe(0);
+  expect(plan.to_version).toBe(CURRENT_SCHEMA_VERSION);
+  expect(plan.revision.id).toBe(lessonRevision.id);
+  expect(plan.revision.revision_id).toBe(migratedRevisionId);
+  expect(plan.revision.operation_id).toBe(migratedOperationId);
+  expect(plan.revision.parents).toEqual([]);
+  expect(plan.revision.status).toBe('candidate');
+  expect(plan.migrated_from).toEqual({
+    revision_id: lessonRevision.revision_id,
+    raw_hash: createHash('sha256').update(raw, 'utf8').digest('hex')
+  });
+  expect(plan.backup).toBe(raw);
+  expect(plan.revision.extra_frontmatter.brain_migrated_from).toEqual({
+    revision_id: lessonRevision.revision_id,
+    raw_hash: plan.migrated_from.raw_hash,
+    schema_version: 0
+  });
+  const decoded = decodeRevision(plan.document);
+  expect(decoded.revision_id).toBe(migratedRevisionId);
+  expect(decoded.extra_frontmatter.owner_label).toBe('Keep this');
+});
+
+test('an explicit migration refuses an unregistered version and a current-schema file', () => {
+  const raw = versionZeroRaw();
+  const empty = new SchemaVersionRegistry();
+  expectBrainCode(
+    () =>
+      planSchemaMigration({
+        raw,
+        scope,
+        revision_id: migratedRevisionId,
+        operation_id: migratedOperationId,
+        timestamp: '2026-09-21T00:00:00Z',
+        registry: empty
+      }),
+    'UNSUPPORTED_SCHEMA'
+  );
+  expectBrainCode(
+    () =>
+      planSchemaMigration({
+        raw: renderRevision(lessonRevision, scope),
+        scope,
+        revision_id: migratedRevisionId,
+        operation_id: migratedOperationId,
+        timestamp: '2026-09-21T00:00:00Z',
+        registry: empty
+      }),
+    'INVALID_INPUT'
+  );
 });

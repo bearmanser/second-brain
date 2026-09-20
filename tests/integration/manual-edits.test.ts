@@ -4,17 +4,17 @@ import Database from 'better-sqlite3';
 import { cp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { BrainError, type BrainErrorCode } from '../../src/contracts/errors.js';
-import type { StoredRevision } from '../../src/core/types.js';
+import type { ScopeConfig, StoredRevision, VaultPort } from '../../src/core/types.js';
 import { relativePathFor } from '../../src/notes/identity.js';
 import {
   CURRENT_SCHEMA_VERSION,
+  SchemaVersionRegistry,
   decodeRevision,
   payloadHash,
-  registerSchemaVersionTransform,
   renderRevision,
-  schemaVersionSupport
+  type SchemaVersionTransform
 } from '../../src/notes/codec.js';
-import { reconcileVault } from '../../src/notes/reconcile.js';
+import { migrateSchemaRevision, reconcileVault } from '../../src/notes/reconcile.js';
 import {
   createCandidateIntent,
   createHarness,
@@ -51,7 +51,7 @@ async function manualCase(name: string): Promise<string> {
   return readFile(join(MANUAL_CASES, name), 'utf8');
 }
 
-function scopeOf(harness: MemoryHarness, id: string): { relative_root: string } {
+function scopeOf(harness: MemoryHarness, id: string): ScopeConfig {
   const scope = harness.deps.config.scopes.find((candidate) => candidate.id === id);
   if (scope === undefined) throw new Error(`unknown scope ${id}`);
   return scope;
@@ -349,26 +349,85 @@ test('a future schema version is quarantined and never coerced', async () => {
   expect(await readFile(absolute, 'utf8')).toBe(raw);
 });
 
-test('an unregistered older schema version is rejected until a transform is registered', async () => {
-  const raw = (await manualCase('managed-lesson.md')).replace(
+const versionZeroRaw = async (): Promise<string> =>
+  (await manualCase('managed-lesson.md')).replace(
     `brain_schema_version: ${CURRENT_SCHEMA_VERSION}`,
     'brain_schema_version: 0'
   );
-  const version = await expectCode(Promise.resolve().then(() => decodeRevision(raw)), 'INVALID_INPUT');
-  expect(version.message).toMatch(/brain_schema_version/);
-  expect(schemaVersionSupport()).toEqual({ current: CURRENT_SCHEMA_VERSION, transforms: [] });
 
-  registerSchemaVersionTransform({
-    from: 0,
-    to: CURRENT_SCHEMA_VERSION,
-    apply: ({ frontmatter, body }) => ({
-      frontmatter: { ...frontmatter, brain_schema_version: CURRENT_SCHEMA_VERSION },
-      body
-    })
+const versionZeroTransform: SchemaVersionTransform = {
+  from: 0,
+  to: CURRENT_SCHEMA_VERSION,
+  apply: ({ frontmatter, body }) => ({
+    frontmatter: { ...frontmatter, brain_schema_version: CURRENT_SCHEMA_VERSION },
+    body
+  })
+};
+
+test('ordinary decode and reconciliation never reinterpret an old schema version', async () => {
+  const h = await openHarness();
+  const scope = scopeOf(h, SCOPE);
+  const raw = await versionZeroRaw();
+  const registry = new SchemaVersionRegistry();
+  registry.register(versionZeroTransform);
+
+  const version = await expectCode(
+    Promise.resolve().then(() => decodeRevision(raw)),
+    'INVALID_INPUT'
+  );
+  expect(version.message).toMatch(/brain_schema_version/);
+  expect(registry.support()).toEqual({ current: CURRENT_SCHEMA_VERSION, transforms: [0] });
+
+  const absolute = await placeFixture(h, `${scope.relative_root}/Lessons/old/old.md`, raw);
+  const report = await reconcileVault(h.deps, SCOPE);
+  expect(report.malformed).toBe(1);
+  expect(report.unsupported_schema).toBe(0);
+  expect(await readFile(absolute, 'utf8')).toBe(raw);
+});
+
+test('an explicit migration writes a new revision and keeps the original', async () => {
+  const h = await openHarness();
+  const scope = scopeOf(h, SCOPE);
+  const raw = await versionZeroRaw();
+  const relativePath = `${scope.relative_root}/Lessons/old/old.md`;
+  const original = await placeFixture(h, relativePath, raw);
+  const registry = new SchemaVersionRegistry();
+  registry.register(versionZeroTransform);
+
+  const revisionId = randomUUID();
+  const result = await migrateSchemaRevision(h.deps, SCOPE, {
+    relative_path: relativePath,
+    revision_id: revisionId,
+    operation_id: randomUUID(),
+    timestamp: '2026-09-21T00:00:00Z',
+    registry
   });
-  const decoded = decodeRevision(raw);
-  expect(decoded.revision_id).toBe('1c9f2d3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e');
-  expect(schemaVersionSupport().transforms).toEqual([0]);
+
+  expect(result.plan.from_version).toBe(0);
+  expect(result.plan.revision.id).toBe('0b8f1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d');
+  expect(result.plan.revision.revision_id).toBe(revisionId);
+  expect(result.plan.revision.parents).toEqual([]);
+  expect(result.plan.migrated_from.revision_id).toBe(
+    '1c9f2d3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e'
+  );
+  expect(await readFile(original, 'utf8')).toBe(raw);
+
+  const migratedPath = relativePathFor(
+    scope.relative_root,
+    'lesson',
+    result.plan.revision.id,
+    result.plan.revision.note.title,
+    revisionId
+  );
+  const migratedRaw = await readFile(join(h.deps.config.mounts.vault, migratedPath), 'utf8');
+  const decoded = decodeRevision(migratedRaw);
+  expect(decoded.id).toBe(result.plan.revision.id);
+  expect(decoded.revision_id).toBe(revisionId);
+  expect(decoded.extra_frontmatter.brain_migrated_from).toEqual({
+    revision_id: '1c9f2d3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e',
+    raw_hash: result.plan.migrated_from.raw_hash,
+    schema_version: 0
+  });
 });
 
 test('unmanaged Obsidian files are counted but never imported', async () => {
@@ -544,4 +603,21 @@ test('a host edit is visible without a restart and periodic scans stay bounded',
     await reviewer.close();
     await h.close();
   }
+});
+
+test('startup fails when the initial full scan cannot enumerate the vault', async () => {
+  const failingVault: VaultPort = {
+    list: async () => {
+      throw new BrainError({
+        code: 'RECOVERY_REQUIRED',
+        message: 'simulated vault enumeration failure'
+      });
+    },
+    read: async () => {
+      throw new BrainError({ code: 'NOT_FOUND', message: 'simulated vault read failure' });
+    }
+  };
+  await expect(startHttpHarness({ vault: failingVault })).rejects.toThrow(
+    /simulated vault enumeration failure/
+  );
 });

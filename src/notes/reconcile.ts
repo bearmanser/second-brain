@@ -7,6 +7,11 @@ import type {
   ScopeConfig
 } from '../core/types.js';
 import type { OperationRecord } from '../storage/journal.js';
+import {
+  planSchemaMigration,
+  type SchemaMigrationPlan,
+  type SchemaVersionRegistry
+} from './codec.js';
 import type { ApprovalProvenance, ApprovalProvenanceInput } from './catalogue.js';
 
 export interface ReconcileOptions {
@@ -144,4 +149,38 @@ export async function reconcileVault(
     };
   }
   return report;
+}
+
+export interface MigrateSchemaRequest {
+  relative_path: string;
+  revision_id: string;
+  operation_id: string;
+  timestamp?: string;
+  registry?: SchemaVersionRegistry;
+}
+
+export interface MigrateSchemaResult {
+  plan: SchemaMigrationPlan;
+  materialized: { permalink: string; relative_path?: string };
+}
+
+export async function migrateSchemaRevision(
+  deps: BrainDeps,
+  scope: string,
+  request: MigrateSchemaRequest
+): Promise<MigrateSchemaResult> {
+  const config = selectScopes(deps, scope)[0];
+  const read = await deps.vault.read(config.id, request.relative_path);
+  const plan = planSchemaMigration({
+    raw: read.raw,
+    scope: config,
+    revision_id: request.revision_id,
+    operation_id: request.operation_id,
+    timestamp: request.timestamp ?? deps.clock.now().toISOString(),
+    ...(request.registry === undefined ? {} : { registry: request.registry })
+  });
+  const materialized = await deps.mutations.serialize(() =>
+    deps.backend.create(plan.planned_write)
+  );
+  return { plan, materialized };
 }

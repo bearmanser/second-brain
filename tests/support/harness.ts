@@ -29,12 +29,14 @@ import type {
   NoteInput,
   Principal,
   RequestContext,
-  StoredRevision
+  StoredRevision,
+  VaultPort
 } from '../../src/core/types.js';
 import type { BrainServices } from '../../src/mcp/server.js';
 import { RevisionCatalogue } from '../../src/notes/catalogue.js';
-import { payloadHash, renderRevision } from '../../src/notes/codec.js';
-import { relativePathFor } from '../../src/notes/identity.js';
+import { encodeRevision, payloadHash, renderRevision } from '../../src/notes/codec.js';
+import { hashRaw, relativePathFor } from '../../src/notes/identity.js';
+import { JournalApprovalProvenance } from '../../src/notes/reconcile.js';
 import { createRuntime, type BrainRuntime } from '../../src/runtime.js';
 import { Journal, type AuditEventRecord } from '../../src/storage/journal.js';
 import { FileVault } from '../../src/storage/vault.js';
@@ -189,7 +191,8 @@ class MemoryHarnessImpl implements MemoryHarness {
     this.catalogue = RevisionCatalogue.open(join(this.stateDir, 'catalogue.db'), {
       vault,
       scopes: this.config.scopes,
-      clock: this.clock
+      clock: this.clock,
+      approval_provenance: new JournalApprovalProvenance(this.journal)
     });
     const journal = wrapJournal(this.journal, this.scheduler);
     const mutations = new MutationCoordinator({
@@ -220,8 +223,18 @@ class MemoryHarnessImpl implements MemoryHarness {
     if (scope === undefined) throw new Error(`unknown scope ${scopeId}`);
     const id = this.ids.next();
     const revisionId = this.ids.next();
-    const operationId = this.ids.next();
     const timestamp = this.clock.now().toISOString();
+    const operationId =
+      status === 'candidate'
+        ? this.ids.next()
+        : this.journal.reserve({
+            principal_id: reviewerPrincipal.id,
+            idempotency_key: randomUUID(),
+            tool: 'brain_review',
+            scope: scopeId,
+            payload_hash: hashRaw(JSON.stringify(note)),
+            payload_json: JSON.stringify({ note })
+          }).record.operation_id;
     const base: StoredRevision = {
       id,
       revision_id: revisionId,
@@ -250,6 +263,20 @@ class MemoryHarnessImpl implements MemoryHarness {
     const absolute = join(this.vaultRoot, relativePath);
     await mkdir(dirname(absolute), { recursive: true });
     await writeFile(absolute, renderRevision(revision, scope), 'utf8');
+    if (status !== 'candidate') {
+      this.journal.savePlan(operationId, encodeRevision(revision, scope));
+      this.journal.mark(operationId, 'submitted');
+      this.journal.mark(operationId, 'complete', {
+        operation_id: operationId,
+        id,
+        revision_id: revisionId,
+        outcome: 'stored',
+        materialized: true,
+        indexed: true,
+        possible_duplicates: [],
+        warnings: []
+      });
+    }
     await this.catalogue.reconcile(scopeId);
     return this.catalogue.get(scopeId, id);
   }
@@ -311,6 +338,7 @@ export interface HttpHarnessOptions {
   allowed_hosts?: string[];
   allowed_origins?: string[];
   reconcile_interval_ms?: number;
+  vault?: VaultPort;
 }
 
 export interface HttpHarness {
@@ -437,6 +465,7 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
   try {
     runtime = await createRuntime(config, {
       backend,
+      ...(options.vault === undefined ? {} : { vault: options.vault }),
       logger: (line) => {
         diagnostics.push(line);
       },

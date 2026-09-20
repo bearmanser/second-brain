@@ -15,7 +15,7 @@ import {
   type ScopeConfig,
   type StoredRevision
 } from '../core/types.js';
-import { permalinkFor, revisionDirectory, storageTitle } from './identity.js';
+import { permalinkFor, hashRaw, revisionDirectory, storageTitle } from './identity.js';
 import {
   EVIDENCE_SECTION_TITLE,
   NOTE_REGISTRY,
@@ -47,27 +47,53 @@ export interface SchemaVersionTransform {
   }): { frontmatter: Record<string, unknown>; body: string };
 }
 
-const schemaVersionTransforms = new Map<number, SchemaVersionTransform>();
+export class SchemaVersionRegistry {
+  private readonly transforms = new Map<number, SchemaVersionTransform>();
+
+  register(transform: SchemaVersionTransform): void {
+    if (!Number.isInteger(transform.from) || !Number.isInteger(transform.to)) {
+      throw invalid('a schema version transform must name integer versions');
+    }
+    if (transform.to !== CURRENT_SCHEMA_VERSION) {
+      throw invalid('a schema version transform must target the current schema version');
+    }
+    if (transform.from >= CURRENT_SCHEMA_VERSION) {
+      throw invalid('a schema version transform must upgrade an older schema version');
+    }
+    if (this.transforms.has(transform.from)) {
+      throw invalid(`a schema version transform for ${transform.from} is already registered`);
+    }
+    this.transforms.set(transform.from, transform);
+  }
+
+  get(from: number): SchemaVersionTransform | undefined {
+    return this.transforms.get(from);
+  }
+
+  support(): { current: number; transforms: number[] } {
+    return {
+      current: CURRENT_SCHEMA_VERSION,
+      transforms: [...this.transforms.keys()].sort((left, right) => left - right)
+    };
+  }
+
+  clear(): void {
+    this.transforms.clear();
+  }
+}
+
+export const defaultSchemaVersionRegistry = new SchemaVersionRegistry();
 
 export function registerSchemaVersionTransform(transform: SchemaVersionTransform): void {
-  if (!Number.isInteger(transform.from) || !Number.isInteger(transform.to)) {
-    throw invalid('a schema version transform must name integer versions');
-  }
-  if (transform.to !== CURRENT_SCHEMA_VERSION) {
-    throw invalid('a schema version transform must target the current schema version');
-  }
-  if (transform.from >= CURRENT_SCHEMA_VERSION) {
-    throw invalid('a schema version transform must upgrade an older schema version');
-  }
-  schemaVersionTransforms.set(transform.from, transform);
+  defaultSchemaVersionRegistry.register(transform);
 }
 
 export function schemaVersionTransform(from: number): SchemaVersionTransform | undefined {
-  return schemaVersionTransforms.get(from);
+  return defaultSchemaVersionRegistry.get(from);
 }
 
 export function schemaVersionSupport(): { current: number; transforms: number[] } {
-  return { current: CURRENT_SCHEMA_VERSION, transforms: [...schemaVersionTransforms.keys()].sort() };
+  return defaultSchemaVersionRegistry.support();
 }
 
 function invalid(message: string, cause?: unknown): BrainError {
@@ -296,24 +322,15 @@ function assembleContent(
 
 export function decodeRevision(raw: string): StoredRevision {
   const normalized = normalizeLineEndings(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
-  const split = splitFrontmatter(normalized);
-  let frontmatter = asRecord(parseYamlValue(split.frontmatter, 'frontmatter'), 'frontmatter');
-  let body = split.body;
+  const { frontmatter: frontmatterText, body } = splitFrontmatter(normalized);
+  const frontmatter = asRecord(parseYamlValue(frontmatterText, 'frontmatter'), 'frontmatter');
 
   const schemaVersion = frontmatter.brain_schema_version;
   if (schemaVersion === undefined) {
     throw invalid('frontmatter brain_schema_version is required');
   }
   if (schemaVersion !== CURRENT_SCHEMA_VERSION) {
-    const transform =
-      typeof schemaVersion === 'number' && Number.isInteger(schemaVersion)
-        ? schemaVersionTransform(schemaVersion)
-        : undefined;
-    if (transform !== undefined) {
-      const upgraded = transform.apply({ frontmatter, body });
-      frontmatter = asRecord(upgraded.frontmatter, 'frontmatter');
-      body = upgraded.body;
-    } else if (
+    if (
       typeof schemaVersion === 'number' &&
       Number.isInteger(schemaVersion) &&
       schemaVersion > CURRENT_SCHEMA_VERSION
@@ -321,11 +338,10 @@ export function decodeRevision(raw: string): StoredRevision {
       throw unsupportedSchema(
         `brain_schema_version ${schemaVersion} is newer than this gateway supports`
       );
-    } else {
-      throw invalid(
-        `frontmatter brain_schema_version must be the integer ${CURRENT_SCHEMA_VERSION}`
-      );
     }
+    throw invalid(
+      `frontmatter brain_schema_version must be the integer ${CURRENT_SCHEMA_VERSION}`
+    );
   }
 
   const kind = resolveKind(frontmatter);
@@ -608,6 +624,92 @@ export function encodeRevision(revision: StoredRevision, scope: ScopeConfig): Pl
     permalink: rendered.permalink,
     body: rendered.body,
     metadata: rendered.frontmatter
+  };
+}
+
+export interface SchemaMigrationInput {
+  raw: string;
+  scope: ScopeConfig;
+  revision_id: string;
+  operation_id: string;
+  timestamp: string;
+  registry?: SchemaVersionRegistry;
+}
+
+export interface SchemaMigrationPlan {
+  from_version: number;
+  to_version: number;
+  migrated_from: { revision_id: string; raw_hash: string };
+  backup: string;
+  revision: StoredRevision;
+  document: string;
+  planned_write: PlannedWrite;
+}
+
+export function planSchemaMigration(input: SchemaMigrationInput): SchemaMigrationPlan {
+  const normalized = normalizeLineEndings(
+    input.raw.charCodeAt(0) === 0xfeff ? input.raw.slice(1) : input.raw
+  );
+  const { frontmatter: frontmatterText, body } = splitFrontmatter(normalized);
+  const frontmatter = asRecord(parseYamlValue(frontmatterText, 'frontmatter'), 'frontmatter');
+  const version = frontmatter.brain_schema_version;
+  if (typeof version !== 'number' || !Number.isInteger(version)) {
+    throw invalid('frontmatter brain_schema_version must be an integer before migration');
+  }
+  if (version === CURRENT_SCHEMA_VERSION) {
+    throw invalid('the revision already uses the current schema version');
+  }
+  const registry = input.registry ?? defaultSchemaVersionRegistry;
+  const transform = registry.get(version);
+  if (transform === undefined) {
+    throw unsupportedSchema(`no registered schema version transform exists for version ${version}`);
+  }
+  const upgraded = transform.apply({ frontmatter, body });
+  const upgradedFrontmatter = asRecord(upgraded.frontmatter, 'frontmatter');
+  upgradedFrontmatter.brain_schema_version = CURRENT_SCHEMA_VERSION;
+  const upgradedRaw = `---\n${stringifyYaml(upgradedFrontmatter)}\n---\n\n${upgraded.body}`;
+  const source = decodeRevision(upgradedRaw);
+
+  if (!uuidSchema.safeParse(input.revision_id).success) {
+    throw invalid('migration revision_id must be a UUID');
+  }
+  if (!uuidSchema.safeParse(input.operation_id).success) {
+    throw invalid('migration operation_id must be a UUID');
+  }
+  if (!timestampSchema.safeParse(input.timestamp).success) {
+    throw invalid('migration timestamp must be a UTC RFC3339 timestamp');
+  }
+  if (source.scope !== input.scope.id) {
+    throw invalid(
+      `migrated revision scope ${source.scope} does not match configured scope ${input.scope.id}`
+    );
+  }
+
+  const migratedFrom = { revision_id: source.revision_id, raw_hash: hashRaw(normalized) };
+  const revision: StoredRevision = {
+    id: source.id,
+    revision_id: input.revision_id,
+    parents: [],
+    scope: input.scope.id,
+    status: 'candidate',
+    note: source.note,
+    created_at: input.timestamp,
+    modified_at: input.timestamp,
+    operation_id: input.operation_id,
+    extra_frontmatter: {
+      ...source.extra_frontmatter,
+      brain_migrated_from: { ...migratedFrom, schema_version: version }
+    },
+    extra_markdown: source.extra_markdown
+  };
+  return {
+    from_version: version,
+    to_version: CURRENT_SCHEMA_VERSION,
+    migrated_from: migratedFrom,
+    backup: normalized,
+    revision,
+    document: renderRevision(revision, input.scope),
+    planned_write: encodeRevision(revision, input.scope)
   };
 }
 

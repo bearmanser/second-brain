@@ -42,6 +42,7 @@ export const SHUTDOWN_DRAIN_MS = 500;
 
 export interface RuntimeOptions {
   backend?: BackendPort;
+  vault?: VaultPort;
   clock?: Clock;
   ids?: IdSource;
   logger?: (line: string) => void;
@@ -202,7 +203,8 @@ class BrainRuntimeImpl implements BrainRuntime {
         ids: this.ids
       });
       this.journal = journal;
-      const vault: VaultPort = new FileVault(this.config.mounts.vault, this.config.scopes);
+      const vault: VaultPort =
+        this.options.vault ?? new FileVault(this.config.mounts.vault, this.config.scopes);
       const catalogue = RevisionCatalogue.open(join(this.config.mounts.state, 'catalogue.db'), {
         vault,
         scopes: this.config.scopes,
@@ -241,7 +243,7 @@ class BrainRuntimeImpl implements BrainRuntime {
       this.deps = deps;
 
       await mutations.recover();
-      await this.reconcileAll();
+      await this.startupReconcile();
 
       this.credentials = loadCredentials(this.config.credentials_file);
       await loadCursorSecret(this.config);
@@ -277,7 +279,7 @@ class BrainRuntimeImpl implements BrainRuntime {
       const reconcileInterval =
         this.config.limits.reconcile_interval_ms ?? RECONCILE_INTERVAL_MS;
       this.reconcileTimer = setInterval(() => {
-        void this.reconcileAll();
+        this.periodicReconcile();
       }, reconcileInterval);
       this.reconcileTimer.unref?.();
 
@@ -367,25 +369,43 @@ class BrainRuntimeImpl implements BrainRuntime {
     }
   }
 
-  private reconcileAll(): Promise<void> {
-    if (this.reconciling || this.closing) return Promise.resolve();
+  private async startupReconcile(): Promise<void> {
+    const report = await this.deps.mutations.serialize(() => reconcileVault(this.deps));
+    this.logReconcile(report);
+  }
+
+  private periodicReconcile(): void {
+    if (this.reconciling || this.closing) return;
     this.reconciling = true;
     const work = async (): Promise<void> => {
       try {
         const report = await this.deps.mutations.serialize(() => reconcileVault(this.deps));
-        this.log(
-          `reconciled ${report.scanned} files in ${report.scopes.length} scopes; ` +
-            `${report.updated} updated, ${report.unmanaged} unmanaged, ${report.malformed} malformed, ` +
-            `${report.conflicted} conflicted, ${report.manual_unreviewed} manual_unreviewed, ` +
-            `${report.unsupported_schema} unsupported_schema`
-        );
+        this.logReconcile(report);
       } catch (error) {
         this.log(internalDiagnostic(error));
       } finally {
         this.reconciling = false;
       }
     };
-    return this.trackOperation(work());
+    void this.trackOperation(work());
+  }
+
+  private logReconcile(report: {
+    scanned: number;
+    updated: number;
+    unmanaged: number;
+    malformed: number;
+    conflicted: number;
+    manual_unreviewed: number;
+    unsupported_schema: number;
+    scopes: string[];
+  }): void {
+    this.log(
+      `reconciled ${report.scanned} files in ${report.scopes.length} scopes; ` +
+        `${report.updated} updated, ${report.unmanaged} unmanaged, ${report.malformed} malformed, ` +
+        `${report.conflicted} conflicted, ${report.manual_unreviewed} manual_unreviewed, ` +
+        `${report.unsupported_schema} unsupported_schema`
+    );
   }
 
   private async stopListening(): Promise<void> {

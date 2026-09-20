@@ -931,7 +931,7 @@ export class RevisionCatalogue implements CataloguePort {
     if (approval === undefined) return false;
     if (approval.payload_hash !== payloadHash(revision)) return true;
     const provenance = this.approvalProvenance;
-    if (provenance === undefined) return false;
+    if (provenance === undefined) return true;
     return !provenance.verify({
       scope: revision.scope,
       id: revision.id,

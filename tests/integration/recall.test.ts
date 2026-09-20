@@ -1,4 +1,5 @@
 import { mkdir, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { expect, test, vi } from 'vitest';
 import { BrainError } from '../../src/contracts/errors.js';
@@ -22,7 +23,7 @@ import {
 } from '../../src/features/recall.js';
 import { review } from '../../src/features/review.js';
 import { hashRaw, relativePathFor } from '../../src/notes/identity.js';
-import { payloadHash, renderRevision } from '../../src/notes/codec.js';
+import { payloadHash, encodeRevision, renderRevision } from '../../src/notes/codec.js';
 import { lessonFixture } from '../fixtures/content.js';
 import {
   ownerContext,
@@ -110,7 +111,6 @@ interface Chain {
 function buildChain(harness: MemoryHarness, noteId: string, count: number): Chain {
   const scope = harness.deps.config.scopes.find((candidate) => candidate.id === 'freellmapi');
   if (scope === undefined) throw new Error('freellmapi scope missing');
-  const operationId = '99999999-9999-4999-8999-999999999999';
   const createdAt = '2026-09-01T00:00:00.000Z';
   const historyNote = lessonNote('chainquery history', { title: 'Alpha chain history' });
   const headNote = lessonNote('chainquery head', { title: 'Zulu chain head' });
@@ -118,6 +118,14 @@ function buildChain(harness: MemoryHarness, noteId: string, count: number): Chai
   const revisions: StoredRevision[] = [];
   for (let index = 0; index < count; index += 1) {
     const revisionId = `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
+    const reserved = harness.deps.journal.reserve({
+      principal_id: reviewerPrincipal.id,
+      idempotency_key: randomUUID(),
+      tool: 'brain_review',
+      scope: scope.id,
+      payload_hash: hashRaw(revisionId),
+      payload_json: JSON.stringify({ revision_id: revisionId })
+    });
     const base: StoredRevision = {
       id: noteId,
       revision_id: revisionId,
@@ -127,7 +135,7 @@ function buildChain(harness: MemoryHarness, noteId: string, count: number): Chai
       note: index === count - 1 ? headNote : historyNote,
       created_at: createdAt,
       modified_at: createdAt,
-      operation_id: operationId,
+      operation_id: reserved.record.operation_id,
       extra_frontmatter: {},
       extra_markdown: ''
     };
@@ -139,6 +147,18 @@ function buildChain(harness: MemoryHarness, noteId: string, count: number): Chai
         payload_hash: payloadHash(base)
       }
     };
+    harness.deps.journal.savePlan(reserved.record.operation_id, encodeRevision(revision, scope));
+    harness.deps.journal.mark(reserved.record.operation_id, 'submitted');
+    harness.deps.journal.mark(reserved.record.operation_id, 'complete', {
+      operation_id: reserved.record.operation_id,
+      id: noteId,
+      revision_id: revisionId,
+      outcome: 'stored',
+      materialized: true,
+      indexed: true,
+      possible_duplicates: [],
+      warnings: []
+    });
     revisions.push(revision);
     parents = [{ revision_id: revisionId, raw_hash: hashRaw(renderRevision(revision, scope)) }];
   }

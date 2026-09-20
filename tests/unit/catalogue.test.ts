@@ -6,7 +6,7 @@ import { BrainError, type BrainErrorCode } from '../../src/contracts/errors.js';
 import type { ScopeConfig, StoredRevision } from '../../src/core/types.js';
 import { makeEtag, payloadHash, renderRevision } from '../../src/notes/codec.js';
 import { hashRaw, relativePathFor } from '../../src/notes/identity.js';
-import { RevisionCatalogue, resolveHead, type ParsedRevision } from '../../src/notes/catalogue.js';
+import { RevisionCatalogue, resolveHead, type ApprovalProvenance, type ParsedRevision } from '../../src/notes/catalogue.js';
 import { FileVault } from '../../src/storage/vault.js';
 import { fixtureIds, lessonFixture, revisionGraphFixture } from '../fixtures/content.js';
 
@@ -87,11 +87,17 @@ const writeRevision = (
   return { path, raw, hash: hashRaw(raw) };
 };
 
-const openCatalogue = (root: string): { vault: FileVault; catalogue: RevisionCatalogue } => {
+const trustAllProvenance: ApprovalProvenance = { verify: () => true };
+
+const openCatalogue = (
+  root: string,
+  provenance: ApprovalProvenance | null = trustAllProvenance
+): { vault: FileVault; catalogue: RevisionCatalogue } => {
   const vault = new FileVault(root, [scopeConfig, sharedScope]);
   const catalogue = RevisionCatalogue.open(join(root, 'catalogue.sqlite'), {
     vault,
-    scopes: [scopeConfig, sharedScope]
+    scopes: [scopeConfig, sharedScope],
+    ...(provenance === null ? {} : { approval_provenance: provenance })
   });
   openCatalogues.push(catalogue);
   return { vault, catalogue };
@@ -268,6 +274,59 @@ test('marks a changed approval payload fingerprint as manual_unreviewed', async 
   expect(changed.revision.status).toBe('active');
   expect(changed.source.status).toBe('candidate');
   expect(changed.source.warnings).toContain('manual_unreviewed');
+});
+
+test('does not trust a matching approval fingerprint without provenance', async () => {
+  const root = makeVaultRoot();
+  const noteId = nextUuid();
+  const base = makeRevision({ id: noteId, status: 'active' });
+  const approved: StoredRevision = {
+    ...base,
+    approval: {
+      principal_id: nextUuid(),
+      rationale: 'Approved after review.',
+      payload_hash: payloadHash(base)
+    }
+  };
+  writeRevision(root, approved);
+  const { catalogue } = openCatalogue(root, null);
+
+  await catalogue.reconcile(scopeConfig.id);
+  const head = await catalogue.get(scopeConfig.id, noteId);
+  expect(head.state).toBe('manual_unreviewed');
+  expect(head.source.status).toBe('candidate');
+  expect(head.revision.status).toBe('active');
+  expect(catalogue.approvalIsValid(head.revision)).toBe(false);
+});
+
+test('trusts a matching approval fingerprint only when provenance verifies', async () => {
+  const root = makeVaultRoot();
+  const noteId = nextUuid();
+  const base = makeRevision({ id: noteId, status: 'active' });
+  const approved: StoredRevision = {
+    ...base,
+    approval: {
+      principal_id: nextUuid(),
+      rationale: 'Approved after review.',
+      payload_hash: payloadHash(base)
+    }
+  };
+  writeRevision(root, approved);
+
+  const denied = openCatalogue(root, { verify: () => false });
+  await denied.catalogue.reconcile(scopeConfig.id);
+  const deniedHead = await denied.catalogue.get(scopeConfig.id, noteId);
+  expect(deniedHead.state).toBe('manual_unreviewed');
+  expect(deniedHead.source.status).toBe('candidate');
+
+  const trusted = openCatalogue(root, {
+    verify: (input) => input.revision_id === approved.revision_id
+  });
+  await trusted.catalogue.reconcile(scopeConfig.id);
+  const trustedHead = await trusted.catalogue.get(scopeConfig.id, noteId);
+  expect(trustedHead.state).toBe('ready');
+  expect(trustedHead.source.status).toBe('active');
+  expect(trusted.catalogue.approvalIsValid(trustedHead.revision)).toBe(true);
 });
 
 test('flags malformed YAML as a conflict without discarding the file', async () => {
