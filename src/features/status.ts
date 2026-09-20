@@ -1,6 +1,11 @@
 import { z } from 'zod';
 import { BrainError, isBrainError } from '../contracts/errors.js';
-import { etagSchema, scopeIdSchema, uuidSchema } from '../contracts/content.js';
+import {
+  etagSchema,
+  noteInputSchema,
+  scopeIdSchema,
+  uuidSchema
+} from '../contracts/content.js';
 import { statusRequestSchema } from '../contracts/protocol.js';
 import type { BrainDeps } from '../core/mutation.js';
 import {
@@ -47,6 +52,34 @@ const mutationReceiptSchema = z.strictObject({
   etag: etagSchema.optional(),
   possible_duplicates: z.array(sourceRefSchema),
   warnings: z.array(z.string())
+});
+
+const storedRevisionSchema = z.looseObject({
+  id: uuidSchema,
+  revision_id: uuidSchema,
+  operation_id: uuidSchema,
+  parents: z.array(z.strictObject({ revision_id: uuidSchema, raw_hash: etagSchema })),
+  scope: scopeIdSchema,
+  status: z.enum(LIFECYCLES),
+  note: noteInputSchema,
+  created_at: z.iso.datetime(),
+  modified_at: z.iso.datetime(),
+  approval: z
+    .strictObject({ principal_id: uuidSchema, rationale: z.string(), payload_hash: etagSchema })
+    .optional(),
+  replacement_id: uuidSchema.optional(),
+  extra_frontmatter: z.record(z.string(), z.unknown()),
+  extra_markdown: z.string()
+});
+
+const plannedWriteSchema = z.looseObject({
+  revision: storedRevisionSchema,
+  backend_project: z.string(),
+  directory: z.string(),
+  storage_title: z.string(),
+  permalink: z.string(),
+  body: z.string(),
+  metadata: z.record(z.string(), z.unknown())
 });
 
 function invalidInput(message: string, cause?: unknown): BrainError {
@@ -112,6 +145,7 @@ function canInspect(principal: Principal, record: OperationRecord): boolean {
 interface PlannedIdentity {
   id: string;
   revision_id: string;
+  operation_id: string;
 }
 
 function plannedIdentity(record: OperationRecord): PlannedIdentity | undefined {
@@ -122,18 +156,20 @@ function plannedIdentity(record: OperationRecord): PlannedIdentity | undefined {
   } catch (cause) {
     throw recoveryRequired(record.operation_id, cause);
   }
-  const revision =
-    plan !== null && typeof plan === 'object'
-      ? (plan as { revision?: { id?: unknown; revision_id?: unknown } }).revision
-      : undefined;
+  const result = plannedWriteSchema.safeParse(plan);
+  if (!result.success) throw recoveryRequired(record.operation_id);
+  const revision = result.data.revision;
   if (
-    revision === undefined ||
-    typeof revision.id !== 'string' ||
-    typeof revision.revision_id !== 'string'
+    revision.operation_id !== record.operation_id ||
+    revision.scope !== record.scope
   ) {
     throw recoveryRequired(record.operation_id);
   }
-  return { id: revision.id, revision_id: revision.revision_id };
+  return {
+    id: revision.id,
+    revision_id: revision.revision_id,
+    operation_id: revision.operation_id
+  };
 }
 
 function receiptFromRecord(record: OperationRecord): MutationReceipt | undefined {
@@ -151,7 +187,9 @@ function receiptFromRecord(record: OperationRecord): MutationReceipt | undefined
     if (receipt.operation_id !== record.operation_id) throw recoveryRequired(record.operation_id);
     if (
       plan !== undefined &&
-      (receipt.id !== plan.id || receipt.revision_id !== plan.revision_id)
+      (receipt.id !== plan.id ||
+        receipt.revision_id !== plan.revision_id ||
+        receipt.operation_id !== plan.operation_id)
     ) {
       throw recoveryRequired(record.operation_id);
     }
@@ -159,7 +197,7 @@ function receiptFromRecord(record: OperationRecord): MutationReceipt | undefined
   }
   if (plan !== undefined) {
     return {
-      operation_id: record.operation_id,
+      operation_id: plan.operation_id,
       id: plan.id,
       revision_id: plan.revision_id,
       outcome: 'pending',

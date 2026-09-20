@@ -938,21 +938,85 @@ function recordWith(overrides: Partial<OperationRecord>): OperationRecord {
   };
 }
 
-test('status rejects corrupt or inconsistent persisted receipts with RECOVERY_REQUIRED', async () => {
+function planJson(
+  overrides: { id?: string; revision_id?: string; operation_id?: string } = {}
+): string {
+  return JSON.stringify({
+    revision: {
+      id: overrides.id ?? fixtureIds.note,
+      revision_id: overrides.revision_id ?? fixtureIds.revision,
+      operation_id: overrides.operation_id ?? fixtureIds.idempotencyKey,
+      parents: [],
+      scope: 'freellmapi',
+      status: 'candidate',
+      note: lessonFixture,
+      created_at: '2026-09-20T00:00:00.000Z',
+      modified_at: '2026-09-20T00:00:00.000Z',
+      extra_frontmatter: {},
+      extra_markdown: ''
+    },
+    backend_project: 'freellmapi',
+    directory: 'Notes',
+    storage_title: lessonFixture.title,
+    permalink: 'freellmapi/notes/compare',
+    body: 'body',
+    metadata: {}
+  });
+}
+
+function planJsonWithoutOperationId(): string {
+  const parsed = JSON.parse(planJson()) as { revision: Record<string, unknown> };
+  delete parsed.revision.operation_id;
+  return JSON.stringify(parsed);
+}
+
+test('status validates plan identity and returns the receipt when it is consistent', async () => {
   const harness = await createHarness();
   try {
-    const mismatchedPlan = JSON.stringify({
-      revision: { id: fixtureIds.note, revision_id: fixtureIds.replacement }
+    const consistent = recordWith({
+      receipt_json: JSON.stringify(receiptSample),
+      plan_json: planJson()
     });
-    const mismatchedIdentity = { ...receiptSample, id: fixtureIds.replacement };
+    const deps = {
+      ...harness.deps,
+      journal: { get: () => consistent, pending: () => [] } as unknown as Journal
+    };
+    const view = await status(workerContext, { operation_id: consistent.operation_id }, deps);
+    expect(view.operation?.operation_id).toBe(consistent.operation_id);
+    expect(view.operation?.id).toBe(fixtureIds.note);
+    expect(view.operation?.revision_id).toBe(fixtureIds.revision);
+  } finally {
+    await harness.close();
+  }
+});
+
+test('status rejects corrupt or inconsistent persisted records with RECOVERY_REQUIRED', async () => {
+  const harness = await createHarness();
+  try {
     const cases: OperationRecord[] = [
       recordWith({ receipt_json: '{not json' }),
       recordWith({ receipt_json: JSON.stringify({ ...receiptSample, outcome: 'bogus' }) }),
       recordWith({
         receipt_json: JSON.stringify({ ...receiptSample, operation_id: fixtureIds.revision })
       }),
-      recordWith({ receipt_json: JSON.stringify(mismatchedIdentity), plan_json: mismatchedPlan }),
-      recordWith({ receipt_json: JSON.stringify(receiptSample), plan_json: '{bad plan' })
+      recordWith({
+        receipt_json: JSON.stringify(receiptSample),
+        plan_json: planJson({ operation_id: fixtureIds.revision })
+      }),
+      recordWith({
+        receipt_json: JSON.stringify(receiptSample),
+        plan_json: planJson({ id: fixtureIds.replacement })
+      }),
+      recordWith({
+        receipt_json: JSON.stringify(receiptSample),
+        plan_json: planJson({ revision_id: fixtureIds.replacement })
+      }),
+      recordWith({
+        receipt_json: JSON.stringify(receiptSample),
+        plan_json: planJsonWithoutOperationId()
+      }),
+      recordWith({ receipt_json: JSON.stringify(receiptSample), plan_json: '{bad plan' }),
+      recordWith({ receipt_json: undefined, plan_json: planJson({ operation_id: fixtureIds.revision }) })
     ];
     for (const record of cases) {
       const deps = {
@@ -967,9 +1031,7 @@ test('status rejects corrupt or inconsistent persisted receipts with RECOVERY_RE
     const pendingPlan = recordWith({
       receipt_json: undefined,
       state: 'submitted',
-      plan_json: JSON.stringify({
-        revision: { id: fixtureIds.note, revision_id: fixtureIds.revision }
-      })
+      plan_json: planJson()
     });
     const deps = {
       ...harness.deps,
@@ -977,6 +1039,7 @@ test('status rejects corrupt or inconsistent persisted receipts with RECOVERY_RE
     };
     const view = await status(workerContext, { operation_id: pendingPlan.operation_id }, deps);
     expect(view.operation).toMatchObject({
+      operation_id: fixtureIds.idempotencyKey,
       outcome: 'pending',
       id: fixtureIds.note,
       revision_id: fixtureIds.revision

@@ -128,9 +128,10 @@ task.
 A requested `operation_id` is returned only to its submitting principal or to an
 owner allowed that scope (read, write, or review permission). An unauthorized
 request is reported as `NOT_FOUND` so the gateway does not confirm that another
-principal's operation exists. A persisted operation record that fails runtime
-validation, or whose identities disagree with the operation's own plan, is
-reported as `RECOVERY_REQUIRED` instead of being returned.
+principal's operation exists. A persisted operation record whose receipt or plan
+fails runtime validation, or whose plan revision identity (`operation_id`,
+`id`, or `revision_id`) disagrees with the record or receipt, is reported as
+`RECOVERY_REQUIRED` instead of being returned.
 
 ## Errors
 
