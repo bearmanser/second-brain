@@ -218,6 +218,43 @@ test('an oversized request body is rejected at the input limit', async () => {
   }
 });
 
+test('an oversized streaming body is rejected before the sender finishes', async () => {
+  const h = await startHttpHarness();
+  try {
+    const outcome = await new Promise<{ status: number; elapsed: number }>((resolve, reject) => {
+      const started = Date.now();
+      const timer = setTimeout(() => {
+        reject(new Error('no response before the sender finished'));
+      }, 4000);
+      const req = httpRequest(
+        { host: '127.0.0.1', port: h.port, method: 'POST', path: '/mcp', headers: authenticated(h) },
+        (res) => {
+          res.resume();
+          res.on('end', () => {
+            clearTimeout(timer);
+            req.destroy();
+            resolve({ status: res.statusCode ?? 0, elapsed: Date.now() - started });
+          });
+        }
+      );
+      req.on('error', () => undefined);
+      const chunk = 'x'.repeat(64 * 1024);
+      let written = 0;
+      const pump = (): void => {
+        if (written >= 5) return;
+        written += 1;
+        req.write(chunk);
+        setTimeout(pump, 10);
+      };
+      pump();
+    });
+    expect(outcome.status).toBe(413);
+    expect(outcome.elapsed).toBeLessThan(3000);
+  } finally {
+    await h.close();
+  }
+});
+
 test('a POST without the SSE accept type is rejected by the SDK transport', async () => {
   const h = await startHttpHarness();
   try {
@@ -239,6 +276,56 @@ test('a malicious Host header is rejected', async () => {
       body: rpc
     });
     expect(response.status).toBe(403);
+  } finally {
+    await h.close();
+  }
+});
+
+test('a Host header with prohibited authority syntax is rejected', async () => {
+  const h = await startHttpHarness();
+  const malformed = ['attacker@localhost', 'localhost/path', 'localhost?x=1', 'localhost:80:90'];
+  try {
+    for (const host of malformed) {
+      const response = await raw(h, {
+        headers: authenticated(h, { host }),
+        body: rpc
+      });
+      expect(response.status, `host=${host}`).toBe(403);
+    }
+  } finally {
+    await h.close();
+  }
+});
+
+test('a Host header carrying a port is matched by hostname', async () => {
+  const h = await startHttpHarness();
+  try {
+    const response = await raw(h, {
+      headers: authenticated(h, { host: `127.0.0.1:${h.port}` }),
+      body: rpc
+    });
+    expect(response.status).toBe(200);
+  } finally {
+    await h.close();
+  }
+});
+
+test('an Origin with userinfo or a path is rejected', async () => {
+  const h = await startHttpHarness({ allowed_origins: ['https://allowed.example'] });
+  const malformed = [
+    'https://user:secret@allowed.example',
+    'https://allowed.example/path',
+    'https://allowed.example?x=1',
+    'https://allowed.example#fragment'
+  ];
+  try {
+    for (const origin of malformed) {
+      const response = await raw(h, {
+        headers: authenticated(h, { origin }),
+        body: rpc
+      });
+      expect(response.status, `origin=${origin}`).toBe(403);
+    }
   } finally {
     await h.close();
   }

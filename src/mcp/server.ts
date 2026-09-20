@@ -1,21 +1,25 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { z } from 'zod';
 import type { ResultDelivery } from '../config/schema.js';
 import { isBrainError } from '../contracts/errors.js';
-import type {
-  CaptureRequest,
-  FeedbackRequest,
-  FeedbackResult,
-  MutationReceipt,
-  ReadRequest,
-  ReadResult,
-  RecallRequest,
-  RecallResult,
-  RequestContext,
-  ReviewListResult,
-  ReviewRequest,
-  StatusRequest,
-  StatusResult
+import { ETAG_PATTERN, SCOPE_ID_PATTERN } from '../core/limits.js';
+import {
+  LIFECYCLES,
+  NOTE_KINDS,
+  type CaptureRequest,
+  type FeedbackRequest,
+  type FeedbackResult,
+  type MutationReceipt,
+  type ReadRequest,
+  type ReadResult,
+  type RecallRequest,
+  type RecallResult,
+  type RequestContext,
+  type ReviewListResult,
+  type ReviewRequest,
+  type StatusRequest,
+  type StatusResult
 } from '../core/types.js';
 import { buildInstructions } from './instructions.js';
 import {
@@ -42,6 +46,98 @@ export interface BrainServices {
 
 export const OUTPUT_SCHEMA_META_KEY = 'second-brain/outputSchema';
 
+const scopeIdOutputSchema = z.string().regex(SCOPE_ID_PATTERN);
+const uuidOutputSchema = z.uuid();
+const etagOutputSchema = z.string().regex(ETAG_PATTERN);
+const stringListOutputSchema = z.array(z.string());
+
+const sourceRefOutputSchema = z.strictObject({
+  id: uuidOutputSchema,
+  revision_id: uuidOutputSchema,
+  scope: scopeIdOutputSchema,
+  title: z.string(),
+  kind: z.enum(NOTE_KINDS),
+  status: z.enum(LIFECYCLES),
+  etag: etagOutputSchema,
+  relative_path: z.string(),
+  warnings: stringListOutputSchema
+});
+
+const recallItemOutputSchema = sourceRefOutputSchema.extend({
+  excerpt: z.string(),
+  reasons: stringListOutputSchema
+});
+
+const mutationReceiptOutputSchema = z.strictObject({
+  operation_id: uuidOutputSchema,
+  id: uuidOutputSchema,
+  revision_id: uuidOutputSchema,
+  outcome: z.enum(['stored', 'stored_conflict', 'pending']),
+  materialized: z.boolean(),
+  indexed: z.boolean(),
+  etag: etagOutputSchema.optional(),
+  possible_duplicates: z.array(sourceRefOutputSchema),
+  warnings: stringListOutputSchema
+});
+
+const reviewListOutputSchema = z.strictObject({
+  items: z.array(sourceRefOutputSchema),
+  next_cursor: z.string().optional()
+});
+
+const readOutputSchema = z.strictObject({
+  source: sourceRefOutputSchema,
+  markdown: z.string(),
+  next_cursor: z.string().optional()
+});
+
+const recallOutputSchema = z.strictObject({
+  retrieval_id: uuidOutputSchema,
+  mode: z.enum(['hybrid', 'text']),
+  partial: z.boolean(),
+  warnings: stringListOutputSchema,
+  budget: z.strictObject({
+    tokenizer: z.literal('cl100k_base'),
+    used: z.number(),
+    limit: z.number()
+  }),
+  items: z.array(recallItemOutputSchema)
+});
+
+const feedbackOutputSchema = z.strictObject({
+  feedback_id: uuidOutputSchema,
+  recorded: z.literal(true)
+});
+
+const statusOutputSchema = z.strictObject({
+  version: z.string(),
+  protocol_version: z.string(),
+  schema_version: z.literal(1),
+  scopes: z.array(
+    z.strictObject({
+      id: scopeIdOutputSchema,
+      can_write: z.boolean(),
+      can_review: z.boolean()
+    })
+  ),
+  health: z.strictObject({
+    gateway: z.enum(['ready', 'recovering', 'degraded']),
+    backend: z.enum(['ready', 'unavailable']),
+    embeddings: z.enum(['ready', 'unavailable', 'unknown'])
+  }),
+  pending_operations: z.number(),
+  operation: mutationReceiptOutputSchema.optional(),
+  schemas: z.record(z.string(), z.unknown()).optional()
+});
+
+const TOOL_OUTPUT_SCHEMAS: Partial<Record<ToolName, z.ZodType>> = {
+  brain_capture: mutationReceiptOutputSchema,
+  brain_feedback: feedbackOutputSchema,
+  brain_read: readOutputSchema,
+  brain_recall: recallOutputSchema,
+  brain_status: statusOutputSchema
+};
+
 type ToolInvoker = (
   services: BrainServices,
   ctx: RequestContext,
@@ -65,6 +161,7 @@ export function createMcpServer(services: BrainServices, ctx: RequestContext): M
   const delivery: ResultDelivery = services.result_delivery ?? 'structured';
 
   for (const definition of toolDefinitions) {
+    const outputSchema = TOOL_OUTPUT_SCHEMAS[definition.name];
     server.registerTool(
       definition.name,
       {
@@ -72,7 +169,8 @@ export function createMcpServer(services: BrainServices, ctx: RequestContext): M
         description: definition.description,
         inputSchema: requestSchemas[definition.name],
         annotations: { ...definition.annotations },
-        _meta: { [OUTPUT_SCHEMA_META_KEY]: definition.outputSchema }
+        _meta: { [OUTPUT_SCHEMA_META_KEY]: definition.outputSchema },
+        ...(outputSchema === undefined ? {} : { outputSchema })
       },
       async (args: unknown): Promise<CallToolResult> => {
         try {
@@ -90,3 +188,4 @@ export function createMcpServer(services: BrainServices, ctx: RequestContext): M
 
   return server;
 }
+

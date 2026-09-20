@@ -12,6 +12,10 @@ import { createMcpServer } from './server.js';
 import { internalDiagnostic } from './tools.js';
 
 export const MCP_PATH = '/mcp';
+export const OVERFLOW_DRAIN_MS = 1000;
+
+const HOST_AUTHORITY = /^[A-Za-z0-9.-]+(?::\d{1,5})?$/;
+const MAX_HOST_LENGTH = 255;
 
 interface JsonRpcErrorBody {
   jsonrpc: '2.0';
@@ -34,27 +38,34 @@ function sendJsonRpcError(
 }
 
 function hostAllowed(header: string | undefined, allowed: readonly string[]): boolean {
-  if (typeof header !== 'string' || header.length === 0) return false;
-  let hostname: string;
-  try {
-    hostname = new URL(`http://${header}`).hostname.toLowerCase();
-  } catch {
+  if (typeof header !== 'string' || header.length === 0 || header.length > MAX_HOST_LENGTH) {
     return false;
   }
+  if (!HOST_AUTHORITY.test(header)) return false;
+  const hostname = header.split(':')[0].toLowerCase();
   return allowed.some((entry) => entry.toLowerCase() === hostname);
 }
 
 function originAllowed(header: string | undefined, allowed: readonly string[]): boolean {
   if (header === undefined || header.length === 0) return true;
-  let normalized: string;
+  let parsed: URL;
   try {
-    normalized = new URL(header).origin;
+    parsed = new URL(header);
   } catch {
+    return false;
+  }
+  if (
+    parsed.username !== '' ||
+    parsed.password !== '' ||
+    parsed.pathname !== '/' ||
+    parsed.search !== '' ||
+    parsed.hash !== ''
+  ) {
     return false;
   }
   return allowed.some((entry) => {
     try {
-      return new URL(entry).origin === normalized;
+      return new URL(entry).origin === parsed.origin;
     } catch {
       return false;
     }
@@ -85,6 +96,8 @@ function readBody(req: IncomingMessage, maxBytes: number): Promise<BodyRead> {
       if (size > maxBytes) {
         tooLarge = true;
         chunks.length = 0;
+        req.pause();
+        finish({ ok: false, tooLarge: true });
         return;
       }
       chunks.push(chunk);
@@ -98,6 +111,19 @@ function readBody(req: IncomingMessage, maxBytes: number): Promise<BodyRead> {
   });
 }
 
+function discardRemainingBody(req: IncomingMessage): void {
+  const timer = setTimeout(() => {
+    req.destroy();
+  }, OVERFLOW_DRAIN_MS);
+  timer.unref?.();
+  const stop = (): void => {
+    clearTimeout(timer);
+  };
+  req.once('end', stop);
+  req.once('error', stop);
+  req.resume();
+}
+
 function resolvePrincipal(runtime: BrainRuntime, req: Request): Principal | undefined {
   try {
     return authenticate(req.headers.authorization, runtime.credentials);
@@ -107,100 +133,113 @@ function resolvePrincipal(runtime: BrainRuntime, req: Request): Principal | unde
   }
 }
 
+async function handleMcpRequest(
+  runtime: BrainRuntime,
+  req: Request,
+  res: Response
+): Promise<void> {
+  if (!hostAllowed(req.headers.host, runtime.config.allowed_hosts)) {
+    sendJsonRpcError(res, 403, -32000, 'the request host is not allowed');
+    return;
+  }
+  if (!originAllowed(req.headers.origin, runtime.config.allowed_origins)) {
+    sendJsonRpcError(res, 403, -32000, 'the request origin is not allowed');
+    return;
+  }
+
+  let principal: Principal | undefined;
+  try {
+    principal = resolvePrincipal(runtime, req);
+  } catch (error) {
+    runtime.services.reportDiagnostic?.(internalDiagnostic(error));
+    sendJsonRpcError(res, 500, -32603, 'the gateway could not authenticate the request');
+    return;
+  }
+  if (principal === undefined) {
+    res.setHeader('WWW-Authenticate', 'Bearer');
+    sendJsonRpcError(res, 401, -32000, 'a valid bearer credential is required');
+    return;
+  }
+
+  if (runtime.closing) {
+    sendJsonRpcError(res, 503, -32000, 'the gateway is shutting down');
+    return;
+  }
+
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
+    sendJsonRpcError(res, 405, -32000, 'this stateless endpoint accepts only POST');
+    return;
+  }
+  if (!isJsonContentType(req.headers['content-type'])) {
+    sendJsonRpcError(res, 415, -32000, 'Content-Type must be application/json');
+    return;
+  }
+
+  const limit = runtime.config.limits.input_body_max_bytes ?? INPUT_BODY_MAX_BYTES;
+  const raw = await readBody(req, limit);
+  if (!raw.ok) {
+    if (raw.tooLarge) {
+      res.setHeader('Connection', 'close');
+      sendJsonRpcError(res, 413, -32000, 'the request body exceeds the input limit');
+      discardRemainingBody(req);
+    } else {
+      sendJsonRpcError(res, 400, -32700, 'the request body could not be read');
+    }
+    return;
+  }
+  let parsedBody: unknown;
+  try {
+    parsedBody = JSON.parse(raw.body.toString('utf8'));
+  } catch {
+    sendJsonRpcError(res, 400, -32700, 'Parse error: Invalid JSON');
+    return;
+  }
+
+  const ctx: RequestContext = {
+    principal,
+    request_id: randomUUID(),
+    signal: runtime.shutdownSignal
+  };
+  const server = createMcpServer(runtime.services, ctx);
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableJsonResponse: true
+  });
+  let cleaned = false;
+  const cleanup = async (): Promise<void> => {
+    if (cleaned) return;
+    cleaned = true;
+    await transport.close().catch(() => undefined);
+    await server.close().catch(() => undefined);
+  };
+  res.on('close', () => {
+    void cleanup();
+  });
+
+  try {
+    await server.connect(transport);
+    await transport.handleRequest(req, res, parsedBody);
+  } catch (error) {
+    runtime.services.reportDiagnostic?.(internalDiagnostic(error));
+    if (!res.headersSent) {
+      sendJsonRpcError(res, 500, -32603, 'the gateway could not complete the request');
+    } else {
+      try {
+        res.end();
+      } catch {}
+    }
+    await cleanup();
+  }
+}
+
 export function createHttpApp(runtime: BrainRuntime): Express {
   const app = express();
   app.disable('x-powered-by');
   app.set('etag', false);
 
   app.all(MCP_PATH, (req: Request, res: Response): void => {
-    void (async (): Promise<void> => {
-      if (!hostAllowed(req.headers.host, runtime.config.allowed_hosts)) {
-        sendJsonRpcError(res, 403, -32000, 'the request host is not allowed');
-        return;
-      }
-      if (!originAllowed(req.headers.origin, runtime.config.allowed_origins)) {
-        sendJsonRpcError(res, 403, -32000, 'the request origin is not allowed');
-        return;
-      }
-
-      let principal: Principal | undefined;
-      try {
-        principal = resolvePrincipal(runtime, req);
-      } catch (error) {
-        runtime.services.reportDiagnostic?.(internalDiagnostic(error));
-        sendJsonRpcError(res, 500, -32603, 'the gateway could not authenticate the request');
-        return;
-      }
-      if (principal === undefined) {
-        res.setHeader('WWW-Authenticate', 'Bearer');
-        sendJsonRpcError(res, 401, -32000, 'a valid bearer credential is required');
-        return;
-      }
-
-      if (req.method !== 'POST') {
-        res.setHeader('Allow', 'POST');
-        sendJsonRpcError(res, 405, -32000, 'this stateless endpoint accepts only POST');
-        return;
-      }
-      if (!isJsonContentType(req.headers['content-type'])) {
-        sendJsonRpcError(res, 415, -32000, 'Content-Type must be application/json');
-        return;
-      }
-
-      const limit = runtime.config.limits.input_body_max_bytes ?? INPUT_BODY_MAX_BYTES;
-      const raw = await readBody(req, limit);
-      if (!raw.ok) {
-        if (raw.tooLarge) {
-          sendJsonRpcError(res, 413, -32000, 'the request body exceeds the input limit');
-        } else {
-          sendJsonRpcError(res, 400, -32700, 'the request body could not be read');
-        }
-        return;
-      }
-      let parsedBody: unknown;
-      try {
-        parsedBody = JSON.parse(raw.body.toString('utf8'));
-      } catch {
-        sendJsonRpcError(res, 400, -32700, 'Parse error: Invalid JSON');
-        return;
-      }
-
-      const ctx: RequestContext = {
-        principal,
-        request_id: randomUUID(),
-        signal: runtime.shutdownSignal
-      };
-      const server = createMcpServer(runtime.services, ctx);
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: undefined,
-        enableJsonResponse: true
-      });
-      let cleaned = false;
-      const cleanup = async (): Promise<void> => {
-        if (cleaned) return;
-        cleaned = true;
-        await transport.close().catch(() => undefined);
-        await server.close().catch(() => undefined);
-      };
-      res.on('close', () => {
-        void cleanup();
-      });
-
-      try {
-        await server.connect(transport);
-        await transport.handleRequest(req, res, parsedBody);
-      } catch (error) {
-        runtime.services.reportDiagnostic?.(internalDiagnostic(error));
-        if (!res.headersSent) {
-          sendJsonRpcError(res, 500, -32603, 'the gateway could not complete the request');
-        } else {
-          try {
-            res.end();
-          } catch {}
-        }
-        await cleanup();
-      }
-    })().catch((error: unknown) => {
+    void handleMcpRequest(runtime, req, res).catch((error: unknown) => {
       runtime.services.reportDiagnostic?.(internalDiagnostic(error));
       sendJsonRpcError(res, 500, -32603, 'the gateway could not complete the request');
     });

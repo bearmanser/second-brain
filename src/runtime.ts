@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile } from 'node:fs/promises';
+import { unwatchFile, watchFile, type StatWatcher } from 'node:fs';
 import { createServer, type Server as HttpServer } from 'node:http';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
@@ -54,7 +55,10 @@ export interface BrainRuntime {
   readonly url: string;
   readonly ready: boolean;
   readonly closing: boolean;
+  readonly closed: boolean;
+  readonly shutdownPending: boolean;
   readonly shutdownSignal: AbortSignal;
+  trackOperation<T>(work: Promise<T>): Promise<T>;
   reloadCredentials(): void;
   close(): Promise<void>;
 }
@@ -127,6 +131,21 @@ function buildServices(
   };
 }
 
+function trackedServices(
+  services: BrainServices,
+  guard: <T>(work: () => Promise<T>) => Promise<T>
+): BrainServices {
+  return {
+    ...services,
+    capture: (ctx, request) => guard(() => services.capture(ctx, request)),
+    review: (ctx, request) => guard(() => services.review(ctx, request)),
+    recall: (ctx, request) => guard(() => services.recall(ctx, request)),
+    read: (ctx, request) => guard(() => services.read(ctx, request)),
+    feedback: (ctx, request) => guard(() => services.feedback(ctx, request)),
+    status: (ctx, request) => guard(() => services.status(ctx, request))
+  };
+}
+
 class BrainRuntimeImpl implements BrainRuntime {
   readonly config: BrainConfig;
   deps!: BrainDeps;
@@ -136,17 +155,25 @@ class BrainRuntimeImpl implements BrainRuntime {
   url = '';
   ready = false;
   closing = false;
+  closed = false;
+  shutdownPending = false;
   private readonly options: RuntimeOptions;
   private readonly clock: Clock;
   private readonly ids: IdSource;
   private readonly log: (line: string) => void;
   private readonly shutdown = new AbortController();
+  private readonly inFlight = new Set<Promise<unknown>>();
+  private drainResolvers: (() => void)[] = [];
+  private closePromise: Promise<void> | undefined;
+  private cleaned = false;
   private lock: InstanceLock | undefined;
   private journal: Journal | undefined;
   private catalogue: RevisionCatalogue | undefined;
   private backend: BackendPort | undefined;
   private httpServer: HttpServer | undefined;
   private pruneTimer: NodeJS.Timeout | undefined;
+  private credentialsWatcher: StatWatcher | undefined;
+  private credentialsListener: (() => void) | undefined;
 
   constructor(config: BrainConfig, options: RuntimeOptions) {
     this.config = config;
@@ -212,10 +239,11 @@ class BrainRuntimeImpl implements BrainRuntime {
 
       this.credentials = loadCredentials(this.config.credentials_file);
       await loadCursorSecret(this.config);
+      this.startCredentialWatch();
 
       const base = buildServices(deps, this.config.result_delivery, this.log);
       const wrapped = this.options.wrapServices?.(base, deps) ?? base;
-      this.services = { ...base, ...wrapped };
+      this.services = trackedServices({ ...base, ...wrapped }, (work) => this.guardOperation(work));
 
       const app = createHttpApp(this);
       const httpServer = createServer(app);
@@ -249,8 +277,69 @@ class BrainRuntimeImpl implements BrainRuntime {
     }
   }
 
+  trackOperation<T>(work: Promise<T>): Promise<T> {
+    const tracked: Promise<T> = work.finally(() => {
+      this.settle(tracked);
+    });
+    this.inFlight.add(tracked);
+    return tracked;
+  }
+
+  private guardOperation<T>(work: () => Promise<T>): Promise<T> {
+    if (this.closing) {
+      return Promise.reject(
+        new BrainError({ code: 'CANCELLED', message: 'the gateway is shutting down' })
+      );
+    }
+    return this.trackOperation(work());
+  }
+
+  private settle(tracked: Promise<unknown>): void {
+    this.inFlight.delete(tracked);
+    if (this.inFlight.size > 0) return;
+    const resolvers = this.drainResolvers;
+    this.drainResolvers = [];
+    for (const resolve of resolvers) resolve();
+  }
+
+  private waitForDrain(timeoutMs: number): Promise<boolean> {
+    if (this.inFlight.size === 0) return Promise.resolve(true);
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const done = (value: boolean): void => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+      this.drainResolvers.push(() => done(true));
+      if (Number.isFinite(timeoutMs)) {
+        const timer = setTimeout(() => done(false), timeoutMs);
+        timer.unref?.();
+      }
+    });
+  }
+
   reloadCredentials(): void {
     this.credentials = loadCredentials(this.config.credentials_file);
+  }
+
+  private startCredentialWatch(): void {
+    const path = this.config.credentials_file;
+    const listener = (): void => {
+      try {
+        this.reloadCredentials();
+      } catch (error) {
+        this.log(internalDiagnostic(error));
+      }
+    };
+    try {
+      const watcher = watchFile(path, { interval: 200, persistent: false }, listener);
+      watcher.unref?.();
+      this.credentialsWatcher = watcher;
+      this.credentialsListener = listener;
+    } catch (error) {
+      this.log(internalDiagnostic(error));
+    }
   }
 
   private prune(): void {
@@ -271,24 +360,32 @@ class BrainRuntimeImpl implements BrainRuntime {
     if (server === undefined || !server.listening) return;
     await new Promise<void>((resolve) => {
       let settled = false;
-      const done = (): void => {
-        if (settled) return;
-        settled = true;
-        resolve();
-      };
-      server.close(() => done());
       const timer = setTimeout(() => {
         server.closeAllConnections?.();
       }, SHUTDOWN_DRAIN_MS);
       timer.unref?.();
+      const done = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      server.close(() => done());
     });
   }
 
   private async cleanup(): Promise<void> {
+    if (this.cleaned) return;
+    this.cleaned = true;
     if (this.pruneTimer !== undefined) {
       clearInterval(this.pruneTimer);
       this.pruneTimer = undefined;
     }
+    if (this.credentialsWatcher !== undefined && this.credentialsListener !== undefined) {
+      unwatchFile(this.config.credentials_file, this.credentialsListener);
+    }
+    this.credentialsWatcher = undefined;
+    this.credentialsListener = undefined;
     this.ready = false;
     await this.backend?.close().catch(() => undefined);
     this.backend = undefined;
@@ -300,13 +397,22 @@ class BrainRuntimeImpl implements BrainRuntime {
     this.lock = undefined;
   }
 
-  async close(): Promise<void> {
-    if (this.closing) return;
+  private async performClose(): Promise<void> {
     this.closing = true;
     this.ready = false;
     this.shutdown.abort();
     await this.stopListening();
+    const drained = await this.waitForDrain(SHUTDOWN_DRAIN_MS);
+    if (!drained) this.shutdownPending = true;
+    await this.waitForDrain(Number.POSITIVE_INFINITY);
     await this.cleanup();
+    this.shutdownPending = false;
+    this.closed = true;
+  }
+
+  async close(): Promise<void> {
+    if (this.closePromise === undefined) this.closePromise = this.performClose();
+    return this.closePromise;
   }
 }
 

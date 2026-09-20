@@ -4,7 +4,6 @@ import { expect, test } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { createRuntime } from '../../src/runtime.js';
-import type { RequestContext } from '../../src/core/types.js';
 import { lessonFixture } from '../fixtures/content.js';
 import { workerPrincipal } from '../fixtures/principals.js';
 import { FakeBackend } from '../support/fake-backend.js';
@@ -52,16 +51,19 @@ const captureArgs = (key: string): Record<string, unknown> => ({
 test('delivers initialization instructions before a tool is invoked', async () => {
   const h = await startHttpHarness();
   const client = new Client({ name: 'brain-contract-test', version: '1.0.0' });
-  await client.connect(
-    new StreamableHTTPClientTransport(new URL(h.url), {
-      requestInit: { headers: { Authorization: `Bearer ${h.token}` } }
-    })
-  );
-  expect(client.getInstructions()).toContain('brain_recall');
-  expect(h.recordedToolCalls()).toEqual([]);
-  expect((await client.listTools()).tools).toHaveLength(6);
-  await client.close();
-  await h.close();
+  try {
+    await client.connect(
+      new StreamableHTTPClientTransport(new URL(h.url), {
+        requestInit: { headers: { Authorization: `Bearer ${h.token}` } }
+      })
+    );
+    expect(client.getInstructions()).toContain('brain_recall');
+    expect(h.recordedToolCalls()).toEqual([]);
+    expect((await client.listTools()).tools).toHaveLength(6);
+  } finally {
+    await client.close();
+    await h.close();
+  }
 });
 
 test('lists the six tools and completes a status call with structured content', async () => {
@@ -75,9 +77,14 @@ test('lists the six tools and completes a status call with structured content', 
       expect(tool.description).toBeTruthy();
     }
     const captureTool = tools.find((tool) => tool.name === 'brain_capture');
-    expect(captureTool?.outputSchema).toBeUndefined();
+    expect(captureTool?.outputSchema).toBeTruthy();
     const meta = captureTool?._meta as Record<string, unknown> | undefined;
     expect(meta?.['second-brain/outputSchema']).toBeTruthy();
+
+    const reviewTool = tools.find((tool) => tool.name === 'brain_review');
+    expect(reviewTool?.outputSchema).toBeUndefined();
+    const reviewMeta = reviewTool?._meta as Record<string, unknown> | undefined;
+    expect(reviewMeta?.['second-brain/outputSchema']).toBeTruthy();
 
     const result = await call(client, 'brain_status', {});
     expect(result.isError).toBeFalsy();
@@ -142,6 +149,31 @@ test('schema-invalid arguments are rejected before any service call', async () =
     expect(result.structuredContent).toBeUndefined();
     expect(textOf(result)).toMatch(/Invalid arguments/);
     expect(h.recordedToolCalls()).toEqual([]);
+  } finally {
+    await client.close();
+    await h.close();
+  }
+});
+
+test('read and review results survive output validation', async () => {
+  const h = await startHttpHarness();
+  const client = await h.connect(h.token);
+  try {
+    const capture = await call(client, 'brain_capture', captureArgs(randomUUID()));
+    const receipt = record(capture.structuredContent);
+    const read = await call(client, 'brain_read', {
+      scope: 'freellmapi',
+      id: receipt.id as string
+    });
+    expect(read.isError).toBeFalsy();
+    expect(typeof record(read.structuredContent).markdown).toBe('string');
+
+    const review = await call(client, 'brain_review', {
+      scope: 'freellmapi',
+      operation: { action: 'list', filter: 'candidate' }
+    });
+    expect(review.isError).toBeFalsy();
+    expect(Array.isArray(record(review.structuredContent).items)).toBe(true);
   } finally {
     await client.close();
     await h.close();
@@ -248,6 +280,49 @@ test('a rotated-out credential stops authenticating after a credential reload', 
   }
 });
 
+test('a running runtime reloads rotated credentials written to disk', async () => {
+  const h = await startHttpHarness();
+  const before = await h.connect(h.token, 'before-rotation');
+  expect((await before.listTools()).tools).toHaveLength(6);
+  await before.close();
+
+  const digest = (token: string): string =>
+    createHash('sha256').update(token, 'utf8').digest('hex');
+  await writeFile(
+    h.credentialsFile,
+    `${JSON.stringify({
+      credentials: [{ token_sha256: digest(h.rotatedToken), principal: workerPrincipal }]
+    })}\n`,
+    'utf8'
+  );
+
+  const deadline = Date.now() + 5000;
+  let status = 0;
+  while (Date.now() < deadline) {
+    const response = await fetch(h.url, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${h.token}`,
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream'
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })
+    });
+    status = response.status;
+    if (status === 401) break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  expect(status).toBe(401);
+
+  const after = await h.connect(h.rotatedToken, 'after-rotation');
+  try {
+    expect((await after.listTools()).tools).toHaveLength(6);
+  } finally {
+    await after.close();
+    await h.close();
+  }
+});
+
 test('recall records a content-free retrieval event', async () => {
   const h = await startHttpHarness();
   const client = await h.connect(h.token);
@@ -270,7 +345,8 @@ test('recall records a content-free retrieval event', async () => {
   }
 });
 
-test('a raw backend tool is not exposed and never reaches the backend', async () => {  const h = await startHttpHarness();
+test('a raw backend tool is not exposed and never reaches the backend', async () => {
+  const h = await startHttpHarness();
   const client = await h.connect(h.token);
   try {
     const names = (await client.listTools()).tools.map((tool) => tool.name);
@@ -306,8 +382,9 @@ test('a client can reconnect and continue calling tools', async () => {
   }
 });
 
-test('a write in flight at shutdown is recovered by the next runtime', async () => {
+test('a write blocked past the drain deadline keeps the lock until it completes', async () => {
   const h = await startHttpHarness();
+  const client = await h.connect(h.token, 'blocked-write');
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
     release = resolve;
@@ -321,49 +398,64 @@ test('a write in flight at shutdown is recovered by the next runtime', async () 
     await gate;
   };
 
-  const ctx: RequestContext = {
-    principal: workerPrincipal,
-    request_id: randomUUID(),
-    signal: h.runtime.shutdownSignal
-  };
-  const inFlight = h.runtime.services.capture(ctx, {
-    idempotency_key: randomUUID(),
-    scope: 'freellmapi',
-    note: lessonFixture
-  });
+  const pending = call(client, 'brain_capture', captureArgs(randomUUID())).catch(() => undefined);
   await enteredPromise;
 
   const closing = h.runtime.close();
-  release();
-  await closing;
-  await inFlight.catch(() => undefined);
+  const drainDeadline = Date.now() + 3000;
+  while (Date.now() < drainDeadline && !h.runtime.shutdownPending) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  expect(h.runtime.shutdownPending).toBe(true);
+  expect(h.runtime.closed).toBe(false);
 
-  const reopenedBackend = new FakeBackend({
+  const replacementBackend = new FakeBackend({
     root: h.config.mounts.vault,
     projects: h.config.scopes.map((scope) => scope.backend_project)
   });
-  const reopened = await createRuntime(h.config, { backend: reopenedBackend });
+  await expect(createRuntime(h.config, { backend: replacementBackend })).rejects.toMatchObject({
+    code: 'CONFLICT'
+  });
+
+  release();
+  await closing;
+  await pending;
+  await client.close().catch(() => undefined);
+  expect(h.runtime.shutdownPending).toBe(false);
+  expect(h.runtime.closed).toBe(true);
+
+  const reopened = await createRuntime(h.config, { backend: replacementBackend });
   try {
     expect(reopened.ready).toBe(true);
     const candidates = await reopened.deps.catalogue.list('freellmapi', 'candidate');
     expect(candidates.items.some((item) => item.title === lessonFixture.title)).toBe(true);
   } finally {
     await reopened.close();
-    await reopenedBackend.close().catch(() => undefined);
+    await replacementBackend.close().catch(() => undefined);
     await h.close();
   }
 });
 
-test('normal operation never writes note or query content into diagnostics', async () => {
+test('note, query, and token markers never reach diagnostics or audit', async () => {
   const h = await startHttpHarness();
   const client = await h.connect(h.token);
   try {
-    const marker = 'diagnostic-secret-marker-9f3a';
-    const capture = await call(client, 'brain_capture', {
+    const noteMarker = 'note-marker-7c1d';
+    const queryMarker = 'query-marker-3ab9';
+
+    h.backend.on_create = async () => {
+      throw new Error('backend link reset');
+    };
+    const failed = await call(client, 'brain_capture', {
       idempotency_key: randomUUID(),
       scope: 'freellmapi',
-      note: { ...lessonFixture, title: marker }
+      note: { ...lessonFixture, title: noteMarker }
     });
+    expect(failed.isError).toBe(true);
+    expect(record(record(failed.structuredContent).error).code).toBe('INTERNAL_ERROR');
+    h.backend.on_create = undefined;
+
+    const capture = await call(client, 'brain_capture', captureArgs(randomUUID()));
     const receipt = record(capture.structuredContent);
     await call(client, 'brain_feedback', {
       idempotency_key: randomUUID(),
@@ -371,19 +463,21 @@ test('normal operation never writes note or query content into diagnostics', asy
       id: receipt.id,
       revision_id: receipt.revision_id,
       verdict: 'useful',
-      reason: marker
+      reason: noteMarker
     });
-    await call(client, 'brain_recall', { scope: 'freellmapi', query: marker });
+    await call(client, 'brain_recall', { scope: 'freellmapi', query: queryMarker });
     await call(client, 'brain_status', {});
 
     expect(h.auditedEvents().length).toBeGreaterThan(0);
-    for (const line of h.loggedDiagnostics()) {
-      expect(line).not.toContain(marker);
-    }
-    for (const event of h.auditedEvents()) {
-      expect(JSON.stringify(event)).not.toContain(marker);
-    }
-    expect(JSON.stringify(h.recordedToolCalls())).not.toContain(marker);
+    const diagnostics = JSON.stringify(h.loggedDiagnostics());
+    expect(diagnostics).not.toContain(noteMarker);
+    expect(diagnostics).not.toContain(queryMarker);
+    expect(diagnostics).not.toContain(h.token);
+    const audit = JSON.stringify(h.auditedEvents());
+    expect(audit).not.toContain(noteMarker);
+    expect(audit).not.toContain(queryMarker);
+    expect(audit).not.toContain(h.token);
+    expect(JSON.stringify(h.recordedToolCalls())).not.toContain(noteMarker);
   } finally {
     await client.close();
     await h.close();

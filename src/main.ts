@@ -49,6 +49,13 @@ function installShutdownHandlers(runtime: BrainRuntime): void {
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  process.on('SIGHUP', () => {
+    try {
+      runtime.reloadCredentials();
+    } catch {
+      process.stderr.write('second-brain credential reload failed\n');
+    }
+  });
 }
 
 const entry = process.argv[1];
