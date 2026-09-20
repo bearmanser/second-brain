@@ -22,7 +22,7 @@ export const noteContentSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('playbook'), use_when: text, prerequisites: texts,
     steps: texts.min(1), verification: texts.min(1), cautions: texts.optional() }),
   z.strictObject({ kind: z.literal('fact'), claim: text, applicability: text,
-    valid_until: z.iso.datetime({ offset: true }).optional() }),
+    valid_until: z.iso.datetime().optional() }),
   z.strictObject({ kind: z.literal('preference'), preference: text,
     applicability: text, source_statement_ref: text, exceptions: texts.optional() }),
   z.strictObject({ kind: z.literal('session'), task: text, state: text,
@@ -58,7 +58,7 @@ export const evidenceSchema = z.strictObject({
   kind: z.enum(EVIDENCE_KINDS),
   ref: text,
   description: text,
-  observed_at: z.iso.datetime({ offset: true }).optional()
+  observed_at: z.iso.datetime().optional()
 });
 
 export const withinInputBodyLimit = (value: unknown): boolean =>

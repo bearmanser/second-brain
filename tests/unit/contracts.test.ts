@@ -16,6 +16,7 @@ import { BRAIN_ERROR_CODES, BrainError } from '../../src/contracts/errors.js';
 import {
   CONTENT_TEXT_MAX_CHARS,
   EVIDENCE_MAX_ITEMS,
+  INPUT_BODY_MAX_BYTES,
   MARKDOWN_BODY_MAX_CHARS,
   READ_BUDGET_TOKENS_MAX,
   READ_BUDGET_TOKENS_MIN,
@@ -278,6 +279,32 @@ test('bounds tags, evidence, links, and nested text arrays', () => {
   expect(noteContentSchema.safeParse({ ...lessonFixture.content, limitations: manyLimitations }).success).toBe(false);
 });
 
+test('enforces the 256 KiB post-parse input-body limit', () => {
+  const fill = (count: number): string[] =>
+    Array.from({ length: count }, () => 'x'.repeat(CONTENT_TEXT_MAX_CHARS));
+  const buildSession = (nextActions: number, blockers: number): NoteInput => ({
+    ...lessonFixture,
+    content: {
+      kind: 'session',
+      task: 'boundary',
+      state: 'boundary',
+      next_actions: fill(nextActions),
+      session_id: 'session-boundary',
+      blockers: fill(blockers)
+    }
+  });
+
+  const under = buildSession(31, 0);
+  const over = buildSession(32, 32);
+  const underBytes = Buffer.byteLength(JSON.stringify(under), 'utf8');
+  const overBytes = Buffer.byteLength(JSON.stringify(over), 'utf8');
+
+  expect(underBytes).toBeLessThanOrEqual(INPUT_BODY_MAX_BYTES);
+  expect(overBytes).toBeGreaterThan(INPUT_BODY_MAX_BYTES);
+  expect(noteInputSchema.safeParse(under).success).toBe(true);
+  expect(noteInputSchema.safeParse(over).success).toBe(false);
+});
+
 test('counts titles in Unicode code points and bounds ordinary strings', () => {
   const astralAtLimit = '😀'.repeat(TITLE_MAX_CODE_POINTS);
   expect(noteInputSchema.safeParse({ ...lessonFixture, title: astralAtLimit }).success).toBe(true);
@@ -305,6 +332,29 @@ test('distinguishes null from absent optionals', () => {
   ).toBe(false);
   expect(
     recallRequestSchema.safeParse({ scope: 'freellmapi', query: 'q', phase: null }).success
+  ).toBe(false);
+});
+
+test('accepts only UTC RFC3339 timestamps and rejects explicit offsets', () => {
+  expect(
+    noteContentSchema.safeParse({ kind: 'fact', claim: 'c', applicability: 'a', valid_until: '2026-09-20T12:00:00Z' })
+      .success
+  ).toBe(true);
+  expect(
+    noteContentSchema.safeParse({ kind: 'fact', claim: 'c', applicability: 'a', valid_until: '2026-09-20T12:00:00+02:00' })
+      .success
+  ).toBe(false);
+  expect(
+    noteInputSchema.safeParse({
+      ...lessonFixture,
+      evidence: [{ kind: 'observation', ref: 'r', description: 'd', observed_at: '2026-09-20T12:00:00Z' }]
+    }).success
+  ).toBe(true);
+  expect(
+    noteInputSchema.safeParse({
+      ...lessonFixture,
+      evidence: [{ kind: 'observation', ref: 'r', description: 'd', observed_at: '2026-09-20T12:00:00+02:00' }]
+    }).success
   ).toBe(false);
 });
 
