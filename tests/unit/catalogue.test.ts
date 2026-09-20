@@ -292,8 +292,14 @@ test('flags malformed YAML as a conflict without discarding the file', async () 
   await expectBrain(catalogue.get(scopeConfig.id, noteId), 'CONFLICT');
 
   const conflicts = await catalogue.list(scopeConfig.id, 'conflict');
-  expect(conflicts.items).toHaveLength(1);
-  expect(conflicts.items[0].warnings).toContain('malformed');
+  expect(conflicts.items).toHaveLength(0);
+
+  const database = new Database(join(root, 'catalogue.sqlite'));
+  const row = database
+    .prepare("SELECT state FROM catalogue_revisions WHERE state = 'malformed'")
+    .get() as { state: string } | undefined;
+  expect(row?.state).toBe('malformed');
+  database.close();
 });
 
 test('quarantines an unknown schema version instead of fabricating a revision', async () => {
@@ -317,8 +323,14 @@ test('quarantines an unknown schema version instead of fabricating a revision', 
   await expectBrain(catalogue.get(scopeConfig.id, revision.id), 'UNSUPPORTED_SCHEMA');
 
   const conflicts = await catalogue.list(scopeConfig.id, 'conflict');
-  expect(conflicts.items).toHaveLength(1);
-  expect(conflicts.items[0].warnings).toContain('unsupported_schema');
+  expect(conflicts.items).toHaveLength(0);
+
+  const database = new Database(join(root, 'catalogue.sqlite'));
+  const row = database
+    .prepare("SELECT state FROM catalogue_revisions WHERE state = 'unsupported_schema'")
+    .get() as { state: string } | undefined;
+  expect(row?.state).toBe('unsupported_schema');
+  database.close();
 });
 
 test('rejects a revision duplicated in two locations', async () => {
@@ -439,4 +451,84 @@ test('rejects a malformed cursor instead of returning unrelated rows', async () 
   const { catalogue } = openCatalogue(root);
   await catalogue.reconcile(scopeConfig.id);
   await expectBrain(catalogue.list(scopeConfig.id, 'candidate', 'not-base64!!'), 'INVALID_INPUT');
+});
+
+test('lists only the candidate head, not a candidate ancestor', async () => {
+  const root = makeVaultRoot();
+  const noteId = nextUuid();
+  const ancestor = makeRevision({ id: noteId, status: 'candidate' });
+  const ancestorInfo = writeRevision(root, ancestor);
+  const head = makeRevision({
+    id: noteId,
+    status: 'candidate',
+    parents: [{ revision_id: ancestor.revision_id, raw_hash: ancestorInfo.hash }]
+  });
+  writeRevision(root, head);
+
+  const { catalogue } = openCatalogue(root);
+  await catalogue.reconcile(scopeConfig.id);
+
+  const candidates = await catalogue.list(scopeConfig.id, 'candidate');
+  expect(candidates.items).toHaveLength(1);
+  expect(candidates.items[0].revision_id).toBe(head.revision_id);
+});
+
+test('detects the same revision identity filed under two scopes', async () => {
+  const root = makeVaultRoot();
+  const noteId = nextUuid();
+  const revisionId = nextUuid();
+  const inScope = makeRevision({ id: noteId, revision_id: revisionId, scope: scopeConfig.id });
+  const shared = makeRevision({ id: noteId, revision_id: revisionId, scope: sharedScope.id });
+  writeRevision(root, inScope);
+  const sharedPath = relativePathFor(
+    sharedScope.relative_root,
+    shared.note.content.kind,
+    shared.id,
+    shared.note.title,
+    shared.revision_id
+  );
+  writeRaw(root, sharedPath, renderRevision(shared, sharedScope));
+
+  const { catalogue } = openCatalogue(root);
+  await catalogue.reconcile(scopeConfig.id);
+  await catalogue.reconcile(sharedScope.id);
+
+  await expectBrain(catalogue.get(scopeConfig.id, noteId), 'CONFLICT');
+  await expectBrain(catalogue.get(sharedScope.id, noteId), 'CONFLICT');
+  const conflicts = await catalogue.list(scopeConfig.id, 'conflict');
+  expect(conflicts.items).toHaveLength(1);
+  expect(conflicts.items[0].warnings).toContain('duplicate_identity');
+});
+
+test('returns a conflicted head when a parseable revision has a malformed duplicate', async () => {
+  const root = makeVaultRoot();
+  const noteId = nextUuid();
+  const revision = makeRevision({ id: noteId });
+  writeRevision(root, revision);
+  const malformed = [
+    '---',
+    'title: Broken duplicate',
+    'type: lesson',
+    'brain_schema_version: 1',
+    `brain_id: ${noteId}`,
+    'brain_scope: freellmapi',
+    'brain_status: candidate',
+    'broken: [unclosed',
+    '---',
+    '',
+    '## Situation',
+    '',
+    'Body'
+  ].join('\n');
+  writeRaw(root, `freellmapi/Notes/${noteId}/broken.md`, malformed);
+
+  const { catalogue } = openCatalogue(root);
+  await catalogue.reconcile(scopeConfig.id);
+  await expectBrain(catalogue.get(scopeConfig.id, noteId), 'CONFLICT');
+
+  const inspected = await catalogue.getRevision(scopeConfig.id, noteId, revision.revision_id);
+  expect(inspected.revision.revision_id).toBe(revision.revision_id);
+  expect(inspected.state).toBe('conflict');
+  expect(inspected.source.warnings).toContain('conflict');
+  expect(inspected.source.warnings).toContain('malformed');
 });

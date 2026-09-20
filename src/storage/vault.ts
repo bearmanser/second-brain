@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
-import { constants } from 'node:fs';
-import { lstat, open, readdir } from 'node:fs/promises';
+import { constants, existsSync, lstatSync, realpathSync } from 'node:fs';
+import { lstat, open, readdir, realpath } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { BrainError } from '../contracts/errors.js';
 import { RENDERED_NOTE_MAX_BYTES } from '../core/limits.js';
@@ -10,6 +11,8 @@ const MARKER_PATTERN = /^[ \t]*brain_schema_version[ \t]*:/m;
 const PREFIX_BYTES = 8 * 1024;
 const MAX_READ_ATTEMPTS = 4;
 const READ_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW;
+const FD_DIRECTORY = '/proc/self/fd';
+const FD_REALPATH_SUPPORTED = existsSync(FD_DIRECTORY);
 
 function forbidden(message: string): BrainError {
   return new BrainError({ code: 'FORBIDDEN', message });
@@ -51,6 +54,48 @@ function segmentsOf(value: string): string[] {
   return value.split('/').filter((segment) => segment.length > 0);
 }
 
+function isInside(parent: string, child: string): boolean {
+  return child === parent || child.startsWith(`${parent}${sep}`);
+}
+
+function isStrictlyInside(parent: string, child: string): boolean {
+  return child.startsWith(`${parent}${sep}`);
+}
+
+function canonicalizeSync(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+}
+
+function validateRelativeRoot(scope: ScopeConfig): string[] {
+  const value = scope.relative_root;
+  if (typeof value !== 'string' || value.length === 0) {
+    throw forbidden(`scope ${scope.id} has an empty relative_root`);
+  }
+  if (value.startsWith('/') || value.startsWith('\\')) {
+    throw forbidden(`scope ${scope.id} has an absolute relative_root`);
+  }
+  if (value.includes('\\')) {
+    throw forbidden(`scope ${scope.id} has a backslash in relative_root`);
+  }
+  if (/%[0-9a-fA-F]{2}/.test(value)) {
+    throw forbidden(`scope ${scope.id} has a percent-encoded relative_root`);
+  }
+  const segments = segmentsOf(value);
+  if (segments.length === 0) {
+    throw forbidden(`scope ${scope.id} has an empty relative_root`);
+  }
+  for (const segment of segments) {
+    if (segment === '.' || segment === '..' || segment.startsWith('.')) {
+      throw forbidden(`scope ${scope.id} has an unsafe relative_root segment`);
+    }
+  }
+  return segments;
+}
+
 export function hasBrainMarker(raw: string): boolean {
   const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
   const lines = text.split('\n');
@@ -66,6 +111,25 @@ export function hasBrainMarker(raw: string): boolean {
   return MARKER_PATTERN.test(lines.slice(1, close).join('\n'));
 }
 
+export interface ByteReader {
+  read(
+    buffer: Buffer,
+    offset: number,
+    length: number,
+    position: number
+  ): Promise<{ bytesRead: number }>;
+}
+
+export async function readBoundedBytes(
+  handle: ByteReader,
+  maxBytes: number
+): Promise<{ kind: 'ok'; buffer: Buffer } | { kind: 'overflow' }> {
+  const buffer = Buffer.alloc(maxBytes + 1);
+  const { bytesRead } = await handle.read(buffer, 0, maxBytes + 1, 0);
+  if (bytesRead > maxBytes) return { kind: 'overflow' };
+  return { kind: 'ok', buffer: buffer.subarray(0, bytesRead) };
+}
+
 interface StableRead {
   kind: 'stable';
   value: { raw: string; raw_hash: string; relative_path: string };
@@ -77,15 +141,27 @@ interface UnstableRead {
 
 export class FileVault implements VaultPort {
   private readonly root: string;
+  private readonly canonicalRoot: string;
   private readonly scopes: Map<string, ScopeConfig>;
+  private readonly scopeRoots: Map<string, string>;
 
   constructor(root: string, scopes: ScopeConfig[]) {
     this.root = resolve(root);
-    this.scopes = new Map(scopes.map((scope) => [scope.id, scope]));
+    this.canonicalRoot = canonicalizeSync(this.root);
+    this.scopes = new Map();
+    this.scopeRoots = new Map();
+    for (const scope of scopes) {
+      this.scopeRoots.set(scope.id, this.validateConfiguredRoot(scope));
+      this.scopes.set(scope.id, scope);
+    }
   }
 
   async list(scope: string): Promise<string[]> {
     const config = this.requireScope(scope);
+    const canonicalScopeRoot = this.scopeRoots.get(config.id);
+    if (canonicalScopeRoot === undefined) {
+      throw forbidden(`scope ${config.id} is not configured for vault access`);
+    }
     const prefix = segmentsOf(config.relative_root);
     const directory = join(this.root, ...prefix);
     let info;
@@ -99,8 +175,13 @@ export class FileVault implements VaultPort {
       throw forbidden(`scope root ${config.relative_root} is a symbolic link`);
     }
     if (!info.isDirectory()) return [];
+    await this.assertDirectoryChain(prefix);
+    const canonicalDirectory = await this.canonicalPath(directory);
+    if (canonicalDirectory === undefined || !isInside(this.canonicalRoot, canonicalDirectory)) {
+      throw forbidden(`scope root ${config.relative_root} resolves outside the vault root`);
+    }
     const found: string[] = [];
-    await this.walk(directory, prefix.join('/'), found);
+    await this.walk(directory, prefix.join('/'), canonicalScopeRoot, found);
     found.sort();
     return found;
   }
@@ -110,16 +191,51 @@ export class FileVault implements VaultPort {
     relativePath: string
   ): Promise<{ raw: string; raw_hash: string; relative_path: string }> {
     const config = this.requireScope(scope);
+    const canonicalScopeRoot = this.scopeRoots.get(config.id);
+    if (canonicalScopeRoot === undefined) {
+      throw forbidden(`scope ${config.id} is not configured for vault access`);
+    }
     const segments = this.validatePath(config, relativePath);
-    const absolute = await this.assertSegments(segments);
     for (let attempt = 0; attempt < MAX_READ_ATTEMPTS; attempt += 1) {
-      const outcome = await this.readOnce(absolute, segments.join('/'));
+      await this.assertSegments(segments);
+      const outcome = await this.readOnce(segments, canonicalScopeRoot);
       if (outcome.kind === 'stable') return outcome.value;
     }
-    throw unstable(`file ${segments.join('/')} changed while it was being read`);
+    throw unstable(`file ${segments.join('/')} changed or left its scope while it was being read`);
   }
 
-  private async readOnce(absolute: string, relativePath: string): Promise<StableRead | UnstableRead> {
+  private validateConfiguredRoot(scope: ScopeConfig): string {
+    const segments = validateRelativeRoot(scope);
+    let current = this.root;
+    for (const segment of segments) {
+      current = join(current, segment);
+      let info;
+      try {
+        info = lstatSync(current);
+      } catch (error) {
+        if (hasErrno(error, 'ENOENT')) break;
+        throw recoveryRequired(`scope ${scope.id} cannot be inspected`, error);
+      }
+      if (info.isSymbolicLink()) {
+        throw forbidden(`scope ${scope.id} traverses the symbolic link ${current}`);
+      }
+      if (!info.isDirectory()) {
+        throw forbidden(`scope ${scope.id} is not a directory at ${current}`);
+      }
+    }
+    const canonicalExpected = canonicalizeSync(join(this.canonicalRoot, ...segments));
+    if (!isInside(this.canonicalRoot, canonicalExpected)) {
+      throw forbidden(`scope ${scope.id} resolves outside the vault root`);
+    }
+    return canonicalExpected;
+  }
+
+  private async readOnce(
+    segments: string[],
+    canonicalScopeRoot: string
+  ): Promise<StableRead | UnstableRead> {
+    const relativePath = segments.join('/');
+    const absolute = join(this.root, ...segments);
     let handle;
     try {
       handle = await open(absolute, READ_FLAGS);
@@ -129,6 +245,10 @@ export class FileVault implements VaultPort {
       throw recoveryRequired(`file ${relativePath} cannot be opened`, error);
     }
     try {
+      const canonical = await this.canonicalForHandle(handle, absolute);
+      if (canonical === undefined || !isStrictlyInside(canonicalScopeRoot, canonical)) {
+        return { kind: 'unstable' };
+      }
       const before = await handle.stat();
       if (!before.isFile()) throw notFound(`file ${relativePath} is not a regular file`);
       if (before.size > RENDERED_NOTE_MAX_BYTES) {
@@ -136,12 +256,18 @@ export class FileVault implements VaultPort {
           `file ${relativePath} is ${before.size} bytes and exceeds the ${RENDERED_NOTE_MAX_BYTES} byte limit`
         );
       }
-      const buffer = await handle.readFile();
+      const bounded = await readBoundedBytes(handle, RENDERED_NOTE_MAX_BYTES);
+      if (bounded.kind === 'overflow') {
+        throw limitExceeded(`file ${relativePath} exceeds the ${RENDERED_NOTE_MAX_BYTES} byte limit`);
+      }
+      const buffer = bounded.buffer;
       const after = await handle.stat();
       if (
         after.size !== before.size ||
         after.mtimeMs !== before.mtimeMs ||
-        after.ino !== before.ino
+        after.ctimeMs !== before.ctimeMs ||
+        after.ino !== before.ino ||
+        after.dev !== before.dev
       ) {
         return { kind: 'unstable' };
       }
@@ -159,7 +285,12 @@ export class FileVault implements VaultPort {
     }
   }
 
-  private async walk(directory: string, relative: string, found: string[]): Promise<void> {
+  private async walk(
+    directory: string,
+    relative: string,
+    canonicalScopeRoot: string,
+    found: string[]
+  ): Promise<void> {
     let entries;
     try {
       entries = await readdir(directory, { withFileTypes: true });
@@ -180,16 +311,22 @@ export class FileVault implements VaultPort {
       }
       if (info.isSymbolicLink()) continue;
       if (info.isDirectory()) {
-        await this.walk(absolute, relativePath, found);
+        const canonical = await this.canonicalPath(absolute);
+        if (canonical === undefined || !isStrictlyInside(canonicalScopeRoot, canonical)) continue;
+        await this.walk(absolute, relativePath, canonicalScopeRoot, found);
         continue;
       }
       if (!info.isFile() || !entry.name.endsWith('.md')) continue;
-      const prefix = await this.readPrefix(absolute, info.size);
+      const prefix = await this.readPrefix(absolute, info.size, canonicalScopeRoot);
       if (prefix !== undefined && hasBrainMarker(prefix)) found.push(relativePath);
     }
   }
 
-  private async readPrefix(absolute: string, size: number): Promise<string | undefined> {
+  private async readPrefix(
+    absolute: string,
+    size: number,
+    canonicalScopeRoot: string
+  ): Promise<string | undefined> {
     const length = Math.min(size, PREFIX_BYTES);
     let handle;
     try {
@@ -198,6 +335,10 @@ export class FileVault implements VaultPort {
       return undefined;
     }
     try {
+      const canonical = await this.canonicalForHandle(handle, absolute);
+      if (canonical === undefined || !isStrictlyInside(canonicalScopeRoot, canonical)) {
+        return undefined;
+      }
       const buffer = Buffer.alloc(length);
       const { bytesRead } = await handle.read(buffer, 0, length, 0);
       return buffer.subarray(0, bytesRead).toString('utf8');
@@ -205,6 +346,30 @@ export class FileVault implements VaultPort {
       return undefined;
     } finally {
       await handle.close();
+    }
+  }
+
+  private async canonicalForHandle(
+    handle: FileHandle,
+    absolute: string
+  ): Promise<string | undefined> {
+    const fd = handle.fd;
+    if (FD_REALPATH_SUPPORTED && typeof fd === 'number' && fd >= 0) {
+      try {
+        const canonical = await realpath(`${FD_DIRECTORY}/${fd}`);
+        if (!canonical.endsWith(' (deleted)')) return canonical;
+      } catch {
+        return undefined;
+      }
+    }
+    return this.canonicalPath(absolute);
+  }
+
+  private async canonicalPath(path: string): Promise<string | undefined> {
+    try {
+      return await realpath(path);
+    } catch {
+      return undefined;
     }
   }
 
@@ -252,7 +417,7 @@ export class FileVault implements VaultPort {
 
   private async assertSegments(segments: string[]): Promise<string> {
     const resolved = resolve(this.root, ...segments);
-    if (resolved !== this.root && !resolved.startsWith(`${this.root}${sep}`)) {
+    if (!isStrictlyInside(this.root, resolved)) {
       throw forbidden('path is outside the vault root');
     }
     let current = this.root;
@@ -279,5 +444,27 @@ export class FileVault implements VaultPort {
       }
     }
     return current;
+  }
+
+  private async assertDirectoryChain(segments: string[]): Promise<void> {
+    let current = this.root;
+    for (const segment of segments) {
+      current = join(current, segment);
+      let info;
+      try {
+        info = await lstat(current);
+      } catch (error) {
+        if (hasErrno(error, 'ENOENT')) {
+          throw notFound(`scope root ${segments.join('/')} does not exist`);
+        }
+        throw recoveryRequired(`scope root ${segments.join('/')} cannot be inspected`, error);
+      }
+      if (info.isSymbolicLink()) {
+        throw forbidden(`scope root ${segments.join('/')} contains a symbolic link`);
+      }
+      if (!info.isDirectory()) {
+        throw forbidden(`scope root ${segments.join('/')} is not a directory`);
+      }
+    }
   }
 }

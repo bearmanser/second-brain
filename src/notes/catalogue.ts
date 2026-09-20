@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import { uuidSchema } from '../contracts/content.js';
 import { BrainError, isBrainError } from '../contracts/errors.js';
 import {
   LIFECYCLES,
@@ -233,10 +234,6 @@ function asLifecycle(value: string | null | undefined): Lifecycle {
   return (LIFECYCLES as readonly string[]).includes(value ?? '') ? (value as Lifecycle) : 'candidate';
 }
 
-function asKind(value: string | null | undefined): NoteKind {
-  return (NOTE_KINDS as readonly string[]).includes(value ?? '') ? (value as NoteKind) : 'note';
-}
-
 export class RevisionCatalogue implements CataloguePort {
   private readonly database: Database.Database;
   private readonly vault: VaultPort;
@@ -332,6 +329,12 @@ export class RevisionCatalogue implements CataloguePort {
         (globalRevisionLocations.get(item.revision.revision_id) ?? 0) + 1
       );
     }
+    const scannedRevisionIds = parsed.map((item) => item.revision.revision_id);
+    const duplicateAcrossScopes = new Set(
+      this.foreignRowsFor(scope, scannedRevisionIds)
+        .map((row) => row.revision_id)
+        .filter((id): id is string => id !== null)
+    );
 
     const groups = new Map<string, (Observation & { revision: StoredRevision })[]>();
     for (const item of parsed) {
@@ -347,7 +350,10 @@ export class RevisionCatalogue implements CataloguePort {
         if (seen.has(item.revision.revision_id)) groupWarnings.push('duplicate_identity');
         seen.add(item.revision.revision_id);
         if (item.revision.scope !== scope) groupWarnings.push('scope_mismatch');
-        if ((globalRevisionLocations.get(item.revision.revision_id) ?? 0) > 1) {
+        if (
+          (globalRevisionLocations.get(item.revision.revision_id) ?? 0) > 1 ||
+          duplicateAcrossScopes.has(item.revision.revision_id)
+        ) {
           groupWarnings.push('duplicate_identity');
         }
       }
@@ -434,7 +440,7 @@ export class RevisionCatalogue implements CataloguePort {
       });
     }
 
-    this.persist(scope, rows, parents);
+    this.persist(scope, rows, parents, this.foreignRowsFor(scope, scannedRevisionIds));
   }
 
   async get(scope: string, id: string): Promise<Head> {
@@ -457,19 +463,35 @@ export class RevisionCatalogue implements CataloguePort {
     if (loaded.parsed.length === 0) {
       throw this.failureError(scope, id, loaded);
     }
-    const all = await this.loadRows(scope, this.rowsForLogicalId(scope, id));
+    const allRows = this.rowsForLogicalId(scope, id);
+    const all = await this.loadRows(scope, allRows);
     const resolution = resolveHead(all.parsed);
     const warnings: string[] = [];
+    const failureReasons = unique([
+      ...all.failures.map((failure) => failure.reason),
+      ...loaded.failures.map((failure) => failure.reason)
+    ]);
+    let conflicted = false;
     if (resolution.state === 'conflict') {
-      warnings.push('conflict');
-    } else if (resolution.head.revision.revision_id !== revisionId) {
-      warnings.push('historical');
+      conflicted = true;
+      warnings.push('conflict', ...resolution.reasons);
+    }
+    if (failureReasons.length > 0) {
+      conflicted = true;
+      warnings.push(...failureReasons, 'conflict');
+    }
+    if (this.hasForeignDuplicate(scope, all.parsed.map((item) => item.revision.revision_id))) {
+      conflicted = true;
+      warnings.push('duplicate_identity', 'conflict');
+    }
+    if (!conflicted && resolution.state === 'ready') {
+      if (resolution.head.revision.revision_id !== revisionId) warnings.push('historical');
     }
     const target =
       loaded.parsed.find((item) => item.revision.revision_id === revisionId) ?? loaded.parsed[0];
     const row = rows.find((item) => item.revision_id === revisionId);
     if (row !== undefined && row.raw_hash !== target.raw_hash) warnings.push('stale_catalogue');
-    return this.buildHead(target, warnings);
+    return this.buildHead(target, unique(warnings), conflicted ? 'conflict' : undefined);
   }
 
   async list(
@@ -488,21 +510,24 @@ export class RevisionCatalogue implements CataloguePort {
         ? (this.database
             .prepare(
               `SELECT * FROM catalogue_revisions
-               WHERE scope = ? AND state IN ('ready', 'manual_unreviewed') AND effective_status = 'candidate'
+               WHERE scope = ? AND state IN ('ready', 'manual_unreviewed')
+                 AND effective_status = 'candidate' AND is_head = 1
                ORDER BY logical_id ASC, revision_id ASC, relative_path ASC`
             )
             .all(scope) as RevisionRow[])
         : (this.database
             .prepare(
               `SELECT * FROM catalogue_revisions
-               WHERE scope = ? AND state IN ('conflict', 'malformed', 'unsupported_schema')
+               WHERE scope = ? AND state = 'conflict'
                ORDER BY logical_id ASC, revision_id ASC, relative_path ASC`
             )
             .all(scope) as RevisionRow[]);
-    const page = rows.slice(offset, offset + LIST_PAGE_SIZE);
-    const items = page.map((row) => this.sourceRefFromRow(row));
-    const next = offset + LIST_PAGE_SIZE < rows.length ? this.encodeCursor(offset + LIST_PAGE_SIZE, scope, filter) : undefined;
-    return next === undefined ? { items } : { items, next_cursor: next };
+    const items = rows
+      .map((row) => this.sourceRefFromRow(row))
+      .filter((item): item is SourceRef => item !== undefined);
+    const page = items.slice(offset, offset + LIST_PAGE_SIZE);
+    const next = offset + LIST_PAGE_SIZE < items.length ? this.encodeCursor(offset + LIST_PAGE_SIZE, scope, filter) : undefined;
+    return next === undefined ? { items: page } : { items: page, next_cursor: next };
   }
 
   close(): void {
@@ -525,6 +550,9 @@ export class RevisionCatalogue implements CataloguePort {
     const resolution = resolveHead(repository);
     if (resolution.state === 'conflict') {
       throw conflict(`note ${id} has no unique valid head: ${resolution.reasons.join(', ')}`);
+    }
+    if (this.hasForeignDuplicate(scope, repository.map((item) => item.revision.revision_id))) {
+      throw conflict(`note ${id} has a duplicate revision identity in another scope`);
     }
     const nonHeadConflicts = rows.filter(
       (row) =>
@@ -606,7 +634,11 @@ export class RevisionCatalogue implements CataloguePort {
     return { parsed, failures };
   }
 
-  private buildHead(item: ParsedRevision, baseWarnings: string[]): Head {
+  private buildHead(
+    item: ParsedRevision,
+    baseWarnings: string[],
+    forcedState?: Head['state']
+  ): Head {
     const revision = item.revision;
     const approvalChanged =
       revision.approval !== undefined && revision.approval.payload_hash !== payloadHash(revision);
@@ -629,25 +661,45 @@ export class RevisionCatalogue implements CataloguePort {
       revision,
       source,
       raw_hash: item.raw_hash,
-      state: approvalChanged ? 'manual_unreviewed' : 'ready'
+      state: forcedState ?? (approvalChanged ? 'manual_unreviewed' : 'ready')
     };
   }
 
-  private sourceRefFromRow(row: RevisionRow): SourceRef {
-    const id = row.logical_id ?? row.relative_path;
-    const revisionId = row.revision_id ?? '';
-    const etagSeed = revisionId.length > 0 ? revisionId : row.relative_path;
+  private sourceRefFromRow(row: RevisionRow): SourceRef | undefined {
+    if (row.logical_id === null || row.revision_id === null) return undefined;
+    if (row.title === null || row.kind === null || row.effective_status === null) return undefined;
+    if (!uuidSchema.safeParse(row.logical_id).success) return undefined;
+    if (!uuidSchema.safeParse(row.revision_id).success) return undefined;
+    if (!(NOTE_KINDS as readonly string[]).includes(row.kind)) return undefined;
+    if (!(LIFECYCLES as readonly string[]).includes(row.effective_status)) return undefined;
     return {
-      id,
-      revision_id: revisionId,
+      id: row.logical_id,
+      revision_id: row.revision_id,
       scope: row.scope,
-      title: row.title ?? '',
-      kind: asKind(row.kind),
-      status: asLifecycle(row.effective_status ?? row.stored_status),
-      etag: makeEtag(etagSeed, row.raw_hash),
+      title: row.title,
+      kind: row.kind as NoteKind,
+      status: row.effective_status as Lifecycle,
+      etag: makeEtag(row.revision_id, row.raw_hash),
       relative_path: row.relative_path,
       warnings: parseWarnings(row.warnings_json)
     };
+  }
+
+  private foreignRowsFor(scope: string, revisionIds: string[]): RevisionRow[] {
+    const ids = unique(revisionIds.filter((id) => id.length > 0));
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => '?').join(', ');
+    return this.database
+      .prepare(
+        `SELECT * FROM catalogue_revisions
+         WHERE scope <> ? AND revision_id IN (${placeholders})
+         ORDER BY scope ASC, relative_path ASC`
+      )
+      .all(scope, ...ids) as RevisionRow[];
+  }
+
+  private hasForeignDuplicate(scope: string, revisionIds: string[]): boolean {
+    return this.foreignRowsFor(scope, revisionIds).length > 0;
   }
 
   private rowsForLogicalId(scope: string, id: string): RevisionRow[] {
@@ -664,7 +716,12 @@ export class RevisionCatalogue implements CataloguePort {
       .all(scope, id, revisionId) as RevisionRow[];
   }
 
-  private persist(scope: string, rows: RevisionRow[], parents: ParentRow[]): void {
+  private persist(
+    scope: string,
+    rows: RevisionRow[],
+    parents: ParentRow[],
+    foreignDuplicates: RevisionRow[]
+  ): void {
     const run = this.database.transaction((): void => {
       this.database.prepare('DELETE FROM catalogue_parents WHERE scope = ?').run(scope);
       this.database.prepare('DELETE FROM catalogue_revisions WHERE scope = ?').run(scope);
@@ -697,6 +754,15 @@ export class RevisionCatalogue implements CataloguePort {
       );
       for (const parent of parents) {
         insertParent.run(parent.scope, parent.revision_id, parent.parent_revision_id, parent.parent_raw_hash);
+      }
+      const markDuplicate = this.database.prepare(
+        `UPDATE catalogue_revisions
+         SET state = 'conflict', is_head = 0, warnings_json = ?
+         WHERE scope = ? AND relative_path = ?`
+      );
+      for (const row of foreignDuplicates) {
+        const warnings = unique([...parseWarnings(row.warnings_json), 'duplicate_identity', 'conflict']);
+        markDuplicate.run(JSON.stringify(warnings), row.scope, row.relative_path);
       }
     });
     run.immediate();
