@@ -217,8 +217,10 @@ afterAll(async () => {
       compose(['down', '-v', '--remove-orphans']);
     }
   } catch {}
-  for (const name of ['brain-state', 'memory-state', 'model-cache']) {
-    spawnSync('docker', ['volume', 'rm', `${project}_${name}`], { encoding: 'utf8' });
+  for (const candidate of [project, `${project}own`]) {
+    for (const name of ['brain-state', 'memory-state', 'model-cache']) {
+      spawnSync('docker', ['volume', 'rm', `${candidate}_${name}`], { encoding: 'utf8' });
+    }
   }
   spawnSync('docker', ['image', 'rm', `${project}-brain`], { encoding: 'utf8' });
   if (workDir.length > 0) rmSync(workDir, { recursive: true, force: true });
@@ -313,6 +315,37 @@ describe('reproducible Docker deployment', () => {
     const status = await client!.callTool({ name: 'brain_status', arguments: {} });
     expect(statusFrom(status).health?.gateway).toBe('ready');
   }, 300_000);
+
+  test('refuses to modify an existing operator-owned volume', () => {
+    const ownedProject = `${project}own`;
+    const ownedVolume = `${ownedProject}_brain-state`;
+    run('docker', ['volume', 'create', ownedVolume]);
+
+    const result = spawnSync('bash', ['scripts/setup.sh'], {
+      cwd: workDir,
+      encoding: 'utf8',
+      maxBuffer: 256 * 1024 * 1024,
+      env: env({ COMPOSE_PROJECT_NAME: ownedProject })
+    });
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}${result.stderr}`).toMatch(/existing volume .* is not writable/);
+
+    const writable = spawnSync(
+      'docker',
+      ['run', '--rm', '--user', '1000:1000', '-v', `${ownedVolume}:/volume`, nodeImage, 'sh', '-c', 'test -w /volume'],
+      { encoding: 'utf8' }
+    );
+    expect(writable.status).not.toBe(0);
+
+    const marker = spawnSync(
+      'docker',
+      ['run', '--rm', '--user', '0:0', '-v', `${ownedVolume}:/volume`, nodeImage, 'sh', '-c', 'test -e /volume/.brain-initialized'],
+      { encoding: 'utf8' }
+    );
+    expect(marker.status).not.toBe(0);
+
+    spawnSync('docker', ['volume', 'rm', ownedVolume], { encoding: 'utf8' });
+  }, 900_000);
 
   test('keeps hybrid search working from a warmed cache with no external network', async () => {
     const modelMarker = 'models--qdrant--bge-small-en-v1.5-onnx-q';

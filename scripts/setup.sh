@@ -131,29 +131,13 @@ inspect_memory_mappings() {
     --entrypoint node "$NODE_IMAGE" -e "$script"
 }
 
-volume_state_file() {
-  printf '%s/.setup-volumes' "$ROOT_DIR"
-}
-
-volume_is_known() {
-  local state
-  state="$(volume_state_file)"
-  [ -f "$state" ] || return 1
-  grep -qxF "$1" "$state"
-}
-
-record_volume() {
-  printf '%s\n' "$1" >> "$(volume_state_file)"
-}
-
-volume_is_initialized() {
+volume_is_writable_by_runtime() {
   docker run --rm --user "$BRAIN_UID:$BRAIN_GID" -v "$1":/volume \
-    --entrypoint sh "$NODE_IMAGE" -c 'test -f /volume/.brain-initialized'
+    --entrypoint sh "$NODE_IMAGE" -c 'test -w /volume'
 }
 
-initialize_volume() {
-  run_as_root -v "$1":/volume "$NODE_IMAGE" \
-    sh -c "chown -R $BRAIN_UID:$BRAIN_GID /volume && touch /volume/.brain-initialized && chown $BRAIN_UID:$BRAIN_GID /volume/.brain-initialized"
+chown_new_volume() {
+  run_as_root -v "$1":/volume "$NODE_IMAGE" chown -R "$BRAIN_UID:$BRAIN_GID" /volume
 }
 
 main() {
@@ -216,24 +200,17 @@ main() {
   for name in brain-state memory-state model-cache; do
     vol="${COMPOSE_PROJECT_NAME}_${name}"
     if docker volume inspect "$vol" >/dev/null 2>&1; then
-      if volume_is_known "$vol"; then
-        if volume_is_initialized "$vol"; then
-          printf 'setup: volume %s already initialized; leaving ownership unchanged\n' "$vol"
-          continue
-        fi
-        printf 'setup: repairing initialization of %s\n' "$vol"
-        initialize_volume "$vol"
+      if volume_is_writable_by_runtime "$vol"; then
+        printf 'setup: volume %s already exists; validated without changing ownership\n' "$vol"
         continue
       fi
-      printf 'setup: volume %s already exists; leaving ownership unchanged\n' "$vol"
-      continue
+      fail "existing volume $vol is not writable by uid $BRAIN_UID; setup never changes ownership of an existing volume, so repair it manually or choose a different COMPOSE_PROJECT_NAME"
     fi
     docker volume create \
       --label "com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
       --label "com.docker.compose.volume=$name" \
       "$vol" >/dev/null
-    record_volume "$vol"
-    initialize_volume "$vol"
+    chown_new_volume "$vol"
   done
 
   local config_volume="${COMPOSE_PROJECT_NAME}_memory-state"

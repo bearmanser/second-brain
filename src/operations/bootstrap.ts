@@ -17,6 +17,7 @@ import type { Principal, ScopeConfig } from '../core/types.js';
 import type { BrainConfig, CredentialRecord } from '../config/schema.js';
 import { BrainError } from '../contracts/errors.js';
 import { brainConfigSchema, credentialsFileSchema } from '../config/schema.js';
+import { hasPermission } from './permissions.js';
 
 export interface BootstrapOptions {
   root: string;
@@ -146,17 +147,6 @@ async function readBinaryIfExists(path: string): Promise<Buffer | undefined> {
 
 const DIRECTORY_ACCESS_MASK = fsConstants.R_OK | fsConstants.W_OK | fsConstants.X_OK;
 
-function hasAccess(
-  info: { uid: number; gid: number; mode: number },
-  uid: number,
-  gid: number,
-  mask: number
-): boolean {
-  if (info.uid === uid && (info.mode & (mask << 6)) === mask << 6) return true;
-  if (info.gid === gid && (info.mode & (mask << 3)) === mask << 3) return true;
-  return (info.mode & mask) === mask;
-}
-
 async function assertDirectoryAccess(
   path: string,
   uid: number,
@@ -173,7 +163,7 @@ async function assertDirectoryAccess(
   if (!info.isDirectory()) {
     throw invalidInput(`${label} is not a directory: ${path}`);
   }
-  if (!hasAccess({ uid: info.uid, gid: info.gid, mode: info.mode }, uid, gid, mask)) {
+  if (!hasPermission({ uid: info.uid, gid: info.gid, mode: info.mode }, uid, gid, mask)) {
     throw invalidInput(`${label} does not grant uid ${uid} the required permissions: ${path}`);
   }
 }
@@ -205,7 +195,7 @@ async function ensureScopePath(
     }
     if (uid !== undefined && uid !== 0) {
       const effectiveGid = gid ?? uid;
-      if (!hasAccess({ uid: info.uid, gid: info.gid, mode: info.mode }, uid, effectiveGid, DIRECTORY_ACCESS_MASK)) {
+      if (!hasPermission({ uid: info.uid, gid: info.gid, mode: info.mode }, uid, effectiveGid, DIRECTORY_ACCESS_MASK)) {
         throw invalidInput(`vault scope path does not grant uid ${uid} the required permissions: ${current}`);
       }
     }
