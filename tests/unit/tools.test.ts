@@ -9,6 +9,7 @@ import {
   feedbackRequestSchema,
   readRequestSchema,
   recallRequestSchema,
+  projectEnsureRequestSchema,
   reviewRequestSchema,
   statusRequestSchema
 } from '../../src/contracts/protocol.js';
@@ -22,7 +23,8 @@ import type {
   RequestContext,
   ReviewListResult,
   SourceRef,
-  StatusResult
+  StatusResult,
+  ProjectEnsureResult
 } from '../../src/core/types.js';
 import { capture } from '../../src/features/capture.js';
 import { status } from '../../src/features/status.js';
@@ -57,6 +59,7 @@ const digest = (value: unknown): string =>
 const requestSchemas: Record<ToolName, z.ZodType> = {
   brain_capture: captureRequestSchema,
   brain_feedback: feedbackRequestSchema,
+  brain_project_ensure: projectEnsureRequestSchema,
   brain_read: readRequestSchema,
   brain_recall: recallRequestSchema,
   brain_review: reviewRequestSchema,
@@ -66,6 +69,7 @@ const requestSchemas: Record<ToolName, z.ZodType> = {
 const TOOL_NAMES: ToolName[] = [
   'brain_capture',
   'brain_feedback',
+  'brain_project_ensure',
   'brain_read',
   'brain_recall',
   'brain_review',
@@ -124,10 +128,22 @@ const statusSample: StatusResult = {
   pending_operations: 0
 };
 
-test('exposes only the six controlled Brain tools', () => {
+const projectEnsureSample: ProjectEnsureResult = {
+  operation_id: fixtureIds.idempotencyKey,
+  repository_identity: 'github.com/bearmanser/second-brain',
+  scope: 'second-brain',
+  created: true,
+  permissions: { can_read: true, can_write: true, can_review: false },
+  backend_ready: true,
+  materialized: true,
+  warnings: []
+};
+
+test('exposes only the seven controlled Brain tools', () => {
   expect(toolDefinitions.map((item) => item.name).sort()).toEqual([
     'brain_capture',
     'brain_feedback',
+    'brain_project_ensure',
     'brain_read',
     'brain_recall',
     'brain_review',
@@ -166,6 +182,12 @@ test('marks read-only and mutating tools distinctly without claiming universal s
       openWorldHint: false
     });
   }
+  expect(tools.brain_project_ensure.annotations).toMatchObject({
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false
+  });
   expect(tools.brain_review.annotations).toMatchObject({
     readOnlyHint: false,
     destructiveHint: true,
@@ -185,6 +207,7 @@ test('output schemas stay consistent with the published data shapes', () => {
   const samples: Record<ToolName, Record<string, unknown>> = {
     brain_capture: receiptSample as unknown as Record<string, unknown>,
     brain_feedback: feedbackSample as unknown as Record<string, unknown>,
+    brain_project_ensure: projectEnsureSample as unknown as Record<string, unknown>,
     brain_read: readSample as unknown as Record<string, unknown>,
     brain_recall: recallSample as unknown as Record<string, unknown>,
     brain_review: receiptSample as unknown as Record<string, unknown>,
@@ -232,6 +255,11 @@ test('the published tool contract is pinned', () => {
         "input": "344e4a1cfa3091868abfbcebf5c57603a3977498e94f509eb26ef170cefd0eab",
         "name": "brain_feedback",
         "output": "0db1da61ddcc5a1c8600781e90507114dbc22afc41437edea448d32dbe1924d5",
+      },
+      {
+        "input": "cc6a684a8e3ef79221529b2b197a0d67cdcb20ac2eb795036a3164b80ab2c5a0",
+        "name": "brain_project_ensure",
+        "output": "7c38e23d28b6861ab8bc2b69304c282510536afcdcab3c385b73da1231c56082",
       },
       {
         "input": "847f7e5740dc8c25781651c7469f6c73029266518cba02da3ccb15223b232026",

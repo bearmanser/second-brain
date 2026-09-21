@@ -71,6 +71,22 @@ export interface CaptureRequest {
   note: NoteInput;
 }
 
+export interface ProjectEnsureRequest {
+  idempotency_key: string;
+  remote_url: string;
+}
+
+export interface ProjectEnsureResult {
+  operation_id: string;
+  repository_identity: string;
+  scope: string;
+  created: boolean;
+  permissions: { can_read: true; can_write: boolean; can_review: boolean };
+  backend_ready: boolean;
+  materialized: boolean;
+  warnings: string[];
+}
+
 export interface RecallRequest {
   scope: string;
   query: string;

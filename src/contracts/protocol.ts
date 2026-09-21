@@ -11,6 +11,7 @@ import {
   cursorSchema,
   etagSchema,
   noteInputSchema,
+  remoteUrlSchema,
   scopeIdSchema,
   uuidSchema,
   withinInputBodyLimit
@@ -68,6 +69,13 @@ export const captureRequestSchema = z
     idempotency_key: uuidSchema,
     scope: scopeIdSchema,
     note: noteInputSchema
+  })
+  .refine(withinInputBodyLimit, { message: 'input body exceeds the 256 KiB limit' });
+
+export const projectEnsureRequestSchema = z
+  .strictObject({
+    idempotency_key: uuidSchema,
+    remote_url: remoteUrlSchema
   })
   .refine(withinInputBodyLimit, { message: 'input body exceeds the 256 KiB limit' });
 

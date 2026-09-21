@@ -5,6 +5,7 @@ import { BrainError, isBrainError } from '../contracts/errors.js';
 import {
   captureRequestSchema,
   feedbackRequestSchema,
+  projectEnsureRequestSchema,
   readRequestSchema,
   recallRequestSchema,
   reviewRequestSchema,
@@ -24,6 +25,7 @@ export const INTERNAL_ERROR_MESSAGE = 'the gateway could not complete the reques
 export const TOOL_NAMES = [
   'brain_capture',
   'brain_feedback',
+  'brain_project_ensure',
   'brain_read',
   'brain_recall',
   'brain_review',
@@ -69,6 +71,7 @@ export interface ToolErrorPayload {
 export const requestSchemas = {
   brain_capture: captureRequestSchema,
   brain_feedback: feedbackRequestSchema,
+  brain_project_ensure: projectEnsureRequestSchema,
   brain_read: readRequestSchema,
   brain_recall: recallRequestSchema,
   brain_review: reviewRequestSchema,
@@ -198,6 +201,40 @@ const feedbackResultSchema: Record<string, unknown> = {
   }
 };
 
+const projectEnsureResultSchema: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  required: [
+    'operation_id',
+    'repository_identity',
+    'scope',
+    'created',
+    'permissions',
+    'backend_ready',
+    'materialized',
+    'warnings'
+  ],
+  properties: {
+    operation_id: UUID,
+    repository_identity: STRING,
+    scope: SCOPE,
+    created: { type: 'boolean' },
+    permissions: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['can_read', 'can_write', 'can_review'],
+      properties: {
+        can_read: { type: 'boolean', const: true },
+        can_write: { type: 'boolean' },
+        can_review: { type: 'boolean' }
+      }
+    },
+    backend_ready: { type: 'boolean' },
+    materialized: { type: 'boolean' },
+    warnings: STRING_ARRAY
+  }
+};
+
 const statusResultSchema: Record<string, unknown> = {
   type: 'object',
   additionalProperties: false,
@@ -245,6 +282,7 @@ const statusResultSchema: Record<string, unknown> = {
 const OUTPUT_SCHEMAS: Record<ToolName, Record<string, unknown>> = {
   brain_capture: mutationReceiptSchema,
   brain_feedback: feedbackResultSchema,
+  brain_project_ensure: projectEnsureResultSchema,
   brain_read: readResultSchema,
   brain_recall: recallResultSchema,
   brain_review: { oneOf: [mutationReceiptSchema, reviewListResultSchema] },
@@ -256,6 +294,8 @@ const DESCRIPTIONS: Record<ToolName, string> = {
     'Capture one structured, typed memory candidate with evidence and an idempotency key. Creates a candidate, never an established fact.',
   brain_feedback:
     'Record useful, irrelevant, stale, incorrect, or contradictory feedback on one specific note revision.',
+  brain_project_ensure:
+    'Idempotently provision and authorize the project scope for one canonical Git repository remote.',
   brain_read:
     'Read the current revision or an explicit historical revision of one authorized note with bounded pagination and an etag.',
   brain_recall:
@@ -276,6 +316,13 @@ const ANNOTATIONS: Record<ToolName, ToolAnnotations> = {
   },
   brain_feedback: {
     title: 'Record memory feedback',
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false
+  },
+  brain_project_ensure: {
+    title: 'Ensure repository project memory',
     readOnlyHint: false,
     destructiveHint: false,
     idempotentHint: true,

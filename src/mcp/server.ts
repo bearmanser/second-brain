@@ -3,7 +3,7 @@ import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import type { ResultDelivery } from '../config/schema.js';
-import { isBrainError } from '../contracts/errors.js';
+import { BrainError, isBrainError } from '../contracts/errors.js';
 import { ETAG_PATTERN, SCOPE_ID_PATTERN } from '../core/limits.js';
 import {
   LIFECYCLES,
@@ -171,6 +171,12 @@ type ToolInvoker = (
 const TOOL_HANDLERS: Record<ToolName, ToolInvoker> = {
   brain_capture: (services, ctx, args) => services.capture(ctx, args as CaptureRequest),
   brain_feedback: (services, ctx, args) => services.feedback(ctx, args as FeedbackRequest),
+  brain_project_ensure: async () => {
+    throw new BrainError({
+      code: 'BACKEND_UNAVAILABLE',
+      message: 'repository project provisioning is not initialized'
+    });
+  },
   brain_read: (services, ctx, args) => services.read(ctx, args as ReadRequest),
   brain_recall: (services, ctx, args) => services.recall(ctx, args as RecallRequest),
   brain_review: async (services, ctx, args) =>
@@ -217,4 +223,3 @@ export function createMcpServer(services: BrainServices, ctx: RequestContext): M
 
   return server;
 }
-

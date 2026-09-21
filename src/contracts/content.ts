@@ -46,6 +46,8 @@ export const etagSchema = z.string().regex(ETAG_PATTERN, {
 
 export const cursorSchema = z.string().min(1);
 
+export const remoteUrlSchema = z.string().min(1).max(2048);
+
 export const titleSchema = z
   .string()
   .trim()

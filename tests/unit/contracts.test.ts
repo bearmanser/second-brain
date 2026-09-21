@@ -9,6 +9,7 @@ import {
   feedbackRequestSchema,
   readRequestSchema,
   recallRequestSchema,
+  projectEnsureRequestSchema,
   reviewRequestSchema,
   statusRequestSchema
 } from '../../src/contracts/protocol.js';
@@ -172,6 +173,7 @@ const publishedInputSchemas = {
   brain_read: readRequestSchema,
   brain_review: reviewRequestSchema,
   brain_feedback: feedbackRequestSchema,
+  brain_project_ensure: projectEnsureRequestSchema,
   brain_status: statusRequestSchema
 } as const;
 
@@ -198,8 +200,34 @@ const publishedExamples: Record<keyof typeof publishedInputSchemas, unknown> = {
   },
   brain_review: { scope: 'freellmapi', operation: reviewOperations.list },
   brain_feedback: validFeedback,
+  brain_project_ensure: {
+    idempotency_key: fixtureIds.idempotencyKey,
+    remote_url: 'git@github.com:bearmanser/second-brain.git'
+  },
   brain_status: { scope: 'freellmapi', operation_id: fixtureIds.revision, include_schemas: true }
 };
+
+test('project ensure accepts only a UUID and a bounded nonempty remote URL', () => {
+  expect(
+    projectEnsureRequestSchema.safeParse({
+      idempotency_key: fixtureIds.idempotencyKey,
+      remote_url: 'https://github.com/bearmanser/second-brain.git'
+    }).success
+  ).toBe(true);
+  expect(
+    projectEnsureRequestSchema.safeParse({
+      idempotency_key: fixtureIds.idempotencyKey,
+      remote_url: ''
+    }).success
+  ).toBe(false);
+  expect(
+    projectEnsureRequestSchema.safeParse({
+      idempotency_key: fixtureIds.idempotencyKey,
+      remote_url: 'https://github.com/bearmanser/second-brain.git',
+      scope: 'caller-controlled'
+    }).success
+  ).toBe(false);
+});
 
 test('accepts one synthetic example for every note kind', () => {
   expect(contentExamples).toHaveLength(7);
@@ -448,7 +476,7 @@ test('status accepts an empty request and optional filters', () => {
 
 test('publishes JSON schemas and validates each registered example', () => {
   const names = Object.keys(publishedInputSchemas) as (keyof typeof publishedInputSchemas)[];
-  expect(names).toHaveLength(6);
+  expect(names).toHaveLength(7);
   for (const name of names) {
     const jsonSchema = z.toJSONSchema(publishedInputSchemas[name]);
     expect(jsonSchema).toMatchObject({ $schema: expect.any(String) });
