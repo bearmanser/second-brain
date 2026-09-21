@@ -1,5 +1,6 @@
 import { BrainError } from '../contracts/errors.js';
 import type { Principal, ScopeConfig } from '../core/types.js';
+import type { ScopeRegistry } from '../projects/scope-registry.js';
 
 export const SHARED_SCOPE_ID = 'shared';
 
@@ -22,20 +23,16 @@ const requireIdentifier = (value: unknown): string => {
   return value.trim();
 };
 
-const resolveIdentifier = (identifier: string, configured: ScopeConfig[]): ScopeConfig => {
-  const matches = configured.filter(
-    (scope) => scope.id === identifier || scope.repository_aliases.includes(identifier)
-  );
-  const unique = matches.filter((scope, index) => matches.indexOf(scope) === index);
-  if (unique.length === 0) throw forbidden('requested scope is not available');
-  if (unique.length > 1) throw forbidden('requested scope identifier is ambiguous');
-  return unique[0];
-};
-
-const permitted = (principal: Principal, scope: string, operation: ScopeOperation): boolean => {
-  if (operation === 'read') return principal.read_scopes.includes(scope);
-  if (operation === 'write') return principal.write_scopes.includes(scope);
-  return canReview(principal, scope, false);
+const permitted = (
+  registry: ScopeRegistry,
+  principal: Principal,
+  scope: string,
+  operation: ScopeOperation
+): boolean => {
+  const permissions = registry.permissions(principal, scope);
+  if (operation === 'read') return permissions.can_read;
+  if (operation === 'write') return permissions.can_write;
+  return permissions.can_review;
 };
 
 export function resolveScopes(
@@ -43,15 +40,17 @@ export function resolveScopes(
   requested: string,
   includeShared: boolean,
   operation: ScopeOperation,
-  configured: ScopeConfig[]
+  registry: ScopeRegistry
 ): ScopeConfig[] {
   const identifier = requireIdentifier(requested);
-  const allowed = configured.filter((scope) => permitted(principal, scope.id, operation));
-  const primary = resolveIdentifier(identifier, allowed);
+  const primary = registry.get(identifier);
+  if (primary === undefined || !permitted(registry, principal, primary.id, operation)) {
+    throw forbidden('requested scope is not available');
+  }
   const resolved: ScopeConfig[] = [primary];
   if (includeShared && primary.id !== SHARED_SCOPE_ID) {
-    const shared = allowed.find((scope) => scope.id === SHARED_SCOPE_ID);
-    if (shared) {
+    const shared = registry.get(SHARED_SCOPE_ID);
+    if (shared !== undefined && permitted(registry, principal, shared.id, operation)) {
       resolved.push(shared);
     }
   }
@@ -61,14 +60,16 @@ export function resolveScopes(
 export function resolveLinkedScopes(
   principal: Principal,
   requested: string[],
-  configured: ScopeConfig[]
+  registry: ScopeRegistry
 ): ScopeConfig[] {
   const resolved: ScopeConfig[] = [];
   const seen = new Set<string>();
-  const allowed = configured.filter((scope) => principal.read_scopes.includes(scope.id));
   for (const value of requested) {
     const identifier = requireIdentifier(value);
-    const scope = resolveIdentifier(identifier, allowed);
+    const scope = registry.get(identifier);
+    if (scope === undefined || !registry.permissions(principal, scope.id).can_read) {
+      throw forbidden('requested scope is not available');
+    }
     if (!seen.has(scope.id)) {
       seen.add(scope.id);
       resolved.push(scope);

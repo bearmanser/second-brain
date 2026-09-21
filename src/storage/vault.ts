@@ -156,6 +156,35 @@ export class FileVault implements VaultPort {
     }
   }
 
+  registerScope(scope: ScopeConfig): void {
+    const existing = this.scopes.get(scope.id);
+    if (existing !== undefined) {
+      if (
+        existing.backend_project !== scope.backend_project ||
+        existing.relative_root !== scope.relative_root
+      ) {
+        throw forbidden(`scope ${scope.id} is already registered with a different mapping`);
+      }
+      return;
+    }
+    const directory = join(this.root, ...validateRelativeRoot(scope));
+    let info;
+    try {
+      info = lstatSync(directory);
+    } catch (error) {
+      if (hasErrno(error, 'ENOENT')) {
+        throw recoveryRequired(`scope root ${scope.relative_root} does not exist`, error);
+      }
+      throw recoveryRequired(`scope ${scope.id} cannot be inspected`, error);
+    }
+    if (!info.isDirectory() || info.isSymbolicLink()) {
+      throw forbidden(`scope root ${scope.relative_root} is not a safe existing directory`);
+    }
+    const canonicalRoot = this.validateConfiguredRoot(scope);
+    this.scopeRoots.set(scope.id, canonicalRoot);
+    this.scopes.set(scope.id, { ...scope, repository_aliases: [...scope.repository_aliases] });
+  }
+
   async list(scope: string): Promise<string[]> {
     const inventory = await this.inventory(scope);
     return inventory.managed;

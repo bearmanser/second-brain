@@ -2,7 +2,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { BrainError, isBrainError } from '../contracts/errors.js';
 import { BACKEND_TIMEOUT_MS } from '../core/limits.js';
-import type { BackendHit, BackendPort, BackendSearch, PlannedWrite } from '../core/types.js';
+import type { BackendHit, BackendPort, BackendSearch, PlannedWrite, ScopeConfig } from '../core/types.js';
 import {
   CREATE_MEMORY_PROJECT_TOOL,
   LIST_MEMORY_PROJECTS_TOOL,
@@ -164,7 +164,8 @@ class SdkBackendConnection implements BackendConnection {
 
 export class BasicMemoryBackend implements BackendPort {
   private readonly url: URL;
-  private readonly projects: readonly string[];
+  private readonly projects: Set<string>;
+  private readonly scopeMappings = new Map<string, { backend_project: string; relative_root: string }>();
   private readonly timeoutMs: number;
   private readonly readAttempts: number;
   private readonly readRetryDelayMs: number;
@@ -175,7 +176,10 @@ export class BasicMemoryBackend implements BackendPort {
 
   constructor(options: BasicMemoryOptions) {
     this.url = options.url instanceof URL ? options.url : new URL(options.url);
-    this.projects = [...options.projects];
+    this.projects = new Set(options.projects);
+    for (const project of options.projects) {
+      this.scopeMappings.set(project, { backend_project: project, relative_root: '' });
+    }
     this.timeoutMs = options.timeout_ms ?? BACKEND_TIMEOUT_MS;
     this.readAttempts = Math.max(1, options.read_attempts ?? DEFAULT_READ_ATTEMPTS);
     this.readRetryDelayMs = Math.max(
@@ -221,6 +225,25 @@ export class BasicMemoryBackend implements BackendPort {
       }
       return { server_version: serverVersion, tools };
     });
+  }
+
+  registerScope(scope: ScopeConfig): void {
+    const existing = this.scopeMappings.get(scope.id);
+    if (existing !== undefined) {
+      const syntheticInitial = existing.relative_root === '' && existing.backend_project === scope.id;
+      if (
+        !syntheticInitial &&
+        (existing.backend_project !== scope.backend_project || existing.relative_root !== scope.relative_root)
+      ) {
+        throw invalidInput(`backend scope ${scope.id} is already registered differently`);
+      }
+      if (!syntheticInitial) return;
+    }
+    this.scopeMappings.set(scope.id, {
+      backend_project: scope.backend_project,
+      relative_root: scope.relative_root
+    });
+    this.projects.add(scope.backend_project);
   }
 
   async create(write: PlannedWrite): Promise<{ permalink: string; relative_path?: string }> {
@@ -289,7 +312,7 @@ export class BasicMemoryBackend implements BackendPort {
   }
 
   private assertProject(project: string): void {
-    if (!this.projects.includes(project)) {
+    if (!this.projects.has(project)) {
       throw invalidInput(`backend project ${project} is not configured`);
     }
   }

@@ -31,6 +31,7 @@ import { internalDiagnostic } from './mcp/tools.js';
 import { RevisionCatalogue } from './notes/catalogue.js';
 import { JournalApprovalProvenance, reconcileVault } from './notes/reconcile.js';
 import { recoverPending } from './operations/recovery.js';
+import { ScopeRegistry } from './projects/scope-registry.js';
 import { resolveScopes } from './security/authorise.js';
 import { BasicMemoryBackend } from './storage/basic-memory.js';
 import { Journal } from './storage/journal.js';
@@ -119,7 +120,7 @@ function buildServices(
           request.scope,
           request.include_shared === true,
           'read',
-          deps.config.scopes
+          deps.scopeRegistry
         );
         deps.journal.recordRetrieval(
           retrievalEventFromRecall(ctx, result, {
@@ -287,6 +288,8 @@ class BrainRuntimeImpl implements BrainRuntime {
         ids: this.ids
       });
       this.journal = journal;
+      const scopeRegistry = new ScopeRegistry(this.config.scopes, journal);
+      for (const scope of scopeRegistry.all()) vault.registerScope(scope);
       if (knowledgeExists && !journal.hasOperationalHistory()) {
         if (!journal.hasOperationalLossAcknowledgement()) {
           throw recoveryRequired(
@@ -296,7 +299,7 @@ class BrainRuntimeImpl implements BrainRuntime {
       }
       const catalogue = RevisionCatalogue.open(cataloguePath, {
         vault,
-        scopes: this.config.scopes,
+        scopes: scopeRegistry.all(),
         clock: this.clock,
         approval_provenance: new JournalApprovalProvenance(journal)
       });
@@ -305,13 +308,15 @@ class BrainRuntimeImpl implements BrainRuntime {
         this.options.backend ??
         new BasicMemoryBackend({
           url: this.config.backend_endpoint,
-          projects: this.config.scopes.map((scope) => scope.backend_project),
+          projects: scopeRegistry.all().map((scope) => scope.backend_project),
           timeout_ms: this.config.limits.backend_timeout_ms
         });
       this.backend = backend;
       await backend.connect();
+      for (const scope of scopeRegistry.all()) backend.registerScope(scope);
       const mutations = new MutationCoordinator({
         config: this.config,
+        scopeRegistry,
         backend,
         vault,
         catalogue,
@@ -321,6 +326,7 @@ class BrainRuntimeImpl implements BrainRuntime {
       });
       const deps: BrainDeps = {
         config: this.config,
+        scopeRegistry,
         backend,
         vault,
         catalogue: catalogue as CataloguePort,

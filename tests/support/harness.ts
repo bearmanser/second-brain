@@ -47,6 +47,7 @@ import type {
   VaultPort
 } from '../../src/core/types.js';
 import type { BrainServices } from '../../src/mcp/server.js';
+import { ScopeRegistry } from '../../src/projects/scope-registry.js';
 import {
   buildManifest,
   resolveBackupPath,
@@ -208,6 +209,7 @@ class MemoryHarnessImpl implements MemoryHarness {
       ids: this.ids
     });
     const vault = new FileVault(this.vaultRoot, this.config.scopes);
+    const scopeRegistry = new ScopeRegistry(this.config.scopes, this.journal);
     this.catalogue = RevisionCatalogue.open(join(this.stateDir, 'catalogue.db'), {
       vault,
       scopes: this.config.scopes,
@@ -217,6 +219,7 @@ class MemoryHarnessImpl implements MemoryHarness {
     const journal = wrapJournal(this.journal, this.scheduler);
     const mutations = new MutationCoordinator({
       config: this.config,
+      scopeRegistry,
       backend: this.backend,
       vault,
       catalogue: this.catalogue,
@@ -226,6 +229,7 @@ class MemoryHarnessImpl implements MemoryHarness {
     });
     this.deps = {
       config: this.config,
+      scopeRegistry,
       backend: this.backend,
       vault,
       catalogue: this.catalogue,

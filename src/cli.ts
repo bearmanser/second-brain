@@ -22,6 +22,7 @@ import {
 import { bootstrap } from './operations/bootstrap.js';
 import { health } from './operations/health.js';
 import { assertRecoveryMode, authenticateOwner, recoverPending, summariseRecovery } from './operations/recovery.js';
+import { ScopeRegistry } from './projects/scope-registry.js';
 import { BasicMemoryBackend } from './storage/basic-memory.js';
 import { Journal } from './storage/journal.js';
 import { FileVault } from './storage/vault.js';
@@ -187,20 +188,24 @@ async function runRecover(_parsed: ParsedArguments, env: NodeJS.ProcessEnv): Pro
   try {
     journal = Journal.open(join(config.mounts.state, 'journal.db'), { requireExisting: true });
     const vault = new FileVault(config.mounts.vault, config.scopes);
+    const scopeRegistry = new ScopeRegistry(config.scopes, journal);
+    for (const scope of scopeRegistry.all()) vault.registerScope(scope);
     catalogue = RevisionCatalogue.open(join(config.mounts.state, 'catalogue.db'), {
       vault,
-      scopes: config.scopes,
+      scopes: scopeRegistry.all(),
       clock: systemClock,
       approval_provenance: new JournalApprovalProvenance(journal)
     });
     backend = new BasicMemoryBackend({
       url: config.backend_endpoint,
-      projects: config.scopes.map((scope) => scope.backend_project),
+      projects: scopeRegistry.all().map((scope) => scope.backend_project),
       timeout_ms: config.limits.backend_timeout_ms
     });
     await backend.connect();
+    for (const scope of scopeRegistry.all()) backend.registerScope(scope);
     const mutations = new MutationCoordinator({
       config,
+      scopeRegistry,
       backend,
       vault,
       catalogue,
@@ -236,9 +241,11 @@ async function runRebuildCatalogue(parsed: ParsedArguments, env: NodeJS.ProcessE
       journal = Journal.open(join(config.mounts.state, 'journal.db'), { requireExisting: true });
     }
     const vault = new FileVault(config.mounts.vault, config.scopes);
+    const scopeRegistry = new ScopeRegistry(config.scopes, journal);
+    for (const scope of scopeRegistry.all()) vault.registerScope(scope);
     catalogue = RevisionCatalogue.open(join(config.mounts.state, 'catalogue.db'), {
       vault,
-      scopes: config.scopes,
+      scopes: scopeRegistry.all(),
       clock: systemClock,
       approval_provenance: new JournalApprovalProvenance(journal)
     });
@@ -246,7 +253,7 @@ async function runRebuildCatalogue(parsed: ParsedArguments, env: NodeJS.ProcessE
     let conflicted = 0;
     let malformed = 0;
     let unsupported = 0;
-    for (const scope of config.scopes) {
+    for (const scope of scopeRegistry.all()) {
       const report = await catalogue.reconcileReport(scope.id);
       scanned += report.scanned;
       conflicted += report.conflicted;
@@ -255,7 +262,7 @@ async function runRebuildCatalogue(parsed: ParsedArguments, env: NodeJS.ProcessE
     }
     if (acceptLoss) journal.acknowledgeOperationalLoss();
     process.stdout.write(
-      `catalogue rebuilt for ${config.scopes.map((scope) => scope.id).join(', ')}; ` +
+      `catalogue rebuilt for ${scopeRegistry.all().map((scope) => scope.id).join(', ')}; ` +
         `scanned ${scanned}, conflicts ${conflicted}, malformed ${malformed}, unsupported ${unsupported}\n`
     );
     return 0;
@@ -288,20 +295,24 @@ async function runRecoverState(parsed: ParsedArguments, env: NodeJS.ProcessEnv):
   try {
     journal = Journal.open(join(config.mounts.state, 'journal.db'), { requireExisting: true });
     const vault = new FileVault(config.mounts.vault, config.scopes);
+    const scopeRegistry = new ScopeRegistry(config.scopes, journal);
+    for (const scope of scopeRegistry.all()) vault.registerScope(scope);
     catalogue = RevisionCatalogue.open(join(config.mounts.state, 'catalogue.db'), {
       vault,
-      scopes: config.scopes,
+      scopes: scopeRegistry.all(),
       clock: systemClock,
       approval_provenance: new JournalApprovalProvenance(journal)
     });
     backend = new BasicMemoryBackend({
       url: config.backend_endpoint,
-      projects: config.scopes.map((scope) => scope.backend_project),
+      projects: scopeRegistry.all().map((scope) => scope.backend_project),
       timeout_ms: config.limits.backend_timeout_ms
     });
     await backend.connect();
+    for (const scope of scopeRegistry.all()) backend.registerScope(scope);
     const mutations = new MutationCoordinator({
       config,
+      scopeRegistry,
       backend,
       vault,
       catalogue,
@@ -311,6 +322,7 @@ async function runRecoverState(parsed: ParsedArguments, env: NodeJS.ProcessEnv):
     });
     const deps: BrainDeps = {
       config,
+      scopeRegistry,
       backend,
       vault,
       catalogue,

@@ -52,7 +52,7 @@ function parseRequest(input: FeedbackRequest): FeedbackRequest {
 }
 
 function authorizeTarget(ctx: RequestContext, requested: string, deps: BrainDeps): ScopeConfig {
-  const [scope] = resolveScopes(ctx.principal, requested, false, 'read', deps.config.scopes);
+  const [scope] = resolveScopes(ctx.principal, requested, false, 'read', deps.scopeRegistry);
   return scope;
 }
 

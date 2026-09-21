@@ -258,7 +258,7 @@ function asLifecycle(value: string | null | undefined): Lifecycle {
 export class RevisionCatalogue implements CataloguePort {
   private readonly database: Database.Database;
   private readonly vault: VaultPort;
-  private readonly scopes: Set<string>;
+  private readonly scopes: Map<string, ScopeConfig>;
   private readonly clock: Clock;
   private readonly approvalProvenance: ApprovalProvenance | undefined;
   private closed = false;
@@ -266,7 +266,7 @@ export class RevisionCatalogue implements CataloguePort {
   private constructor(
     database: Database.Database,
     vault: VaultPort,
-    scopes: Set<string>,
+    scopes: Map<string, ScopeConfig>,
     clock: Clock,
     approvalProvenance: ApprovalProvenance | undefined
   ) {
@@ -298,7 +298,7 @@ export class RevisionCatalogue implements CataloguePort {
     return new RevisionCatalogue(
       database,
       options.vault,
-      new Set(options.scopes.map((scope) => scope.id)),
+      new Map(options.scopes.map((scope) => [scope.id, { ...scope, repository_aliases: [...scope.repository_aliases] }])),
       clock,
       options.approval_provenance
     );
@@ -321,6 +321,21 @@ export class RevisionCatalogue implements CataloguePort {
     } finally {
       database.close();
     }
+  }
+
+  registerScope(scope: ScopeConfig): void {
+    this.assertOpen();
+    const existing = this.scopes.get(scope.id);
+    if (existing !== undefined) {
+      if (
+        existing.backend_project !== scope.backend_project ||
+        existing.relative_root !== scope.relative_root
+      ) {
+        throw conflict(`scope ${scope.id} is already registered with a different mapping`);
+      }
+      return;
+    }
+    this.scopes.set(scope.id, { ...scope, repository_aliases: [...scope.repository_aliases] });
   }
 
   async reconcile(scope: string): Promise<void> {

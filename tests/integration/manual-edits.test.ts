@@ -633,6 +633,7 @@ test('a host edit is visible without a restart and periodic scans stay bounded',
 
 test('startup fails when the initial full scan cannot enumerate the vault', async () => {
   const failingVault: VaultPort = {
+    registerScope: () => undefined,
     list: async () => {
       throw new BrainError({
         code: 'RECOVERY_REQUIRED',

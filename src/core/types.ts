@@ -336,6 +336,7 @@ export interface BackendSearch {
 export interface BackendPort {
   connect(): Promise<void>;
   probe(): Promise<{ server_version: string; tools: string[] }>;
+  registerScope(scope: ScopeConfig): void;
   ensureProject(project: string, projectPath: string): Promise<{ created: boolean }>;
   create(write: PlannedWrite): Promise<{ permalink: string; relative_path?: string }>;
   search(input: BackendSearch): Promise<{ hits: BackendHit[]; has_more: boolean }>;
@@ -356,6 +357,7 @@ export interface VaultScan {
 }
 
 export interface VaultPort {
+  registerScope(scope: ScopeConfig): void;
   list(scope: string): Promise<string[]>;
   read(
     scope: string,
@@ -400,6 +402,7 @@ export interface ReconcileReport extends ReconcileCounts {
 }
 
 export interface CataloguePort {
+  registerScope(scope: ScopeConfig): void;
   reconcile(scope: string): Promise<void>;
   reconcileReport(scope: string): Promise<ReconcileScopeReport>;
   approvalIsValid(revision: StoredRevision): boolean;

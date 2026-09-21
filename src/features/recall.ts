@@ -456,7 +456,7 @@ export async function recall(
     request.scope,
     request.include_shared === true,
     'read',
-    deps.config.scopes
+    deps.scopeRegistry
   );
   const kinds = requestedKinds(request);
   const searchText = buildSearchText(request.query, request.topics);

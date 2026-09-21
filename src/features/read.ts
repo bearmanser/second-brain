@@ -204,7 +204,7 @@ export async function read(
   deps: BrainDeps
 ): Promise<ReadResult> {
   if (ctx.signal.aborted) throw cancelled();
-  const [scope] = resolveScopes(ctx.principal, input.scope, false, 'read', deps.config.scopes);
+  const [scope] = resolveScopes(ctx.principal, input.scope, false, 'read', deps.scopeRegistry);
   const request = parseRequest(input);
   const now = deps.clock.now();
 

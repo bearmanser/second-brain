@@ -26,6 +26,7 @@ import {
   toolDefinitions
 } from '../mcp/tools.js';
 import { resolveScopes } from '../security/authorise.js';
+import type { ScopeRegistry } from '../projects/scope-registry.js';
 import type { OperationRecord } from '../storage/journal.js';
 
 const MATERIALIZATION_UNCONFIRMED = 'materialization_unconfirmed';
@@ -117,29 +118,24 @@ function parseRequest(input: StatusRequest): StatusRequest {
   return parsed.data as StatusRequest;
 }
 
-function readableScopes(principal: Principal, configured: ScopeConfig[]): ScopeConfig[] {
-  return configured.filter((scope) => principal.read_scopes.includes(scope.id));
-}
-
 function scopeEntry(
   principal: Principal,
-  scope: ScopeConfig
+  scope: ScopeConfig,
+  registry: ScopeRegistry
 ): { id: string; can_write: boolean; can_review: boolean } {
+  const permissions = registry.permissions(principal, scope.id);
   return {
     id: scope.id,
-    can_write: principal.write_scopes.includes(scope.id),
-    can_review: principal.review_scopes.includes(scope.id)
+    can_write: permissions.can_write,
+    can_review: permissions.can_review
   };
 }
 
-function canInspect(principal: Principal, record: OperationRecord): boolean {
+function canInspect(principal: Principal, record: OperationRecord, registry: ScopeRegistry): boolean {
   if (record.principal_id === principal.id) return true;
   if (principal.role !== 'owner') return false;
-  return (
-    principal.read_scopes.includes(record.scope) ||
-    principal.write_scopes.includes(record.scope) ||
-    principal.review_scopes.includes(record.scope)
-  );
+  const permissions = registry.permissions(principal, record.scope);
+  return permissions.can_read || permissions.can_write || permissions.can_review;
 }
 
 interface PlannedIdentity {
@@ -212,11 +208,13 @@ function receiptFromRecord(record: OperationRecord): MutationReceipt | undefined
 
 function filterReadableDuplicates(
   principal: Principal,
-  receipt: MutationReceipt
+  receipt: MutationReceipt,
+  registry: ScopeRegistry
 ): MutationReceipt {
   if (receipt.possible_duplicates.length === 0) return receipt;
-  const readable = new Set(principal.read_scopes);
-  const visible = receipt.possible_duplicates.filter((entry) => readable.has(entry.scope));
+  const visible = receipt.possible_duplicates.filter(
+    (entry) => registry.permissions(principal, entry.scope).can_read
+  );
   if (visible.length === receipt.possible_duplicates.length) return receipt;
   const warnings = [...receipt.warnings];
   if (!warnings.includes(DUPLICATE_DETAILS_WITHHELD)) warnings.push(DUPLICATE_DETAILS_WITHHELD);
@@ -252,14 +250,15 @@ export async function status(
   if (ctx.signal.aborted) throw cancelled();
   const request = parseRequest(input);
 
-  const authorized = readableScopes(ctx.principal, deps.config.scopes);
+  const authorized = deps.scopeRegistry.visibleTo(ctx.principal);
   const scopes =
     request.scope === undefined
-      ? authorized.map((scope) => scopeEntry(ctx.principal, scope))
+      ? authorized.map((scope) => scopeEntry(ctx.principal, scope, deps.scopeRegistry))
       : [
           scopeEntry(
             ctx.principal,
-            resolveScopes(ctx.principal, request.scope, false, 'read', deps.config.scopes)[0]
+            resolveScopes(ctx.principal, request.scope, false, 'read', deps.scopeRegistry)[0],
+            deps.scopeRegistry
           )
         ];
 
@@ -280,9 +279,11 @@ export async function status(
 
   if (request.operation_id !== undefined) {
     const record = deps.journal.get(request.operation_id);
-    if (record === undefined || !canInspect(ctx.principal, record)) throw notFound();
+    if (record === undefined || !canInspect(ctx.principal, record, deps.scopeRegistry)) throw notFound();
     const receipt = receiptFromRecord(record);
-    if (receipt !== undefined) result.operation = filterReadableDuplicates(ctx.principal, receipt);
+    if (receipt !== undefined) {
+      result.operation = filterReadableDuplicates(ctx.principal, receipt, deps.scopeRegistry);
+    }
   }
 
   if (request.include_schemas === true) result.schemas = toolSchemas();

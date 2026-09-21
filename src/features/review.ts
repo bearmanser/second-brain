@@ -13,7 +13,7 @@ import type {
 } from '../core/types.js';
 import { decodeRevision, makeEtag, normalizeLineEndings, payloadHash } from '../notes/codec.js';
 import { resolveHead, type ParsedRevision } from '../notes/catalogue.js';
-import { canReview, resolveScopes } from '../security/authorise.js';
+import { resolveScopes } from '../security/authorise.js';
 import { assertNoCredentials } from '../security/redact.js';
 import { authorizeRelatedIds } from './related.js';
 
@@ -119,18 +119,28 @@ function rejectCredentialText(note: NoteInput): void {
 }
 
 function readScope(ctx: RequestContext, requested: string, deps: BrainDeps): ScopeConfig {
-  const [scope] = resolveScopes(ctx.principal, requested, false, 'read', deps.config.scopes);
+  const [scope] = resolveScopes(ctx.principal, requested, false, 'read', deps.scopeRegistry);
   return scope;
 }
 
 function writeScope(ctx: RequestContext, requested: string, deps: BrainDeps): ScopeConfig {
-  const [scope] = resolveScopes(ctx.principal, requested, false, 'write', deps.config.scopes);
+  const [scope] = resolveScopes(ctx.principal, requested, false, 'write', deps.scopeRegistry);
   return scope;
 }
 
 function reviewScope(ctx: RequestContext, requested: string, deps: BrainDeps): ScopeConfig {
-  const [scope] = resolveScopes(ctx.principal, requested, false, 'review', deps.config.scopes);
+  const [scope] = resolveScopes(ctx.principal, requested, false, 'review', deps.scopeRegistry);
   return scope;
+}
+
+function mayReview(
+  ctx: RequestContext,
+  scope: string,
+  protectedNote: boolean,
+  deps: BrainDeps
+): boolean {
+  if (!deps.scopeRegistry.permissions(ctx.principal, scope).can_review) return false;
+  return !protectedNote || ctx.principal.role === 'owner';
 }
 
 function hasValidApproval(revision: StoredRevision, deps: BrainDeps): boolean {
@@ -322,7 +332,7 @@ async function analyseFork(
   }
   const heads = resolution.heads;
   for (const head of heads) {
-    if ((await isProtectedNote(scope.id, head.revision, deps)) && !canReview(ctx.principal, scope.id, true)) {
+    if ((await isProtectedNote(scope.id, head.revision, deps)) && !mayReview(ctx, scope.id, true, deps)) {
       throw forbidden('a protected note can only be resolved by an owner');
     }
   }
@@ -438,7 +448,7 @@ async function approveAction(
   const build: RevisionBuilder = async (identities, heads) => {
     const head = requireSingleHead(heads, operation.id);
     const protectedNote = await isProtectedNote(scope.id, head.revision, deps);
-    if (!canReview(ctx.principal, scope.id, protectedNote)) {
+    if (!mayReview(ctx, scope.id, protectedNote, deps)) {
       throw forbidden(`principal ${ctx.principal.id} may not approve note ${operation.id}`);
     }
     assertApprovable(head);
@@ -484,7 +494,7 @@ async function archiveAction(
   };
   const build: RevisionBuilder = (identities, heads) => {
     const head = requireSingleHead(heads, operation.id);
-    if (!canReview(ctx.principal, scope.id, false)) {
+    if (!mayReview(ctx, scope.id, false, deps)) {
       throw forbidden(`principal ${ctx.principal.id} may not archive note ${operation.id}`);
     }
     return {
@@ -530,7 +540,7 @@ async function reviseAction(
   };
   const build: RevisionBuilder = async (identities, heads) => {
     const head = requireSingleHead(heads, operation.id);
-    if ((await isProtectedNote(scope.id, head.revision, deps)) && !canReview(ctx.principal, scope.id, true)) {
+    if ((await isProtectedNote(scope.id, head.revision, deps)) && !mayReview(ctx, scope.id, true, deps)) {
       throw forbidden(`only an owner may revise the protected note ${operation.id}`);
     }
     return {
@@ -572,7 +582,7 @@ async function supersedeAction(
   };
   const build: RevisionBuilder = async (identities, heads) => {
     const head = requireSingleHead(heads, operation.id);
-    if (!canReview(ctx.principal, scope.id, false)) {
+    if (!mayReview(ctx, scope.id, false, deps)) {
       throw forbidden(`principal ${ctx.principal.id} may not supersede note ${operation.id}`);
     }
     await assertReplacement(ctx, scope, operation, deps);

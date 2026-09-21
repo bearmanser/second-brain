@@ -16,6 +16,7 @@ import { startHttpHarness } from '../support/harness.js';
 const TOOL_NAMES = [
   'brain_capture',
   'brain_feedback',
+  'brain_project_ensure',
   'brain_read',
   'brain_recall',
   'brain_review',
@@ -71,14 +72,14 @@ test('delivers initialization instructions before a tool is invoked', async () =
     );
     expect(client.getInstructions()).toContain('brain_recall');
     expect(h.recordedToolCalls()).toEqual([]);
-    expect((await client.listTools()).tools).toHaveLength(6);
+    expect((await client.listTools()).tools).toHaveLength(7);
   } finally {
     await client.close();
     await h.close();
   }
 });
 
-test('lists the six tools and completes a status call with structured content', async () => {
+test('lists the seven tools and completes a status call with structured content', async () => {
   const h = await startHttpHarness();
   const client = await h.connect(h.token);
   try {
@@ -413,7 +414,7 @@ test('rotated tokens authenticate as one principal identity', async () => {
 test('a rotated-out credential stops authenticating after a credential reload', async () => {
   const h = await startHttpHarness();
   const before = await h.connect(h.token, 'before-rotation');
-  expect((await before.listTools()).tools).toHaveLength(6);
+  expect((await before.listTools()).tools).toHaveLength(7);
   await before.close();
 
   const digest = (token: string): string =>
@@ -440,7 +441,7 @@ test('a rotated-out credential stops authenticating after a credential reload', 
 
   const after = await h.connect(h.rotatedToken, 'after-rotation');
   try {
-    expect((await after.listTools()).tools).toHaveLength(6);
+    expect((await after.listTools()).tools).toHaveLength(7);
   } finally {
     await after.close();
     await h.close();
@@ -450,7 +451,7 @@ test('a rotated-out credential stops authenticating after a credential reload', 
 test('a running runtime reloads rotated credentials written to disk', async () => {
   const h = await startHttpHarness();
   const before = await h.connect(h.token, 'before-rotation');
-  expect((await before.listTools()).tools).toHaveLength(6);
+  expect((await before.listTools()).tools).toHaveLength(7);
   await before.close();
 
   const digest = (token: string): string =>
@@ -483,7 +484,7 @@ test('a running runtime reloads rotated credentials written to disk', async () =
 
   const after = await h.connect(h.rotatedToken, 'after-rotation');
   try {
-    expect((await after.listTools()).tools).toHaveLength(6);
+    expect((await after.listTools()).tools).toHaveLength(7);
   } finally {
     await after.close();
     await h.close();

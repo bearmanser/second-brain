@@ -394,7 +394,7 @@ test('an absent Origin is allowed for non-browser MCP clients', async () => {
   try {
     const response = await raw(h, { headers: authenticated(h), body: rpc });
     expect(response.status).toBe(200);
-    expect(JSON.parse(response.text).result.tools).toHaveLength(6);
+    expect(JSON.parse(response.text).result.tools).toHaveLength(7);
   } finally {
     await h.close();
   }

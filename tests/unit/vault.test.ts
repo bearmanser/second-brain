@@ -69,6 +69,26 @@ const makeRevision = (overrides: Partial<StoredRevision> = {}): StoredRevision =
   ...overrides
 });
 
+test('registers only an existing dynamic scope directory and rejects mapping changes', async () => {
+  const root = makeVaultRoot();
+  mkdirSync(join(root, scopeConfig.relative_root), { recursive: true });
+  const vault = new FileVault(root, [scopeConfig]);
+  const dynamic: ScopeConfig = {
+    id: 'second-brain',
+    backend_project: 'second-brain',
+    relative_root: 'Projects/second-brain',
+    repository_aliases: []
+  };
+  expect(() => vault.registerScope(dynamic)).toThrow(/RECOVERY_REQUIRED/);
+  mkdirSync(join(root, 'Projects', 'second-brain'), { recursive: true });
+  expect(() => vault.registerScope(dynamic)).not.toThrow();
+  expect(() => vault.registerScope(dynamic)).not.toThrow();
+  await expect(vault.list(dynamic.id)).resolves.toEqual([]);
+  expect(() => vault.registerScope({ ...dynamic, relative_root: 'Projects/other' })).toThrow(
+    /FORBIDDEN/
+  );
+});
+
 const managedPath = (revision: StoredRevision): string =>
   relativePathFor(
     scopeConfig.relative_root,

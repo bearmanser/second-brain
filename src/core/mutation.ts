@@ -22,6 +22,7 @@ import type { BrainConfig } from '../config/schema.js';
 import { decodeRevision, encodeRevision, makeEtag, payloadHash } from '../notes/codec.js';
 import { slugify } from '../notes/identity.js';
 import { resolveScopes } from '../security/authorise.js';
+import type { ScopeRegistry } from '../projects/scope-registry.js';
 import type {
   Journal,
   OperationRecord,
@@ -82,6 +83,7 @@ export interface MutationJournal {
 
 export interface BrainDeps {
   config: BrainConfig;
+  scopeRegistry: ScopeRegistry;
   backend: BackendPort;
   vault: VaultPort;
   catalogue: CataloguePort;
@@ -120,6 +122,7 @@ export interface RecoveryReport {
 
 export interface MutationDeps {
   config: BrainConfig;
+  scopeRegistry: ScopeRegistry;
   backend: BackendPort;
   vault: VaultPort;
   catalogue: CataloguePort;
@@ -516,7 +519,7 @@ export class MutationCoordinator {
         pending: count('pending'),
         blocking_operations: blocking,
         operations,
-        scopes: this.deps.config.scopes.map((scope) => scope.id)
+        scopes: this.deps.scopeRegistry.all().map((scope) => scope.id)
       };
     });
   }
@@ -571,7 +574,7 @@ export class MutationCoordinator {
     requested: string,
     authorization: MutationAuthorization
   ): ScopeConfig {
-    const [scope] = resolveScopes(principal, requested, false, authorization, this.deps.config.scopes);
+    const [scope] = resolveScopes(principal, requested, false, authorization, this.deps.scopeRegistry);
     return scope;
   }
 
@@ -1051,7 +1054,7 @@ export class MutationCoordinator {
       }
       return this.failDefinitively(record, 'missing_plan');
     }
-    const scope = this.deps.config.scopes.find((candidate) => candidate.id === record.scope);
+    const scope = this.deps.scopeRegistry.get(record.scope);
     if (scope === undefined) return this.failDefinitively(record, 'unknown_scope');
     if (plan.revision.scope !== scope.id) return this.failDefinitively(record, 'plan_scope_mismatch');
 

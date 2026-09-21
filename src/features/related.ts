@@ -13,7 +13,7 @@ export async function authorizeRelatedIds(
 ): Promise<void> {
   const targets = [...new Set(relatedIds)];
   if (targets.length === 0) return;
-  const scopes = deps.config.scopes.filter((scope) => ctx.principal.read_scopes.includes(scope.id));
+  const scopes = deps.scopeRegistry.visibleTo(ctx.principal);
   for (const target of targets) {
     let visible = false;
     for (const scope of scopes) {

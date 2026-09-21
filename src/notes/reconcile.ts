@@ -89,30 +89,24 @@ export class JournalApprovalProvenance implements ApprovalProvenance {
 }
 
 function selectScopes(deps: BrainDeps, scope: string | undefined): ScopeConfig[] {
-  if (scope === undefined) return [...deps.config.scopes];
-  const matches = deps.config.scopes.filter(
-    (candidate) => candidate.id === scope || candidate.repository_aliases.includes(scope)
-  );
-  const unique = matches.filter((candidate, index) => matches.indexOf(candidate) === index);
-  if (unique.length === 0) {
+  if (scope === undefined) return deps.scopeRegistry.all();
+  const match = deps.scopeRegistry.get(scope);
+  if (match === undefined) {
     throw new BrainError({
       code: 'FORBIDDEN',
       message: `scope ${scope} is not configured for reconciliation`
     });
   }
-  if (unique.length > 1) {
-    throw new BrainError({
-      code: 'INVALID_INPUT',
-      message: `scope ${scope} is ambiguous for reconciliation`
-    });
-  }
-  return unique;
+  return [match];
 }
 
-function authorized(findings: ReconcileFinding[], principal: Principal | undefined): ReconcileFinding[] {
+function authorized(
+  deps: BrainDeps,
+  findings: ReconcileFinding[],
+  principal: Principal | undefined
+): ReconcileFinding[] {
   if (principal === undefined) return findings;
-  const readable = new Set(principal.read_scopes);
-  return findings.filter((finding) => readable.has(finding.scope));
+  return findings.filter((finding) => deps.scopeRegistry.permissions(principal, finding.scope).can_read);
 }
 
 function idsFor(
@@ -157,7 +151,7 @@ export async function reconcileVault(
     findings.push(...scoped.findings);
   }
   if (options.detailed === true) {
-    const visible = authorized(findings, options.principal);
+    const visible = authorized(deps, findings, options.principal);
     report.findings = visible;
     report.ids = {
       malformed: idsFor(visible, 'malformed'),

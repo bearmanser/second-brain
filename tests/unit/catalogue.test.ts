@@ -71,6 +71,31 @@ const makeRevision = (overrides: Partial<StoredRevision> = {}): StoredRevision =
   ...overrides
 });
 
+test('registers a dynamic catalogue scope idempotently and rejects mapping changes', async () => {
+  const root = makeVaultRoot();
+  mkdirSync(join(root, scopeConfig.relative_root), { recursive: true });
+  const vault = new FileVault(root, [scopeConfig]);
+  const catalogue = RevisionCatalogue.open(join(root, 'catalogue.sqlite'), {
+    vault,
+    scopes: [scopeConfig]
+  });
+  openCatalogues.push(catalogue);
+  const dynamic: ScopeConfig = {
+    id: 'second-brain',
+    backend_project: 'second-brain',
+    relative_root: 'Projects/second-brain',
+    repository_aliases: []
+  };
+  mkdirSync(join(root, 'Projects', 'second-brain'), { recursive: true });
+  vault.registerScope(dynamic);
+  expect(() => catalogue.registerScope(dynamic)).not.toThrow();
+  expect(() => catalogue.registerScope(dynamic)).not.toThrow();
+  await expect(catalogue.reconcileReport(dynamic.id)).resolves.toMatchObject({ scope: dynamic.id });
+  expect(() => catalogue.registerScope({ ...dynamic, backend_project: 'wrong' })).toThrow(
+    /CONFLICT/
+  );
+});
+
 const writeRevision = (
   root: string,
   revision: StoredRevision
@@ -214,7 +239,8 @@ test('reconciles a single revision into a unique head and stays rebuildable', as
     { version: 4 },
     { version: 5 },
     { version: 6 },
-    { version: 7 }
+    { version: 7 },
+    { version: 8 }
   ]);
   database.close();
 });

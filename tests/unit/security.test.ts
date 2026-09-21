@@ -9,6 +9,7 @@ import { BrainError } from '../../src/contracts/errors.js';
 import type { Principal } from '../../src/core/types.js';
 import { authenticate } from '../../src/security/authenticate.js';
 import { canReview, resolveLinkedScopes, resolveScopes } from '../../src/security/authorise.js';
+import { ScopeRegistry } from '../../src/projects/scope-registry.js';
 import {
   REDACTED,
   REDACTION_CAVEAT,
@@ -61,23 +62,25 @@ const baseConfig = {
   limits: {}
 };
 
+const scopeRegistry = new ScopeRegistry(scopeFixtures);
+
 test('a scope label is not permission to read another project', () => {
-  expect(() => resolveScopes(workerPrincipal, 'private-project', false, 'read', scopeFixtures))
+  expect(() => resolveScopes(workerPrincipal, 'private-project', false, 'read', scopeRegistry))
     .toThrow(/FORBIDDEN/);
 });
 
 test('workers cannot turn review metadata into reviewer authority', () => {
-  expect(() => resolveScopes(workerPrincipal, 'freellmapi', false, 'review', scopeFixtures))
+  expect(() => resolveScopes(workerPrincipal, 'freellmapi', false, 'review', scopeRegistry))
     .toThrow(/FORBIDDEN/);
 });
 
 test('resolves a named scope and requires a scope identifier when it is empty', () => {
-  expect(resolveScopes(workerPrincipal, 'freellmapi', false, 'read', scopeFixtures).map((scope) => scope.id))
+  expect(resolveScopes(workerPrincipal, 'freellmapi', false, 'read', scopeRegistry).map((scope) => scope.id))
     .toEqual(['freellmapi']);
-  expect(resolveScopes(workerPrincipal, 'free-llm-api', false, 'read', scopeFixtures).map((scope) => scope.id))
+  expect(resolveScopes(workerPrincipal, 'free-llm-api', false, 'read', scopeRegistry).map((scope) => scope.id))
     .toEqual(['freellmapi']);
-  expect(() => resolveScopes(workerPrincipal, '', false, 'read', scopeFixtures)).toThrow(/SCOPE_REQUIRED/);
-  expect(() => resolveScopes(workerPrincipal, '   ', false, 'read', scopeFixtures)).toThrow(/SCOPE_REQUIRED/);
+  expect(() => resolveScopes(workerPrincipal, '', false, 'read', scopeRegistry)).toThrow(/SCOPE_REQUIRED/);
+  expect(() => resolveScopes(workerPrincipal, '   ', false, 'read', scopeRegistry)).toThrow(/SCOPE_REQUIRED/);
 });
 
 test('rejects an ambiguous scope alias collision', () => {
@@ -85,17 +88,16 @@ test('rejects an ambiguous scope alias collision', () => {
     { id: 'shared', backend_project: 'shared', relative_root: 'shared', repository_aliases: [] },
     { id: 'freellmapi', backend_project: 'freellmapi', relative_root: 'freellmapi', repository_aliases: ['shared'] }
   ];
-  expect(() => resolveScopes(workerPrincipal, 'shared', false, 'read', idAndAliasCollision))
-    .toThrow(/FORBIDDEN/);
+  expect(() => new ScopeRegistry(idAndAliasCollision)).toThrow(/INVALID_INPUT/);
 
   const duplicateAliases = [
     { id: 'freellmapi', backend_project: 'freellmapi', relative_root: 'freellmapi', repository_aliases: ['dup'] },
     { id: 'shared', backend_project: 'shared', relative_root: 'shared', repository_aliases: ['dup'] }
   ];
-  expect(() => resolveScopes(workerPrincipal, 'dup', false, 'read', duplicateAliases)).toThrow(/FORBIDDEN/);
+  expect(() => new ScopeRegistry(duplicateAliases)).toThrow(/INVALID_INPUT/);
 });
 
-test('filters unauthorized scopes before resolving an identifier', () => {
+test('rejects aliases that shadow a configured identifier', () => {
   const interference = [
     ...scopeFixtures,
     {
@@ -105,12 +107,7 @@ test('filters unauthorized scopes before resolving an identifier', () => {
       repository_aliases: ['freellmapi']
     }
   ];
-  expect(resolveScopes(workerPrincipal, 'freellmapi', false, 'read', interference).map((scope) => scope.id))
-    .toEqual(['freellmapi']);
-  expect(() => resolveScopes(workerPrincipal, 'secret-project', false, 'read', interference))
-    .toThrow(/FORBIDDEN/);
-  expect(() => resolveScopes(workerPrincipal, 'secret-project', false, 'read', interference))
-    .not.toThrow(/ambiguous/);
+  expect(() => new ScopeRegistry(interference)).toThrow(/INVALID_INPUT/);
   const hiddenAlias = [
     ...scopeFixtures,
     {
@@ -120,21 +117,22 @@ test('filters unauthorized scopes before resolving an identifier', () => {
       repository_aliases: ['hidden-alias']
     }
   ];
-  expect(() => resolveScopes(workerPrincipal, 'hidden-alias', false, 'read', hiddenAlias))
+  const hiddenRegistry = new ScopeRegistry(hiddenAlias);
+  expect(() => resolveScopes(workerPrincipal, 'hidden-alias', false, 'read', hiddenRegistry))
     .toThrow(/FORBIDDEN/);
 });
 
 test('rejects a configured scope the caller may not use', () => {
   const withoutProfile = scopeFixtures.filter((scope) => scope.id !== 'profile');
-  expect(() => resolveScopes(ownerPrincipal, 'profile', false, 'read', withoutProfile)).toThrow(/FORBIDDEN/);
-  expect(() => resolveScopes(workerPrincipal, 'profile', false, 'read', scopeFixtures)).toThrow(/FORBIDDEN/);
-  expect(() => resolveScopes(reviewerPrincipal, 'shared', false, 'write', scopeFixtures)).toThrow(/FORBIDDEN/);
+  expect(() => resolveScopes(ownerPrincipal, 'profile', false, 'read', new ScopeRegistry(withoutProfile))).toThrow(/FORBIDDEN/);
+  expect(() => resolveScopes(workerPrincipal, 'profile', false, 'read', scopeRegistry)).toThrow(/FORBIDDEN/);
+  expect(() => resolveScopes(reviewerPrincipal, 'shared', false, 'write', scopeRegistry)).toThrow(/FORBIDDEN/);
 });
 
 test('adds a shared scope only when requested and allowed', () => {
-  expect(resolveScopes(workerPrincipal, 'freellmapi', true, 'read', scopeFixtures).map((scope) => scope.id))
+  expect(resolveScopes(workerPrincipal, 'freellmapi', true, 'read', scopeRegistry).map((scope) => scope.id))
     .toEqual(['freellmapi', 'shared']);
-  expect(resolveScopes(workerPrincipal, 'freellmapi', false, 'read', scopeFixtures).map((scope) => scope.id))
+  expect(resolveScopes(workerPrincipal, 'freellmapi', false, 'read', scopeRegistry).map((scope) => scope.id))
     .toEqual(['freellmapi']);
   const projectOnly: Principal = {
     id: '00000000-0000-4000-8000-00000000000a',
@@ -143,20 +141,20 @@ test('adds a shared scope only when requested and allowed', () => {
     write_scopes: ['freellmapi'],
     review_scopes: []
   };
-  expect(resolveScopes(projectOnly, 'freellmapi', true, 'read', scopeFixtures).map((scope) => scope.id))
+  expect(resolveScopes(projectOnly, 'freellmapi', true, 'read', scopeRegistry).map((scope) => scope.id))
     .toEqual(['freellmapi']);
-  expect(() => resolveScopes(projectOnly, 'shared', true, 'read', scopeFixtures)).toThrow(/FORBIDDEN/);
-  expect(resolveScopes(reviewerPrincipal, 'freellmapi', true, 'write', scopeFixtures).map((scope) => scope.id))
+  expect(() => resolveScopes(projectOnly, 'shared', true, 'read', scopeRegistry)).toThrow(/FORBIDDEN/);
+  expect(resolveScopes(reviewerPrincipal, 'freellmapi', true, 'write', scopeRegistry).map((scope) => scope.id))
     .toEqual(['freellmapi']);
 });
 
 test('refuses cross-scope related IDs outside the caller read scopes', () => {
-  expect(resolveLinkedScopes(workerPrincipal, ['freellmapi', 'shared'], scopeFixtures).map((scope) => scope.id))
+  expect(resolveLinkedScopes(workerPrincipal, ['freellmapi', 'shared'], scopeRegistry).map((scope) => scope.id))
     .toEqual(['freellmapi', 'shared']);
-  expect(resolveLinkedScopes(workerPrincipal, [], scopeFixtures)).toEqual([]);
-  expect(() => resolveLinkedScopes(workerPrincipal, ['freellmapi', 'profile'], scopeFixtures))
+  expect(resolveLinkedScopes(workerPrincipal, [], scopeRegistry)).toEqual([]);
+  expect(() => resolveLinkedScopes(workerPrincipal, ['freellmapi', 'profile'], scopeRegistry))
     .toThrow(/FORBIDDEN/);
-  expect(() => resolveLinkedScopes(workerPrincipal, ['freellmapi', 'private-project'], scopeFixtures))
+  expect(() => resolveLinkedScopes(workerPrincipal, ['freellmapi', 'private-project'], scopeRegistry))
     .toThrow(/FORBIDDEN/);
 });
 

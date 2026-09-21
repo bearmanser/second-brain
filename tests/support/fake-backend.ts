@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { dirname, join, relative, sep } from 'node:path';
 import { parse, stringify } from 'yaml';
 import { BrainError } from '../../src/contracts/errors.js';
-import type { BackendHit, BackendPort, BackendSearch, PlannedWrite } from '../../src/core/types.js';
+import type { BackendHit, BackendPort, BackendSearch, PlannedWrite, ScopeConfig } from '../../src/core/types.js';
 import { slugify } from '../../src/notes/identity.js';
 
 export type FakeBackendFault =
@@ -68,6 +68,7 @@ const toPosix = (value: string): string => value.split(sep).join('/');
 export class FakeBackend implements BackendPort {
   readonly root: string;
   private readonly configuredProjects: string[];
+  private readonly scopeMappings = new Map<string, { backend_project: string; relative_root: string }>();
   readonly create_calls: PlannedWrite[] = [];
   fail_once?: FakeBackendFault;
   on_create?: (write: PlannedWrite) => void | Promise<void>;
@@ -77,6 +78,9 @@ export class FakeBackend implements BackendPort {
   constructor(options: FakeBackendOptions) {
     this.root = options.root;
     this.configuredProjects = [...(options.projects ?? [])];
+    for (const project of this.configuredProjects) {
+      this.scopeMappings.set(project, { backend_project: project, relative_root: '' });
+    }
   }
 
   async connect(): Promise<void> {
@@ -94,6 +98,24 @@ export class FakeBackend implements BackendPort {
   async probe(): Promise<{ server_version: string; tools: string[] }> {
     this.record();
     return { server_version: FAKE_SERVER_VERSION, tools: [...FAKE_TOOLS] };
+  }
+
+  registerScope(scope: ScopeConfig): void {
+    const existing = this.scopeMappings.get(scope.id);
+    if (
+      existing !== undefined &&
+      existing.relative_root !== '' &&
+      (existing.backend_project !== scope.backend_project || existing.relative_root !== scope.relative_root)
+    ) {
+      throw invalidInput(`fake backend scope ${scope.id} is already registered differently`);
+    }
+    this.scopeMappings.set(scope.id, {
+      backend_project: scope.backend_project,
+      relative_root: scope.relative_root
+    });
+    if (!this.configuredProjects.includes(scope.backend_project)) {
+      this.configuredProjects.push(scope.backend_project);
+    }
   }
 
   async ensureProject(project: string, projectPath: string): Promise<{ created: boolean }> {

@@ -120,7 +120,7 @@ function authorizeScope(
   requested: string,
   deps: BrainDeps
 ): ScopeConfig {
-  const [scope] = resolveScopes(ctx.principal, requested, false, 'write', deps.config.scopes);
+  const [scope] = resolveScopes(ctx.principal, requested, false, 'write', deps.scopeRegistry);
   return scope;
 }
 
