@@ -6,8 +6,11 @@ import { stringify } from 'yaml';
 import {
   BACKEND_TIMEOUT_MS,
   CONCURRENT_READS,
+  DYNAMIC_PROJECTS_MAX,
   INPUT_BODY_MAX_BYTES,
   MATERIALIZATION_TIMEOUT_MS,
+  PROJECT_PROVISION_GLOBAL_PER_MINUTE,
+  PROJECT_PROVISION_PER_PRINCIPAL_PER_MINUTE,
   RECONCILE_INTERVAL_MS,
   RENDERED_NOTE_MAX_BYTES,
   SCOPE_ID_PATTERN,
@@ -111,7 +114,10 @@ function buildConfig(scopes: ScopeConfig[]): BrainConfig {
       backend_timeout_ms: BACKEND_TIMEOUT_MS,
       materialization_timeout_ms: MATERIALIZATION_TIMEOUT_MS,
       reconcile_interval_ms: RECONCILE_INTERVAL_MS,
-      concurrent_reads: CONCURRENT_READS
+      concurrent_reads: CONCURRENT_READS,
+      project_provision_per_principal_per_minute: PROJECT_PROVISION_PER_PRINCIPAL_PER_MINUTE,
+      project_provision_global_per_minute: PROJECT_PROVISION_GLOBAL_PER_MINUTE,
+      dynamic_projects_max: DYNAMIC_PROJECTS_MAX
     },
     allowed_hosts: ['127.0.0.1', 'localhost'],
     allowed_origins: ['http://127.0.0.1:7331', 'http://localhost:7331'],

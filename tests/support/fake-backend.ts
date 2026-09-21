@@ -72,6 +72,7 @@ export class FakeBackend implements BackendPort {
   readonly create_calls: PlannedWrite[] = [];
   fail_once?: FakeBackendFault;
   on_create?: (write: PlannedWrite) => void | Promise<void>;
+  ensure_project_fail_once = false;
   call_count = 0;
   private connected = false;
 
@@ -120,8 +121,15 @@ export class FakeBackend implements BackendPort {
 
   async ensureProject(project: string, projectPath: string): Promise<{ created: boolean }> {
     this.record();
+    if (this.ensure_project_fail_once) {
+      this.ensure_project_fail_once = false;
+      throw unavailable('fake backend could not create the project');
+    }
     if (this.configuredProjects.includes(project)) return { created: false };
-    mkdirSync(projectPath, { recursive: true });
+    if (projectPath !== `/app/data/Projects/${project}`) {
+      throw invalidInput('fake backend received an unexpected project path');
+    }
+    mkdirSync(join(this.root, 'Projects', project), { recursive: true });
     this.configuredProjects.push(project);
     return { created: true };
   }

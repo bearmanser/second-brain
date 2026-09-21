@@ -14,6 +14,8 @@ import {
   type IdSource,
   type DynamicProjectGrant,
   type MutationReceipt,
+  type ProjectEnsureResult,
+  type ProjectProvisioningPlan,
   type PlannedWrite,
   type RecallMode,
   type RepositoryProjectRecord,
@@ -896,6 +898,18 @@ export class Journal {
     return rows.map(toRepositoryProject);
   }
 
+  countProjects(): number {
+    this.assertOpen();
+    const row = this.database.prepare('SELECT COUNT(*) AS count FROM repository_projects').get() as {
+      count: number;
+    };
+    return row.count;
+  }
+
+  saveProjectPlan(id: string, plan: ProjectProvisioningPlan): void {
+    this.savePlanJson(id, plan, false);
+  }
+
   markProjectReady(repositoryIdentity: string): RepositoryProjectRecord {
     this.assertOpen();
     const run = this.database.transaction((): RepositoryProjectRecord => {
@@ -995,6 +1009,14 @@ export class Journal {
   }
 
   savePlan(id: string, plan: PlannedWrite): void {
+    this.savePlanJson(id, plan, true);
+  }
+
+  private savePlanJson(
+    id: string,
+    plan: PlannedWrite | ProjectProvisioningPlan,
+    approval: boolean
+  ): void {
     this.assertOpen();
     const payload = JSON.stringify(plan);
     const timestamp = this.timestamp();
@@ -1011,12 +1033,12 @@ export class Journal {
       this.database
         .prepare('UPDATE operations SET plan_json = ?, updated_at = ? WHERE operation_id = ?')
         .run(payload, timestamp, id);
-      this.persistApprovalProvenance(id, plan);
+      if (approval) this.persistApprovalProvenance(id, plan as PlannedWrite);
     });
     run.immediate();
   }
 
-  mark(id: string, state: OperationState, receipt?: MutationReceipt): void {
+  mark(id: string, state: OperationState, receipt?: MutationReceipt | ProjectEnsureResult): void {
     this.assertOpen();
     if (!OPERATION_STATES.includes(state)) {
       throw invalidInput(`unknown operation state ${String(state)}`);

@@ -225,6 +225,9 @@ test('loads the documented example configuration', () => {
   expect(config.allowed_hosts.length).toBeGreaterThan(0);
   expect(config.limits.backend_timeout_ms).toBe(15000);
   expect(config.limits.concurrent_reads).toBe(8);
+  expect(config.limits.project_provision_per_principal_per_minute).toBe(10);
+  expect(config.limits.project_provision_global_per_minute).toBe(50);
+  expect(config.limits.dynamic_projects_max).toBe(1000);
 });
 
 test('rejects missing, malformed, and schema-invalid configuration', () => {

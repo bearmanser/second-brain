@@ -73,6 +73,9 @@ limits:
   materialization_timeout_ms: 10000
   reconcile_interval_ms: 30000
   concurrent_reads: 8
+  project_provision_per_principal_per_minute: 10
+  project_provision_global_per_minute: 50
+  dynamic_projects_max: 1000
 
 # Tool-result delivery for MCP clients. `structured` (the default) sends the
 # complete result in MCP structuredContent plus a compact text pointer. The

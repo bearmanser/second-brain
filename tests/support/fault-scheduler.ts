@@ -1,4 +1,4 @@
-import type { MutationReceipt, PlannedWrite } from '../../src/core/types.js';
+import type { MutationReceipt, PlannedWrite, ProjectEnsureResult, ProjectProvisioningPlan } from '../../src/core/types.js';
 import type {
   AuditEvent,
   AuditEventRecord,
@@ -69,10 +69,22 @@ export function wrapJournal(journal: Journal, scheduler: FaultScheduler): Journa
       maybeThrow('save_plan');
       journal.savePlan(id, plan);
     },
-    mark(id: string, state: OperationState, receipt?: MutationReceipt): void {
+    saveProjectPlan(id: string, plan: ProjectProvisioningPlan): void {
+      journal.saveProjectPlan(id, plan);
+    },
+    mark(id: string, state: OperationState, receipt?: MutationReceipt | ProjectEnsureResult): void {
       maybeThrow('mark', state);
       journal.mark(id, state, receipt);
     },
+    reserveProject: journal.reserveProject.bind(journal),
+    getProjectByIdentity: journal.getProjectByIdentity.bind(journal),
+    getProjectByScope: journal.getProjectByScope.bind(journal),
+    countProjects: journal.countProjects.bind(journal),
+    markProjectReady: journal.markProjectReady.bind(journal),
+    markProjectRecoveryRequired: journal.markProjectRecoveryRequired.bind(journal),
+    grantProject: journal.grantProject.bind(journal),
+    listProjectGrants: journal.listProjectGrants.bind(journal),
+    listReadyProjects: journal.listReadyProjects.bind(journal),
     get(id: string): OperationRecord | undefined {
       return journal.get(id);
     },

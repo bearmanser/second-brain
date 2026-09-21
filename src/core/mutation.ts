@@ -7,9 +7,13 @@ import type {
   BackendPort,
   CataloguePort,
   Clock,
+  DynamicProjectGrant,
   Head,
   IdSource,
   MutationReceipt,
+  ProjectEnsureResult,
+  ProjectProvisioningPlan,
+  RepositoryProjectRecord,
   PlannedWrite,
   Principal,
   RequestContext,
@@ -31,6 +35,7 @@ import type {
   ReceiptAvailability,
   ReservationResult
 } from '../storage/journal.js';
+import { recoverProjectOperation } from '../features/project-ensure.js';
 
 const POLL_INTERVAL_MS = 20;
 const UNCERTAIN_WRITE_CODES = ['BACKEND_UNAVAILABLE', 'EMBEDDINGS_UNAVAILABLE', 'BACKEND_PROTOCOL_ERROR'] as const;
@@ -74,11 +79,24 @@ export type RevisionBuilder = (
 export interface MutationJournal {
   reserve(input: OperationReservation): ReservationResult;
   savePlan(id: string, plan: PlannedWrite): void;
-  mark(id: string, state: OperationState, receipt?: MutationReceipt): void;
+  saveProjectPlan(id: string, plan: ProjectProvisioningPlan): void;
+  mark(id: string, state: OperationState, receipt?: MutationReceipt | ProjectEnsureResult): void;
   get(id: string): OperationRecord | undefined;
   pending(): OperationRecord[];
   abort(id: string): void;
   refreshReceiptAvailability(id: string, availability: ReceiptAvailability): OperationRecord;
+  reserveProject(input: {
+    repository_identity: string;
+    scope: string;
+    created_by_principal_id: string;
+    creation_operation_id: string;
+  }): { kind: 'new' | 'replay'; project: RepositoryProjectRecord };
+  getProjectByIdentity(identity: string): RepositoryProjectRecord | undefined;
+  getProjectByScope(scope: string): RepositoryProjectRecord | undefined;
+  countProjects(): number;
+  markProjectReady(identity: string): RepositoryProjectRecord;
+  markProjectRecoveryRequired(identity: string, stage: string, code: string): RepositoryProjectRecord;
+  grantProject(grant: DynamicProjectGrant): DynamicProjectGrant;
 }
 
 export interface BrainDeps {
@@ -498,7 +516,10 @@ export class MutationCoordinator {
       for (const record of this.deps.journal.pending()) {
         let operation: RecoveryOperationReport;
         try {
-          operation = await this.recoverOne(record);
+          operation =
+            record.tool === 'brain_project_ensure'
+              ? await recoverProjectOperation(record, this.deps)
+              : await this.recoverOne(record);
         } catch {
           operation = this.failDefinitively(record, 'recovery_error');
         }

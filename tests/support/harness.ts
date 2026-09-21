@@ -22,7 +22,10 @@ import type { BrainConfig, CredentialRecord, ResultDelivery } from '../../src/co
 import {
   BACKEND_TIMEOUT_MS,
   CONCURRENT_READS,
+  DYNAMIC_PROJECTS_MAX,
   INPUT_BODY_MAX_BYTES,
+  PROJECT_PROVISION_GLOBAL_PER_MINUTE,
+  PROJECT_PROVISION_PER_PRINCIPAL_PER_MINUTE,
   RECONCILE_INTERVAL_MS,
   RENDERED_NOTE_MAX_BYTES,
   TOOL_RESULT_MAX_BYTES
@@ -172,7 +175,10 @@ class MemoryHarnessImpl implements MemoryHarness {
         backend_timeout_ms: BACKEND_TIMEOUT_MS,
         materialization_timeout_ms: MATERIALIZATION_TIMEOUT_MS,
         reconcile_interval_ms: RECONCILE_INTERVAL_MS,
-        concurrent_reads: CONCURRENT_READS
+        concurrent_reads: CONCURRENT_READS,
+        project_provision_per_principal_per_minute: PROJECT_PROVISION_PER_PRINCIPAL_PER_MINUTE,
+        project_provision_global_per_minute: PROJECT_PROVISION_GLOBAL_PER_MINUTE,
+        dynamic_projects_max: DYNAMIC_PROJECTS_MAX
       },
       allowed_hosts: ['127.0.0.1'],
       allowed_origins: [],
@@ -210,9 +216,13 @@ class MemoryHarnessImpl implements MemoryHarness {
     });
     const vault = new FileVault(this.vaultRoot, this.config.scopes);
     const scopeRegistry = new ScopeRegistry(this.config.scopes, this.journal);
+    for (const scope of scopeRegistry.all()) {
+      vault.registerScope(scope);
+      this.backend.registerScope(scope);
+    }
     this.catalogue = RevisionCatalogue.open(join(this.stateDir, 'catalogue.db'), {
       vault,
-      scopes: this.config.scopes,
+      scopes: scopeRegistry.all(),
       clock: this.clock,
       approval_provenance: new JournalApprovalProvenance(this.journal)
     });
@@ -537,7 +547,10 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
       backend_timeout_ms: BACKEND_TIMEOUT_MS,
       materialization_timeout_ms: MATERIALIZATION_TIMEOUT_MS,
       reconcile_interval_ms: options.reconcile_interval_ms ?? RECONCILE_INTERVAL_MS,
-      concurrent_reads: options.concurrent_reads ?? CONCURRENT_READS
+      concurrent_reads: options.concurrent_reads ?? CONCURRENT_READS,
+      project_provision_per_principal_per_minute: PROJECT_PROVISION_PER_PRINCIPAL_PER_MINUTE,
+      project_provision_global_per_minute: PROJECT_PROVISION_GLOBAL_PER_MINUTE,
+      dynamic_projects_max: DYNAMIC_PROJECTS_MAX
     },
     allowed_hosts: options.allowed_hosts ?? ['127.0.0.1', 'localhost'],
     allowed_origins: options.allowed_origins ?? [],

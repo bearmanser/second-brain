@@ -39,6 +39,9 @@ export const CURSOR_TTL_MS = 10 * 60 * 1000;
 export const AUDIT_RETENTION_DAYS = 30;
 export const CONCURRENT_READS = 8;
 export const WRITE_COORDINATORS = 1;
+export const PROJECT_PROVISION_PER_PRINCIPAL_PER_MINUTE = 10;
+export const PROJECT_PROVISION_GLOBAL_PER_MINUTE = 50;
+export const DYNAMIC_PROJECTS_MAX = 1000;
 
 export const SCOPE_ID_PATTERN = /^[a-z][a-z0-9-]{0,63}$/;
 export const ETAG_PATTERN = /^[a-f0-9]{64}$/;

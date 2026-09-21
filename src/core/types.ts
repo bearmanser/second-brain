@@ -87,6 +87,14 @@ export interface ProjectEnsureResult {
   warnings: string[];
 }
 
+export interface ProjectProvisioningPlan {
+  repository_identity: string;
+  scope: string;
+  backend_project: string;
+  relative_root: string;
+  grant: DynamicProjectGrant;
+}
+
 export type RepositoryProjectState = 'provisioning' | 'ready' | 'recovery_required';
 
 export interface RepositoryProjectRecord {

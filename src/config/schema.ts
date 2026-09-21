@@ -2,8 +2,11 @@ import { z } from 'zod';
 import {
   BACKEND_TIMEOUT_MS,
   CONCURRENT_READS,
+  DYNAMIC_PROJECTS_MAX,
   INPUT_BODY_MAX_BYTES,
   MATERIALIZATION_TIMEOUT_MS,
+  PROJECT_PROVISION_GLOBAL_PER_MINUTE,
+  PROJECT_PROVISION_PER_PRINCIPAL_PER_MINUTE,
   RECONCILE_INTERVAL_MS,
   RENDERED_NOTE_MAX_BYTES,
   SCOPE_ID_PATTERN,
@@ -122,7 +125,18 @@ export const brainLimitsSchema = z.strictObject({
   backend_timeout_ms: z.int().positive().optional().default(BACKEND_TIMEOUT_MS),
   materialization_timeout_ms: z.int().positive().optional().default(MATERIALIZATION_TIMEOUT_MS),
   reconcile_interval_ms: z.int().positive().optional().default(RECONCILE_INTERVAL_MS),
-  concurrent_reads: z.int().positive().optional().default(CONCURRENT_READS)
+  concurrent_reads: z.int().positive().optional().default(CONCURRENT_READS),
+  project_provision_per_principal_per_minute: z
+    .int()
+    .positive()
+    .optional()
+    .default(PROJECT_PROVISION_PER_PRINCIPAL_PER_MINUTE),
+  project_provision_global_per_minute: z
+    .int()
+    .positive()
+    .optional()
+    .default(PROJECT_PROVISION_GLOBAL_PER_MINUTE),
+  dynamic_projects_max: z.int().positive().optional().default(DYNAMIC_PROJECTS_MAX)
 });
 
 const DEFAULT_LIMITS = {
@@ -132,7 +146,10 @@ const DEFAULT_LIMITS = {
   backend_timeout_ms: BACKEND_TIMEOUT_MS,
   materialization_timeout_ms: MATERIALIZATION_TIMEOUT_MS,
   reconcile_interval_ms: RECONCILE_INTERVAL_MS,
-  concurrent_reads: CONCURRENT_READS
+  concurrent_reads: CONCURRENT_READS,
+  project_provision_per_principal_per_minute: PROJECT_PROVISION_PER_PRINCIPAL_PER_MINUTE,
+  project_provision_global_per_minute: PROJECT_PROVISION_GLOBAL_PER_MINUTE,
+  dynamic_projects_max: DYNAMIC_PROJECTS_MAX
 };
 
 export const brainConfigSchema = z.strictObject({
@@ -162,6 +179,9 @@ export interface BrainLimits {
   materialization_timeout_ms: number;
   reconcile_interval_ms: number;
   concurrent_reads: number;
+  project_provision_per_principal_per_minute: number;
+  project_provision_global_per_minute: number;
+  dynamic_projects_max: number;
 }
 
 export interface BrainConfig {
