@@ -624,7 +624,7 @@ test('the operational scripts carry the required restart and validation guards',
 
   const restore = await readFile(join(REPO_ROOT, 'scripts', 'restore.sh'), 'utf8');
   expect(restore).toMatch(/--check/);
-  expect(restore).toMatch(/symlink/);
+  expect(restore).toMatch(/symbolic link/);
   expect(restore).toMatch(/compose.*project|COMPOSE_PROJECT_NAME/);
 
   const rebuild = await readFile(join(REPO_ROOT, 'scripts', 'rebuild.sh'), 'utf8');

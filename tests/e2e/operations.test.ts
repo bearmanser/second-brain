@@ -1,6 +1,6 @@
 import { spawnSync, type SpawnSyncOptions } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -192,6 +192,19 @@ beforeAll(async () => {
   const structured = (captured as { structuredContent?: { materialized?: boolean } }).structuredContent;
   expect(structured?.materialized).toBe(true);
 
+  run('docker', [
+    'run',
+    '--rm',
+    '--user',
+    '0:0',
+    '-v',
+    `${project}_model-cache:/cache`,
+    nodeImage,
+    'sh',
+    '-c',
+    'mkdir -p /cache/check && printf target > /cache/check/target.txt && ln -sf target.txt /cache/check/link.txt'
+  ]);
+
   run('bash', ['scripts/backup.sh', backupDir, '--yes'], {
     cwd: workDir,
     env: env({ VAULT_PATH: vaultPath })
@@ -226,17 +239,16 @@ describe('disposable Compose operations', () => {
     const manifest = manifestOf(backupDir);
     expect(manifest.format_version).toBe(1);
     expect(manifest.stores).toEqual(
-      expect.arrayContaining(['vault', 'brain-state', 'memory-state'])
+      expect.arrayContaining(['vault', 'brain-state', 'memory-state', 'model-cache'])
     );
-    expect(manifest.stores).not.toContain('model-cache');
     expect(manifest.volumes['brain-state']).toBe(`${project}_brain-state`);
     expect(manifest.volumes['memory-state']).toBe(`${project}_memory-state`);
-    expect(manifest.volumes['model-cache']).toBeUndefined();
+    expect(manifest.volumes['model-cache']).toBe(`${project}_model-cache`);
     expect(manifest.sensitive).toBe(false);
     const paths = manifest.files.map((file) => file.path);
     expect(paths).toContain('vault.tar');
     expect(paths).toContain('volumes/brain-state.tar');
-    expect(paths).not.toContain('volumes/model-cache.tar');
+    expect(paths).toContain('volumes/model-cache.tar');
     expect(paths).not.toContain('secrets.tar');
     expect(existsSync(join(backupDir, 'checksums.sha256'))).toBe(true);
 
@@ -256,6 +268,12 @@ describe('disposable Compose operations', () => {
     expect(extracted.status).toBe(0);
     expect(existsSync(join(restored, 'volumes', 'brain-state', 'journal.db'))).toBe(true);
     expect(existsSync(join(restored, 'vault'))).toBe(true);
+    const restoredLink = join(restored, 'volumes', 'model-cache', 'check', 'link.txt');
+    expect(lstatSync(restoredLink).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(restoredLink)).toBe('target.txt');
+    expect(readFileSync(join(restored, 'volumes', 'model-cache', 'check', 'target.txt'), 'utf8')).toBe(
+      'target'
+    );
   }, 300_000);
 
   test('restore.sh --start boots the restored stack under a separate project and port', async () => {
@@ -364,6 +382,69 @@ describe('disposable Compose operations', () => {
     }
     await waitForHealth(300_000);
   }, 300_000);
+
+  test('backup.sh refuses a named volume with an escaping symbolic link', async () => {
+    const escape = '/cache/check/escape';
+    run('docker', [
+      'run',
+      '--rm',
+      '--user',
+      '0:0',
+      '-v',
+      `${project}_model-cache:/cache`,
+      nodeImage,
+      'sh',
+      '-c',
+      `ln -sf /etc/passwd ${escape}`
+    ]);
+    try {
+      const result = run(
+        'bash',
+        ['scripts/backup.sh', join(workDir, 'escape-backup'), '--yes'],
+        { cwd: workDir, env: env({ VAULT_PATH: vaultPath }), allowFailure: true }
+      );
+      expect(result.status).not.toBe(0);
+      expect(`${result.stdout}${result.stderr}`).toMatch(/escaping|symbolic link/);
+      expect(`${result.stdout}${result.stderr}`).toContain('escape');
+    } finally {
+      run('docker', [
+        'run',
+        '--rm',
+        '--user',
+        '0:0',
+        '-v',
+        `${project}_model-cache:/cache`,
+        nodeImage,
+        'sh',
+        '-c',
+        'rm -f /cache/check/escape'
+      ]);
+    }
+    await waitForHealth(300_000);
+  }, 600_000);
+
+  test('backup.sh aborts when a symlink appears while copying', async () => {
+    const injected = join(vaultPath, 'injected-link');
+    try {
+      const result = run(
+        'bash',
+        ['scripts/backup.sh', join(workDir, 'injected-backup'), '--yes'],
+        {
+          cwd: workDir,
+          env: env({
+            VAULT_PATH: vaultPath,
+            BRAIN_BACKUP_TEST_INJECT: `ln -s /etc "${injected}"`
+          }),
+          allowFailure: true
+        }
+      );
+      expect(result.status).not.toBe(0);
+      expect(`${result.stdout}${result.stderr}`).toMatch(/inconsistent/);
+    } finally {
+      rmSync(injected, { force: true });
+    }
+    await waitForHealth(300_000);
+  }, 600_000);
 
   test('a corrupt cold backup is rejected', () => {
     const corrupt = join(workDir, 'corrupt-backup');

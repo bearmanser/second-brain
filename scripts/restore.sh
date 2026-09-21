@@ -111,8 +111,28 @@ if [ -f "$BACKUP/checksums.sha256" ]; then
   fi
 fi
 
+validate_volume_links() {
+  local root link target
+  root="$(cd "$1" && pwd -P)"
+  while IFS= read -r -d '' link; do
+    target="$(readlink -f "$link" 2>/dev/null || true)"
+    if [ -z "$target" ]; then
+      printf 'restore: broken symbolic link in a restored volume: %s\n' "$link" >&2
+      return 1
+    fi
+    case "$target" in
+      "$root" | "$root"/*) ;;
+      *)
+        printf 'restore: symbolic link escapes the restored volume: %s -> %s\n' "$link" "$target" >&2
+        return 1
+        ;;
+    esac
+  done < <(find "$root" -type l -print0)
+  return 0
+}
+
 verify_archive() {
-  local archive="$1" member
+  local archive="$1" mode="$2" member
   [ -f "$archive" ] || fail "backup archive is missing: $archive"
   while IFS= read -r member; do
     [ -n "$member" ] || continue
@@ -124,13 +144,10 @@ verify_archive() {
     esac
   done < <(tar -tf "$archive")
   if tar -tvf "$archive" | grep -Eq '^l'; then
-    fail "archive contains a symbolic link (symlink) member: $archive"
+    if [ "$mode" = "vault" ]; then
+      fail "the vault archive contains a symbolic link member: $archive"
+    fi
   fi
-}
-
-declared_archive() {
-  local relative="$1"
-  grep -F '"path"' "$BACKUP/manifest.json" | grep -Fq "\"$relative\""
 }
 
 shopt -s nullglob
@@ -138,10 +155,33 @@ ARCHIVES=("$BACKUP"/*.tar "$BACKUP"/volumes/*.tar)
 shopt -u nullglob
 [ "${#ARCHIVES[@]}" -gt 0 ] || fail "backup contains no archives"
 
+declared_archive() {
+  local relative="$1"
+  grep -F '"path"' "$BACKUP/manifest.json" | grep -Fq "\"$relative\""
+}
+
 for archive in "${ARCHIVES[@]}"; do
   relative="${archive#"$BACKUP"/}"
   declared_archive "$relative" || fail "backup contains an undeclared archive: $relative"
-  verify_archive "$archive"
+  mode="other"
+  [ "$relative" = "vault.tar" ] && mode="vault"
+  case "$relative" in
+    volumes/*.tar) mode="volume" ;;
+  esac
+  verify_archive "$archive" "$mode"
+  if [ "$mode" = "volume" ] && tar -tvf "$archive" | grep -Eq '^l'; then
+    temporary="$(mktemp -d)"
+    if ! tar -xf "$archive" -C "$temporary" --no-same-owner --no-same-permissions; then
+      rm -rf "$temporary"
+      fail "a named-volume archive could not be inspected: $relative"
+    fi
+    if ! validate_volume_links "$temporary" >/dev/null 2>&1; then
+      validate_volume_links "$temporary" || true
+      rm -rf "$temporary"
+      fail "a named-volume archive contains a symbolic link that escapes the volume root: $relative"
+    fi
+    rm -rf "$temporary"
+  fi
 done
 
 if [ -e "$NEW_ROOT" ] || [ -L "$NEW_ROOT" ]; then
@@ -175,6 +215,10 @@ for archive in "$BACKUP"/volumes/*.tar; do
   key="$(basename "$archive" .tar)"
   mkdir -p "$NEW_ROOT/volumes/$key"
   tar -xf "$archive" -C "$NEW_ROOT/volumes/$key" --no-same-owner --no-same-permissions
+  if ! validate_volume_links "$NEW_ROOT/volumes/$key"; then
+    rm -rf "$NEW_ROOT"
+    fail "the restored volume $key contains a symbolic link that escapes its root; the restore was discarded"
+  fi
 done
 if [ -f "$BACKUP/secrets.tar" ]; then
   mkdir -p "$NEW_ROOT/secrets"
