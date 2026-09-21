@@ -53,5 +53,5 @@ was exercised by the automated suites unless marked otherwise.
 The automatic-project release gate is recorded in
 `docs/release-gate/2026-09-21/automatic-projects-verify.txt`,
 `automatic-projects-e2e.txt`, and `automatic-projects-compatibility.txt`.
-It executed 334 unit/contract, 290 integration, and 66 Docker end-to-end tests;
+It executed 340 unit/contract, 294 integration, and 66 Docker end-to-end tests;
 the real-backend retrieval gate passed at recall@5 0.9286 with zero leakage.

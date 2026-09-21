@@ -1,5 +1,5 @@
 import { randomUUID, createHash } from 'node:crypto';
-import { rm, writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { expect, test } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -744,6 +744,73 @@ test('normal runtime startup refuses an existing vault after its journal is lost
   await expect(rm(`${h.config.mounts.state}/journal.db`)).rejects.toMatchObject({ code: 'ENOENT' });
   await backend.close().catch(() => undefined);
   await h.close();
+});
+
+test('normal runtime startup detects lost state when only a dynamic project remains', async () => {
+  const h = await startHttpHarness();
+  const client = await h.connect(h.token, 'lost-dynamic-state-seed');
+  try {
+    const ensured = await call(client, 'brain_project_ensure', {
+      idempotency_key: randomUUID(),
+      remote_url: 'https://github.com/example/dynamic-only.git'
+    });
+    const scope = record(ensured.structuredContent).scope as string;
+    const captured = await call(client, 'brain_capture', {
+      idempotency_key: randomUUID(),
+      scope,
+      note: lessonFixture
+    });
+    expect(captured.isError).toBeFalsy();
+  } finally {
+    await client.close();
+    await h.runtime.close();
+  }
+  await rm(h.config.mounts.state, { recursive: true, force: true });
+  await mkdir(h.config.mounts.state, { recursive: true });
+  const backend = new FakeBackend({
+    root: h.config.mounts.vault,
+    projects: h.config.scopes.map((scope) => scope.backend_project)
+  });
+  await expect(createRuntime(h.config, { backend })).rejects.toMatchObject({
+    code: 'RECOVERY_REQUIRED'
+  });
+  await backend.close().catch(() => undefined);
+  await h.close();
+});
+
+test('startup quarantines one broken dynamic scope while unrelated scopes remain available', async () => {
+  const h = await startHttpHarness();
+  const client = await h.connect(h.token, 'broken-dynamic-scope-seed');
+  let scope = '';
+  try {
+    const ensured = await call(client, 'brain_project_ensure', {
+      idempotency_key: randomUUID(),
+      remote_url: 'https://github.com/example/broken-dynamic.git'
+    });
+    scope = record(ensured.structuredContent).scope as string;
+  } finally {
+    await client.close();
+    await h.runtime.close();
+  }
+  await rm(`${h.config.mounts.vault}/Projects/${scope}`, { recursive: true, force: true });
+  const backend = new FakeBackend({
+    root: h.config.mounts.vault,
+    projects: h.config.scopes.map((candidate) => candidate.backend_project)
+  });
+  const reopened = await createRuntime(h.config, { backend });
+  try {
+    expect(reopened.ready).toBe(true);
+    expect(reopened.deps.scopeRegistry.get(scope)).toBeUndefined();
+    expect(reopened.deps.scopeRegistry.get('shared')).toBeDefined();
+    expect(reopened.deps.journal.getProjectByScope(scope)).toMatchObject({
+      state: 'recovery_required',
+      failure_stage: 'startup_verification'
+    });
+  } finally {
+    await reopened.close();
+    await backend.close().catch(() => undefined);
+    await h.close();
+  }
 });
 
 test('enforces the configured shared read-concurrency limit', async () => {

@@ -4,7 +4,7 @@
 
 $ npm run test:e2e
 exit 0
-5 files passed; 66 tests passed; duration 350.75s
+5 files passed; 66 tests passed; duration 364.91s
 
 tests/e2e/recovery.test.ts: 16 passed
 tests/e2e/docker.test.ts: 7 passed
@@ -20,4 +20,5 @@ Automatic-project evidence exercised by this run:
 - concurrent mixed-principal requests without authorization crossover
 - secret-bearing and reserved remote rejection without input disclosure
 - backend outage recovery and owner repair after an exact path conflict
+- ready-project re-verification, affected-scope quarantine, and dynamic-only state-loss refusal
 - gateway published on loopback only and no public Basic Memory port

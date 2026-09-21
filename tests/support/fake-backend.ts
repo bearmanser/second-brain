@@ -79,6 +79,14 @@ export class FakeBackend implements BackendPort {
   constructor(options: FakeBackendOptions) {
     this.root = options.root;
     this.configuredProjects = [...(options.projects ?? [])];
+    const dynamicRoot = join(this.root, 'Projects');
+    if (existsSync(dynamicRoot)) {
+      for (const entry of readdirSync(dynamicRoot, { withFileTypes: true })) {
+        if (entry.isDirectory() && !this.configuredProjects.includes(entry.name)) {
+          this.configuredProjects.push(entry.name);
+        }
+      }
+    }
     for (const project of this.configuredProjects) {
       this.scopeMappings.set(project, { backend_project: project, relative_root: '' });
     }
@@ -132,6 +140,19 @@ export class FakeBackend implements BackendPort {
     mkdirSync(join(this.root, 'Projects', project), { recursive: true });
     this.configuredProjects.push(project);
     return { created: true };
+  }
+
+  async verifyProject(project: string, projectPath: string): Promise<boolean> {
+    this.record();
+    if (projectPath !== `/app/data/Projects/${project}`) {
+      throw invalidInput('fake backend received an unexpected project path');
+    }
+    return this.configuredProjects.includes(project);
+  }
+
+  removeProject(project: string): void {
+    const index = this.configuredProjects.indexOf(project);
+    if (index >= 0) this.configuredProjects.splice(index, 1);
   }
 
   async create(write: PlannedWrite): Promise<{ permalink: string; relative_path?: string }> {

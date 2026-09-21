@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile } from 'node:fs/promises';
-import { existsSync, unwatchFile, watchFile, type StatWatcher } from 'node:fs';
+import { existsSync, readdirSync, unwatchFile, watchFile, type StatWatcher } from 'node:fs';
 import { createServer, type Server as HttpServer } from 'node:http';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { loadCredentials } from './config/load.js';
 import type { BrainConfig, CredentialRecord } from './config/schema.js';
-import { BrainError } from './contracts/errors.js';
+import { BrainError, isBrainError } from './contracts/errors.js';
 import type {
   BackendPort,
   CataloguePort,
@@ -292,8 +292,7 @@ class BrainRuntimeImpl implements BrainRuntime {
         ids: this.ids
       });
       this.journal = journal;
-      const scopeRegistry = new ScopeRegistry(this.config.scopes, journal);
-      for (const scope of scopeRegistry.all()) vault.registerScope(scope);
+      const scopeRegistry = new ScopeRegistry(this.config.scopes);
       if (knowledgeExists && !journal.hasOperationalHistory()) {
         if (!journal.hasOperationalLossAcknowledgement()) {
           throw recoveryRequired(
@@ -301,13 +300,6 @@ class BrainRuntimeImpl implements BrainRuntime {
           );
         }
       }
-      const catalogue = RevisionCatalogue.open(cataloguePath, {
-        vault,
-        scopes: scopeRegistry.all(),
-        clock: this.clock,
-        approval_provenance: new JournalApprovalProvenance(journal)
-      });
-      this.catalogue = catalogue;
       const backend =
         this.options.backend ??
         new BasicMemoryBackend({
@@ -318,6 +310,53 @@ class BrainRuntimeImpl implements BrainRuntime {
       this.backend = backend;
       await backend.connect();
       for (const scope of scopeRegistry.all()) backend.registerScope(scope);
+      const projectGrants = journal.listProjectGrants();
+      for (const project of journal.listReadyProjects()) {
+        const scope = {
+          id: project.scope,
+          backend_project: project.backend_project,
+          relative_root: project.relative_root,
+          repository_aliases: []
+        };
+        try {
+          vault.registerScope(scope);
+          const verified = await backend.verifyProject(
+            project.backend_project,
+            `/app/data/${project.relative_root}`
+          );
+          if (!verified) {
+            throw new BrainError({
+              code: 'BACKEND_PROTOCOL_ERROR',
+              message: 'ready repository project is missing from the backend'
+            });
+          }
+          backend.registerScope(scope);
+          scopeRegistry.registerReadyProject(project);
+          for (const grant of projectGrants) {
+            if (grant.scope === project.scope) scopeRegistry.registerReadyProject(project, grant);
+          }
+        } catch (error) {
+          if (
+            isBrainError(error) &&
+            ['RECOVERY_REQUIRED', 'FORBIDDEN', 'CONFLICT', 'BACKEND_PROTOCOL_ERROR'].includes(error.code)
+          ) {
+            journal.markProjectRecoveryRequired(
+              project.repository_identity,
+              'startup_verification',
+              error.code
+            );
+            continue;
+          }
+          throw error;
+        }
+      }
+      const catalogue = RevisionCatalogue.open(cataloguePath, {
+        vault,
+        scopes: scopeRegistry.all(),
+        clock: this.clock,
+        approval_provenance: new JournalApprovalProvenance(journal)
+      });
+      this.catalogue = catalogue;
       const mutations = new MutationCoordinator({
         config: this.config,
         scopeRegistry,
@@ -402,7 +441,25 @@ class BrainRuntimeImpl implements BrainRuntime {
       const paths = await vault.list(scope.id);
       if (paths.length > 0) return true;
     }
-    return false;
+    return this.dynamicProjectStorageExists();
+  }
+
+  private dynamicProjectStorageExists(): boolean {
+    const projectsRoot = join(this.config.mounts.vault, 'Projects');
+    if (!existsSync(projectsRoot)) return false;
+    const configured = new Set(
+      this.config.scopes
+        .map((scope) => scope.relative_root.split('/'))
+        .filter((segments) => segments.length === 2 && segments[0] === 'Projects')
+        .map((segments) => segments[1])
+    );
+    try {
+      return readdirSync(projectsRoot, { withFileTypes: true }).some(
+        (entry) => !configured.has(entry.name) && (entry.isDirectory() || entry.isSymbolicLink())
+      );
+    } catch (cause) {
+      throw recoveryRequired('dynamic project storage cannot be inspected', cause);
+    }
   }
 
   trackOperation<T>(work: Promise<T>): Promise<T> {

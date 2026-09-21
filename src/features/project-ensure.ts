@@ -168,6 +168,41 @@ async function finalizePlan(
     throw failure('RECOVERY_REQUIRED', 'repository project requires owner recovery', record.operation_id);
   }
   if (project.state === 'ready') {
+    const scope = scopeFor(project);
+    try {
+      deps.vault.registerScope(scope);
+      const verified = await deps.backend.verifyProject(
+        project.backend_project,
+        `/app/data/${project.relative_root}`
+      );
+      if (!verified) {
+        throw new BrainError({
+          code: 'BACKEND_PROTOCOL_ERROR',
+          message: 'ready repository project is missing from the backend'
+        });
+      }
+    } catch (error) {
+      if (
+        isBrainError(error) &&
+        ['RECOVERY_REQUIRED', 'FORBIDDEN', 'CONFLICT', 'BACKEND_PROTOCOL_ERROR'].includes(error.code)
+      ) {
+        deps.journal.markProjectRecoveryRequired(
+          plan.repository_identity,
+          'ready_verification',
+          error.code
+        );
+        deps.scopeRegistry.quarantineProject(project.scope);
+        try {
+          deps.journal.mark(record.operation_id, 'conflict');
+        } catch {}
+        throw failure(
+          'RECOVERY_REQUIRED',
+          'ready repository project requires owner recovery',
+          record.operation_id
+        );
+      }
+      throw error;
+    }
     const grant = deps.journal.grantProject(plan.grant);
     deps.scopeRegistry.registerReadyProject(project, grant);
     const result: ProjectEnsureResult = {

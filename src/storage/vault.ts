@@ -165,8 +165,16 @@ export class FileVault implements VaultPort {
       ) {
         throw forbidden(`scope ${scope.id} is already registered with a different mapping`);
       }
+      this.requireExistingScopeRoot(scope);
       return;
     }
+    this.requireExistingScopeRoot(scope);
+    const canonicalRoot = this.validateConfiguredRoot(scope);
+    this.scopeRoots.set(scope.id, canonicalRoot);
+    this.scopes.set(scope.id, { ...scope, repository_aliases: [...scope.repository_aliases] });
+  }
+
+  private requireExistingScopeRoot(scope: ScopeConfig): void {
     const directory = join(this.root, ...validateRelativeRoot(scope));
     let info;
     try {
@@ -180,9 +188,6 @@ export class FileVault implements VaultPort {
     if (!info.isDirectory() || info.isSymbolicLink()) {
       throw forbidden(`scope root ${scope.relative_root} is not a safe existing directory`);
     }
-    const canonicalRoot = this.validateConfiguredRoot(scope);
-    this.scopeRoots.set(scope.id, canonicalRoot);
-    this.scopes.set(scope.id, { ...scope, repository_aliases: [...scope.repository_aliases] });
   }
 
   async list(scope: string): Promise<string[]> {

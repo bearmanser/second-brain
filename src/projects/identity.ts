@@ -64,6 +64,7 @@ export function normalizeRepositoryIdentity(remoteUrl: string): string {
 
   const scp = SCP_REMOTE.exec(remoteUrl);
   if (scp !== null) {
+    if (scp[1] !== 'git') throw invalidRepository();
     let hostname: string;
     try {
       hostname = new URL(`ssh://${scp[1]}@${scp[2]}`).hostname;
@@ -83,10 +84,12 @@ export function normalizeRepositoryIdentity(remoteUrl: string): string {
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'ssh:') throw invalidRepository();
   if (parsed.password.length > 0) throw invalidRepository();
   if (parsed.protocol === 'https:' && parsed.username.length > 0) throw invalidRepository();
+  if (parsed.protocol === 'ssh:' && parsed.username !== 'git') throw invalidRepository();
   if (parsed.search.length > 0 || parsed.hash.length > 0 || parsed.hostname.length === 0) {
     throw invalidRepository();
   }
-  const host = parsed.port.length > 0 ? `${parsed.hostname}:${parsed.port}` : parsed.hostname;
+  const port = parsed.protocol === 'ssh:' && parsed.port === '22' ? '' : parsed.port;
+  const host = port.length > 0 ? `${parsed.hostname}:${port}` : parsed.hostname;
   return `${host.toLowerCase()}/${normalizePath(parsed.pathname)}`;
 }
 

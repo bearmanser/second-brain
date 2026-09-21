@@ -373,6 +373,23 @@ test('ensureProject rejects an existing project whose path differs', async () =>
   ).rejects.toMatchObject({ code: 'BACKEND_PROTOCOL_ERROR' });
 });
 
+test('verifyProject distinguishes an exact mapping, a missing project, and a path conflict', async () => {
+  let projects = [{ name: 'second-brain', path: '/Projects/second-brain' }];
+  const { backend } = scriptedBackend(async () => envelope({ projects }));
+  await backend.connect();
+  await expect(
+    backend.verifyProject('second-brain', '/app/data/Projects/second-brain')
+  ).resolves.toBe(true);
+  projects = [];
+  await expect(
+    backend.verifyProject('second-brain', '/app/data/Projects/second-brain')
+  ).resolves.toBe(false);
+  projects = [{ name: 'second-brain', path: '/app/data/Projects/wrong' }];
+  await expect(
+    backend.verifyProject('second-brain', '/app/data/Projects/second-brain')
+  ).rejects.toMatchObject({ code: 'BACKEND_PROTOCOL_ERROR' });
+});
+
 test('ensureProject fails closed on tool errors without leaking the backend payload', async () => {
   let listCalls = 0;
   const { backend } = scriptedBackend(async (name) => {

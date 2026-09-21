@@ -85,6 +85,29 @@ test('does not promote a valid capture just because evidence was provided', asyn
   await h.close();
 });
 
+test('a pending project ensure does not block writes in an unrelated ready scope', async () => {
+  const h = await createHarness();
+  const operation = h.deps.journal.reserve({
+    principal_id: workerContext.principal.id,
+    idempotency_key: key(900),
+    tool: 'brain_project_ensure',
+    scope: 'unrelated-project',
+    payload_hash: 'a'.repeat(64),
+    payload_json: '{"repository_identity":"github.com/example/unrelated-project"}'
+  }).record;
+  h.deps.mutations.setRecoveryBlockers([operation.operation_id]);
+  try {
+    const receipt = await capture(workerContext, {
+      idempotency_key: key(901),
+      scope: 'freellmapi',
+      note: noteFor(lessonFixture.content, { title: 'unrelated write remains available' })
+    }, h.deps);
+    expect(receipt.outcome).toBe('stored');
+  } finally {
+    await h.close();
+  }
+});
+
 test('captures every note kind as a candidate without a universal lesson requirement', async () => {
   const h = await createHarness();
   for (const [index, content] of kindContents.entries()) {

@@ -295,6 +295,15 @@ export class BasicMemoryBackend implements BackendPort {
     return result;
   }
 
+  async verifyProject(project: string, projectPath: string): Promise<boolean> {
+    const existing = (await this.listProjects()).find((entry) => entry.name === project);
+    if (existing === undefined) return false;
+    if (!projectPathMatches(existing.path, projectPath)) {
+      throw protocolError('existing backend project path did not match the expected mapping');
+    }
+    return true;
+  }
+
   async search(input: BackendSearch): Promise<{ hits: BackendHit[]; has_more: boolean }> {
     this.assertProject(input.project);
     const argumentsForRequest = argumentsForSearch(input);

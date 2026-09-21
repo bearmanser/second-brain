@@ -5,20 +5,20 @@
 $ npm run verify
 exit 0
 tsc --noEmit: pass
-unit + contract: 18 files passed; 334 tests passed
+unit + contract: 18 files passed; 340 tests passed
 production build: pass (tsc -p tsconfig.build.json && node scripts/copy-assets.mjs)
 
 $ npm run test:integration
 exit 0
-11 files passed; 290 tests passed; duration 60.80s
+11 files passed; 294 tests passed; duration 68.25s
 
 $ npm run eval:retrieval
 exit 0; gate pass
-run retrieval-2026-09-21T10:19:50.919Z-6d44deb5
+run retrieval-2026-09-21T10:47:28.820Z-007eb16f
 backend basic-memory-docker; notes 11; queries 23
 recall@5 0.9286 (target 0.8); precision@5 0.8536
 positive 14; negative 9; negative passed 9; negative failed 0
-leakage events 0; mean elapsed 57.1 ms
+leakage events 0; mean elapsed 49.8 ms
 
 Model-dependent instruction/agent pilot: NOT RUN
 Reason: no approved external chat-model budget. This skipped work is not reported as green.

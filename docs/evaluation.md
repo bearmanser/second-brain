@@ -355,15 +355,18 @@ passed with recall@5 = 0.9286.
 ## Automatic repository provisioning release gate
 
 Recorded on 2026-09-21 against the pinned Docker images. The complete
-non-model gate exited 0: `npm run verify` (334 tests),
-`npm run test:integration` (290 tests), `npm run test:e2e` (66 tests), and
+non-model gate exited 0: `npm run verify` (340 tests),
+`npm run test:integration` (294 tests), `npm run test:e2e` (66 tests), and
 `npm run eval:retrieval`. Retrieval run
-`retrieval-2026-09-21T10:19:50.919Z-6d44deb5` scored recall@5 0.9286,
+`retrieval-2026-09-21T10:47:28.820Z-007eb16f` scored recall@5 0.9286,
 precision@5 0.8536, 9/9 negative queries empty, and zero leakage events.
 
 The Docker suite created unknown repository projects through the public MCP
 gateway, used returned scopes for capture/recall, verified role-derived grants,
 and preserved mappings and grants through restart and operational recovery.
+The post-implementation review added explicit ready-project re-verification,
+affected-scope-only quarantine, dynamic-only state-loss detection, scope-local
+provisioning recovery blockers, and stricter SSH credential parsing.
 The detailed evidence is in `docs/release-gate/2026-09-21/automatic-projects-*.txt`.
 
 The automatic-use instruction/agent pilot remains **NOT RUN** because no

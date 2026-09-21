@@ -824,7 +824,7 @@ export class Journal {
     const operationId = requireProjectText(input.creation_operation_id, 'operation');
     if (
       repositoryIdentity.includes('://') ||
-      repositoryIdentity.includes('@') ||
+      (repositoryIdentity.split('/', 1)[0]?.includes('@') ?? true) ||
       containsCredentials(repositoryIdentity) ||
       !SCOPE_ID_PATTERN.test(scope)
     ) {
@@ -947,9 +947,6 @@ export class Journal {
     }
     const run = this.database.transaction((): RepositoryProjectRecord => {
       const project = this.requireProject(repositoryIdentity);
-      if (project.state === 'ready') {
-        throw conflict('a ready repository project cannot enter provisioning recovery', project.creation_operation_id);
-      }
       this.database
         .prepare(
           `UPDATE repository_projects

@@ -47,7 +47,7 @@ test('concurrent SSH and HTTPS spellings create one project and stable grants', 
     expect(https.scope).toBe('second-brain');
     expect(ssh.scope).toBe('second-brain');
     expect([https.created, ssh.created].sort()).toEqual([false, true]);
-    expect(h.backend.call_count - before).toBe(1);
+    expect(h.backend.call_count - before).toBe(2);
     expect(h.deps.journal.listProjectGrants()).toHaveLength(2);
   } finally { await h.close(); }
 });
@@ -123,7 +123,7 @@ test('a second principal receives its own grant without recreating the project',
     const reviewer = await ensureProject(reviewerContext, request(remote), h.deps);
     expect(reviewer.created).toBe(false);
     expect(reviewer.permissions.can_review).toBe(true);
-    expect(h.backend.call_count).toBe(calls);
+    expect(h.backend.call_count).toBe(calls + 1);
     expect(h.deps.journal.listProjectGrants()).toHaveLength(2);
   } finally { await h.close(); }
 });
@@ -172,6 +172,24 @@ test('marks a mismatched backend mapping for explicit recovery', async () => {
       state: 'recovery_required', failure_stage: 'backend_verification', failure_code: 'BACKEND_PROTOCOL_ERROR'
     });
     expect(h.deps.scopeRegistry.get('mismatch')).toBeUndefined();
+  } finally { await h.close(); }
+});
+
+test('quarantines a ready project that disappears before granting another principal', async () => {
+  const h = await createHarness();
+  try {
+    const remote = 'https://github.com/example/drifted-ready.git';
+    const created = await ensureProject(workerContext, request(remote), h.deps);
+    h.backend.removeProject(created.scope);
+    await expect(ensureProject(reviewerContext, request(remote), h.deps))
+      .rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(h.deps.journal.getProjectByIdentity('github.com/example/drifted-ready')).toMatchObject({
+      state: 'recovery_required',
+      failure_stage: 'ready_verification',
+      failure_code: 'BACKEND_PROTOCOL_ERROR'
+    });
+    expect(h.deps.scopeRegistry.get(created.scope)).toBeUndefined();
+    expect(h.deps.journal.listProjectGrants(reviewerContext.principal.id)).toEqual([]);
   } finally { await h.close(); }
 });
 

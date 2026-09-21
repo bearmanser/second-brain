@@ -14,6 +14,15 @@ test.each([
   expect(normalizeRepositoryIdentity(remote)).toBe('github.com/bearmanser/second-brain');
 });
 
+test('removes the SSH default port and preserves valid at-signs in repository paths', () => {
+  expect(normalizeRepositoryIdentity('ssh://git@github.com:22/owner/repo.git')).toBe(
+    'github.com/owner/repo'
+  );
+  expect(normalizeRepositoryIdentity('https://github.com/owner/repo@v2.git')).toBe(
+    'github.com/owner/repo@v2'
+  );
+});
+
 test('lowercases and IDNA-normalizes the host while preserving repository path case', () => {
   expect(normalizeRepositoryIdentity('https://BÜCHER.example/Owner/Repo.GIT')).toBe(
     'xn--bcher-kva.example/Owner/Repo'
@@ -34,6 +43,9 @@ test.each([
   'https://github.com/owner/../repo.git',
   'https://github.com/owner/./repo.git',
   'https://user:secret@github.com/owner/repo.git',
+  'ssh://deploy@github.com/owner/repo.git',
+  'ssh://ghp_abcdefghijklmnopqrstuvwxyz123456@github.com/owner/repo.git',
+  'deploy@github.com:owner/repo.git',
   'git@github.com:owner//repo.git',
   'git@github.com:owner/repo.git\nmalicious'
 ])('rejects malformed or unsafe repository identity input without echoing it', (remote) => {

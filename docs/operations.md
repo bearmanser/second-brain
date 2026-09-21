@@ -246,7 +246,9 @@ require a backup or explicit owner recovery. A repository project in
 vault, mapping, and grant state. After correcting the underlying Basic Memory
 name/path conflict, the owner calls `brain_project_ensure` for the same remote
 with a new idempotency key; only successful exact-path verification returns the
-project to `ready`.
+project to `ready`. Startup and every new-principal ensure re-verify persisted
+ready mappings against both the vault directory and Basic Memory. A broken
+dynamic scope is quarantined without hiding unrelated ready scopes.
 
 ## Logs and status
 
@@ -263,8 +265,10 @@ Normal logs carry opaque IDs, sizes, durations, outcomes, and error codes, never
 note bodies, queries, or credentials. `brain_status` reports
 `health.gateway` (`ready`/`recovering`/`degraded`), `health.backend`,
 `health.embeddings`, and `pending_operations`. While an operation is ambiguous,
-reads continue and new mutations are refused with `RECOVERY_REQUIRED` until
-reconciled; `recover-state --mode=recover` exits non-zero when ambiguity remains.
+reads continue. An ambiguous note write blocks new mutations until reconciled;
+an ambiguous project provision blocks only its affected scope, so unrelated
+ready scopes remain writable. `recover-state --mode=recover` exits non-zero when
+ambiguity remains.
 
 ## Offline cache
 

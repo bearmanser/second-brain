@@ -424,6 +424,21 @@ test('reserves repository projects idempotently with generated storage mappings'
   journal.close();
 });
 
+test('persists a normalized repository identity whose path contains an at-sign', () => {
+  const journal = Journal.open(':memory:');
+  try {
+    const reserved = journal.reserveProject({
+      repository_identity: 'github.com/owner/repo@v2',
+      scope: 'repo-v2',
+      created_by_principal_id: 'owner-v2',
+      creation_operation_id: fixtureIds.idempotencyKey
+    });
+    expect(reserved.project.repository_identity).toBe('github.com/owner/repo@v2');
+  } finally {
+    journal.close();
+  }
+});
+
 test('enforces unique repository identity and scope bindings', () => {
   const journal = Journal.open(':memory:');
   journal.reserveProject({

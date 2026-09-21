@@ -97,10 +97,18 @@ export class ScopeRegistry {
         };
   }
 
-  registerReadyProject(project: RepositoryProjectRecord, grant: DynamicProjectGrant): void {
+  registerReadyProject(project: RepositoryProjectRecord, grant?: DynamicProjectGrant): void {
     if (project.state !== 'ready') throw invalidInput('only ready repository projects can register');
     this.registerDynamicScope(project);
-    this.registerGrant(project.scope, grant);
+    if (grant !== undefined) this.registerGrant(project.scope, grant);
+  }
+
+  quarantineProject(scope: string): void {
+    if (!this.dynamicScopes.delete(scope)) return;
+    this.scopes.delete(scope);
+    for (const key of this.grants.keys()) {
+      if (key.endsWith(`\u0000${scope}`)) this.grants.delete(key);
+    }
   }
 
   private registerStatic(scope: ScopeConfig): void {

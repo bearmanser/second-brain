@@ -12,5 +12,5 @@ BASIC_MEMORY_PROJECT_ROOT: /app/data/Projects
 Basic Memory image: ghcr.io/basicmachines-co/basic-memory@sha256:939f1173d96626c280763e14622f2381d49fbbb7db17cae2e832f4f639405643
 
 The same pinned backend was exercised by the 66-test Docker suite and by retrieval run
-retrieval-2026-09-21T10:19:50.919Z-6d44deb5. Existing projects were accepted only
+retrieval-2026-09-21T10:47:28.820Z-007eb16f. Existing projects were accepted only
 when the backend-reported normalized path matched the server-generated project path.

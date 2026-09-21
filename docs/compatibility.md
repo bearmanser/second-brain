@@ -454,10 +454,10 @@ Sanitized committed transcripts:
 ### Automatic repository projects release gate
 
 The 2026-09-21 automatic-project gate used Node 24.21.0, npm 11.19.0,
-Docker Engine 29.7.2, and Docker Compose 5.5.0. `npm run verify` passed 334
-unit/contract tests, `npm run test:integration` passed 290 tests, and the full
+Docker Engine 29.7.2, and Docker Compose 5.5.0. `npm run verify` passed 340
+unit/contract tests, `npm run test:integration` passed 294 tests, and the full
 Docker suite passed 66 tests. Retrieval run
-`retrieval-2026-09-21T10:19:50.919Z-6d44deb5` passed with recall@5 0.9286 and
+`retrieval-2026-09-21T10:47:28.820Z-007eb16f` passed with recall@5 0.9286 and
 zero leakage events. Compose interpolation confirmed the gateway is published
 only at loopback port 7331, the backend has no published port, the gateway
 vault mount remains read-only, and the backend project root is

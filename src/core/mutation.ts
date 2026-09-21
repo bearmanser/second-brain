@@ -510,6 +510,16 @@ export class MutationCoordinator {
     return this.recoveryBlockers.size > 0;
   }
 
+  private blocksScope(scope: string): boolean {
+    for (const operationId of this.recoveryBlockers) {
+      const record = this.deps.journal.get(operationId);
+      if (record === undefined || record.tool !== 'brain_project_ensure' || record.scope === scope) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   async recoverDetailed(): Promise<RecoveryReport> {
     return this.withLock(async () => {
       const operations: RecoveryOperationReport[] = [];
@@ -576,7 +586,7 @@ export class MutationCoordinator {
       payload_json: storedPayloadJson(digest.payload_json, advisory)
     };
     const reserved = this.deps.journal.reserve(reservation);
-    if (reserved.kind === 'new' && this.recoveryBlockers.size > 0) {
+    if (reserved.kind === 'new' && this.blocksScope(scope.id)) {
       try {
         this.deps.journal.abort(reserved.record.operation_id);
       } catch {
