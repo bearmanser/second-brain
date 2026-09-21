@@ -1074,6 +1074,9 @@ export class MutationCoordinator {
           warnings: ['materialization_absent']
         });
       }
+      if (record.state === 'submitted' && this.materializationWindowElapsed(record)) {
+        return this.failDefinitively(record, 'materialization_absent', ['materialization_absent']);
+      }
       return this.operationReport(record, {
         outcome: 'pending',
         reason: 'not_materialized',
@@ -1120,6 +1123,13 @@ export class MutationCoordinator {
         warnings: ['finalize_unconfirmed']
       });
     }
+  }
+
+  private materializationWindowElapsed(record: OperationRecord): boolean {
+    const submittedAt = Date.parse(record.updated_at);
+    if (!Number.isFinite(submittedAt)) return false;
+    const timeout = this.deps.config.limits.materialization_timeout_ms ?? MATERIALIZATION_TIMEOUT_MS;
+    return this.deps.clock.now().getTime() - submittedAt >= timeout;
   }
 
   private operationReport(

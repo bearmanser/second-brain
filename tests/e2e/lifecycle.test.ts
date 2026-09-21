@@ -277,7 +277,7 @@ describe('release-candidate lifecycle (real Docker gateway)', () => {
 });
 
 describe('lifecycle recovery and restore verification', () => {
-  test('an uncertain pre-write failure remains pending and is never blindly resubmitted', async () => {
+  test('an absent pre-write failure settles without ever being blindly resubmitted', async () => {
     const h: MemoryHarness = await createHarness();
     try {
       h.backend.fail_once = 'before_write';
@@ -288,13 +288,13 @@ describe('lifecycle recovery and restore verification', () => {
 
       await h.restart();
       const afterRestart = await recoverPending(h.deps);
-      expect(afterRestart.operations).toHaveLength(1);
-      expect(afterRestart.operations[0].outcome).toBe('pending');
+      expect(afterRestart.blocking_operations).toHaveLength(0);
+      expect(h.deps.journal.get(first.operation_id)?.state).toBe('failed');
       expect(h.backend.create_calls).toHaveLength(1);
 
-      const replay = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
-      expect(replay.outcome).toBe('pending');
-      expect(replay.revision_id).toBe(first.revision_id);
+      await expect(
+        h.deps.mutations.commit(reviewerContext, request.intent, request.build)
+      ).rejects.toThrow(/operation failed definitively/);
 
       const files = (await h.deps.vault.list('freellmapi')).filter((path) => path.endsWith('.md'));
       expect(files).toHaveLength(0);

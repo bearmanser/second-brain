@@ -9,7 +9,7 @@ import {
   type RevisionBuilder
 } from '../../src/core/mutation.js';
 import type { PlannedWrite, RequestContext, StoredRevision } from '../../src/core/types.js';
-import { makeEtag, renderRevision } from '../../src/notes/codec.js';
+import { encodeRevision, makeEtag, renderRevision } from '../../src/notes/codec.js';
 import { relativePathFor } from '../../src/notes/identity.js';
 import { fixtureIds, lessonFixture } from '../fixtures/content.js';
 import {
@@ -656,18 +656,66 @@ test('does not resend when the vault cannot be enumerated during a submitted rep
   await h.close();
 });
 
-test('keeps a submitted operation blocking when no materialization is visible yet', async () => {
+test('keeps a newly submitted operation blocking during its materialization window', async () => {
+  const h = await createHarness();
+  const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
+  const record = h.deps.journal.reserve({
+    principal_id: reviewerPrincipal.id,
+    idempotency_key: request.intent.idempotency_key,
+    tool: request.intent.tool,
+    scope: request.intent.scope,
+    payload_hash: 'a'.repeat(64),
+    payload_json: '{}'
+  }).record;
+  const revision = await request.build(
+    {
+      operation_id: record.operation_id,
+      note_id: randomUUID(),
+      revision_id: randomUUID(),
+      timestamp: record.created_at
+    },
+    []
+  );
+  h.deps.journal.savePlan(record.operation_id, encodeRevision(revision, scopeOf(record.scope)));
+  h.deps.journal.mark(record.operation_id, 'submitted');
+
+  const report = await h.deps.mutations.recoverDetailed();
+  expect(report.pending).toBe(1);
+  expect(report.operations[0]?.reason).toBe('not_materialized');
+  expect(report.blocking_operations).toContain(record.operation_id);
+  expect(h.deps.journal.get(record.operation_id)?.state).toBe('submitted');
+  expect(h.backend.create_calls).toHaveLength(0);
+  await h.close();
+});
+
+test('settled recovery fails an absent write without resubmitting an identical retry', async () => {
   const h = await createHarness();
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   h.backend.fail_once = 'before_write';
   const first = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
   expect(first.outcome).toBe('pending');
   expect(h.backend.create_calls).toHaveLength(1);
-  const replay = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
-  expect(replay.outcome).toBe('pending');
+
+  const originalList = h.deps.vault.list.bind(h.deps.vault);
+  h.deps.vault.list = async () => {
+    throw new Error('vault listing unavailable');
+  };
+  const inconclusive = await h.deps.mutations.recoverDetailed();
+  expect(inconclusive.pending).toBe(1);
+  expect(inconclusive.blocking_operations).toContain(first.operation_id);
+  expect(h.deps.journal.get(first.operation_id)?.state).toBe('submitted');
+
+  h.deps.vault.list = originalList;
+  const settled = await h.deps.mutations.recoverDetailed();
+  expect(settled.failed).toBe(1);
+  expect(settled.operations[0]?.reason).toBe('materialization_absent');
+  expect(settled.blocking_operations).not.toContain(first.operation_id);
+  expect(h.deps.journal.get(first.operation_id)?.state).toBe('failed');
+
+  await expect(
+    h.deps.mutations.commit(reviewerContext, request.intent, request.build)
+  ).rejects.toThrow(/operation failed definitively/);
   expect(h.backend.create_calls).toHaveLength(1);
-  const report = await h.deps.mutations.recoverDetailed();
-  expect(report.blocking_operations).toContain(first.operation_id);
   await h.close();
 });
 

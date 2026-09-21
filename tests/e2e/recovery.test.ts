@@ -123,7 +123,7 @@ test('recovers an interrupted write at every journal transition', async () => {
   }
 });
 
-test('never replays a write merely because the receipt is absent', async () => {
+test('fails a conclusively absent write without replaying the backend create', async () => {
   const h = await createHarness();
   h.backend.fail_once = 'before_write';
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
@@ -134,13 +134,18 @@ test('never replays a write merely because the receipt is absent', async () => {
   const report = await recoverPending(h.deps);
   expect(report.finalized).toBe(0);
   expect(report.conflicted).toBe(0);
-  expect(report.pending).toBe(1);
-  expect(report.operations[0].reason).toBe('not_materialized');
+  expect(report.failed).toBe(1);
+  expect(report.operations[0].reason).toBe('materialization_absent');
+  expect(report.blocking_operations).toHaveLength(0);
+  expect(h.deps.journal.get(first.operation_id)?.state).toBe('failed');
+  await expect(
+    h.deps.mutations.commit(reviewerContext, request.intent, request.build)
+  ).rejects.toThrow(/operation failed definitively/);
   expect(h.backend.create_calls).toHaveLength(1);
   await h.close();
 });
 
-test('restarting Basic Memory during a pending write keeps Markdown authoritative', async () => {
+test('restarting Basic Memory finalizes a late Markdown materialization without resubmitting', async () => {
   const h = await createHarness();
   h.backend.fail_once = 'before_write';
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
@@ -153,11 +158,6 @@ test('restarting Basic Memory during a pending write keeps Markdown authoritativ
   });
   await restarted.connect();
   h.deps.backend = restarted;
-
-  const before = await recoverPending(h.deps);
-  expect(before.finalized).toBe(0);
-  expect(before.pending).toBe(1);
-  expect(h.backend.create_calls).toHaveLength(1);
 
   await materialisePlan(h, await planOf(h));
   const after = await recoverPending(h.deps);
