@@ -5,6 +5,14 @@ import { startHttpHarness } from '../support/harness.js';
 import { scoreRetrieval, summariseRetrieval, type ScoredRetrievalCase } from './analyse.mjs';
 import { makeLexicalSearch } from './lexical-backend.mjs';
 import { seedCorpus, type CorpusFile, type SeedRegistry } from './seed.mjs';
+import {
+  RECALL_TARGET,
+  retrievalGate,
+  validateCaseRecord,
+  validateCorpus,
+  validateRetrieval,
+  type RetrievalLike
+} from './plan.mjs';
 import { runAgentPilot } from './agent.mjs';
 import { runInstructionProbe } from './instruction.mjs';
 import {
@@ -71,6 +79,7 @@ export interface RetrievalRunOutput {
   corpus: { notes: number; seeded_keys: string[] };
   seeding: { tool_timeline: string[]; elapsed_ms: number };
   metrics: ReturnType<typeof summariseRetrieval>;
+  gate: { ok: boolean; reasons: string[] };
   target_recall_at_5: number;
   forbidden_markers: string[];
   cases: Array<Record<string, unknown>>;
@@ -84,6 +93,15 @@ export async function runRetrieval(
   const queriesPath = args.get('queries') ?? join(REPO_ROOT, 'tests/eval/retrieval.json');
   const corpus = await readJson<CorpusFile>(corpusPath);
   const retrieval = await readJson<RetrievalFile>(queriesPath);
+  const corpusErrors = validateCorpus(corpus);
+  const retrievalErrors = validateRetrieval(
+    retrieval as unknown as RetrievalLike,
+    new Set(corpus.notes.map((note) => note.key))
+  );
+  const fixtureErrors = [...corpusErrors, ...retrievalErrors];
+  if (fixtureErrors.length > 0) {
+    throw new Error(`evaluation fixtures are invalid: ${fixtureErrors.join('; ')}`);
+  }
   const runId = `retrieval-${new Date().toISOString()}-${randomUUID().slice(0, 8)}`;
 
   const harness = await startHttpHarness();
@@ -170,6 +188,19 @@ export async function runRetrieval(
       elapsed_ms: Number(entry.elapsed_ms)
     }));
     const metrics = summariseRetrieval(scored);
+    const gate = retrievalGate(
+      metrics,
+      cases.map((entry) => ({
+        outcome: String(entry.outcome),
+        leaked: entry.leaked === true
+      }))
+    );
+    for (const record of cases) {
+      const missing = validateCaseRecord(record);
+      if (missing.length > 0) {
+        throw new Error(`case ${String(record.case_id)} misses required fields: ${missing.join(', ')}`);
+      }
+    }
     const output: RetrievalRunOutput = {
       run_id: runId,
       mode: 'retrieval',
@@ -181,13 +212,14 @@ export async function runRetrieval(
       corpus: { notes: corpus.notes.length, seeded_keys: [...registry.by_key.keys()] },
       seeding: { tool_timeline: registry.timeline, elapsed_ms: seedElapsed },
       metrics,
-      target_recall_at_5: 0.8,
+      gate,
+      target_recall_at_5: RECALL_TARGET,
       forbidden_markers: retrieval.forbidden_markers,
       cases
     };
     const outPath = args.get('out') ?? join(REPO_ROOT, 'tests/eval/results/retrieval.json');
     await writeJson(outPath, output);
-    return { output, failed: metrics.leakage_events > 0 };
+    return { output, failed: !gate.ok };
   } finally {
     await harness.close();
   }
@@ -200,6 +232,7 @@ export function formatRetrievalSummary(output: RetrievalRunOutput): string {
     `recall@5 ${output.metrics.recall_at_5} (target ${output.target_recall_at_5}); precision@5 ${output.metrics.precision_at_5}`,
     `positive ${output.metrics.positive_cases}; negative ${output.metrics.negative_cases}; negative passed ${output.metrics.negative_cases_passed}; negative failed ${output.metrics.negative_cases_failed}`,
     `leakage events ${output.metrics.leakage_events}`,
+    `gate ${output.gate.ok ? 'pass' : `fail (${output.gate.reasons.join('; ')})`}`,
     `mean elapsed ${output.metrics.mean_elapsed_ms} ms`
   ];
   for (const entry of output.cases) {

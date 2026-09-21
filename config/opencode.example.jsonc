@@ -4,6 +4,10 @@
   // V2 stores servers under `mcp.servers.<name>`; it does not accept a server
   // name directly under `mcp`. `codemode: false` exposes the MCP tools on the
   // model's native tool list instead of through Code Mode.
+  // Verified with this client: run the gateway with `result_delivery: text-json`
+  // in its own Brain configuration. The model did not receive `structuredContent`
+  // (it saw only the compact pointer) in the Task 19 probe; the text-json mode
+  // delivered the payload. Recorded in docs/evaluation.md.
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
     "servers": {

@@ -8,8 +8,9 @@ import { makeLexicalSearch } from './lexical-backend.mjs';
 import { seedCorpus, type CorpusFile, type SeedRegistry } from './seed.mjs';
 import { REPO_ROOT, readJson, writeJson } from './io.mjs';
 import { OPENCODE_BIN } from './instruction.mjs';
+import { MAX_PILOT_RUNS, planPilotRuns } from './plan.mjs';
 
-export const MAX_PILOT_RUNS = 24;
+export { MAX_PILOT_RUNS };
 export const AGENT_TIMEOUT_MS = 420_000;
 
 interface AgentTask {
@@ -35,12 +36,12 @@ interface CommandOutcome {
 async function runCommand(
   command: string,
   args: string[],
-  options: { cwd: string; timeout_ms: number }
+  options: { cwd: string; timeout_ms: number; env?: NodeJS.ProcessEnv }
 ): Promise<CommandOutcome> {
   return new Promise((resolve) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
-      env: process.env,
+      env: options.env ?? process.env,
       stdio: ['ignore', 'pipe', 'pipe']
     });
     let stdout = '';
@@ -71,7 +72,7 @@ async function runCommand(
 function extractUsage(stdout: string): { input: number; output: number; total: number } | null {
   const matches = [
     ...stdout.matchAll(
-      /"(?:input|prompt)_tokens"\s*:\s*(\d+)[^}]*?"(?:output|completion)_tokens"\s*:\s*(\d+)/g
+      /"tokens"\s*:\s*\{[^}]*?"input"\s*:\s*(\d+)[^}]*?"output"\s*:\s*(\d+)/g
     )
   ];
   const last = matches[matches.length - 1];
@@ -79,6 +80,51 @@ function extractUsage(stdout: string): { input: number; output: number; total: n
   const input = Number(last[1]);
   const output = Number(last[2]);
   return { input, output, total: input + output };
+}
+
+function collectItemIds(value: unknown, found: Set<string>): void {
+  if (Array.isArray(value)) {
+    for (const entry of value) collectItemIds(entry, found);
+    return;
+  }
+  if (typeof value !== 'object' || value === null) return;
+  const record = value as Record<string, unknown>;
+  const items = record.items;
+  if (Array.isArray(items)) {
+    for (const item of items) {
+      if (typeof item === 'object' && item !== null) {
+        const id = (item as Record<string, unknown>).id;
+        if (typeof id === 'string') found.add(id);
+      }
+    }
+  }
+  for (const entry of Object.values(record)) collectItemIds(entry, found);
+}
+
+export function parseRetrievedIds(stdout: string): string[] {
+  const found = new Set<string>();
+  for (const line of stdout.split('\n')) {
+    if (!line.startsWith('{')) continue;
+    let event: unknown;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const part = (event as { part?: { tool?: unknown; state?: { output?: unknown } } }).part;
+    if (typeof part?.tool !== 'string' || !part.tool.includes('brain_recall')) continue;
+    const output = part.state?.output;
+    let parsed: unknown = output;
+    if (typeof output === 'string') {
+      try {
+        parsed = JSON.parse(output);
+      } catch {
+        parsed = output;
+      }
+    }
+    collectItemIds(parsed, found);
+  }
+  return [...found];
 }
 
 interface PilotRunRecord {
@@ -89,6 +135,7 @@ interface PilotRunRecord {
   model_identifier: string;
   client_version: string;
   tool_timeline: string[];
+  retrieved_ids: string[];
   retrieved_memory: boolean;
   expected_signal_seen: boolean;
   outcome: 'matched' | 'missed' | 'error' | 'timeout';
@@ -112,7 +159,7 @@ export async function runAgentPilot(
   const repeats = Number(args.get('repeats') ?? '2');
   const budget = Number(args.get('budget') ?? String(MAX_PILOT_RUNS));
   const planned = taskFile.tasks.length * repeats * 2;
-  const cap = Math.max(0, Math.min(planned, MAX_PILOT_RUNS, budget));
+  const cap = planPilotRuns(taskFile.tasks.length, repeats, budget);
   const opencodeVersion = (await runCommand(OPENCODE_BIN, ['--version'], {
     cwd: REPO_ROOT,
     timeout_ms: 30_000
@@ -195,39 +242,44 @@ async function runOne(
       const registry: SeedRegistry = { by_id: new Map(), by_key: new Map(), timeline: [] };
       await seedCorpus(harness, corpus, registry, { keys: task.memory_keys });
     }
+    const config: Record<string, unknown> = {
+      $schema: 'https://opencode.ai/config.json'
+    };
+    if (condition === 'enabled') {
+      config.mcp = {
+        servers: {
+          'second-brain': {
+            type: 'remote',
+            url: harness.url,
+            oauth: false,
+            codemode: false,
+            headers: { Authorization: `Bearer ${harness.token}` }
+          }
+        }
+      };
+    }
     await writeFile(
       join(workDir, 'opencode.json'),
-      `${JSON.stringify(
-        {
-          $schema: 'https://opencode.ai/config.json',
-          mcp: {
-            servers: {
-              'second-brain': {
-                type: 'remote',
-                url: harness.url,
-                oauth: false,
-                codemode: false,
-                headers: { Authorization: `Bearer ${harness.token}` }
-              }
-            }
-          }
-        },
-        null,
-        2
-      )}\n`,
+      `${JSON.stringify(config, null, 2)}\n`,
       'utf8'
     );
     await runCommand('git', ['init', '-q'], { cwd: workDir, timeout_ms: 30_000 });
+    await runCommand('git', ['commit', '--allow-empty', '-q', '-m', 'init'], {
+      cwd: workDir,
+      timeout_ms: 30_000
+    });
+    const env: NodeJS.ProcessEnv = { ...process.env, PWD: workDir };
     const started = Date.now();
     const outcome = await runCommand(
       OPENCODE_BIN,
-      ['run', '--model', model, '--format', 'json', '--auto', task.prompt],
-      { cwd: workDir, timeout_ms: AGENT_TIMEOUT_MS }
+      ['run', '--standalone', '--model', model, '--format', 'json', '--auto', task.prompt],
+      { cwd: workDir, env, timeout_ms: AGENT_TIMEOUT_MS }
     );
     const elapsed = Date.now() - started;
     const combined = `${outcome.stdout}\n${outcome.stderr}`;
     const signalSeen = combined.toLowerCase().includes(task.expected_signal.toLowerCase());
-    const recallEvents = (combined.match(/brain_recall/g) ?? []).length;
+    const retrievedIds = parseRetrievedIds(outcome.stdout);
+    const recallEvents = (outcome.stdout.match(/brain_recall/g) ?? []).length;
     const outcomeLabel: PilotRunRecord['outcome'] = outcome.timed_out
       ? 'timeout'
       : outcome.code !== 0
@@ -243,7 +295,8 @@ async function runOne(
       model_identifier: model,
       client_version: `opencode ${opencodeVersion}`,
       tool_timeline: recallEvents > 0 ? ['brain_recall'] : [],
-      retrieved_memory: recallEvents > 0,
+      retrieved_ids: retrievedIds,
+      retrieved_memory: retrievedIds.length > 0 || recallEvents > 0,
       expected_signal_seen: signalSeen,
       outcome: outcomeLabel,
       elapsed_ms: elapsed,

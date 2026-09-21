@@ -68,7 +68,7 @@ backend remains the production path.
 
 ### Results
 
-Run `retrieval-2026-09-21T02:03:15.063Z-4fed9666` (23 queries, 11 notes):
+Run `retrieval-2026-09-21T02:29:02.718Z-3f9f7f4e` (23 queries, 11 notes):
 
 | Metric | Value |
 |---|---|
@@ -78,8 +78,9 @@ Run `retrieval-2026-09-21T02:03:15.063Z-4fed9666` (23 queries, 11 notes):
 | Negative/scoping queries | 9 |
 | Negative queries with an empty result | 9 / 9 |
 | Forbidden-marker leakage events | 0 |
-| Mean recall elapsed time | 85.2 ms |
-| Corpus seeding (capture + review) | 5850 ms, 22 tool calls |
+| Mean recall elapsed time | 48.4 ms |
+| Corpus seeding (capture + review) | 3350 ms, 22 tool calls |
+| Functional gate | pass |
 
 The recall target is at least 0.8 at five. The result clears it on this 14-query
 set. Precision is 0.53 because a single lexical query returns every note that
@@ -107,38 +108,49 @@ guidance (it must contain `brain_recall`, `candidate`, and `untrusted data`).
 This proves the *server* sends instructions. It does **not** prove that a client
 or model receives or obeys them.
 
-### Live instruction probe (NOT RUN)
+### Live instruction probe (RUN)
 
 `tests/eval/run.mts --mode instruction --allow-model` starts a disposable probe
-MCP server whose `initialize` instructions carry a random marker and whose
-`probe_fixture` tool returns a random fact in `structuredContent` with a text
-pointer that does not contain the fact. It then runs a fresh OpenCode session
-with a prompt that contains neither value.
+MCP server (stdio) whose `initialize` instructions carry a random marker and
+whose `probe_fixture` tool returns a random fact. The runner verifies that the
+client connected to the disposable server, then runs a fresh OpenCode session in
+a disposable project with `opencode run --standalone` and a prompt that contains
+neither value. `--standalone` is required: without it the run can attach to a
+shared background service and mask the disposable project's configuration, and
+the child process needs its `PWD` set to the disposable directory.
 
-Result: **NOT RUN**.
+Observed result for `deepseek/deepseek-v4-flash` on opencode `v2.0.10`:
 
-- A probe MCP server built on the pinned SDK was verified directly: an SDK
-  client received the marker in `instructions`, listed `probe_fixture`, and
-  received the fact in `structuredContent`.
-- In the same disposable project, `opencode debug config` showed the project
-  document (`/tmp/probe-check-…/opencode.jsonc`) with the server configured,
-  but `opencode mcp list` reported `No MCP servers configured` and the model's
-  Code Mode catalog never contained the probe tools. The model fell back to
-  `execute`/`search` and did not call the probe tool.
-- Two delivery attempts (`structured`, then `text-json`) both returned
-  `exit_code: 0` with neither the fact nor the marker present. Raw telemetry,
-  including reported token usage, is in
-  `tests/eval/results/instruction-delivery.json`.
-- A missing response must not be read as proof that instructions are absent;
-  absent delivery and ignored instructions are indistinguishable here. The
-  blocker is the client's failure to surface the disposable server's tools, not
-  observed instruction content.
+| Run | Server tool payload | Marker in model output | Fact in model output | MCP connected |
+|---|---|---|---|---|
+| `structured` | `structuredContent` only; text is a pointer | yes | **no** | yes |
+| `text-json` | fact serialized into the text block | yes | **yes** | yes |
 
-Because the tool payload was never observed in a model response, no
-`result_delivery` mode is claimed as verified. The shipped default remains
-`structured`; `text-json` remains the documented fallback for a client that
-cannot read structured content (`docs/agent-protocol.md`). Operators must
-confirm the mode against their own installed client before relying on it.
+- **Instruction delivery is observed**: in both runs the model reported the
+  random instruction marker, which exists only in the MCP initialization
+  response. This is behavioral evidence from the model's own output; no
+  model-bound instruction trace was inspected, so it is not definitive
+  inspection.
+- **Structured content is not model-visible in this client**: with the default
+  `structured` delivery the model received only the pointer and could not report
+  the fact. The verified `result_delivery` mode for OpenCode is **`text-json`**.
+- The gateway's `result_delivery` setting lives in the Brain configuration
+  (`config/brain.example.yaml`), not in the client config. The shipped example
+  still shows `structured`; deploy with `result_delivery: text-json` when OpenCode
+  is the client. `config/opencode.example.jsonc` records this requirement.
+- Raw sanitized runs, including per-run token usage, are in
+  `tests/eval/results/instruction-delivery.json` (stdout is stored only as a
+  sha256 digest plus a character count).
+- A missing response must not be read as proof that instructions are absent.
+  Here both values were positively observed, so delivery is confirmed for this
+  client and model combination.
+
+Transport note: the same probe exposed the model to a **remote** Streamable HTTP
+MCP server first, and in this environment the installed client timed out before
+sending any request to it, while a **local stdio** server connected reliably.
+The stdio path is used for the recorded result. The remote path remains the
+production transport and should be re-verified when the deployment client is
+finalized.
 
 ### Manual fallback
 
@@ -205,16 +217,16 @@ outcome, elapsed time, and reported token usage (null when unavailable).
 
 ```bash
 npx tsx tests/eval/run.mts --mode retrieval
-npx tsx tests/eval/run.mts --mode instruction
+npx tsx tests/eval/run.mts --mode instruction --allow-model --model deepseek/deepseek-v4-flash
 npx tsx tests/eval/run.mts --mode agent
 npm test -- tests/unit/evaluation.test.ts
 npm run typecheck
 ```
 
-`--mode instruction` and `--mode agent` record NOT RUN until an approved chat
-provider is supplied with `--allow-model --model <provider/model>`. The
-deterministic unit tests, the retrieval evaluator, and `npm run typecheck` are
-the parts that must pass without a chat model.
+`--mode instruction` and `--mode agent` record NOT RUN unless a chat provider is
+supplied with `--allow-model --model <provider/model>`. The deterministic unit
+tests, the retrieval evaluator, and `npm run typecheck` are the parts that must
+pass without a chat model.
 
 ## Limitations
 
@@ -223,5 +235,9 @@ the parts that must pass without a chat model.
   claims.
 - Retrieval quality is measured with a lexical fixture ranker, not Basic
   Memory's embedding search.
-- Instruction delivery to a real model was not demonstrated in this environment.
-- The 24-run memory pilot was not executed here.
+- Instruction delivery and tool-payload visibility were demonstrated for one
+  client/model pair (`opencode v2.0.10` + `deepseek/deepseek-v4-flash`) over a
+  local stdio probe. A remote Streamable HTTP MCP server did not connect in this
+  environment, so the production remote transport remains to be re-verified.
+- The 24-run memory pilot was not executed here (no approved free provider, and
+  switching to a priced provider without approval is forbidden).

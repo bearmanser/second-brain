@@ -276,10 +276,20 @@ documentation and the installed binary, not against that schema.
 
 - The deterministic SDK test proves a disposable gateway sends initialization
   guidance over real MCP.
-- The live model probe is **NOT RUN**: in a disposable project with a verified
-  probe MCP server, `opencode mcp list` reported `No MCP servers configured` and
-  the model's Code Mode catalog never contained the probe tools, so neither the
-  random instruction marker nor the fixture fact appeared in model output.
+- The live model probe **ran** with `deepseek/deepseek-v4-flash` on
+  `opencode v2.0.10` over a local stdio probe server:
+  - both delivery runs reported the random instruction marker (behavioral
+    evidence of initialization-instruction delivery);
+  - with the default `structured` delivery the model received only the compact
+    pointer and could **not** report the fixture fact, so the verified
+    `result_delivery` mode for OpenCode is **`text-json`**;
+  - with `text-json` the model reported the fixture fact.
+- `--standalone` (and `PWD` pointing at the disposable project) is required so
+  the run does not attach to a shared background service and mask the disposable
+  project's configuration. A **remote** Streamable HTTP MCP server did not
+  connect in this environment (the client timed out before sending a request);
+  the local stdio transport connected reliably. The remote transport remains the
+  production path and should be re-verified on the target deployment.
 - The 24-run memory pilot is **NOT RUN**: the only working provider is priced and
   unapproved, and the configured free provider rejects its key.
 
