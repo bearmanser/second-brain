@@ -138,3 +138,69 @@ export function retrievalGate(
   }
   return { ok: reasons.length === 0, reasons };
 }
+
+export interface McpServerView {
+  name: string;
+  disabled: boolean;
+}
+
+export function effectiveMcpServers(documents: unknown[]): McpServerView[] {
+  const merged = new Map<string, McpServerView>();
+  for (const document of documents) {
+    if (typeof document !== 'object' || document === null) continue;
+    const info = (document as { info?: unknown }).info;
+    if (typeof info !== 'object' || info === null) continue;
+    const mcp = (info as { mcp?: unknown }).mcp;
+    if (typeof mcp !== 'object' || mcp === null) continue;
+    const servers = (mcp as { servers?: unknown }).servers;
+    if (typeof servers !== 'object' || servers === null) continue;
+    for (const [name, value] of Object.entries(servers as Record<string, unknown>)) {
+      const disabled =
+        typeof value === 'object' && value !== null &&
+        (value as Record<string, unknown>).disabled === true;
+      merged.set(name, { name, disabled });
+    }
+  }
+  return [...merged.values()];
+}
+
+export function secondBrainServers(servers: McpServerView[]): McpServerView[] {
+  return servers.filter(
+    (server) => /second[-_ ]?brain/i.test(server.name) && server.disabled !== true
+  );
+}
+
+export interface InstructionEvidence {
+  preflight_visible: boolean;
+  exit_code: number | null;
+  timed_out: boolean;
+  marker_seen: boolean;
+  fact_seen: boolean;
+}
+
+export interface InstructionDecision {
+  status: 'RUN' | 'NOT RUN';
+  reasons: string[];
+  observed: { marker: boolean; fact: boolean; tool_payload: boolean };
+}
+
+export function instructionStatus(evidence: InstructionEvidence): InstructionDecision {
+  const reasons: string[] = [];
+  if (!evidence.preflight_visible) {
+    reasons.push('preflight did not list the disposable MCP server');
+  }
+  if (evidence.timed_out) reasons.push('the model process timed out');
+  if (evidence.exit_code !== 0) {
+    reasons.push(`the model process exited with code ${String(evidence.exit_code)}`);
+  }
+  if (!evidence.marker_seen) reasons.push('the instruction marker was not observed');
+  return {
+    status: reasons.length === 0 ? 'RUN' : 'NOT RUN',
+    reasons,
+    observed: {
+      marker: evidence.marker_seen,
+      fact: evidence.fact_seen,
+      tool_payload: evidence.fact_seen
+    }
+  };
+}

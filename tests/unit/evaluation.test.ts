@@ -8,8 +8,11 @@ import {
   MIN_NEGATIVE_QUERIES,
   MIN_POSITIVE_QUERIES,
   RECALL_TARGET,
+  effectiveMcpServers,
+  instructionStatus,
   planPilotRuns,
   retrievalGate,
+  secondBrainServers,
   validateCaseRecord,
   validateCorpus,
   validateRetrieval,
@@ -141,4 +144,44 @@ test('the case record schema requires the mandated fields', () => {
   delete missing.retrieved_ids;
   expect(validateCaseRecord(missing)).toContain('retrieved_ids');
   expect(validateCaseRecord({ ...complete, token_usage: 0 })).toContain('token_usage is neither null nor an object');
+});
+
+test('effective MCP servers merge later documents over earlier ones', () => {
+  const servers = effectiveMcpServers([
+    { info: { mcp: { servers: { browsermcp: { type: 'local' }, 'second-brain': { type: 'remote' } } } } },
+    { info: { mcp: { servers: { 'second-brain': { type: 'remote', disabled: true } } } } }
+  ]);
+  expect(servers).toEqual([
+    { name: 'browsermcp', disabled: false },
+    { name: 'second-brain', disabled: true }
+  ]);
+});
+
+test('second-brain servers are detected only when enabled', () => {
+  expect(
+    secondBrainServers([
+      { name: 'second-brain', disabled: true },
+      { name: 'second_brain', disabled: false },
+      { name: 'browsermcp', disabled: false }
+    ]).map((server) => server.name)
+  ).toEqual(['second_brain']);
+  expect(secondBrainServers([{ name: 'browsermcp', disabled: false }])).toEqual([]);
+});
+
+test('instruction RUN requires preflight, a clean exit, and the marker', () => {
+  const base = {
+    preflight_visible: true,
+    exit_code: 0,
+    timed_out: false,
+    marker_seen: true,
+    fact_seen: false
+  };
+  expect(instructionStatus(base).status).toBe('RUN');
+  expect(instructionStatus(base).observed).toEqual({ marker: true, fact: false, tool_payload: false });
+  expect(instructionStatus({ ...base, preflight_visible: false }).status).toBe('NOT RUN');
+  expect(instructionStatus({ ...base, exit_code: 1 }).status).toBe('NOT RUN');
+  expect(instructionStatus({ ...base, timed_out: true }).status).toBe('NOT RUN');
+  expect(instructionStatus({ ...base, marker_seen: false }).status).toBe('NOT RUN');
+  expect(instructionStatus({ ...base, marker_seen: false, fact_seen: true }).status).toBe('NOT RUN');
+  expect(instructionStatus({ ...base, marker_seen: false, fact_seen: true }).observed.tool_payload).toBe(true);
 });

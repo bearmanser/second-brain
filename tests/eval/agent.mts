@@ -1,4 +1,3 @@
-import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -7,8 +6,8 @@ import { startHttpHarness } from '../support/harness.js';
 import { makeLexicalSearch } from './lexical-backend.mjs';
 import { seedCorpus, type CorpusFile, type SeedRegistry } from './seed.mjs';
 import { REPO_ROOT, readJson, writeJson } from './io.mjs';
-import { OPENCODE_BIN } from './instruction.mjs';
-import { MAX_PILOT_RUNS, planPilotRuns } from './plan.mjs';
+import { OPENCODE_BIN, mcpPreflight, runCommand } from './instruction.mjs';
+import { MAX_PILOT_RUNS, planPilotRuns, secondBrainServers } from './plan.mjs';
 
 export { MAX_PILOT_RUNS };
 export const AGENT_TIMEOUT_MS = 420_000;
@@ -24,49 +23,6 @@ interface AgentTask {
 interface TaskFile {
   version: number;
   tasks: AgentTask[];
-}
-
-interface CommandOutcome {
-  code: number | null;
-  stdout: string;
-  stderr: string;
-  timed_out: boolean;
-}
-
-async function runCommand(
-  command: string,
-  args: string[],
-  options: { cwd: string; timeout_ms: number; env?: NodeJS.ProcessEnv }
-): Promise<CommandOutcome> {
-  return new Promise((resolve) => {
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      env: options.env ?? process.env,
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-    let stdout = '';
-    let stderr = '';
-    let timedOut = false;
-    child.stdout.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString('utf8');
-    });
-    child.stderr.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString('utf8');
-    });
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill('SIGKILL');
-    }, options.timeout_ms);
-    timer.unref?.();
-    child.on('error', (error) => {
-      clearTimeout(timer);
-      resolve({ code: null, stdout, stderr: `${stderr}${error.message}\n`, timed_out: false });
-    });
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      resolve({ code, stdout, stderr, timed_out: timedOut });
-    });
-  });
 }
 
 function extractUsage(stdout: string): { input: number; output: number; total: number } | null {
@@ -138,7 +94,10 @@ interface PilotRunRecord {
   retrieved_ids: string[];
   retrieved_memory: boolean;
   expected_signal_seen: boolean;
-  outcome: 'matched' | 'missed' | 'error' | 'timeout';
+  isolation_ok: boolean;
+  mcp_launched: boolean;
+  preflight_servers: string[];
+  outcome: 'matched' | 'missed' | 'error' | 'timeout' | 'invalid_isolation';
   elapsed_ms: number;
   token_usage: { input: number; output: number; total: number } | null;
   exit_code: number | null;
@@ -215,7 +174,10 @@ export async function runAgentPilot(
     enabled_total: enabled.length,
     disabled_matched: matched(disabled),
     disabled_total: disabled.length,
-    errors: runs.filter((entry) => entry.outcome === 'error' || entry.outcome === 'timeout').length
+    errors: runs.filter(
+      (entry) => entry.outcome === 'error' || entry.outcome === 'timeout'
+    ).length,
+    invalid_isolation: runs.filter((entry) => entry.outcome === 'invalid_isolation').length
   };
   await writeJson(outPath, record);
   const summaryRecord = record.summary as Record<string, number>;
@@ -242,33 +204,82 @@ async function runOne(
       const registry: SeedRegistry = { by_id: new Map(), by_key: new Map(), timeline: [] };
       await seedCorpus(harness, corpus, registry, { keys: task.memory_keys });
     }
-    const config: Record<string, unknown> = {
-      $schema: 'https://opencode.ai/config.json'
+    const writeConfig = async (servers: Record<string, unknown>): Promise<void> => {
+      await writeFile(
+        join(workDir, 'opencode.json'),
+        `${JSON.stringify(
+          { $schema: 'https://opencode.ai/config.json', mcp: { servers } },
+          null,
+          2
+        )}\n`,
+        'utf8'
+      );
     };
-    if (condition === 'enabled') {
-      config.mcp = {
-        servers: {
-          'second-brain': {
-            type: 'remote',
-            url: harness.url,
-            oauth: false,
-            codemode: false,
-            headers: { Authorization: `Bearer ${harness.token}` }
-          }
-        }
-      };
-    }
-    await writeFile(
-      join(workDir, 'opencode.json'),
-      `${JSON.stringify(config, null, 2)}\n`,
-      'utf8'
-    );
+    const ownServer: Record<string, unknown> = {
+      type: 'remote',
+      url: harness.url,
+      oauth: false,
+      codemode: false,
+      headers: { Authorization: `Bearer ${harness.token}` }
+    };
+    await writeConfig(condition === 'enabled' ? { 'second-brain': ownServer } : {});
     await runCommand('git', ['init', '-q'], { cwd: workDir, timeout_ms: 30_000 });
     await runCommand('git', ['commit', '--allow-empty', '-q', '-m', 'init'], {
       cwd: workDir,
       timeout_ms: 30_000
     });
     const env: NodeJS.ProcessEnv = { ...process.env, PWD: workDir };
+    const inherited = await mcpPreflight(workDir, env);
+    if (condition === 'disabled') {
+      const offenders = secondBrainServers(inherited.servers);
+      if (offenders.length > 0) {
+        const overrides: Record<string, unknown> = {};
+        for (const offender of offenders) {
+          overrides[offender.name] = {
+            type: 'remote',
+            url: 'http://127.0.0.1:1/mcp',
+            oauth: false,
+            disabled: true
+          };
+        }
+        await writeConfig(overrides);
+      }
+    }
+    const preflight = await mcpPreflight(
+      workDir,
+      env,
+      condition === 'enabled' ? 'second-brain' : undefined
+    );
+    const isolationOk =
+      condition === 'enabled'
+        ? preflight.ok
+        : preflight.ok && secondBrainServers(preflight.servers).length === 0;
+    const preflightServers = preflight.servers.map(
+      (server) => `${server.name}${server.disabled ? ' (disabled)' : ''}`
+    );
+    if (!isolationOk) {
+      return {
+        run_index: runIndex,
+        task_id: task.id,
+        repeat,
+        memory_condition: condition,
+        model_identifier: model,
+        client_version: `opencode ${opencodeVersion}`,
+        tool_timeline: [],
+        retrieved_ids: [],
+        retrieved_memory: false,
+        expected_signal_seen: false,
+        isolation_ok: false,
+        mcp_launched: false,
+        preflight_servers: preflightServers,
+        outcome: 'invalid_isolation',
+        elapsed_ms: 0,
+        token_usage: null,
+        exit_code: null,
+        stdout_sha256: createHash('sha256').update('').digest('hex'),
+        stdout_chars: 0
+      };
+    }
     const started = Date.now();
     const outcome = await runCommand(
       OPENCODE_BIN,
@@ -298,12 +309,15 @@ async function runOne(
       retrieved_ids: retrievedIds,
       retrieved_memory: retrievedIds.length > 0 || recallEvents > 0,
       expected_signal_seen: signalSeen,
+      isolation_ok: true,
+      mcp_launched: true,
+      preflight_servers: preflightServers,
       outcome: outcomeLabel,
       elapsed_ms: elapsed,
       token_usage: extractUsage(combined),
       exit_code: outcome.code,
-      stdout_sha256: createHash('sha256').update(combined, 'utf8').digest('hex'),
-      stdout_chars: combined.length
+      stdout_sha256: createHash('sha256').update(outcome.stdout, 'utf8').digest('hex'),
+      stdout_chars: outcome.stdout.length
     };
   } finally {
     await harness.close();

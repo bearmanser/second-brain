@@ -68,7 +68,7 @@ backend remains the production path.
 
 ### Results
 
-Run `retrieval-2026-09-21T02:29:02.718Z-3f9f7f4e` (23 queries, 11 notes):
+Run `retrieval-2026-09-21T02:38:22.185Z-d97f30f6` (23 queries, 11 notes):
 
 | Metric | Value |
 |---|---|
@@ -78,8 +78,8 @@ Run `retrieval-2026-09-21T02:29:02.718Z-3f9f7f4e` (23 queries, 11 notes):
 | Negative/scoping queries | 9 |
 | Negative queries with an empty result | 9 / 9 |
 | Forbidden-marker leakage events | 0 |
-| Mean recall elapsed time | 48.4 ms |
-| Corpus seeding (capture + review) | 3350 ms, 22 tool calls |
+| Mean recall elapsed time | 55.1 ms |
+| Corpus seeding (capture + review) | 3996 ms, 22 tool calls |
 | Functional gate | pass |
 
 The recall target is at least 0.8 at five. The result clears it on this 14-query
@@ -112,19 +112,27 @@ or model receives or obeys them.
 
 `tests/eval/run.mts --mode instruction --allow-model` starts a disposable probe
 MCP server (stdio) whose `initialize` instructions carry a random marker and
-whose `probe_fixture` tool returns a random fact. The runner verifies that the
-client connected to the disposable server, then runs a fresh OpenCode session in
-a disposable project with `opencode run --standalone` and a prompt that contains
-neither value. `--standalone` is required: without it the run can attach to a
-shared background service and mask the disposable project's configuration, and
-the child process needs its `PWD` set to the disposable directory.
+whose `probe_fixture` tool returns a random fact. The runner runs an **MCP
+visibility preflight** before launching the model: it parses the resolved
+configuration from `opencode debug config` and merges the `mcp.servers` entries
+in document order. The model is **not launched** unless the disposable server is
+present and enabled in that effective configuration. `opencode run --standalone`
+is used with `PWD` set to the disposable project; without `--standalone` the run
+can attach to a shared background service and mask the disposable project's
+configuration.
+
+`RUN` requires all three of: (a) the preflight listed the disposable server,
+(b) the model process exited 0 without timing out, and (c) the random
+instruction marker was observed in the model's own stdout. `fact_seen` alone can
+never produce `RUN`. If the preflight does not list the server, the model is not
+launched and the status is `NOT RUN` with the preflight evidence.
 
 Observed result for `deepseek/deepseek-v4-flash` on opencode `v2.0.10`:
 
-| Run | Server tool payload | Marker in model output | Fact in model output | MCP connected |
-|---|---|---|---|---|
-| `structured` | `structuredContent` only; text is a pointer | yes | **no** | yes |
-| `text-json` | fact serialized into the text block | yes | **yes** | yes |
+| Run | Preflight server | Marker observed | Fact observed | Exit | Status |
+|---|---|---|---|---|---|
+| `structured` | `evalprobe…` listed | yes | **no** | 0 | RUN |
+| `text-json` | `evalprobe…` listed | yes | **yes** | 0 | RUN |
 
 - **Instruction delivery is observed**: in both runs the model reported the
   random instruction marker, which exists only in the MCP initialization
@@ -138,12 +146,16 @@ Observed result for `deepseek/deepseek-v4-flash` on opencode `v2.0.10`:
   (`config/brain.example.yaml`), not in the client config. The shipped example
   still shows `structured`; deploy with `result_delivery: text-json` when OpenCode
   is the client. `config/opencode.example.jsonc` records this requirement.
-- Raw sanitized runs, including per-run token usage, are in
-  `tests/eval/results/instruction-delivery.json` (stdout is stored only as a
-  sha256 digest plus a character count).
+- Raw sanitized runs, including per-run token usage and the preflight server
+  list, are in `tests/eval/results/instruction-delivery.json` (stdout is stored
+  only as a sha256 digest plus a character count).
 - A missing response must not be read as proof that instructions are absent.
   Here both values were positively observed, so delivery is confirmed for this
   client and model combination.
+- `opencode mcp list` still reports `No MCP servers configured` for disposable
+  projects even when `debug config` and the run itself show the server, so the
+  effective-config preflight is authoritative and the `mcp list` text is kept as
+  supplementary evidence only.
 
 Transport note: the same probe exposed the model to a **remote** Streamable HTTP
 MCP server first, and in this environment the installed client timed out before
@@ -173,6 +185,26 @@ disposable Brain, and a fresh vault. The run cap is computed from
 `min(tasks * repeats * 2, 24, --budget)` before any run starts. No paid provider
 is used and no budget is raised.
 
+### Disabled-condition isolation
+
+A memory-disabled run must not inherit a second-brain MCP server from the user or
+global configuration. Each run performs an effective-config preflight with
+`opencode debug config`, merging every `mcp.servers` entry in document order:
+
+- Disabled runs first write a project configuration with no second-brain server,
+  then read the inherited server list. Any inherited server whose name matches
+  `/second[-_ ]?brain/i` is explicitly overridden with `disabled: true` in the
+  project configuration.
+- A second preflight must then prove that **no enabled second-brain server**
+  remains. If it does, the run is recorded as `invalid_isolation` and the model
+  is **not launched**; it is never presented as a valid disabled comparison.
+- Enabled runs must show the project `second-brain` server enabled in the
+  preflight, otherwise they are also recorded as `invalid_isolation`.
+
+The same preflight helper backs the instruction probe, so both model-driven
+paths prove MCP visibility before launching a model. Unit tests cover the merge
+and detection logic (`effectiveMcpServers`, `secondBrainServers`).
+
 ### Result: NOT RUN
 
 - The configured default provider (`freellmapi/auto`) rejects its API key:
@@ -183,9 +215,10 @@ is used and no budget is raised.
   forbidden by the task, so the 24-run pilot was not started.
 
 Blocker: no approved, working, free chat provider. The pilot code path is
-implemented and gated behind `--allow-model --model <provider/model>`; it will
-record per-run case, condition, model identifier, client version, tool timeline,
-outcome, elapsed time, and reported token usage (null when unavailable).
+implemented and gated behind `--allow-model --model <provider/model>`; it records
+per-run case, condition, model identifier, client version, tool timeline,
+retrieved note IDs, isolation/preflight evidence, outcome, elapsed time, and
+reported token usage (null when unavailable).
 
 ## OpenCode configuration verification
 

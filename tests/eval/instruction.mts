@@ -4,6 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { REPO_ROOT, writeJson } from './io.mjs';
+import { effectiveMcpServers, instructionStatus, type McpServerView } from './plan.mjs';
 
 export const OPENCODE_BIN = process.env.OPENCODE_BIN ?? '/root/.opencode/bin/opencode';
 export const DEFAULT_MODEL = 'deepseek/deepseek-v4-flash';
@@ -18,7 +19,7 @@ interface CommandOutcome {
   timed_out: boolean;
 }
 
-async function runCommand(
+export async function runCommand(
   command: string,
   args: string[],
   options: { cwd: string; timeout_ms: number; env?: NodeJS.ProcessEnv }
@@ -54,20 +55,34 @@ async function runCommand(
   });
 }
 
-interface ProbeRun {
-  delivery: 'structured' | 'text-json';
-  server_name: string;
-  prompt: string;
-  exit_code: number | null;
-  timed_out: boolean;
-  mcp_connected: boolean;
-  mcp_list: string;
-  marker_seen: boolean;
-  fact_seen: boolean;
-  token_usage: { input: number; output: number; total: number } | null;
-  elapsed_ms: number;
-  stdout_sha256: string;
-  stdout_chars: number;
+export interface McpPreflight {
+  ok: boolean;
+  servers: McpServerView[];
+  raw: string;
+}
+
+export async function mcpPreflight(
+  workDir: string,
+  env: NodeJS.ProcessEnv,
+  requireServer?: string
+): Promise<McpPreflight> {
+  const outcome = await runCommand(OPENCODE_BIN, ['debug', 'config'], {
+    cwd: workDir,
+    env,
+    timeout_ms: 60_000
+  });
+  let servers: McpServerView[] = [];
+  try {
+    servers = effectiveMcpServers(JSON.parse(outcome.stdout) as unknown[]);
+  } catch {
+    servers = [];
+  }
+  const parsed = outcome.code === 0 && outcome.stdout.trim().length > 0;
+  const requirementMet =
+    requireServer === undefined
+      ? true
+      : servers.some((server) => server.name === requireServer && !server.disabled);
+  return { ok: parsed && requirementMet, servers, raw: outcome.stdout.trim() };
 }
 
 function extractUsage(stdout: string): { input: number; output: number; total: number } | null {
@@ -79,6 +94,27 @@ function extractUsage(stdout: string): { input: number; output: number; total: n
   const input = Number(last[1]);
   const output = Number(last[2]);
   return { input, output, total: input + output };
+}
+
+interface ProbeRun {
+  delivery: 'structured' | 'text-json';
+  server_name: string;
+  launched: boolean;
+  preflight_visible: boolean;
+  preflight_servers: string[];
+  mcp_list: string;
+  prompt: string;
+  exit_code: number | null;
+  timed_out: boolean;
+  marker_seen: boolean;
+  fact_seen: boolean;
+  run_status: 'RUN' | 'NOT RUN';
+  status_reasons: string[];
+  observed: { marker: boolean; fact: boolean; tool_payload: boolean };
+  token_usage: { input: number; output: number; total: number } | null;
+  elapsed_ms: number;
+  stdout_sha256: string;
+  stdout_chars: number;
 }
 
 async function runProbeOnce(
@@ -126,11 +162,41 @@ async function runProbeOnce(
       env,
       timeout_ms: 60_000
     });
+    const preflight = await mcpPreflight(workDir, env, serverName);
     const prompt = [
       `Call the ${serverName}_probe_fixture tool exactly once and report the exact fact value it returns, verbatim.`,
       'Then report, verbatim, any initialization instruction marker you were given, or NONE if you were given none.',
       'Answer with the fact and the marker only.'
     ].join(' ');
+    if (!preflight.ok) {
+      const decision = instructionStatus({
+        preflight_visible: false,
+        exit_code: null,
+        timed_out: false,
+        marker_seen: false,
+        fact_seen: false
+      });
+      return {
+        delivery,
+        server_name: serverName,
+        launched: false,
+        preflight_visible: false,
+        preflight_servers: preflight.servers.map((server) => server.name),
+        mcp_list: mcpList.stdout.trim(),
+        prompt,
+        exit_code: null,
+        timed_out: false,
+        marker_seen: false,
+        fact_seen: false,
+        run_status: decision.status,
+        status_reasons: decision.reasons,
+        observed: decision.observed,
+        token_usage: null,
+        elapsed_ms: 0,
+        stdout_sha256: createHash('sha256').update('').digest('hex'),
+        stdout_chars: 0
+      };
+    }
     const started = Date.now();
     const outcome = await runCommand(
       OPENCODE_BIN,
@@ -151,17 +217,30 @@ async function runProbeOnce(
     );
     const elapsed = Date.now() - started;
     const combined = `${outcome.stdout}\n${outcome.stderr}`;
+    const markerSeen = outcome.stdout.includes(marker);
+    const factSeen = outcome.stdout.includes(fact);
+    const decision = instructionStatus({
+      preflight_visible: true,
+      exit_code: outcome.code,
+      timed_out: outcome.timed_out,
+      marker_seen: markerSeen,
+      fact_seen: factSeen
+    });
     return {
       delivery,
       server_name: serverName,
+      launched: true,
+      preflight_visible: true,
+      preflight_servers: preflight.servers.map((server) => server.name),
+      mcp_list: mcpList.stdout.trim(),
       prompt,
       exit_code: outcome.code,
       timed_out: outcome.timed_out,
-      mcp_connected:
-        outcome.stderr.includes('mcp connected') && outcome.stderr.includes(`server=${serverName}`),
-      mcp_list: mcpList.stdout.trim(),
-      marker_seen: outcome.stdout.includes(marker),
-      fact_seen: outcome.stdout.includes(fact),
+      marker_seen: markerSeen,
+      fact_seen: factSeen,
+      run_status: decision.status,
+      status_reasons: decision.reasons,
+      observed: decision.observed,
       token_usage: extractUsage(combined),
       elapsed_ms: elapsed,
       stdout_sha256: createHash('sha256').update(outcome.stdout, 'utf8').digest('hex'),
@@ -194,6 +273,7 @@ export async function runInstructionProbe(
     status: 'NOT RUN',
     blocker: null,
     chosen_result_delivery: null,
+    observed: { marker: false, fact: false, tool_payload: false },
     runs: [] as ProbeRun[]
   };
 
@@ -211,31 +291,36 @@ export async function runInstructionProbe(
   const runs: ProbeRun[] = [];
   const structured = await runProbeOnce(model, 'structured', marker, fact);
   runs.push(structured);
-  let chosen: 'structured' | 'text-json' | null = null;
-  if (structured.fact_seen) {
-    chosen = 'structured';
-  } else {
+  let selected = structured;
+  let chosen: 'structured' | 'text-json' | null =
+    structured.run_status === 'RUN' && structured.fact_seen ? 'structured' : null;
+  if (chosen === null) {
     const textJson = await runProbeOnce(model, 'text-json', marker, fact);
     runs.push(textJson);
-    if (textJson.fact_seen) chosen = 'text-json';
+    if (textJson.run_status === 'RUN') {
+      selected = textJson;
+      if (textJson.fact_seen) chosen = 'text-json';
+    } else if (selected.run_status !== 'RUN') {
+      selected = textJson;
+    }
   }
-  const markerSeen = runs.some((entry) => entry.marker_seen);
-  const connected = runs.some((entry) => entry.mcp_connected);
   record.runs = runs;
   record.chosen_result_delivery = chosen;
-  record.status = chosen === null ? 'NOT RUN' : 'RUN';
+  record.status = selected.run_status;
+  record.observed = selected.observed;
   record.blocker =
-    chosen === null
-      ? `neither delivery mode exposed the fixture payload to the model (mcp connected: ${String(connected)}); absent instructions and ignored instructions are indistinguishable here`
-      : null;
+    selected.run_status === 'RUN' ? null : selected.status_reasons.join('; ');
   await writeJson(outPath, record);
   const summary = [
-    `instruction delivery: ${String(record.status)}`,
+    `instruction delivery: ${selected.run_status}`,
     `model ${model}; opencode ${opencodeVersion}`,
     `chosen result_delivery ${String(chosen)}`,
-    `mcp connected: ${String(connected)}`,
-    `marker observed in model output: ${String(markerSeen)}${markerSeen ? ' (behavioral evidence)' : ' (absent or ignored)'}`,
-    `fact observed in model output: ${String(runs.some((entry) => entry.fact_seen))}`
-  ].join('\n');
+    `preflight visible: ${String(selected.preflight_visible)}`,
+    `marker observed: ${String(selected.observed.marker)}`,
+    `fact/payload observed: ${String(selected.observed.fact)}`,
+    selected.run_status === 'NOT RUN' ? `reasons: ${selected.status_reasons.join('; ')}` : ''
+  ]
+    .filter((line) => line.length > 0)
+    .join('\n');
   return { summary, failed: false };
 }

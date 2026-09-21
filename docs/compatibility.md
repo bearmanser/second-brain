@@ -278,18 +278,29 @@ documentation and the installed binary, not against that schema.
   guidance over real MCP.
 - The live model probe **ran** with `deepseek/deepseek-v4-flash` on
   `opencode v2.0.10` over a local stdio probe server:
+  - an MCP visibility preflight (`opencode debug config`, merged `mcp.servers`)
+    listed the disposable server before the model was launched;
   - both delivery runs reported the random instruction marker (behavioral
-    evidence of initialization-instruction delivery);
+    evidence of initialization-instruction delivery) and exited 0;
   - with the default `structured` delivery the model received only the compact
     pointer and could **not** report the fixture fact, so the verified
     `result_delivery` mode for OpenCode is **`text-json`**;
   - with `text-json` the model reported the fixture fact.
+- `RUN` for the probe requires the preflight listing, a clean exit, and the
+  marker observed; `fact_seen` alone never produces `RUN`. If the preflight does
+  not list the disposable server, the model is not launched.
+- `opencode mcp list` reports `No MCP servers configured` for disposable projects
+  even when the effective config and the run itself show the server, so the
+  merged-config preflight is authoritative and `mcp list` output is supplementary.
 - `--standalone` (and `PWD` pointing at the disposable project) is required so
   the run does not attach to a shared background service and mask the disposable
   project's configuration. A **remote** Streamable HTTP MCP server did not
   connect in this environment (the client timed out before sending a request);
   the local stdio transport connected reliably. The remote transport remains the
   production path and should be re-verified on the target deployment.
+- Memory-disabled pilot runs must prove MCP isolation: inherited second-brain
+  servers are explicitly disabled in the project config and the preflight must
+  show none enabled, or the run is recorded as `invalid_isolation`.
 - The 24-run memory pilot is **NOT RUN**: the only working provider is priced and
   unapproved, and the configured free provider rejects its key.
 
