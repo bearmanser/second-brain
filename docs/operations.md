@@ -236,6 +236,54 @@ graph position, and retrieval continues to exclude archived and superseded statu
 reconstruct retry history or feedback, does not recover a corrupt vault, and does not
 repair a damaged revision graph. Those require a backup or explicit owner recovery.
 
+## Logs and status
+
+```sh
+docker compose logs -f brain
+docker compose logs -f memory
+docker compose ps
+docker compose exec brain node dist/cli.js health
+docker compose exec brain node dist/cli.js recover
+docker compose exec brain node dist/cli.js verify-backup --root /backup --manifest /backup/manifest.json
+```
+
+Normal logs carry opaque IDs, sizes, durations, outcomes, and error codes, never
+note bodies, queries, or credentials. `brain_status` reports
+`health.gateway` (`ready`/`recovering`/`degraded`), `health.backend`,
+`health.embeddings`, and `pending_operations`. While an operation is ambiguous,
+reads continue and new mutations are refused with `RECOVERY_REQUIRED` until
+reconciled; `recover-state --mode=recover` exits non-zero when ambiguity remains.
+
+## Offline cache
+
+The first hybrid search downloads the local FastEmbed model into the
+`model-cache` volume at the verified path
+`/home/appuser/.basic-memory/fastembed_cache`. After warm-up, hybrid search works
+with no external egress (the Compose network can be switched to `internal: true`
+for a test), and restarts reuse the cached model. Index and embedding state are
+derived and rebuildable; the cache never contains authoritative notes.
+
+## Safe upgrades
+
+1. Take a cold backup and validate it (`scripts/restore.sh ... --check`) before
+   changing an image or configuration.
+2. Change `NODE_IMAGE`/`BASIC_MEMORY_IMAGE` only to another digest-pinned
+   reference, then `docker compose up -d --build`.
+3. Re-run `bash scripts/setup.sh`; it preserves existing tokens, credentials,
+   `.env` user settings, and the ownership of existing volumes.
+4. On start the gateway reconciles pending operations before accepting
+   mutations. If `brain_status` reports `recovering`, inspect with
+   `node dist/cli.js recover`.
+5. If the state schema changed, rebuild the catalogue only through
+   `scripts/rebuild.sh`; it requires `journal.db` and validates the graph.
+6. Roll back by restoring the previous digest-pinned images and
+   `config/brain.yaml`. The vault is authoritative and derived state rebuilds.
+7. No image publishing or release automation runs automatically; a registry and
+   release repository must be selected explicitly first.
+
+For the full user-facing runbook (client registration, typed notes, candidate
+review, credentials, and limitations), see `docs/setup.md`.
+
 ## Observed environment notes
 
 - The pinned Basic Memory image advertises `reindex` and `doctor`; the supported

@@ -10,6 +10,11 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json && node scripts/copy-assets.mjs",
+    "verify": "npm run typecheck && vitest run tests/unit tests/contract && npm run build",
+    "test:contract": "vitest run tests/contract",
+    "test:integration": "vitest run tests/integration",
+    "test:e2e": "vitest run tests/e2e",
+    "eval:retrieval": "tsx tests/eval/run.mts --mode retrieval",
     "probe": "tsx scripts/probe-compatibility.mts"
   },
   "dependencies": {

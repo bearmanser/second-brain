@@ -283,3 +283,38 @@ pass without a chat model.
   environment, so the production remote transport remains to be re-verified.
 - The 24-run memory pilot was not executed here (no approved free provider, and
   switching to a priced provider without approval is forbidden).
+
+## Task 20 release-gate evaluation
+
+Recorded on the execution host on 2026-09-21.
+
+### Retrieval gate
+
+`npm run eval:retrieval` exited 0 with `gate pass`. Run
+`retrieval-2026-09-21T03:34:10.928Z-0d9d2d58`:
+
+| Metric | Value |
+|---|---|
+| Notes / queries | 11 / 23 |
+| Recall at five | 1.0 (target >= 0.8) |
+| Precision at five | 0.5262 |
+| Positive queries | 14 |
+| Negative/scoping queries with an empty result | 9 / 9 |
+| Forbidden-marker leakage events | 0 |
+| Mean elapsed per query | 58.4 ms |
+
+This is the same deterministic lexical fixture ranker as the earlier Task 19
+run, not Basic Memory embedding search. The committed raw result is
+`tests/eval/results/retrieval.json` from the Task 19 run; this Task 20 run
+reproduced the identical gate metrics.
+
+### Model-dependent items
+
+| Item | Status | Reason |
+|---|---|---|
+| `--mode instruction` | NOT RUN | Requires a chat model and an approved budget. Task 19's probe result is retained in this document. |
+| `--mode agent` (24-run pilot) | NOT RUN | Same blocker; no approved model/budget. |
+| Remote Streamable-HTTP MCP transport | NOT VERIFIED | The client did not connect in this sandbox; local stdio worked. Re-verify on the target deployment. |
+
+No model-dependent test is reported as green. The retrieval evaluator, which
+does not invoke a chat model, passed.

@@ -1,7 +1,21 @@
+import { spawnSync, type SpawnSyncOptions } from 'node:child_process';
 import { randomUUID, createHash, randomBytes } from 'node:crypto';
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync
+} from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { BrainConfig, CredentialRecord, ResultDelivery } from '../../src/config/schema.js';
@@ -574,6 +588,609 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
     close: async () => {
       await runtime.close();
       await rm(root, { recursive: true, force: true }).catch(() => undefined);
+    }
+  };
+}
+
+const DOCKER_REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
+const DOCKER_WORK_ROOT = '/tmp/opencode';
+const DOCKER_SUITE_TIMEOUT_MS = 2_400_000;
+const DOCKER_PRINCIPAL_IDS = ['owner', 'project-worker', 'project-reviewer'] as const;
+const DOCKER_FORBIDDEN_QUERY = 'private project marker';
+
+const DOCKER_COPY_ITEMS = [
+  'Dockerfile',
+  '.dockerignore',
+  'package.json',
+  'package-lock.json',
+  'tsconfig.json',
+  'tsconfig.build.json',
+  'compose.yaml',
+  '.env.example',
+  'src',
+  'scripts',
+  'config'
+] as const;
+
+export interface DockerToolResponse {
+  isError: boolean;
+  structured: unknown;
+  text: string | undefined;
+  error?: { code?: number; message: string };
+}
+
+export interface DockerFixtureReceipt {
+  id: string;
+  revision_id: string;
+  etag?: string;
+  warnings: string[];
+}
+
+export interface DockerHarness {
+  workDir: string;
+  project: string;
+  port: number;
+  url: string;
+  vaultPath: string;
+  principalIds: readonly string[];
+  timeoutMs: number;
+  callAs(principalId: string, tool: string, args: unknown): Promise<DockerToolResponse>;
+  listToolsAs(principalId: string): Promise<string[]>;
+  captureAs(
+    principalId: string,
+    scope: string,
+    note: unknown,
+    idempotencyKey?: string
+  ): Promise<DockerToolResponse>;
+  approveAs(
+    principalId: string,
+    scope: string,
+    id: string,
+    expectedEtag: string,
+    rationale: string
+  ): Promise<DockerToolResponse>;
+  recallAs(
+    principalId: string,
+    scope: string,
+    query: string,
+    extra?: Record<string, unknown>
+  ): Promise<DockerToolResponse>;
+  seedNote(principalId: string, scope: string, note: unknown): Promise<DockerFixtureReceipt>;
+  seedForbiddenMarker(marker: string): Promise<DockerFixtureReceipt>;
+  vaultFiles(relativeDir?: string): Promise<string[]>;
+  readVaultFile(relativePath: string): Promise<string>;
+  writeVaultFile(relativePath: string, content: string): Promise<void>;
+  symlinkInVault(linkRelativePath: string, target: string): Promise<void>;
+  compose(
+    args: string[],
+    allowFailure?: boolean
+  ): { status: number | null; stdout: string; stderr: string };
+  docker(
+    args: string[],
+    allowFailure?: boolean
+  ): { status: number | null; stdout: string; stderr: string };
+  restartBrain(): Promise<void>;
+  waitForHealth(timeoutMs?: number): Promise<void>;
+  close(): Promise<void>;
+}
+
+function dockerSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function dockerFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      if (address === null || typeof address === 'string') {
+        reject(new Error('could not allocate a free port'));
+        return;
+      }
+      const port = address.port;
+      server.close(() => resolve(port));
+    });
+  });
+}
+
+function normalizeDockerToolResult(result: unknown): DockerToolResponse {
+  const record =
+    typeof result === 'object' && result !== null ? (result as Record<string, unknown>) : {};
+  const content = Array.isArray(record.content) ? record.content : [];
+  const text = content
+    .filter(
+      (entry) =>
+        typeof entry === 'object' &&
+        entry !== null &&
+        (entry as { type?: unknown }).type === 'text' &&
+        typeof (entry as { text?: unknown }).text === 'string'
+    )
+    .map((entry) => (entry as { text: string }).text)
+    .join('\n');
+  return {
+    isError: record.isError === true,
+    structured: record.structuredContent,
+    text: text.length > 0 ? text : undefined
+  };
+}
+
+function structuredReceipt(response: DockerToolResponse): DockerFixtureReceipt | undefined {
+  const structured = response.structured;
+  if (typeof structured !== 'object' || structured === null) return undefined;
+  const record = structured as Record<string, unknown>;
+  if (typeof record.id !== 'string' || typeof record.revision_id !== 'string') return undefined;
+  const warnings = Array.isArray(record.warnings)
+    ? record.warnings.filter((entry): entry is string => typeof entry === 'string')
+    : [];
+  return {
+    id: record.id,
+    revision_id: record.revision_id,
+    ...(typeof record.etag === 'string' ? { etag: record.etag } : {}),
+    warnings
+  };
+}
+
+function readImagesEnv(): { node: string; memory: string } {
+  const text = readFileSync(join(DOCKER_REPO_ROOT, 'config/images.env'), 'utf8');
+  let node = '';
+  let memory = '';
+  for (const line of text.split('\n')) {
+    const [key, ...rest] = line.split('=');
+    if (key === 'NODE_IMAGE') node = rest.join('=');
+    if (key === 'BASIC_MEMORY_IMAGE') memory = rest.join('=');
+  }
+  if (!node.includes('@sha256:') || !memory.includes('@sha256:')) {
+    throw new Error('config/images.env does not contain digest-pinned images');
+  }
+  return { node, memory };
+}
+
+export async function startDockerHarness(): Promise<DockerHarness> {
+  if (process.env.BRAIN_SKIP_DOCKER_E2E === '1') {
+    throw new Error('BRAIN_SKIP_DOCKER_E2E is set; the Docker e2e suite must run as an explicit job');
+  }
+  const images = readImagesEnv();
+  const probe = spawnSync('docker', ['version', '--format', '{{.Server.Version}}'], {
+    encoding: 'utf8'
+  });
+  if (probe.status !== 0) {
+    throw new Error(`Docker is unavailable: ${probe.stdout ?? ''}${probe.stderr ?? ''}`);
+  }
+
+  const workDir = mkdtempSync(join(DOCKER_WORK_ROOT, 'brain-docker-'));
+  const project = `braindocker${process.pid}${Math.floor(Math.random() * 1000)}`;
+  const port = await dockerFreePort();
+  const vaultPath = join(workDir, 'docker-vault');
+  const modelCacheSeed = process.env.BRAIN_E2E_MODEL_CACHE;
+
+  const runDocker = (
+    args: string[],
+    allowFailure = false
+  ): { status: number | null; stdout: string; stderr: string } => {
+    const options: SpawnSyncOptions = {
+      encoding: 'utf8',
+      maxBuffer: 256 * 1024 * 1024,
+      cwd: workDir,
+      env: {
+        ...process.env,
+        COMPOSE_PROJECT_NAME: project,
+        NODE_IMAGE: images.node,
+        BASIC_MEMORY_IMAGE: images.memory,
+        VAULT_PATH: vaultPath,
+        BRAIN_PORT: String(port),
+        BRAIN_UID: '1000',
+        BRAIN_GID: '1000'
+      }
+    };
+    const result = spawnSync('docker', args, options);
+    const stdout = String(result.stdout ?? '');
+    const stderr = String(result.stderr ?? '');
+    if (result.error !== undefined) throw result.error;
+    if (result.status !== 0 && !allowFailure) {
+      throw new Error(`docker ${args.join(' ')} exited ${String(result.status)}\n${stdout}\n${stderr}`);
+    }
+    return { status: result.status, stdout, stderr };
+  };
+
+  const compose = (args: string[], allowFailure = false) =>
+    runDocker(['compose', '-p', project, '-f', 'compose.yaml', ...args], allowFailure);
+
+  const principalNames = [...DOCKER_PRINCIPAL_IDS] as string[];
+  const tokens = new Map<string, string>();
+  const credentials = principalNames.map((name) => {
+    const token = newToken();
+    tokens.set(name, token);
+    const scopes = ['freellmapi', 'shared', 'profile'];
+    const principal =
+      name === 'owner'
+        ? {
+            id: randomUUID(),
+            role: 'owner' as const,
+            read_scopes: [...scopes],
+            write_scopes: [...scopes],
+            review_scopes: [...scopes]
+          }
+        : name === 'project-worker'
+          ? {
+              id: randomUUID(),
+              role: 'worker' as const,
+              read_scopes: ['freellmapi', 'shared'],
+              write_scopes: ['freellmapi'],
+              review_scopes: [] as string[]
+            }
+          : {
+              id: randomUUID(),
+              role: 'reviewer' as const,
+              read_scopes: ['freellmapi', 'shared'],
+              write_scopes: ['freellmapi'],
+              review_scopes: ['freellmapi']
+            };
+    return { token_sha256: tokenDigest(token), principal };
+  });
+
+  const tokenFor = (principalId: string): string => {
+    const token = tokens.get(principalId);
+    if (token === undefined) {
+      throw new Error(`unknown docker principal: ${principalId}`);
+    }
+    return token;
+  };
+
+  let closed = false;
+
+  const callAs = async (
+    principalId: string,
+    tool: string,
+    args: unknown
+  ): Promise<DockerToolResponse> => {
+    const token = tokenFor(principalId);
+    const client = new Client({ name: 'second-brain-docker-e2e', version: '1.0.0' });
+    try {
+      await client.connect(
+        new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), {
+          requestInit: { headers: { Authorization: `Bearer ${token}` } }
+        })
+      );
+    } catch (error) {
+      await client.close().catch(() => undefined);
+      return {
+        isError: true,
+        structured: undefined,
+        text: undefined,
+        error: { message: error instanceof Error ? error.message : String(error) }
+      };
+    }
+    try {
+      const result = await client.callTool({
+        name: tool,
+        arguments: (args ?? {}) as Record<string, unknown>
+      });
+      return normalizeDockerToolResult(result);
+    } catch (error) {
+      return {
+        isError: true,
+        structured: undefined,
+        text: undefined,
+        error: {
+          ...(typeof (error as { code?: unknown }).code === 'number'
+            ? { code: (error as { code: number }).code }
+            : {}),
+          message: error instanceof Error ? error.message : String(error)
+        }
+      };
+    } finally {
+      await client.close().catch(() => undefined);
+    }
+  };
+
+  const recallAs = (
+    principalId: string,
+    scope: string,
+    query: string,
+    extra: Record<string, unknown> = {}
+  ): Promise<DockerToolResponse> =>
+    callAs(principalId, 'brain_recall', { scope, query, ...extra });
+
+  const statusOperation = async (
+    principalId: string,
+    operationId: string
+  ): Promise<DockerToolResponse> =>
+    callAs(principalId, 'brain_status', { operation_id: operationId });
+
+  const resolveReceipt = async (
+    principalId: string,
+    response: DockerToolResponse
+  ): Promise<DockerFixtureReceipt> => {
+    if (response.isError) {
+      throw new Error(`capture failed: ${JSON.stringify(response)}`);
+    }
+    const receipt = structuredReceipt(response);
+    if (receipt === undefined) {
+      throw new Error(`capture did not return a receipt: ${JSON.stringify(response.structured)}`);
+    }
+    if (receipt.etag !== undefined) return receipt;
+    const structured = response.structured as { operation_id?: unknown };
+    const operationId =
+      typeof structured.operation_id === 'string' ? structured.operation_id : undefined;
+    if (operationId === undefined) return receipt;
+    const deadline = Date.now() + 60_000;
+    let etag: string | undefined = receipt.etag;
+    while (Date.now() < deadline && etag === undefined) {
+      const status = await statusOperation(principalId, operationId);
+      const operation = (status.structured as { operation?: { etag?: unknown } } | undefined)
+        ?.operation;
+      if (typeof operation?.etag === 'string') etag = operation.etag;
+      else await dockerSleep(1_000);
+    }
+    return { ...receipt, ...(etag === undefined ? {} : { etag }) };
+  };
+
+  const captureAs = (
+    principalId: string,
+    scope: string,
+    note: unknown,
+    idempotencyKey?: string
+  ): Promise<DockerToolResponse> =>
+    callAs(principalId, 'brain_capture', {
+      idempotency_key: idempotencyKey ?? randomUUID(),
+      scope,
+      note
+    });
+
+  const approveAs = (
+    principalId: string,
+    scope: string,
+    id: string,
+    expectedEtag: string,
+    rationale: string
+  ): Promise<DockerToolResponse> =>
+    callAs(principalId, 'brain_review', {
+      scope,
+      operation: {
+        action: 'approve',
+        idempotency_key: randomUUID(),
+        id,
+        expected_etag: expectedEtag,
+        rationale
+      }
+    });
+
+  const seedNote = async (
+    principalId: string,
+    scope: string,
+    note: unknown
+  ): Promise<DockerFixtureReceipt> => resolveReceipt(principalId, await captureAs(principalId, scope, note));
+
+  const seedForbiddenMarker = async (marker: string): Promise<DockerFixtureReceipt> => {
+    const note = {
+      title: `Private project marker ${marker}`,
+      tags: ['synthetic', 'profile-marker'],
+      content: {
+        kind: 'note',
+        summary: `Private project marker ${marker}`,
+        body_markdown: `This owner-only profile note is a private project marker: ${marker}.`
+      },
+      evidence: [],
+      related_ids: []
+    };
+    const receipt = await seedNote('owner', 'profile', note);
+    if (receipt.etag === undefined) {
+      throw new Error('the forbidden marker fixture did not expose an etag for approval');
+    }
+    const approved = await approveAs(
+      'owner',
+      'profile',
+      receipt.id,
+      receipt.etag,
+      'synthetic forbidden-marker fixture approval'
+    );
+    if (approved.isError) {
+      throw new Error(`the forbidden marker fixture could not be approved: ${JSON.stringify(approved)}`);
+    }
+    const deadline = Date.now() + 120_000;
+    let ready = false;
+    while (Date.now() < deadline && !ready) {
+      const recalled = await recallAs('owner', 'profile', DOCKER_FORBIDDEN_QUERY);
+      ready = !recalled.isError && JSON.stringify(recalled.structured).includes(marker);
+      if (!ready) await dockerSleep(2_000);
+    }
+    if (!ready) {
+      throw new Error('the forbidden marker fixture never became recallable by its owner');
+    }
+    return receipt;
+  };
+
+  const vaultFiles = async (relativeDir = ''): Promise<string[]> => {
+    const base = relativeDir.length === 0 ? vaultPath : join(vaultPath, relativeDir);
+    const found: string[] = [];
+    const walk = (directory: string): void => {
+      if (!existsSync(directory)) return;
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const absolute = join(directory, entry.name);
+        if (entry.isDirectory()) walk(absolute);
+        else found.push(relative(vaultPath, absolute).split(sep).join('/'));
+      }
+    };
+    walk(base);
+    return found.sort();
+  };
+
+  const waitForHealth = async (timeoutMs = 900_000): Promise<void> => {
+    const deadline = Date.now() + timeoutMs;
+    let last = '';
+    while (Date.now() < deadline) {
+      const result = compose(
+        ['exec', '-T', 'brain', 'node', 'dist/cli.js', 'health'],
+        true
+      );
+      if (result.status === 0) return;
+      last = `${result.stdout}${result.stderr}`;
+      await dockerSleep(5_000);
+    }
+    throw new Error(`the Docker gateway never reported healthy: ${last}`);
+  };
+
+  try {
+    for (const item of DOCKER_COPY_ITEMS) {
+      cpSync(join(DOCKER_REPO_ROOT, item), join(workDir, item), { recursive: true });
+    }
+
+    const setup = spawnSync('bash', ['scripts/setup.sh'], {
+      encoding: 'utf8',
+      maxBuffer: 256 * 1024 * 1024,
+      cwd: workDir,
+      env: {
+        ...process.env,
+        COMPOSE_PROJECT_NAME: project,
+        NODE_IMAGE: images.node,
+        BASIC_MEMORY_IMAGE: images.memory,
+        VAULT_PATH: vaultPath,
+        BRAIN_PORT: String(port),
+        BRAIN_UID: '1000',
+        BRAIN_GID: '1000',
+        BRAIN_SETUP_OWNER_CREDENTIAL: '1'
+      }
+    });
+    if (setup.status !== 0) {
+      throw new Error(`setup.sh failed: ${setup.stdout ?? ''}${setup.stderr ?? ''}`);
+    }
+
+    writeFileSync(
+      join(workDir, 'secrets', 'credentials.json'),
+      `${JSON.stringify({ credentials }, null, 2)}\n`,
+      'utf8'
+    );
+    writeFileSync(join(workDir, 'secrets', 'brain-token'), `${tokenFor('owner')}\n`, 'utf8');
+    runDocker([
+      'run',
+      '--rm',
+      '--user',
+      '0:0',
+      '-v',
+      `${join(workDir, 'secrets')}:/secrets`,
+      images.node,
+      'sh',
+      '-c',
+      'chown -R 1000:1000 /secrets && chmod 700 /secrets && chmod 600 /secrets/*'
+    ]);
+
+    if (modelCacheSeed !== undefined && modelCacheSeed.length > 0 && existsSync(modelCacheSeed)) {
+      runDocker([
+        'run',
+        '--rm',
+        '--user',
+        '0:0',
+        '-v',
+        `${project}_model-cache:/cache`,
+        '-v',
+        `${modelCacheSeed}:/seed:ro`,
+        images.node,
+        'sh',
+        '-c',
+        'cp -a /seed/. /cache/ 2>/dev/null || true; chown -R 1000:1000 /cache'
+      ]);
+    }
+
+    compose(['up', '-d', '--build']);
+    await waitForHealth();
+  } catch (error) {
+    try {
+      compose(['down', '-v', '--remove-orphans'], true);
+    } catch {
+      undefined;
+    }
+    rmSync(workDir, { recursive: true, force: true });
+    throw error;
+  }
+
+  return {
+    workDir,
+    project,
+    port,
+    url: `http://127.0.0.1:${port}/mcp`,
+    vaultPath,
+    principalIds: principalNames,
+    timeoutMs: DOCKER_SUITE_TIMEOUT_MS,
+    callAs,
+    async listToolsAs(principalId: string): Promise<string[]> {
+      const token = tokenFor(principalId);
+      const client = new Client({ name: 'second-brain-docker-tools', version: '1.0.0' });
+      try {
+        await client.connect(
+          new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), {
+            requestInit: { headers: { Authorization: `Bearer ${token}` } }
+          })
+        );
+        const listed = await client.listTools();
+        return listed.tools.map((tool) => tool.name);
+      } finally {
+        await client.close().catch(() => undefined);
+      }
+    },
+    captureAs,
+    approveAs,
+    recallAs,
+    seedNote,
+    seedForbiddenMarker,
+    vaultFiles,
+    async readVaultFile(relativePath: string): Promise<string> {
+      return readFile(join(vaultPath, relativePath), 'utf8');
+    },
+    async writeVaultFile(relativePath: string, content: string): Promise<void> {
+      writeFileSync(join(vaultPath, relativePath), content, 'utf8');
+    },
+    async symlinkInVault(linkRelativePath: string, target: string): Promise<void> {
+      const absolute = join(vaultPath, linkRelativePath);
+      await mkdir(dirname(absolute), { recursive: true });
+      symlinkSync(target, absolute);
+    },
+    compose,
+    docker: runDocker,
+    async restartBrain(): Promise<void> {
+      compose(['restart', 'brain']);
+      await waitForHealth();
+    },
+    waitForHealth,
+    async close(): Promise<void> {
+      if (closed) return;
+      closed = true;
+      if (modelCacheSeed !== undefined && modelCacheSeed.length > 0) {
+        try {
+          mkdirSync(modelCacheSeed, { recursive: true });
+          runDocker(
+            [
+              'run',
+              '--rm',
+              '--user',
+              '0:0',
+              '-v',
+              `${project}_model-cache:/cache`,
+              '-v',
+              `${modelCacheSeed}:/seed`,
+              images.node,
+              'sh',
+              '-c',
+              'cp -a /cache/. /seed/ 2>/dev/null || true'
+            ],
+            true
+          );
+        } catch {
+          undefined;
+        }
+      }
+      try {
+        compose(['down', '-v', '--remove-orphans'], true);
+      } catch {
+        undefined;
+      }
+      for (const name of ['brain-state', 'memory-state', 'model-cache']) {
+        spawnSync('docker', ['volume', 'rm', '-f', `${project}_${name}`], { encoding: 'utf8' });
+      }
+      spawnSync('docker', ['image', 'rm', '-f', `${project}-brain`], { encoding: 'utf8' });
+      rmSync(workDir, { recursive: true, force: true });
     }
   };
 }

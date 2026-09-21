@@ -309,3 +309,92 @@ documentation and the installed binary, not against that schema.
 
 Full detail and raw sanitized results: `docs/evaluation.md` and
 `tests/eval/results/`.
+
+## Task 20 release gate
+
+Observed on the execution host on 2026-09-21. The branch was `feat/second-brain`
+at commit `172cd82` plus the Task 20 working changes. Every command below was
+run synchronously and its raw output is preserved under
+`/tmp/opencode/task20-gate/`.
+
+### Observed runtime
+
+| Component | Version |
+|---|---|
+| Node.js (host) | v24.21.0 |
+| npm | 11.19.0 |
+| Docker Engine | 28.0.1 |
+| Docker Compose plugin | v2.33.1 |
+| TypeScript | 7.0.2 |
+| Vitest | 5.0.1 |
+
+Container inputs are the digest-pinned references from `config/images.env`
+(Node `sha256:ebfe2f90...`, Basic Memory `sha256:939f1173...`). No floating tag
+was used.
+
+### Command results
+
+| Command | Result |
+|---|---|
+| `npm ci` | Exit 0. npm warned that `better-sqlite3@13.0.3` and `esbuild@0.28.2` have install scripts not covered by the local `allowScripts` policy; the locked tree still installed and all suites ran. |
+| `npm run verify` | Exit 0. `tsc --noEmit` clean; 278 unit + contract tests passed in 16 files; production build succeeded. |
+| `npm run test:integration` | Exit 0. 252 tests passed in 10 files (59.68 s). |
+| `npm run test:e2e` | Exit 0. 57 tests passed in 5 files (770.56 s): `operations` 11, `docker` 7, `security` 15, `lifecycle` 8, `recovery` 16. |
+| `npm run eval:retrieval` | Exit 0, gate pass. Run `retrieval-2026-09-21T03:34:10.928Z-0d9d2d58`: 11 notes, 23 queries, recall@5 = 1 (target >= 0.8), precision@5 = 0.5262, 14 positives, 9/9 negatives empty, 0 leakage events, mean 58.4 ms. This is a lexical fixture ranker, not Basic Memory embeddings. |
+| `docker compose config` | Exit 0. Interpolated the pinned digests; one published port `host_ip: 127.0.0.1`, `published: "7331"`, `target: 7331`; the backend had no published port. |
+| `docker compose up -d --build` | Exit 0. Built the gateway image and started `brain` and `memory` with synthetic volumes. |
+| `docker compose exec brain node dist/cli.js health` | First attempt returned `the health check failed: fetch failed` while the gateway was still starting; the next poll returned `healthy` (exit 0). |
+
+### Fresh-vault, restart, backup/restore, and session
+
+Observed with `COMPOSE_PROJECT_NAME=secondbrain-gate` and a fresh empty
+`VAULT_PATH=/tmp/opencode/task20-gate/vault`:
+
+- **Fresh start.** `setup.sh` seeded the three Basic Memory projects; `up -d
+  --build` started both services; health became `healthy`.
+- **Restart.** `docker compose restart brain` followed by health returned
+  `healthy` on the first poll.
+- **End-to-end session.** A new MCP client session captured a lesson
+  (`outcome: stored`), approved it through `brain_review` (`outcome: stored`),
+  recalled it (`recall_found: true`, 1 item), and read it back
+  (`read_ok: true`) over `http://127.0.0.1:7331/mcp`.
+- **Cold backup.** `scripts/backup.sh … --yes` stopped both services, archived
+  `vault`, `brain-state`, `memory-state`, and `model-cache` with a manifest and
+  checksums (5 declared files), and restarted both services from the exit trap.
+- **Restore.** `scripts/restore.sh … --check` reported
+  `backup is valid (format=1 schema=1 files=5)`; `--acknowledge` extracted into
+  a fresh directory.
+- **Restored operational state.** The restored `brain-state/journal.db` opened
+  read-only and contained 2 operations, 1 retrieval event, and schema migrations
+  4, confirming that journal and retrieval state survive the cold backup.
+- **Materialization confirmation (Task 8 follow-up).** Both the candidate and
+  the approved materialized files carried only gateway-owned frontmatter keys
+  (`title`, `type`, `permalink`, `tags`, `created`, `modified`, `brain_*`); no
+  Basic Memory-injected key was observed. The capture returned
+  `materialized: true`, which requires the coordinator's strict same-plan
+  payload-hash match, so the pinned backend did not break authorization or
+  materialization with injected keys.
+- **WAL safety (Task 5/R07 follow-up).** The `brain-state` archive is taken
+  while both services are stopped, so `journal.db` and any `-wal`/`-shm`
+  companions inside the volume are captured together; the restored database
+  opened cleanly and preserved the operation/retrieval rows.
+
+### Known test-history note
+
+An earlier full `test:e2e` run failed one lifecycle test. The cause was a
+test-fixture defect: the human-edit test selected the first Markdown file in
+the note directory, which could be the retained candidate revision rather than
+the approved head, so the edit changed a parent and produced a real
+`parent_hash_mismatch` conflict. The test now targets the approved revision
+file by its revision ID, and the final full run above is green. No product code
+changed for this.
+
+### Not run
+
+- **Instruction/agent pilot** (`tests/eval/run.mts --mode instruction|agent`):
+  NOT RUN, no approved chat-model budget.
+- **Remote Streamable-HTTP MCP client transport**: NOT VERIFIED in this sandbox
+  (the local stdio probe worked). The remote transport remains the production
+  path and must be re-verified on the target deployment.
+- **24-run agent pilot**: NOT RUN (same budget/provider blocker as Task 19).
+
