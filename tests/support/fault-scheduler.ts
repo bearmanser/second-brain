@@ -110,6 +110,36 @@ export function wrapJournal(journal: Journal, scheduler: FaultScheduler): Journa
     listFeedback(scope?: string): FeedbackEntry[] {
       return journal.listFeedback(scope);
     },
+    hasUnresolvedQualityConcern(scope: string, logical_id: string, revision_id: string): boolean {
+      return journal.hasUnresolvedQualityConcern(scope, logical_id, revision_id);
+    },
+    getApprovalProvenance(operation_id: string) {
+      return journal.getApprovalProvenance(operation_id);
+    },
+    hasOperationalHistory(): boolean {
+      return journal.hasOperationalHistory();
+    },
+    acknowledgeOperationalLoss(): void {
+      journal.acknowledgeOperationalLoss();
+    },
+    hasOperationalLossAcknowledgement(): boolean {
+      return journal.hasOperationalLossAcknowledgement();
+    },
+    storeReadCursor(payload_json: string, expires_at: string): number {
+      return journal.storeReadCursor(payload_json, expires_at);
+    },
+    updateReadCursor(cursor_id: number, payload_json: string, expires_at: string): void {
+      journal.updateReadCursor(cursor_id, payload_json, expires_at);
+    },
+    deleteReadCursor(cursor_id: number): void {
+      journal.deleteReadCursor(cursor_id);
+    },
+    getReadCursor(cursor_id: number): string | undefined {
+      return journal.getReadCursor(cursor_id);
+    },
+    pruneReadCursors(now: Date): number {
+      return journal.pruneReadCursors(now);
+    },
     purgeFeedback(scope: string): number {
       return journal.purgeFeedback(scope);
     },

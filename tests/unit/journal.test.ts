@@ -299,6 +299,45 @@ test('prunes only terminal payloads older than seven days', () => {
   journal.close();
 });
 
+test('keeps compact approval provenance after pruning recovery payloads', () => {
+  const clock = new TestClock('2026-09-01T00:00:00.000Z');
+  const journal = Journal.open(':memory:', { clock, ids: new SequenceIds() });
+  const operation = journal.reserve(reservation({ idempotency_key: 'approved' }));
+  const base = samplePlan(fixtureIds.revision);
+  const approval = {
+    principal_id: '00000000-0000-4000-8000-000000000002',
+    rationale: 'reviewed',
+    payload_hash: 'b'.repeat(64)
+  };
+  const plan = { ...base, revision: { ...base.revision, status: 'active' as const, approval } };
+  journal.savePlan(operation.record.operation_id, plan);
+  journal.mark(operation.record.operation_id, 'submitted');
+  journal.mark(operation.record.operation_id, 'complete', receiptFor(operation.record.operation_id));
+  clock.advance(8 * 24 * 60 * 60 * 1000);
+
+  expect(journal.pruneTerminalPayloads(clock.now())).toBe(1);
+  expect(journal.getApprovalProvenance(operation.record.operation_id)).toMatchObject({
+    operation_id: operation.record.operation_id,
+    principal_id: '00000000-0000-4000-8000-000000000002',
+    payload_hash: 'b'.repeat(64)
+  });
+  expect(journal.reserve(reservation({ idempotency_key: 'approved' })).record.receipt_json).toBe(
+    JSON.stringify(receiptFor(operation.record.operation_id))
+  );
+  journal.close();
+});
+
+test('retains explicit operational-loss acknowledgement until real history begins', () => {
+  const journal = Journal.open(':memory:');
+  expect(journal.hasOperationalLossAcknowledgement()).toBe(false);
+  journal.acknowledgeOperationalLoss();
+  expect(journal.hasOperationalLossAcknowledgement()).toBe(true);
+  journal.reserve(reservation());
+  expect(journal.hasOperationalLossAcknowledgement()).toBe(false);
+  expect(() => journal.acknowledgeOperationalLoss()).toThrow(/history exists/);
+  journal.close();
+});
+
 test('uses injected deterministic providers and random UUID defaults', () => {
   const clock = new TestClock('2026-09-20T12:34:56.000Z');
   const journal = Journal.open(':memory:', { clock, ids: new SequenceIds('op') });
@@ -346,7 +385,10 @@ test('applies versioned migrations in order and reruns them idempotently', () =>
     { version: 1 },
     { version: 2 },
     { version: 3 },
-    { version: 4 }
+    { version: 4 },
+    { version: 5 },
+    { version: 6 },
+    { version: 7 }
   ]);
   expect(second.get(record.record.operation_id)?.idempotency_key).toBe('c1');
   probe.close();

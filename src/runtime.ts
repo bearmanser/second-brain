@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile } from 'node:fs/promises';
-import { unwatchFile, watchFile, type StatWatcher } from 'node:fs';
+import { existsSync, unwatchFile, watchFile, type StatWatcher } from 'node:fs';
 import { createServer, type Server as HttpServer } from 'node:http';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
@@ -137,17 +137,88 @@ function buildServices(
 
 function trackedServices(
   services: BrainServices,
-  guard: <T>(work: () => Promise<T>) => Promise<T>
+  guard: <T>(work: () => Promise<T>) => Promise<T>,
+  readGuard: <T>(signal: AbortSignal, work: () => Promise<T>) => Promise<T>
 ): BrainServices {
   return {
     ...services,
     capture: (ctx, request) => guard(() => services.capture(ctx, request)),
-    review: (ctx, request) => guard(() => services.review(ctx, request)),
-    recall: (ctx, request) => guard(() => services.recall(ctx, request)),
-    read: (ctx, request) => guard(() => services.read(ctx, request)),
+    review: (ctx, request) =>
+      request.operation.action === 'list'
+        ? readGuard(ctx.signal, () => services.review(ctx, request))
+        : guard(() => services.review(ctx, request)),
+    recall: (ctx, request) => readGuard(ctx.signal, () => services.recall(ctx, request)),
+    read: (ctx, request) => readGuard(ctx.signal, () => services.read(ctx, request)),
     feedback: (ctx, request) => guard(() => services.feedback(ctx, request)),
-    status: (ctx, request) => guard(() => services.status(ctx, request))
+    status: (ctx, request) => readGuard(ctx.signal, () => services.status(ctx, request))
   };
+}
+
+class ReadLimiter {
+  private readonly limit: number;
+  private active = 0;
+  private readonly waiting: {
+    signal: AbortSignal;
+    resolve: () => void;
+    reject: (error: BrainError) => void;
+    abort: () => void;
+  }[] = [];
+
+  constructor(limit: number) {
+    this.limit = Math.max(1, Math.trunc(limit));
+  }
+
+  async run<T>(signal: AbortSignal, work: () => Promise<T>): Promise<T> {
+    await this.acquire(signal);
+    try {
+      if (signal.aborted) throw new BrainError({ code: 'CANCELLED', message: 'the read was cancelled' });
+      return await work();
+    } finally {
+      this.release();
+    }
+  }
+
+  private acquire(signal: AbortSignal): Promise<void> {
+    if (signal.aborted) {
+      return Promise.reject(new BrainError({ code: 'CANCELLED', message: 'the read was cancelled' }));
+    }
+    if (this.active < this.limit) {
+      this.active += 1;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve, reject) => {
+      const entry = {
+        signal,
+        resolve: (): void => {
+          signal.removeEventListener('abort', entry.abort);
+          this.active += 1;
+          resolve();
+        },
+        reject,
+        abort: (): void => {
+          const index = this.waiting.indexOf(entry);
+          if (index >= 0) this.waiting.splice(index, 1);
+          reject(new BrainError({ code: 'CANCELLED', message: 'the read was cancelled' }));
+        }
+      };
+      signal.addEventListener('abort', entry.abort, { once: true });
+      this.waiting.push(entry);
+    });
+  }
+
+  private release(): void {
+    this.active = Math.max(0, this.active - 1);
+    while (this.active < this.limit) {
+      const next = this.waiting.shift();
+      if (next === undefined) return;
+      if (next.signal.aborted) {
+        next.abort();
+        continue;
+      }
+      next.resolve();
+      return;
+    }
+  }
 }
 
 class BrainRuntimeImpl implements BrainRuntime {
@@ -180,6 +251,7 @@ class BrainRuntimeImpl implements BrainRuntime {
   private reconciling = false;
   private credentialsWatcher: StatWatcher | undefined;
   private credentialsListener: (() => void) | undefined;
+  private readonly readLimiter: ReadLimiter;
 
   constructor(config: BrainConfig, options: RuntimeOptions) {
     this.config = config;
@@ -187,6 +259,7 @@ class BrainRuntimeImpl implements BrainRuntime {
     this.clock = options.clock ?? systemClock;
     this.ids = options.ids ?? systemIds;
     this.log = options.logger ?? silentLogger;
+    this.readLimiter = new ReadLimiter(config.limits.concurrent_reads);
   }
 
   get shutdownSignal(): AbortSignal {
@@ -199,14 +272,29 @@ class BrainRuntimeImpl implements BrainRuntime {
     this.lock = lock;
     let started = false;
     try {
-      const journal = Journal.open(join(this.config.mounts.state, 'journal.db'), {
+      const vault: VaultPort =
+        this.options.vault ?? new FileVault(this.config.mounts.vault, this.config.scopes);
+      const journalPath = join(this.config.mounts.state, 'journal.db');
+      const cataloguePath = join(this.config.mounts.state, 'catalogue.db');
+      const knowledgeExists = await this.knowledgeExists(vault, cataloguePath);
+      if (!existsSync(journalPath) && knowledgeExists) {
+        throw recoveryRequired(
+          'the operation journal is missing while managed knowledge exists; explicit recovery is required'
+        );
+      }
+      const journal = Journal.open(journalPath, {
         clock: this.clock,
         ids: this.ids
       });
       this.journal = journal;
-      const vault: VaultPort =
-        this.options.vault ?? new FileVault(this.config.mounts.vault, this.config.scopes);
-      const catalogue = RevisionCatalogue.open(join(this.config.mounts.state, 'catalogue.db'), {
+      if (knowledgeExists && !journal.hasOperationalHistory()) {
+        if (!journal.hasOperationalLossAcknowledgement()) {
+          throw recoveryRequired(
+            'the operation journal is empty while managed knowledge exists; explicit recovery is required'
+          );
+        }
+      }
+      const catalogue = RevisionCatalogue.open(cataloguePath, {
         vault,
         scopes: this.config.scopes,
         clock: this.clock,
@@ -253,7 +341,11 @@ class BrainRuntimeImpl implements BrainRuntime {
 
       const base = buildServices(deps, this.config.result_delivery, this.log);
       const wrapped = this.options.wrapServices?.(base, deps) ?? base;
-      this.services = trackedServices({ ...base, ...wrapped }, (work) => this.guardOperation(work));
+      this.services = trackedServices(
+        { ...base, ...wrapped },
+        (work) => this.guardOperation(work),
+        (signal, work) => this.guardOperation(() => this.readLimiter.run(signal, work))
+      );
 
       const app = createHttpApp(this);
       const httpServer = createServer(app);
@@ -292,6 +384,15 @@ class BrainRuntimeImpl implements BrainRuntime {
         await this.cleanup();
       }
     }
+  }
+
+  private async knowledgeExists(vault: VaultPort, cataloguePath: string): Promise<boolean> {
+    if (RevisionCatalogue.hasPersistedRevisions(cataloguePath)) return true;
+    for (const scope of this.config.scopes) {
+      const paths = await vault.list(scope.id);
+      if (paths.length > 0) return true;
+    }
+    return false;
   }
 
   trackOperation<T>(work: Promise<T>): Promise<T> {
@@ -366,6 +467,8 @@ class BrainRuntimeImpl implements BrainRuntime {
       const now = this.clock.now();
       journal.pruneRetrievalEvents(now);
       journal.pruneAuditEvents(now);
+      journal.pruneTerminalPayloads(now);
+      journal.pruneReadCursors(now);
     } catch (error) {
       this.log(internalDiagnostic(error));
     }
@@ -381,6 +484,8 @@ class BrainRuntimeImpl implements BrainRuntime {
     this.reconciling = true;
     const work = async (): Promise<void> => {
       try {
+        const recovery = await recoverPending(this.deps);
+        this.logRecovery(recovery);
         const report = await this.deps.mutations.serialize(() => reconcileVault(this.deps));
         this.logReconcile(report);
       } catch (error) {

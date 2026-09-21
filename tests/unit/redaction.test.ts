@@ -156,6 +156,16 @@ test('redacts credentials from a message without inventing content', () => {
   expect(redactString(`token=${ASSIGNMENT_SECRET}`)).not.toContain(ASSIGNMENT_SECRET);
 });
 
+test.each([
+  'sk-abcdefghijklmnopqrstuvwxyz012345',
+  'ghp_abcdefghijklmnopqrstuvwxyz012345',
+  'xoxb-1234567890-secret',
+  'AKIAABCDEFGHIJKLMNOP',
+  'AIzaabcdefghijklmnopqrstuvwxyz1234567890'
+])('redacts every recognizable secret family from arbitrary text', (secret) => {
+  expect(redactString(`backend failed with ${secret}`)).not.toContain(secret);
+});
+
 test('redactValue strips credential-named keys from structured logs', () => {
   const redacted = redactValue({
     authorization: `Bearer ${BEARER_TOKEN}`,

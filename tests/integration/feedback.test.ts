@@ -11,6 +11,8 @@ import {
   retrievalEventFromRecall
 } from '../../src/features/feedback.js';
 import { recall } from '../../src/features/recall.js';
+import { read } from '../../src/features/read.js';
+import { review } from '../../src/features/review.js';
 import { authenticate } from '../../src/security/authenticate.js';
 import { redactError } from '../../src/security/redact.js';
 import type { FeedbackRequest, RecallResult } from '../../src/core/types.js';
@@ -85,6 +87,59 @@ test('repeated usefulness feedback does not create repeated evidence', async () 
   const second = await feedback(reviewerContext, request, h.deps);
   expect(second.feedback_id).toBe(first.feedback_id);
   expect(h.deps.journal.listFeedback('freellmapi')).toHaveLength(1);
+  await h.close();
+});
+
+test('projects unresolved feedback onto the exact revision across restart and not onto a revision', async () => {
+  const h = await createHarness();
+  const head = await h.seed(lessonFixture, { status: 'active' });
+  await feedback(
+    reviewerContext,
+    requestFor(head, { verdict: 'incorrect', reason: 'The benchmark no longer supports this wording.' }),
+    h.deps
+  );
+  const firstRead = await read(
+    reviewerContext,
+    { scope: 'freellmapi', id: head.source.id, revision_id: head.source.revision_id },
+    h.deps
+  );
+  expect(firstRead.source.warnings).toContain(FEEDBACK_WARNING_UNRESOLVED);
+  const firstRecall = await recall(
+    reviewerContext,
+    { scope: 'freellmapi', query: lessonFixture.title, mode: 'text' },
+    h.deps
+  );
+  expect(firstRecall.items[0]?.warnings).toContain(FEEDBACK_WARNING_UNRESOLVED);
+
+  await h.restart();
+  const afterRestart = await read(
+    reviewerContext,
+    { scope: 'freellmapi', id: head.source.id, revision_id: head.source.revision_id },
+    h.deps
+  );
+  expect(afterRestart.source.warnings).toContain(FEEDBACK_WARNING_UNRESOLVED);
+  const revised = await review(
+    reviewerContext,
+    {
+      scope: 'freellmapi',
+      operation: {
+        action: 'revise',
+        id: head.source.id,
+        expected_etag: (await h.deps.catalogue.get('freellmapi', head.source.id)).source.etag,
+        idempotency_key: uuid(),
+        rationale: 'Replace the disputed wording.',
+        note: { ...lessonFixture, title: 'Revised latency lesson' }
+      }
+    },
+    h.deps
+  );
+  if ('items' in revised) throw new Error('expected mutation receipt');
+  const current = await read(
+    reviewerContext,
+    { scope: 'freellmapi', id: head.source.id, revision_id: revised.revision_id },
+    h.deps
+  );
+  expect(current.source.warnings).not.toContain(FEEDBACK_WARNING_UNRESOLVED);
   await h.close();
 });
 

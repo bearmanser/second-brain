@@ -351,10 +351,12 @@ function expectedRelativePath(scope: ScopeConfig, plan: PlannedWrite): string {
 
 export class InstanceLock {
   private readonly lockPath: string;
+  private readonly owner: string;
   private released = false;
 
-  private constructor(lockPath: string) {
+  private constructor(lockPath: string, owner: string) {
     this.lockPath = lockPath;
+    this.owner = owner;
   }
 
   static acquire(stateDir: string, name = 'gateway.lock'): InstanceLock {
@@ -363,12 +365,13 @@ export class InstanceLock {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
         const fd = openSync(lockPath, 'wx', 0o600);
+        const owner = `${JSON.stringify({ pid: process.pid, start_time: InstanceLock.processStartTime(process.pid) })}\n`;
         try {
-          writeSync(fd, `${process.pid}\n`);
+          writeSync(fd, owner);
         } finally {
           closeSync(fd);
         }
-        return new InstanceLock(lockPath);
+        return new InstanceLock(lockPath, owner);
       } catch (error) {
         if (!hasErrno(error, 'EEXIST')) {
           throw recoveryRequired(`instance lock ${lockPath} cannot be created`, undefined, error);
@@ -393,8 +396,30 @@ export class InstanceLock {
     } catch {
       return false;
     }
-    const pid = Number.parseInt(raw.trim(), 10);
+    let pid: number;
+    let recordedStart: string | undefined;
+    try {
+      const parsed = JSON.parse(raw) as { pid?: unknown; start_time?: unknown };
+      pid = typeof parsed.pid === 'number' ? parsed.pid : Number.NaN;
+      recordedStart = typeof parsed.start_time === 'string' ? parsed.start_time : undefined;
+    } catch {
+      pid = Number.parseInt(raw.trim(), 10);
+    }
     if (!Number.isInteger(pid) || pid <= 0) return false;
+    const currentStart = InstanceLock.processStartTime(pid);
+    const stale =
+      currentStart === undefined ||
+      (recordedStart !== undefined && recordedStart !== currentStart) ||
+      (recordedStart === undefined && pid === process.pid);
+    if (stale) {
+      try {
+        if (readFileSync(lockPath, 'utf8') !== raw) return false;
+        unlinkSync(lockPath);
+        return true;
+      } catch {
+        return false;
+      }
+    }
     try {
       process.kill(pid, 0);
       return false;
@@ -409,10 +434,25 @@ export class InstanceLock {
     }
   }
 
+  private static processStartTime(pid: number): string | undefined {
+    let stat: string;
+    try {
+      stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    } catch {
+      return undefined;
+    }
+    const close = stat.lastIndexOf(')');
+    if (close < 0) return undefined;
+    const fields = stat.slice(close + 1).trim().split(/\s+/u);
+    const startTime = fields[19];
+    return typeof startTime === 'string' && /^\d+$/u.test(startTime) ? startTime : undefined;
+  }
+
   release(): void {
     if (this.released) return;
     this.released = true;
     try {
+      if (readFileSync(this.lockPath, 'utf8') !== this.owner) return;
       unlinkSync(this.lockPath);
     } catch {
       return;
@@ -569,9 +609,6 @@ export class MutationCoordinator {
         const wait = await this.awaitMaterialization(scope, persisted);
         if (wait.kind === 'matched') {
           return this.finalize(scope, persisted, wait.matches, record.operation_id, advisory);
-        }
-        if (wait.kind === 'absent') {
-          return this.submit(ctx, scope, persisted, record.operation_id, advisory);
         }
         return this.pending(record.operation_id, persisted, advisory);
       }
@@ -1040,6 +1077,7 @@ export class MutationCoordinator {
       return this.operationReport(record, {
         outcome: 'pending',
         reason: 'not_materialized',
+        blocking: record.state === 'submitted',
         warnings: ['materialization_unconfirmed']
       });
     }

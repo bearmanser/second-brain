@@ -321,6 +321,7 @@ export const toolDefinitions: readonly ToolDefinition[] = TOOL_NAMES.map((name) 
 
 const POINTER_NOTE =
   'The complete result is in structuredContent; set result_delivery: text-json for a client that cannot read structured content.';
+const READ_POINTER_NOTE = 'Complete result: structuredContent.';
 
 const POINTER_FIELDS = [
   'retrieval_id',
@@ -352,17 +353,34 @@ export function sanitizeDiagnostic(message: string): string {
     : collapsed;
 }
 
-function pointerFor(tool: ToolName, result: Record<string, unknown>): Record<string, unknown> {
+export function pointerFor(tool: ToolName, result: Record<string, unknown>): Record<string, unknown> {
   const summary: Record<string, unknown> = {};
   for (const field of POINTER_FIELDS) {
-    if (field in result) summary[field] = result[field];
+    if (field === 'next_cursor' && field in result) summary[field] = true;
+    else if (field in result) summary[field] = result[field];
   }
   if (Array.isArray(result.items)) summary.items = result.items.length;
   if (Array.isArray(result.scopes)) summary.scopes = result.scopes.length;
   if (result.budget !== null && typeof result.budget === 'object') summary.budget = result.budget;
   if (result.health !== null && typeof result.health === 'object') summary.health = result.health;
   if (typeof result.markdown === 'string') summary.markdown_chars = result.markdown.length;
-  return { tool, delivery: 'structured', summary, note: POINTER_NOTE };
+  return {
+    tool,
+    delivery: 'structured',
+    ...(tool === 'brain_read' ? {} : { summary }),
+    note: tool === 'brain_read' ? READ_POINTER_NOTE : POINTER_NOTE
+  };
+}
+
+export function modelVisibleRepresentation(
+  tool: ToolName,
+  result: Record<string, unknown>,
+  delivery: ResultDelivery
+): string {
+  const structured = JSON.stringify(result);
+  return delivery === 'text-json'
+    ? structured
+    : `${structured}\n${JSON.stringify(pointerFor(tool, result))}`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -371,6 +389,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function transmittedBytes(result: ToolCallResult): number {
   return Buffer.byteLength(JSON.stringify(result), 'utf8');
+}
+
+export function toolResultByteLength(
+  tool: ToolName,
+  result: Record<string, unknown>,
+  delivery: ResultDelivery
+): number {
+  const text =
+    delivery === 'text-json' ? JSON.stringify(result) : JSON.stringify(pointerFor(tool, result));
+  return transmittedBytes({ content: [{ type: 'text', text }], structuredContent: result });
 }
 
 export function toToolResult(
@@ -384,7 +412,7 @@ export function toToolResult(
   const text =
     delivery === 'text-json' ? JSON.stringify(result) : JSON.stringify(pointerFor(tool, result));
   const call: ToolCallResult = { content: [{ type: 'text', text }], structuredContent: result };
-  if (transmittedBytes(call) > TOOL_RESULT_MAX_BYTES) {
+  if (toolResultByteLength(tool, result, delivery) > TOOL_RESULT_MAX_BYTES) {
     throw new BrainError({
       code: 'LIMIT_EXCEEDED',
       message: `the ${tool} result exceeds the ${TOOL_RESULT_MAX_BYTES} byte MCP payload limit`

@@ -43,6 +43,7 @@ const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 const MIGRATION_FILE_PATTERN = /^(\d+)-[a-z0-9-]+\.sql$/;
 const AUDIT_TEXT_MAX_LENGTH = 256;
+const OPERATIONAL_LOSS_ACKNOWLEDGEMENT = 'operational_loss_acknowledged';
 
 export const AUDIT_FIELDS = ['request_id', 'tool', 'outcome', 'duration_ms', 'note_count'] as const;
 export type AuditField = (typeof AUDIT_FIELDS)[number];
@@ -98,6 +99,15 @@ export interface Migration {
 export interface ReceiptAvailability {
   materialized?: boolean;
   indexed?: boolean;
+}
+
+export interface ApprovalProvenanceRecord {
+  operation_id: string;
+  scope: string;
+  logical_id: string;
+  revision_id: string;
+  principal_id: string;
+  payload_hash: string;
 }
 
 export interface AuditEvent {
@@ -643,6 +653,7 @@ export class Journal {
         );
       }
       applyMigrations(database, MIGRATIONS_DIRECTORY, clock.now().toISOString());
+      Journal.backfillApprovalProvenance(database);
     } catch (error) {
       database.close();
       if (isBrainError(error)) throw error;
@@ -682,6 +693,7 @@ export class Journal {
       if (stored === undefined) {
         throw recoveryRequired(`operation ${operation_id} was not persisted`);
       }
+      this.clearOperationalLossAcknowledgement();
       if (stored.operation_id === operation_id) return { kind: 'new', record: stored };
       return this.reconcile(value, stored);
     });
@@ -705,6 +717,7 @@ export class Journal {
       this.database
         .prepare('UPDATE operations SET plan_json = ?, updated_at = ? WHERE operation_id = ?')
         .run(payload, timestamp, id);
+      this.persistApprovalProvenance(id, plan);
     });
     run.immediate();
   }
@@ -788,6 +801,83 @@ export class Journal {
       )
       .all(...TERMINAL_STATES) as OperationRow[];
     return rows.map(toRecord);
+  }
+
+  hasOperationalHistory(): boolean {
+    this.assertOpen();
+    const row = this.database
+      .prepare(
+        `SELECT EXISTS(SELECT 1 FROM operations LIMIT 1)
+          OR EXISTS(SELECT 1 FROM feedback_records LIMIT 1) AS present`
+      )
+      .get() as { present: number };
+    return row.present === 1;
+  }
+
+  acknowledgeOperationalLoss(): void {
+    this.assertOpen();
+    if (this.hasOperationalHistory()) {
+      throw recoveryRequired('operational loss cannot be acknowledged while history exists');
+    }
+    this.database
+      .prepare(
+        `INSERT INTO runtime_metadata (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+      )
+      .run(OPERATIONAL_LOSS_ACKNOWLEDGEMENT, this.clock.now().toISOString());
+  }
+
+  hasOperationalLossAcknowledgement(): boolean {
+    this.assertOpen();
+    return (
+      this.database.prepare('SELECT 1 FROM runtime_metadata WHERE key = ?').get(
+        OPERATIONAL_LOSS_ACKNOWLEDGEMENT
+      ) !== undefined
+    );
+  }
+
+  getApprovalProvenance(operation_id: string): ApprovalProvenanceRecord | undefined {
+    this.assertOpen();
+    return this.database
+      .prepare('SELECT * FROM operation_approvals WHERE operation_id = ?')
+      .get(operation_id) as ApprovalProvenanceRecord | undefined;
+  }
+
+  storeReadCursor(payload_json: string, expires_at: string): number {
+    this.assertOpen();
+    const result = this.database
+      .prepare('INSERT INTO read_cursors (payload_json, expires_at) VALUES (?, ?)')
+      .run(payload_json, expires_at);
+    return Number(result.lastInsertRowid);
+  }
+
+  updateReadCursor(cursor_id: number, payload_json: string, expires_at: string): void {
+    this.assertOpen();
+    const result = this.database
+      .prepare('UPDATE read_cursors SET payload_json = ?, expires_at = ? WHERE cursor_id = ?')
+      .run(payload_json, expires_at, cursor_id);
+    if (result.changes !== 1) {
+      throw recoveryRequired(`read cursor ${cursor_id} could not be finalized`);
+    }
+  }
+
+  deleteReadCursor(cursor_id: number): void {
+    this.assertOpen();
+    this.database.prepare('DELETE FROM read_cursors WHERE cursor_id = ?').run(cursor_id);
+  }
+
+  getReadCursor(cursor_id: number): string | undefined {
+    this.assertOpen();
+    const row = this.database
+      .prepare('SELECT payload_json FROM read_cursors WHERE cursor_id = ?')
+      .get(cursor_id) as { payload_json: string } | undefined;
+    return row?.payload_json;
+  }
+
+  pruneReadCursors(now: Date): number {
+    this.assertOpen();
+    return this.database.prepare('DELETE FROM read_cursors WHERE expires_at < ?').run(now.toISOString())
+      .changes;
   }
 
   abort(id: string): void {
@@ -923,6 +1013,7 @@ export class Journal {
       if (stored === undefined) {
         throw recoveryRequired(`feedback ${feedback_id} was not persisted`);
       }
+      this.clearOperationalLossAcknowledgement();
       return { kind: 'new', entry: stored };
     });
     return run.immediate();
@@ -946,6 +1037,18 @@ export class Journal {
             )
             .all(scope) as FeedbackRow[]);
     return rows.map(toFeedback);
+  }
+
+  hasUnresolvedQualityConcern(scope: string, logical_id: string, revision_id: string): boolean {
+    this.assertOpen();
+    return (
+      this.database
+        .prepare(
+          `SELECT 1 AS present FROM feedback_records
+           WHERE scope = ? AND logical_id = ? AND revision_id = ? AND warning = ? LIMIT 1`
+        )
+        .get(scope, logical_id, revision_id, 'unresolved_quality_concern') !== undefined
+    );
   }
 
   purgeFeedback(scope: string): number {
@@ -1013,6 +1116,76 @@ export class Journal {
       });
     }
     return { kind: 'replay', record: existing };
+  }
+
+  private persistApprovalProvenance(id: string, plan: PlannedWrite): void {
+    const approval = plan.revision.approval;
+    if (approval === undefined) return;
+    this.database
+      .prepare(
+        `INSERT INTO operation_approvals (
+          operation_id, scope, logical_id, revision_id, principal_id, payload_hash
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(operation_id) DO NOTHING`
+      )
+      .run(
+        id,
+        plan.revision.scope,
+        plan.revision.id,
+        plan.revision.revision_id,
+        approval.principal_id,
+        approval.payload_hash
+      );
+  }
+
+  private clearOperationalLossAcknowledgement(): void {
+    this.database
+      .prepare('DELETE FROM runtime_metadata WHERE key = ?')
+      .run(OPERATIONAL_LOSS_ACKNOWLEDGEMENT);
+  }
+
+  private static backfillApprovalProvenance(database: Database.Database): void {
+    const rows = database
+      .prepare('SELECT operation_id, plan_json FROM operations WHERE plan_json IS NOT NULL')
+      .all() as { operation_id: string; plan_json: string }[];
+    const insert = database.prepare(
+      `INSERT INTO operation_approvals (
+        operation_id, scope, logical_id, revision_id, principal_id, payload_hash
+      ) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(operation_id) DO NOTHING`
+    );
+    const backfill = database.transaction(() => {
+      for (const row of rows) {
+        let plan: PlannedWrite;
+        try {
+          plan = JSON.parse(row.plan_json) as PlannedWrite;
+        } catch {
+          continue;
+        }
+        const revision = plan?.revision;
+        const approval = revision?.approval;
+        if (
+          revision === undefined ||
+          approval === undefined ||
+          typeof revision.scope !== 'string' ||
+          typeof revision.id !== 'string' ||
+          typeof revision.revision_id !== 'string' ||
+          typeof approval.principal_id !== 'string' ||
+          typeof approval.payload_hash !== 'string'
+        ) {
+          continue;
+        }
+        insert.run(
+          row.operation_id,
+          revision.scope,
+          revision.id,
+          revision.revision_id,
+          approval.principal_id,
+          approval.payload_hash
+        );
+      }
+    });
+    backfill.immediate();
   }
 
   private selectByKey(principal_id: string, idempotency_key: string): OperationRecord | undefined {

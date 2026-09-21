@@ -17,6 +17,7 @@ interface AgentTask {
   title: string;
   prompt: string;
   expected_signal: string;
+  expected_artifact: string;
   memory_keys: string[];
 }
 
@@ -83,6 +84,79 @@ export function parseRetrievedIds(stdout: string): string[] {
   return [...found];
 }
 
+export interface ParsedAgentEvents {
+  answer_text: string;
+  tool_timeline: string[];
+  retrieved_ids: string[];
+  recall_before_substantive_work: boolean;
+  candidates_captured: number;
+  review_performed: boolean;
+  memory_call_events: { tool: string; event_index: number }[];
+}
+
+export function parseAgentEvents(stdout: string): ParsedAgentEvents {
+  const answer: string[] = [];
+  const timeline: string[] = [];
+  const retrieved = new Set<string>();
+  const memoryCalls: { tool: string; event_index: number }[] = [];
+  let firstSubstantive = Number.POSITIVE_INFINITY;
+  let firstRecall = Number.POSITIVE_INFINITY;
+  let captured = 0;
+  let reviewed = false;
+  let eventIndex = 0;
+  for (const line of stdout.split('\n')) {
+    if (!line.startsWith('{')) continue;
+    let event: unknown;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const envelope = event as {
+      type?: unknown;
+      part?: { type?: unknown; text?: unknown; tool?: unknown; state?: { status?: unknown; output?: unknown } };
+    };
+    const part = envelope.part;
+    if (envelope.type === 'text' && typeof part?.text === 'string') {
+      answer.push(part.text);
+      if (part.text.trim().length >= 20 && !Number.isFinite(firstSubstantive)) {
+        firstSubstantive = eventIndex;
+      }
+    }
+    if (typeof part?.tool === 'string' && part.tool.startsWith('brain_')) {
+      const completed = part.state?.status === undefined || part.state.status === 'completed';
+      if (completed) {
+        timeline.push(part.tool);
+        memoryCalls.push({ tool: part.tool, event_index: eventIndex });
+        if (part.tool === 'brain_recall') {
+          firstRecall = Math.min(firstRecall, eventIndex);
+          let output: unknown = part.state?.output;
+          if (typeof output === 'string') {
+            try {
+              output = JSON.parse(output);
+            } catch {}
+          }
+          collectItemIds(output, retrieved);
+        } else if (part.tool === 'brain_capture') {
+          captured += 1;
+        } else if (part.tool === 'brain_review') {
+          reviewed = true;
+        }
+      }
+    }
+    eventIndex += 1;
+  }
+  return {
+    answer_text: answer.join('\n'),
+    tool_timeline: timeline,
+    retrieved_ids: [...retrieved],
+    recall_before_substantive_work: Number.isFinite(firstRecall) && firstRecall < firstSubstantive,
+    candidates_captured: captured,
+    review_performed: reviewed,
+    memory_call_events: memoryCalls
+  };
+}
+
 interface PilotRunRecord {
   run_index: number;
   task_id: string;
@@ -93,6 +167,12 @@ interface PilotRunRecord {
   tool_timeline: string[];
   retrieved_ids: string[];
   retrieved_memory: boolean;
+  instructions_received: boolean | null;
+  tools_available: string[];
+  recall_before_substantive_work: boolean;
+  candidates_captured: number;
+  review_performed: boolean;
+  memory_call_events: { tool: string; event_index: number }[];
   expected_signal_seen: boolean;
   isolation_ok: boolean;
   mcp_launched: boolean;
@@ -201,7 +281,7 @@ async function runOne(
   corpus: CorpusFile,
   opencodeVersion: string
 ): Promise<PilotRunRecord> {
-  const harness = await startHttpHarness();
+  const harness = await startHttpHarness({ result_delivery: 'text-json' });
   const workDir = await mkdtemp(join(tmpdir(), 'brain-agent-'));
   try {
     harness.backend.search = makeLexicalSearch(harness.backend.root);
@@ -273,6 +353,12 @@ async function runOne(
         tool_timeline: [],
         retrieved_ids: [],
         retrieved_memory: false,
+        instructions_received: null,
+        tools_available: [],
+        recall_before_substantive_work: false,
+        candidates_captured: 0,
+        review_performed: false,
+        memory_call_events: [],
         expected_signal_seen: false,
         isolation_ok: false,
         mcp_launched: false,
@@ -293,9 +379,9 @@ async function runOne(
     );
     const elapsed = Date.now() - started;
     const combined = `${outcome.stdout}\n${outcome.stderr}`;
-    const signalSeen = combined.toLowerCase().includes(task.expected_signal.toLowerCase());
-    const retrievedIds = parseRetrievedIds(outcome.stdout);
-    const recallEvents = (outcome.stdout.match(/brain_recall/g) ?? []).length;
+    const events = parseAgentEvents(outcome.stdout);
+    const signalSeen = events.answer_text.toLowerCase().includes(task.expected_signal.toLowerCase());
+    const retrievedIds = events.retrieved_ids;
     const outcomeLabel: PilotRunRecord['outcome'] = outcome.timed_out
       ? 'timeout'
       : outcome.code !== 0
@@ -310,9 +396,15 @@ async function runOne(
       memory_condition: condition,
       model_identifier: model,
       client_version: `opencode ${opencodeVersion}`,
-      tool_timeline: recallEvents > 0 ? ['brain_recall'] : [],
+      tool_timeline: events.tool_timeline,
       retrieved_ids: retrievedIds,
-      retrieved_memory: retrievedIds.length > 0 || recallEvents > 0,
+      retrieved_memory: retrievedIds.length > 0 || events.tool_timeline.includes('brain_recall'),
+      instructions_received: null,
+      tools_available: [...new Set(events.tool_timeline)],
+      recall_before_substantive_work: events.recall_before_substantive_work,
+      candidates_captured: events.candidates_captured,
+      review_performed: events.review_performed,
+      memory_call_events: events.memory_call_events,
       expected_signal_seen: signalSeen,
       isolation_ok: true,
       mcp_launched: true,

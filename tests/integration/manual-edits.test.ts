@@ -525,6 +525,32 @@ test('an approval fingerprint without authenticated journal provenance is untrus
   }
 });
 
+test('removing approval fields from an active revision makes it candidate-effective', async () => {
+  const h = await openHarness();
+  const active = await h.seed(lessonFixture, { status: 'active' });
+  await h.externalEdit(active, (raw) =>
+    raw
+      .split('\n')
+      .filter((line) => !line.startsWith('brain_approv'))
+      .join('\n')
+  );
+  await h.deps.catalogue.reconcile(SCOPE);
+  const changed = await h.deps.catalogue.get(SCOPE, active.source.id);
+  expect(changed.state).toBe('manual_unreviewed');
+  expect(changed.source.status).toBe('candidate');
+  expect(changed.source.warnings).toContain('manual_unreviewed');
+});
+
+test('changing a candidate status to active without approval remains candidate-effective', async () => {
+  const h = await openHarness();
+  const candidate = await h.seed(lessonFixture, { status: 'candidate' });
+  await h.externalEdit(candidate, (raw) => raw.replace('brain_status: candidate', 'brain_status: active'));
+  await h.deps.catalogue.reconcile(SCOPE);
+  const changed = await h.deps.catalogue.get(SCOPE, candidate.source.id);
+  expect(changed.state).toBe('manual_unreviewed');
+  expect(changed.source.status).toBe('candidate');
+});
+
 test('a host edit is visible without a restart and periodic scans stay bounded', async () => {
   const h = await startHttpHarness({ reconcile_interval_ms: 25 });
   const worker = await h.connect(h.token, 'host-edit-worker');

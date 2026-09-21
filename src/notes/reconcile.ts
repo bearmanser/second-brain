@@ -23,6 +23,14 @@ export type { ReconcileFinding, ReconcileReport, ReconcileScopeReport } from '..
 
 interface ApprovalJournal {
   get(operation_id: string): OperationRecord | undefined;
+  getApprovalProvenance(operation_id: string): {
+    operation_id: string;
+    scope: string;
+    logical_id: string;
+    revision_id: string;
+    principal_id: string;
+    payload_hash: string;
+  } | undefined;
 }
 
 interface PlannedApprovalRecord {
@@ -41,6 +49,16 @@ export class JournalApprovalProvenance implements ApprovalProvenance {
   }
 
   verify(input: ApprovalProvenanceInput): boolean {
+    const durable = this.journal.getApprovalProvenance(input.operation_id);
+    if (durable !== undefined) {
+      return (
+        durable.scope === input.scope &&
+        durable.logical_id === input.id &&
+        durable.revision_id === input.revision_id &&
+        durable.principal_id === input.principal_id &&
+        durable.payload_hash === input.payload_hash
+      );
+    }
     const record = this.journal.get(input.operation_id);
     if (record === undefined || record.scope !== input.scope) return false;
     if (record.plan_json === undefined) return false;

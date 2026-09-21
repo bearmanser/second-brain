@@ -446,6 +446,19 @@ test('releases the instance locks when the gateway closes', async () => {
   vaultLock.release();
 });
 
+test('reclaims a lock whose PID was reused by a different process lifetime', async () => {
+  const root = join('/tmp/opencode', `brain-lock-${randomUUID()}`);
+  await mkdir(root, { recursive: true });
+  await writeFile(
+    join(root, 'gateway.lock'),
+    `${JSON.stringify({ pid: process.pid, start_time: 'not-this-process' })}\n`,
+    'utf8'
+  );
+  const lock = InstanceLock.acquire(root);
+  expect(() => InstanceLock.acquire(root)).toThrow(/CONFLICT/);
+  lock.release();
+});
+
 test('reuses deterministic identities across a save-plan fault', async () => {
   const h = await createHarness();
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
@@ -643,7 +656,7 @@ test('does not resend when the vault cannot be enumerated during a submitted rep
   await h.close();
 });
 
-test('resends a submitted operation only after a conclusive zero-match window', async () => {
+test('keeps a submitted operation blocking when no materialization is visible yet', async () => {
   const h = await createHarness();
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   h.backend.fail_once = 'before_write';
@@ -651,8 +664,30 @@ test('resends a submitted operation only after a conclusive zero-match window', 
   expect(first.outcome).toBe('pending');
   expect(h.backend.create_calls).toHaveLength(1);
   const replay = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
-  expect(replay.outcome).toBe('stored');
-  expect(h.backend.create_calls).toHaveLength(2);
+  expect(replay.outcome).toBe('pending');
+  expect(h.backend.create_calls).toHaveLength(1);
+  const report = await h.deps.mutations.recoverDetailed();
+  expect(report.blocking_operations).toContain(first.operation_id);
+  await h.close();
+});
+
+test('running recovery finalizes a late materialization without resubmitting it', async () => {
+  const h = await createHarness();
+  const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
+  h.backend.fail_once = 'before_write';
+  const first = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+  const record = h.deps.journal.pending()[0];
+  const plan = JSON.parse(record.plan_json ?? '') as PlannedWrite;
+  const scope = scopeOf(plan.revision.scope);
+  const absolute = join(h.deps.config.mounts.vault, planRelativePath(plan));
+  await mkdir(dirname(absolute), { recursive: true });
+  await writeFile(absolute, renderRevision(plan.revision, scope), 'utf8');
+
+  const report = await h.deps.mutations.recoverDetailed();
+  expect(report.finalized).toBe(1);
+  expect(report.blocking_operations).not.toContain(first.operation_id);
+  expect(h.deps.journal.get(first.operation_id)?.state).toBe('complete');
+  expect(h.backend.create_calls).toHaveLength(1);
   await h.close();
 });
 

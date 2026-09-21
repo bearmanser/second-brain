@@ -414,8 +414,22 @@ function buildExcerpt(revision: StoredRevision, terms: string[]): { excerpt: str
   return { excerpt: parts.join('\n\n'), section: matched?.title ?? '' };
 }
 
-function toItem(hit: EligibleHit, mode: 'hybrid' | 'text'): RecallResult['items'][number] {
+function toItem(
+  hit: EligibleHit,
+  mode: 'hybrid' | 'text',
+  deps: BrainDeps
+): RecallResult['items'][number] {
   const warnings = [...hit.head.source.warnings];
+  if (
+    deps.journal.hasUnresolvedQualityConcern(
+      hit.head.source.scope,
+      hit.head.source.id,
+      hit.head.source.revision_id
+    ) &&
+    !warnings.includes('unresolved_quality_concern')
+  ) {
+    warnings.push('unresolved_quality_concern');
+  }
   if (hit.head.source.status === 'candidate' && !warnings.includes(RECALL_WARNING_CANDIDATE)) {
     warnings.push(RECALL_WARNING_CANDIDATE);
   }
@@ -548,7 +562,7 @@ export async function recall(
 
   const ranked = rankEligible(eligible, request.phase ?? 'general');
   const limit = resolveLimit(request.limit);
-  const items = ranked.slice(0, limit).map((hit) => toItem(hit, mode));
+  const items = ranked.slice(0, limit).map((hit) => toItem(hit, mode, deps));
   const budget = clampRecallBudget(request.budget_tokens);
 
   return packRecall(
@@ -559,6 +573,7 @@ export async function recall(
       partial,
       warnings
     },
-    budget
+    budget,
+    deps.config.result_delivery
   );
 }

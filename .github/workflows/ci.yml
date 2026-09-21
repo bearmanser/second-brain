@@ -52,13 +52,15 @@ jobs:
           set -euo pipefail
           node -e '
             const fs = require("fs");
-            for (const line of fs.readFileSync("config/images.env", "utf8").split("\n")) {
+           for (const line of fs.readFileSync("config/images.env", "utf8").split("\n")) {
               const [key, ...rest] = line.split("=");
               if (key === "NODE_IMAGE" || key === "BASIC_MEMORY_IMAGE") {
                 fs.appendFileSync(process.env.GITHUB_ENV, `${key}=${rest.join("=")}\n`);
-              }
-            }
-          '
+             }
+           }
+           '
+          export NODE_IMAGE="$(sed -n 's/^NODE_IMAGE=//p' config/images.env)"
+          export BASIC_MEMORY_IMAGE="$(sed -n 's/^BASIC_MEMORY_IMAGE=//p' config/images.env)"
           test -n "$NODE_IMAGE"
           test -n "$BASIC_MEMORY_IMAGE"
       - name: pull pinned images

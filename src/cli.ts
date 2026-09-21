@@ -253,6 +253,7 @@ async function runRebuildCatalogue(parsed: ParsedArguments, env: NodeJS.ProcessE
       malformed += report.malformed;
       unsupported += report.unsupported_schema;
     }
+    if (acceptLoss) journal.acknowledgeOperationalLoss();
     process.stdout.write(
       `catalogue rebuilt for ${config.scopes.map((scope) => scope.id).join(', ')}; ` +
         `scanned ${scanned}, conflicts ${conflicted}, malformed ${malformed}, unsupported ${unsupported}\n`

@@ -17,6 +17,8 @@ const ASSIGNMENT_PATTERN =
   /\b(password|passwd|passphrase|secret|token|api[-_]?key|x-api-key|client[-_]?secret|access[-_]?key|refresh[-_]?token)\b(\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s,;&#"']+)/gi;
 const RECOGNIZABLE_SECRET_PATTERN =
   /\b(sk-[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\-_]{30,})\b/;
+const RECOGNIZABLE_SECRET_REDACTION_PATTERN =
+  /\b(sk-[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\-_]{30,})\b/g;
 
 const MAX_DEPTH = 8;
 
@@ -56,7 +58,8 @@ export function redactString(value: string): string {
   return value
     .replace(PRIVATE_KEY_PATTERN, REDACTED_PRIVATE_KEY)
     .replace(BEARER_PATTERN, REDACTED_BEARER)
-    .replace(ASSIGNMENT_PATTERN, (_match, key: string, separator: string) => `${key}${separator}${REDACTED}`);
+    .replace(ASSIGNMENT_PATTERN, (_match, key: string, separator: string) => `${key}${separator}${REDACTED}`)
+    .replace(RECOGNIZABLE_SECRET_REDACTION_PATTERN, REDACTED);
 }
 
 export interface RedactedError {

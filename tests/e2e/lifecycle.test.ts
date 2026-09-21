@@ -124,6 +124,18 @@ describe('release-candidate lifecycle (real Docker gateway)', () => {
     expect((read.structured as { markdown?: string }).markdown).toContain('restart durability marker delta');
   }, 900_000);
 
+  test('a SIGKILL and container recreation reclaims the retained instance lock', async () => {
+    const note = lessonNote('Crash lock recovery', 'sigkill retained lock marker');
+    const approved = await approveNote(h, 'freellmapi', 'project-reviewer', note);
+    expect(h.compose(['kill', '-s', 'SIGKILL', 'brain']).status).toBe(0);
+    expect(h.compose(['rm', '-f', 'brain']).status).toBe(0);
+    expect(h.compose(['up', '-d', 'brain']).status).toBe(0);
+    await h.waitForHealth(240_000);
+    const read = await readUntilSettled(h, approved.id);
+    expect(read.isError, JSON.stringify(read)).toBe(false);
+    expect((read.structured as { markdown?: string }).markdown).toContain('sigkill retained lock marker');
+  }, 900_000);
+
   test('a human Obsidian edit is detected and never silently overwritten', async () => {
     const note = lessonNote('Human edit case', 'human edit marker epsilon');
     const approved = await approveNote(h, 'freellmapi', 'project-reviewer', note);
@@ -265,7 +277,7 @@ describe('release-candidate lifecycle (real Docker gateway)', () => {
 });
 
 describe('lifecycle recovery and restore verification', () => {
-  test('process death mid-write recovers to a terminal, non-duplicated revision', async () => {
+  test('an uncertain pre-write failure remains pending and is never blindly resubmitted', async () => {
     const h: MemoryHarness = await createHarness();
     try {
       h.backend.fail_once = 'before_write';
@@ -280,20 +292,15 @@ describe('lifecycle recovery and restore verification', () => {
       expect(afterRestart.operations[0].outcome).toBe('pending');
       expect(h.backend.create_calls).toHaveLength(1);
 
-      const completed = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
-      expect(completed.outcome).toBe('stored');
-      expect(completed.operation_id).toBe(first.operation_id);
-      expect(h.deps.journal.get(first.operation_id)?.state).toBe('complete');
-
       const replay = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
-      expect(replay.outcome).toBe('stored');
-      expect(replay.revision_id).toBe(completed.revision_id);
+      expect(replay.outcome).toBe('pending');
+      expect(replay.revision_id).toBe(first.revision_id);
 
       const files = (await h.deps.vault.list('freellmapi')).filter((path) => path.endsWith('.md'));
-      expect(files).toHaveLength(1);
+      expect(files).toHaveLength(0);
       const candidates = await h.deps.catalogue.list('freellmapi', 'candidate');
-      expect(candidates.items.filter((item) => item.id === completed.id)).toHaveLength(1);
-      expect(h.backend.create_calls).toHaveLength(2);
+      expect(candidates.items.filter((item) => item.id === first.id)).toHaveLength(0);
+      expect(h.backend.create_calls).toHaveLength(1);
     } finally {
       await h.close();
     }

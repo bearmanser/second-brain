@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { BrainError, isBrainError } from '../contracts/errors.js';
+import { BrainError } from '../contracts/errors.js';
 import { captureRequestSchema } from '../contracts/protocol.js';
 import type { BrainDeps, MutationAdvisory, MutationIntent, RevisionBuilder } from '../core/mutation.js';
 import { NOTE_KINDS, LIFECYCLES } from '../core/types.js';
@@ -16,6 +16,7 @@ import type {
 import { decodeRevision, makeEtag } from '../notes/codec.js';
 import { resolveScopes } from '../security/authorise.js';
 import { assertNoCredentials } from '../security/redact.js';
+import { authorizeRelatedIds } from './related.js';
 
 const CAPTURE_TOOL = 'brain_capture';
 const DUPLICATE_PAGE_SIZE = 5;
@@ -24,10 +25,6 @@ export const DUPLICATE_DETAILS_WITHHELD = 'duplicate_details_withheld';
 
 function invalidInput(message: string, cause?: unknown): BrainError {
   return new BrainError({ code: 'INVALID_INPUT', message, cause });
-}
-
-function forbidden(message: string): BrainError {
-  return new BrainError({ code: 'FORBIDDEN', message });
 }
 
 function parseCaptureRequest(input: CaptureRequest): CaptureRequest {
@@ -125,41 +122,6 @@ function authorizeScope(
 ): ScopeConfig {
   const [scope] = resolveScopes(ctx.principal, requested, false, 'write', deps.config.scopes);
   return scope;
-}
-
-function readableScopes(ctx: RequestContext, deps: BrainDeps): ScopeConfig[] {
-  return deps.config.scopes.filter((scope) => ctx.principal.read_scopes.includes(scope.id));
-}
-
-async function authorizeRelatedIds(
-  ctx: RequestContext,
-  note: NoteInput,
-  deps: BrainDeps
-): Promise<void> {
-  const targets = [...new Set(note.related_ids)];
-  if (targets.length === 0) return;
-  const scopes = readableScopes(ctx, deps);
-  for (const target of targets) {
-    let visible = false;
-    for (const scope of scopes) {
-      try {
-        await deps.catalogue.get(scope.id, target);
-        visible = true;
-        break;
-      } catch (error) {
-        if (!isBrainError(error)) throw error;
-        if (error.code === 'NOT_FOUND') continue;
-        if (error.code === 'CONFLICT') {
-          visible = true;
-          break;
-        }
-        throw error;
-      }
-    }
-    if (!visible) {
-      throw forbidden(`related note ${target} is not an authorized reference`);
-    }
-  }
 }
 
 function vaultRelativePath(scope: ScopeConfig, relativePath: string): string {
@@ -278,7 +240,7 @@ export async function capture(
   const scope = authorizeScope(ctx, request.scope, deps);
   const note = normalizeNote(request.note);
 
-  await authorizeRelatedIds(ctx, note, deps);
+  await authorizeRelatedIds(ctx, note.related_ids, deps);
   rejectCredentialText(note);
 
   const lookup = await findPossibleDuplicates(ctx, scope, note, deps);

@@ -197,6 +197,26 @@ test('returns an active keyword match with its matching section and source refer
   await h.close();
 });
 
+test('keeps an aged approved note recall-eligible after terminal payload pruning and restart', async () => {
+  const h = await createHarness();
+  const head = await h.seed(lessonFixture, { status: 'active' });
+  const future = new Date(Date.now() + 8 * 24 * 60 * 60 * 1000);
+  expect(h.deps.journal.pruneTerminalPayloads(future)).toBe(1);
+  expect(h.deps.journal.get(head.revision.operation_id)?.plan_json).toBeUndefined();
+
+  await h.restart();
+  const current = await h.deps.catalogue.get('freellmapi', head.revision.id);
+  expect(current.revision.status).toBe('active');
+  expect(current.state).toBe('ready');
+  const result = await recall(
+    reviewerContext,
+    { scope: 'freellmapi', query: 'streaming', phase: 'debugging' },
+    h.deps
+  );
+  expect(result.items.map((item) => item.id)).toContain(head.revision.id);
+  await h.close();
+});
+
 test('finds a semantically paraphrased hit supplied by the backend', async () => {
   const h = await createHarness();
   const head = await h.seed(

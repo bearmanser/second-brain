@@ -37,6 +37,7 @@ const STRING_FIELDS: readonly CursorField[] = [
 const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
 const UTC_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
 const MIN_SECRET_BYTES = 32;
+const STORED_CURSOR_SIGNATURE_BYTES = 16;
 
 function invalid(message: string): BrainError {
   return new BrainError({ code: 'INVALID_INPUT', message });
@@ -79,6 +80,18 @@ function decodeBase64Url(value: string): Buffer {
 
 function signatureOf(body: Buffer, secret: Uint8Array): Buffer {
   return createHmac('sha256', secret).update(body).digest();
+}
+
+export interface CursorStore {
+  storeReadCursor(payload_json: string, expires_at: string): number;
+  updateReadCursor(cursor_id: number, payload_json: string, expires_at: string): void;
+  deleteReadCursor(cursor_id: number): void;
+  getReadCursor(cursor_id: number): string | undefined;
+}
+
+export interface StoredCursorReservation {
+  cursor_id: number;
+  token: string;
 }
 
 function parsePayload(value: unknown): CursorPayload {
@@ -126,6 +139,86 @@ export function signCursor(payload: CursorPayload, secret: Uint8Array): string {
   return `${encodeBase64Url(body)}.${encodeBase64Url(signature)}`;
 }
 
+export function reserveStoredCursor(
+  payload: CursorPayload,
+  secret: Uint8Array,
+  store: CursorStore
+): StoredCursorReservation {
+  requireSecret(secret);
+  const body = canonicalBody(payload);
+  const cursorId = store.storeReadCursor(body.toString('utf8'), payload.expires_at);
+  if (!Number.isSafeInteger(cursorId) || cursorId <= 0) {
+    throw invalid('read cursor store returned an invalid id');
+  }
+  const id = cursorId.toString(36);
+  const signature = signatureOf(Buffer.from(`r1.${id}`, 'utf8'), secret).subarray(
+    0,
+    STORED_CURSOR_SIGNATURE_BYTES
+  );
+  return { cursor_id: cursorId, token: `r1.${id}.${encodeBase64Url(signature)}` };
+}
+
+export function finalizeStoredCursor(
+  reservation: StoredCursorReservation,
+  payload: CursorPayload,
+  store: CursorStore
+): string {
+  const body = canonicalBody(payload);
+  store.updateReadCursor(reservation.cursor_id, body.toString('utf8'), payload.expires_at);
+  return reservation.token;
+}
+
+function validatePayload(payload: CursorPayload, ctx: RequestContext, now: Date): CursorPayload {
+  if (payload.principal_id !== ctx.principal.id) {
+    throw invalid('read cursor belongs to another principal');
+  }
+  const expiry = Date.parse(payload.expires_at);
+  if (!Number.isFinite(expiry)) {
+    throw invalid('read cursor expiry is invalid');
+  }
+  const reference = now.getTime();
+  if (reference > expiry) {
+    throw invalid('read cursor has expired');
+  }
+  if (expiry - reference > CURSOR_TTL_MS) {
+    throw invalid('read cursor expiry is out of range');
+  }
+  return payload;
+}
+
+export function verifyStoredCursor(
+  cursor: string,
+  secret: Uint8Array,
+  ctx: RequestContext,
+  now: Date,
+  store: CursorStore
+): CursorPayload {
+  requireSecret(secret);
+  const parts = cursor.split('.');
+  if (parts.length !== 3 || parts[0] !== 'r1' || !/^[0-9a-z]+$/u.test(parts[1])) {
+    throw invalid('read cursor is not a stored token');
+  }
+  const provided = decodeBase64Url(parts[2]);
+  const expected = signatureOf(Buffer.from(`r1.${parts[1]}`, 'utf8'), secret).subarray(
+    0,
+    STORED_CURSOR_SIGNATURE_BYTES
+  );
+  if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
+    throw invalid('read cursor signature is invalid');
+  }
+  const id = Number.parseInt(parts[1], 36);
+  if (!Number.isSafeInteger(id) || id <= 0) throw invalid('read cursor id is invalid');
+  const stored = store.getReadCursor(id);
+  if (stored === undefined) throw invalid('read cursor is unavailable');
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(stored);
+  } catch {
+    throw invalid('read cursor body is not valid JSON');
+  }
+  return validatePayload(parsePayload(decoded), ctx, now);
+}
+
 export function verifyCursor(
   cursor: string,
   secret: Uint8Array,
@@ -153,19 +246,5 @@ export function verifyCursor(
     throw invalid('read cursor body is not valid JSON');
   }
   const payload = parsePayload(decoded);
-  if (payload.principal_id !== ctx.principal.id) {
-    throw invalid('read cursor belongs to another principal');
-  }
-  const expiry = Date.parse(payload.expires_at);
-  if (!Number.isFinite(expiry)) {
-    throw invalid('read cursor expiry is invalid');
-  }
-  const reference = now.getTime();
-  if (reference > expiry) {
-    throw invalid('read cursor has expired');
-  }
-  if (expiry - reference > CURSOR_TTL_MS) {
-    throw invalid('read cursor expiry is out of range');
-  }
-  return payload;
+  return validatePayload(payload, ctx, now);
 }

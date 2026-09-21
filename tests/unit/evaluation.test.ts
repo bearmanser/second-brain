@@ -23,6 +23,7 @@ import {
 } from '../eval/plan.mjs';
 import { startHttpHarness } from '../support/harness.js';
 import { modelTextFromEvents } from '../eval/instruction.mjs';
+import { parseAgentEvents } from '../eval/agent.mjs';
 
 const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 
@@ -224,4 +225,31 @@ test('instruction RUN requires preflight, a clean exit, and the marker', () => {
   expect(instructionStatus({ ...base, marker_seen: false }).status).toBe('NOT RUN');
   expect(instructionStatus({ ...base, marker_seen: false, fact_seen: true }).status).toBe('NOT RUN');
   expect(instructionStatus({ ...base, marker_seen: false, fact_seen: true }).observed.tool_payload).toBe(true);
+});
+
+test('agent evidence separates tool payloads from model answers and records behavior timing', () => {
+  const stdout = [
+    JSON.stringify({ type: 'tool_use', part: { tool: 'brain_recall', state: { status: 'completed', output: JSON.stringify({ items: [{ id: 'memory-1' }] }) } } }),
+    JSON.stringify({ type: 'text', part: { type: 'text', text: 'Implemented the bounded retry and added tests.' } }),
+    JSON.stringify({ type: 'tool_use', part: { tool: 'brain_capture', state: { status: 'completed', output: JSON.stringify({ outcome: 'stored' }) } } }),
+    JSON.stringify({ type: 'tool_use', part: { tool: 'brain_review', state: { status: 'completed', output: JSON.stringify({ outcome: 'stored' }) } } })
+  ].join('\n');
+  const parsed = parseAgentEvents(stdout);
+  expect(parsed.answer_text).toContain('Implemented the bounded retry');
+  expect(parsed.answer_text).not.toContain('memory-1');
+  expect(parsed.tool_timeline).toEqual(['brain_recall', 'brain_capture', 'brain_review']);
+  expect(parsed.retrieved_ids).toEqual(['memory-1']);
+  expect(parsed.recall_before_substantive_work).toBe(true);
+  expect(parsed.candidates_captured).toBe(1);
+  expect(parsed.review_performed).toBe(true);
+});
+
+test('agent tasks are substantive work rather than memory quotation lookups', () => {
+  const tasks = readJson<{ tasks: { prompt: string; expected_artifact: string }[] }>('tests/eval/tasks.json');
+  expect(tasks.tasks).toHaveLength(6);
+  for (const task of tasks.tasks) {
+    expect(task.expected_artifact.length).toBeGreaterThan(0);
+    expect(task.prompt).not.toMatch(/quote|recite/i);
+    expect(task.prompt).toMatch(/implement|debug|design|review|plan|write/i);
+  }
 });

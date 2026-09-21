@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -27,6 +28,85 @@ const versions: VersionManifest = {
   sensitive: false,
   created_at: '2026-09-20T00:00:00.000Z'
 };
+
+async function runBackupDiscovery(mode: 'compose-fail' | 'missing-state' | 'tar-fail') {
+  const root = await mkdtemp(join(tmpdir(), 'brain-backup-discovery-'));
+  const bin = join(root, 'bin');
+  const vault = join(root, 'vault');
+  await mkdir(bin, { recursive: true });
+  await mkdir(vault, { recursive: true });
+  const docker = join(bin, 'docker');
+  await writeFile(
+    docker,
+    `#!/bin/sh
+if [ "$1" = compose ] && [ "$4" = config ]; then
+  [ "$BRAIN_TEST_MODE" = compose-fail ] && exit 17
+  [ "$BRAIN_TEST_MODE" = missing-state ] && printf 'memory-state\\nmodel-cache\\n' || printf 'brain-state\\nmemory-state\\nmodel-cache\\n'
+  exit 0
+fi
+if [ "$1" = volume ] && [ "$2" = ls ]; then
+  key=""
+  for arg in "$@"; do case "$arg" in *compose.volume=*) key="\${arg##*=}" ;; esac; done
+  printf 'test_%s\\n' "$key"
+  exit 0
+fi
+if [ "$1" = image ] && [ "$2" = inspect ]; then exit 0; fi
+if [ "$1" = compose ] && [ "$4" = ps ]; then exit 0; fi
+if [ "$1" = run ]; then exit 0; fi
+exit 19
+`,
+    { mode: 0o755 }
+  );
+  if (mode === 'tar-fail') {
+    await writeFile(
+      join(bin, 'tar'),
+      `#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -cf ]; then
+    shift
+    printf partial > "$1"
+    exit 23
+  fi
+  shift
+done
+exit 23
+`,
+      { mode: 0o755 }
+    );
+  }
+  const destination = join(root, 'backup');
+  const result = spawnSync('bash', ['scripts/backup.sh', destination, '--yes'], {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH ?? ''}`,
+      VAULT_PATH: vault,
+      BRAIN_TEST_MODE: mode
+    }
+  });
+  const destinationExists = existsSync(destination);
+  await rm(root, { recursive: true, force: true });
+  return { result, destinationExists };
+}
+
+test('backup fails when Compose volume enumeration fails', async () => {
+  const { result } = await runBackupDiscovery('compose-fail');
+  expect(result.status).not.toBe(0);
+  expect(`${result.stdout}${result.stderr}`).toMatch(/volume discovery failed|could not enumerate/i);
+});
+
+test('backup fails when the required brain-state volume is absent', async () => {
+  const { result } = await runBackupDiscovery('missing-state');
+  expect(result.status).not.toBe(0);
+  expect(`${result.stdout}${result.stderr}`).toContain("required Compose volume 'brain-state'");
+});
+
+test('backup removes its destination when archive creation fails', async () => {
+  const { result, destinationExists } = await runBackupDiscovery('tar-fail');
+  expect(result.status).not.toBe(0);
+  expect(destinationExists).toBe(false);
+});
 
 test('refuses a restore when a stored file hash no longer matches', async () => {
   const fixture = await makeBackupFixture();

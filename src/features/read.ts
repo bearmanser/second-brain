@@ -19,9 +19,12 @@ import type {
 } from '../core/types.js';
 import { resolveScopes } from '../security/authorise.js';
 import { countReferenceTokens } from '../retrieval/budget.js';
+import { modelVisibleRepresentation, toolResultByteLength } from '../mcp/tools.js';
 import {
-  signCursor,
+  finalizeStoredCursor,
+  reserveStoredCursor,
   verifyCursor,
+  verifyStoredCursor,
   type CursorPayload
 } from '../retrieval/cursor.js';
 
@@ -209,7 +212,9 @@ export async function read(
 
   let cursor: CursorPayload | undefined;
   if (request.cursor !== undefined) {
-    cursor = verifyCursor(request.cursor, loadCursorSecret(deps), ctx, now);
+    cursor = request.cursor.startsWith('r1.')
+      ? verifyStoredCursor(request.cursor, loadCursorSecret(deps), ctx, now, deps.journal)
+      : verifyCursor(request.cursor, loadCursorSecret(deps), ctx, now);
     if (cursor.scope !== scope.id || cursor.id !== request.id) {
       throw invalidInput('read cursor does not belong to the requested note');
     }
@@ -219,7 +224,14 @@ export async function read(
   }
 
   const head = await loadHead(scope, request, cursor, deps);
-  if (head.state === 'conflict' || head.state === 'malformed') {
+  const explicitRevision = (cursor?.revision_id ?? request.revision_id) !== undefined;
+  const inspectableFork =
+    explicitRevision &&
+    head.state === 'conflict' &&
+    head.source.warnings.includes('fork') &&
+    !head.source.warnings.includes('duplicate_identity') &&
+    !head.source.warnings.includes('duplicate_revision_id');
+  if ((head.state === 'conflict' && !inspectableFork) || head.state === 'malformed') {
     throw conflict(`note ${request.id} has a ${head.state} head and cannot be read`);
   }
 
@@ -234,6 +246,16 @@ export async function read(
   }
 
   const warnings = [...head.source.warnings];
+  if (
+    deps.journal.hasUnresolvedQualityConcern(
+      scope.id,
+      head.revision.id,
+      head.revision.revision_id
+    ) &&
+    !warnings.includes('unresolved_quality_concern')
+  ) {
+    warnings.push('unresolved_quality_concern');
+  }
   if (head.state === 'manual_unreviewed' && !warnings.includes('manual_unreviewed')) {
     warnings.push('manual_unreviewed');
   }
@@ -243,23 +265,72 @@ export async function read(
 
   const budget = clampReadBudget(request.budget_tokens);
   const offset = cursor?.offset ?? 0;
-  const { page, nextOffset } = paginate(markdown, offset, budget);
-
-  if (nextOffset === undefined) {
-    return { source, markdown: page };
-  }
+  const points = [...markdown];
+  const remaining = Math.max(0, points.length - offset);
   const expires = new Date(now.getTime() + CURSOR_TTL_MS).toISOString();
-  const next_cursor = signCursor(
-    {
-      principal_id: ctx.principal.id,
-      scope: scope.id,
-      id: head.revision.id,
-      revision_id: head.revision.revision_id,
-      raw_hash: head.raw_hash,
-      offset: nextOffset,
-      expires_at: expires
-    },
-    loadCursorSecret(deps)
-  );
-  return { source, markdown: page, next_cursor };
+  let secret: Uint8Array | undefined;
+  const cursorSecret = (): Uint8Array => {
+    secret ??= loadCursorSecret(deps);
+    return secret;
+  };
+  const cursorPayload = (end: number): CursorPayload => ({
+    principal_id: ctx.principal.id,
+    scope: scope.id,
+    id: head.revision.id,
+    revision_id: head.revision.revision_id,
+    raw_hash: head.raw_hash,
+    offset: end,
+    expires_at: expires
+  });
+  const candidate = (length: number, nextCursor?: string): ReadResult => {
+    const end = offset + length;
+    const page = points.slice(offset, end).join('');
+    if (end >= points.length) return { source, markdown: page };
+    if (nextCursor === undefined) {
+      throw recoveryRequired('the paginated read cursor was not reserved');
+    }
+    return { source, markdown: page, next_cursor: nextCursor };
+  };
+  const fits = (result: ReadResult): boolean =>
+    countReferenceTokens(
+      modelVisibleRepresentation(
+        'brain_read',
+        result as unknown as Record<string, unknown>,
+        deps.config.result_delivery
+      )
+    ) <= budget &&
+    toolResultByteLength(
+      'brain_read',
+      result as unknown as Record<string, unknown>,
+      deps.config.result_delivery
+    ) <= deps.config.limits.tool_result_max_bytes &&
+    Buffer.byteLength(result.markdown, 'utf8') <= RENDERED_NOTE_MAX_BYTES;
+  const complete = candidate(remaining);
+  if (fits(complete)) return complete;
+  const reservation = reserveStoredCursor(cursorPayload(offset), cursorSecret(), deps.journal);
+  let finalized = false;
+  try {
+    let low = 0;
+    let high = remaining;
+    let best = -1;
+    while (low <= high) {
+      const middle = (low + high) >> 1;
+      const result = candidate(middle, reservation.token);
+      if (fits(result)) {
+        best = middle;
+        low = middle + 1;
+      } else {
+        high = middle - 1;
+      }
+    }
+    if (best < 0 || (best === 0 && remaining > 0)) {
+      throw limitExceeded('the read budget is too small for the source and pagination envelope');
+    }
+    const end = offset + best;
+    const nextCursor = finalizeStoredCursor(reservation, cursorPayload(end), deps.journal);
+    finalized = true;
+    return candidate(best, nextCursor);
+  } finally {
+    if (!finalized) deps.journal.deleteReadCursor(reservation.cursor_id);
+  }
 }

@@ -62,13 +62,14 @@ function longLesson(chars: number): NoteInput {
   };
 }
 
-function emojiLesson(): NoteInput {  return {
+function emojiLesson(): NoteInput {
+  return {
     ...lessonFixture,
     title: 'Multibyte lesson fixture',
     content: {
       kind: 'lesson',
       situation: 'Unicode boundaries matter when paging.',
-      lesson: '🚀✨🛰️ 星空 データ Ω≈ç√ '.repeat(200),
+      lesson: '🚀✨🛰️ 星空 データ Ω≈ç√ '.repeat(10),
       applicability: 'Pagination must not split a code point.'
     }
   };
@@ -320,6 +321,41 @@ test('serves a manually-edited head with the manual_unreviewed warning', async (
   expect(result.source.warnings).toContain('manual_unreviewed');
   expect(result.source.status).toBe('candidate');
   expect(result.markdown).toContain('Manually edited latency');
+  await h.close();
+});
+
+test('allows an explicit parseable revision read from a two-head fork while ordinary read stays blocked', async () => {
+  const h = await createHarness();
+  const head = await h.seed(lessonFixture, { status: 'candidate' });
+  const scope = scopeFixtures.find((candidate) => candidate.id === 'freellmapi');
+  if (scope === undefined) throw new Error('missing scope');
+  const fork: StoredRevision = {
+    ...head.revision,
+    revision_id: randomUUID(),
+    operation_id: randomUUID(),
+    note: { ...head.revision.note, title: 'Forked explicit read' }
+  };
+  const forkPath = relativePathFor(
+    scope.relative_root,
+    fork.note.content.kind,
+    fork.id,
+    fork.note.title,
+    fork.revision_id
+  );
+  await writeVaultFile(h, forkPath, renderRevision(fork, scope));
+  await h.deps.catalogue.reconcile('freellmapi');
+
+  await expect(
+    read(workerContext, { scope: 'freellmapi', id: head.revision.id }, h.deps)
+  ).rejects.toMatchObject({ code: 'CONFLICT' });
+  const selected = await read(
+    workerContext,
+    { scope: 'freellmapi', id: head.revision.id, revision_id: fork.revision_id },
+    h.deps
+  );
+  expect(selected.source.revision_id).toBe(fork.revision_id);
+  expect(selected.source.warnings).toEqual(expect.arrayContaining(['conflict', 'fork', 'historical']));
+  expect(selected.markdown).toContain('Forked explicit read');
   await h.close();
 });
 

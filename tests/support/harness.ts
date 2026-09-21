@@ -423,6 +423,7 @@ export interface HttpHarnessOptions {
   allowed_hosts?: string[];
   allowed_origins?: string[];
   reconcile_interval_ms?: number;
+  concurrent_reads?: number;
   vault?: VaultPort;
 }
 
@@ -532,7 +533,7 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
       backend_timeout_ms: BACKEND_TIMEOUT_MS,
       materialization_timeout_ms: MATERIALIZATION_TIMEOUT_MS,
       reconcile_interval_ms: options.reconcile_interval_ms ?? RECONCILE_INTERVAL_MS,
-      concurrent_reads: CONCURRENT_READS
+      concurrent_reads: options.concurrent_reads ?? CONCURRENT_READS
     },
     allowed_hosts: options.allowed_hosts ?? ['127.0.0.1', 'localhost'],
     allowed_origins: options.allowed_origins ?? [],

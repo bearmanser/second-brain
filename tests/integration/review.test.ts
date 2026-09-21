@@ -539,6 +539,52 @@ test('revises with supplied typed fields while preserving manual extras', async 
   await h.close();
 });
 
+test('revise authorizes every related note before reserving an operation', async () => {
+  const h = await createHarness();
+  const target = await h.seed(lessonFixture, { status: 'candidate' });
+  const authorized = await h.seed(noteWith(flexibleContent), { scope: 'shared', status: 'active' });
+  const inaccessible = await h.seed(noteWith(flexibleContent), { scope: 'profile', status: 'active' });
+  for (const relatedId of [randomUUID(), inaccessible.source.id]) {
+    await expectCode(
+      review(
+        reviewerContext,
+        {
+          scope: SCOPE,
+          operation: {
+            action: 'revise',
+            id: target.source.id,
+            expected_etag: target.source.etag,
+            idempotency_key: randomUUID(),
+            rationale: 'Authorize links before persistence.',
+            note: noteWith(lessonContentOf(), { related_ids: [relatedId] })
+          }
+        },
+        h.deps
+      ),
+      'FORBIDDEN'
+    );
+  }
+  const receipt = asReceipt(
+    await review(
+      reviewerContext,
+      {
+        scope: SCOPE,
+        operation: {
+          action: 'revise',
+          id: target.source.id,
+          expected_etag: target.source.etag,
+          idempotency_key: randomUUID(),
+          rationale: 'The shared link is readable.',
+          note: noteWith(lessonContentOf(), { related_ids: [authorized.source.id] })
+        }
+      },
+      h.deps
+    )
+  );
+  expect(receipt.outcome).toBe('stored');
+  await h.close();
+});
+
 test('archives a note without physically deleting its earlier revisions', async () => {
   const h = await createHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
@@ -738,6 +784,51 @@ test('resolves a structurally valid revision fork with every head as a parent', 
   );
   expectUntouched(before, await scopeFiles(h));
   await h.close();
+});
+
+test('resolve rejects nonexistent and inaccessible related notes and accepts an authorized link', async () => {
+  const cases: Array<{ related: 'missing' | 'inaccessible' | 'authorized'; accepted: boolean }> = [
+    { related: 'missing', accepted: false },
+    { related: 'inaccessible', accepted: false },
+    { related: 'authorized', accepted: true }
+  ];
+  for (const item of cases) {
+    const h = await createHarness();
+    const root = await h.seed(lessonFixture, { status: 'candidate' });
+    const copy = await duplicateRevisionFile(h, root, `related-${item.related}`);
+    const authorized = await h.seed(noteWith(flexibleContent), { scope: 'shared', status: 'active' });
+    const inaccessible = await h.seed(noteWith(flexibleContent), { scope: 'profile', status: 'active' });
+    const relatedId =
+      item.related === 'authorized'
+        ? authorized.source.id
+        : item.related === 'inaccessible'
+          ? inaccessible.source.id
+          : randomUUID();
+    const request = review(
+      reviewerContext,
+      {
+        scope: SCOPE,
+        operation: {
+          action: 'resolve',
+          id: root.source.id,
+          expected_heads: [
+            { revision_id: root.source.revision_id, etag: root.source.etag },
+            {
+              revision_id: copy.revisionId,
+              etag: (await h.deps.catalogue.getRevision(SCOPE, root.source.id, copy.revisionId)).source.etag
+            }
+          ],
+          idempotency_key: randomUUID(),
+          rationale: 'Resolve with an authorized reference.',
+          note: noteWith(lessonContentOf(), { related_ids: [relatedId] })
+        }
+      },
+      h.deps
+    );
+    if (item.accepted) expect(asReceipt(await request).outcome).toBe('stored');
+    else await expectCode(request, 'FORBIDDEN');
+    await h.close();
+  }
 });
 
 test('rejects a partial conflict-head submission', async () => {

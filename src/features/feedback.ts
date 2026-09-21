@@ -15,6 +15,7 @@ import type {
   RetrievalEventInput,
   RetrievalOutcome
 } from '../storage/journal.js';
+import { authorizeRelatedIds } from './related.js';
 
 export { AUDIT_FIELDS, FEEDBACK_REASON_MAX_LENGTH } from '../storage/journal.js';
 
@@ -29,10 +30,6 @@ const UNRESOLVED_VERDICTS: readonly FeedbackRequest['verdict'][] = [
 
 function invalidInput(message: string, cause?: unknown): BrainError {
   return new BrainError({ code: 'INVALID_INPUT', message, cause });
-}
-
-function forbidden(message: string): BrainError {
-  return new BrainError({ code: 'FORBIDDEN', message });
 }
 
 function notFound(message: string): BrainError {
@@ -74,22 +71,6 @@ async function requireTargetRevision(
     }
     throw error;
   }
-}
-
-async function authorizeRelated(ctx: RequestContext, relatedId: string, deps: BrainDeps): Promise<void> {
-  const scopes = deps.config.scopes.filter((scope) => ctx.principal.read_scopes.includes(scope.id));
-  for (const scope of scopes) {
-    try {
-      await deps.catalogue.get(scope.id, relatedId);
-      return;
-    } catch (error) {
-      if (!isBrainError(error)) throw error;
-      if (error.code === 'NOT_FOUND') continue;
-      if (error.code === 'CONFLICT') return;
-      throw error;
-    }
-  }
-  throw forbidden(`related note ${relatedId} is not an authorized reference`);
 }
 
 function assertRetrievalBinding(
@@ -212,7 +193,7 @@ export async function feedback(
   try {
     const scope = authorizeTarget(ctx, request.scope, deps);
     if (request.related_id !== undefined) {
-      await authorizeRelated(ctx, request.related_id, deps);
+      await authorizeRelatedIds(ctx, [request.related_id], deps);
     }
     assertNoCredentials(request.reason, 'reason');
     const warning = UNRESOLVED_VERDICTS.includes(request.verdict)

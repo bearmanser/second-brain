@@ -15,6 +15,7 @@ import { decodeRevision, makeEtag, normalizeLineEndings, payloadHash } from '../
 import { resolveHead, type ParsedRevision } from '../notes/catalogue.js';
 import { canReview, resolveScopes } from '../security/authorise.js';
 import { assertNoCredentials } from '../security/redact.js';
+import { authorizeRelatedIds } from './related.js';
 
 const REVIEW_TOOL = 'brain_review';
 const FACTUAL_KINDS: readonly string[] = ['lesson', 'fact', 'decision', 'playbook'];
@@ -517,6 +518,7 @@ async function reviseAction(
   deps: BrainDeps
 ): Promise<MutationReceipt> {
   const note = normalizeNote(operation.note);
+  await authorizeRelatedIds(ctx, note.related_ids, deps);
   rejectCredentialText(note);
   const intent: MutationIntent = {
     tool: REVIEW_TOOL,
@@ -606,6 +608,7 @@ async function resolveAction(
   deps: BrainDeps
 ): Promise<MutationReceipt> {
   const note = normalizeNote(operation.note);
+  await authorizeRelatedIds(ctx, note.related_ids, deps);
   rejectCredentialText(note);
   const intent: MutationIntent = {
     tool: REVIEW_TOOL,

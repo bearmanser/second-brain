@@ -1,10 +1,13 @@
 import { randomUUID, createHash } from 'node:crypto';
-import { writeFile } from 'node:fs/promises';
+import { rm, writeFile } from 'node:fs/promises';
 import { expect, test } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
 import { createRuntime } from '../../src/runtime.js';
+import { countReferenceTokens } from '../../src/retrieval/budget.js';
+import { BrainError } from '../../src/contracts/errors.js';
+import { TOOL_RESULT_MAX_BYTES } from '../../src/core/limits.js';
 import { lessonFixture } from '../fixtures/content.js';
 import { workerPrincipal } from '../fixtures/principals.js';
 import { FakeBackend } from '../support/fake-backend.js';
@@ -42,6 +45,14 @@ async function call(
 }
 
 const textOf = (result: ToolResult): string => result.content[0].text;
+
+function deliveredTokens(result: ToolResult, delivery: 'structured' | 'text-json'): number {
+  const visible =
+    delivery === 'text-json'
+      ? textOf(result)
+      : `${JSON.stringify(result.structuredContent)}\n${textOf(result)}`;
+  return countReferenceTokens(visible);
+}
 
 const captureArgs = (key: string): Record<string, unknown> => ({
   idempotency_key: key,
@@ -123,6 +134,112 @@ test('text-json delivery serializes the complete result once in the text block',
     await h.close();
   }
 });
+
+test.each(['structured', 'text-json'] as const)(
+  '%s delivery keeps the full MCP read envelope inside the requested budget',
+  async (delivery) => {
+    const h = await startHttpHarness({ result_delivery: delivery });
+    const client = await h.connect(h.token, `read-budget-${delivery}`);
+    try {
+      const content = lessonFixture.content.kind === 'lesson' ? lessonFixture.content : undefined;
+      if (content === undefined) throw new Error('lesson fixture has the wrong kind');
+      const note = {
+        ...lessonFixture,
+        content: {
+          ...content,
+          lesson: `${content.lesson} ${'latency '.repeat(500)}`
+        }
+      };
+      const captured = await call(client, 'brain_capture', {
+        idempotency_key: randomUUID(),
+        scope: 'freellmapi',
+        note
+      });
+      const receipt = record(captured.structuredContent);
+      const result = await call(client, 'brain_read', {
+        scope: 'freellmapi',
+        id: receipt.id,
+        budget_tokens: 256
+      });
+      expect(result.isError).toBeFalsy();
+      expect(deliveredTokens(result, delivery)).toBeLessThanOrEqual(256);
+    } finally {
+      await client.close();
+      await h.close();
+    }
+  }
+);
+
+test('text-json delivery paginates a compressible read beneath the aggregate byte cap', async () => {
+  const h = await startHttpHarness({ result_delivery: 'text-json' });
+  const client = await h.connect(h.token, 'read-byte-budget');
+  try {
+    const content = lessonFixture.content.kind === 'lesson' ? lessonFixture.content : undefined;
+    if (content === undefined) throw new Error('lesson fixture has the wrong kind');
+    const captured = await call(client, 'brain_capture', {
+      idempotency_key: randomUUID(),
+      scope: 'freellmapi',
+      note: {
+        ...lessonFixture,
+        content: {
+          ...content,
+          limitations: Array.from({ length: 8 }, () => ' accomplishment'.repeat(533))
+        }
+      }
+    });
+    expect(captured.isError).toBeFalsy();
+    const receipt = record(captured.structuredContent);
+    const result = await call(client, 'brain_read', {
+      scope: 'freellmapi',
+      id: receipt.id,
+      budget_tokens: 8000
+    });
+    expect(result.isError).toBeFalsy();
+    expect(record(result.structuredContent).next_cursor).toBeDefined();
+    expect(Buffer.byteLength(JSON.stringify(result), 'utf8')).toBeLessThanOrEqual(
+      TOOL_RESULT_MAX_BYTES
+    );
+  } finally {
+    await client.close();
+    await h.close();
+  }
+});
+
+test.each(['structured', 'text-json'] as const)(
+  '%s delivery keeps the full MCP recall envelope inside the requested budget',
+  async (delivery) => {
+    const h = await startHttpHarness({ result_delivery: delivery });
+    const worker = await h.connect(h.token, `recall-budget-worker-${delivery}`);
+    const reviewer = await h.connect(h.reviewerToken, `recall-budget-reviewer-${delivery}`);
+    try {
+      const captured = await call(worker, 'brain_capture', captureArgs(randomUUID()));
+      const receipt = record(captured.structuredContent);
+      const approved = await call(reviewer, 'brain_review', {
+        scope: 'freellmapi',
+        operation: {
+          action: 'approve',
+          idempotency_key: randomUUID(),
+          id: receipt.id,
+          expected_etag: receipt.etag,
+          rationale: 'The synthetic benchmark evidence supports this lesson.'
+        }
+      });
+      expect(approved.isError).toBeFalsy();
+      const result = await call(worker, 'brain_recall', {
+        scope: 'freellmapi',
+        query: 'first token latency',
+        mode: 'text',
+        budget_tokens: 256
+      });
+      expect(result.isError).toBeFalsy();
+      expect(deliveredTokens(result, delivery)).toBeLessThanOrEqual(256);
+    } finally {
+      await worker.close();
+      await reviewer.close();
+      await h.close();
+    }
+  }
+);
 
 test('an unauthorized scope returns a structured, retryability-tagged tool error', async () => {
   const h = await startHttpHarness();
@@ -482,6 +599,95 @@ test('a write blocked past the drain deadline keeps the lock until it completes'
   } finally {
     await reopened.close();
     await replacementBackend.close().catch(() => undefined);
+    await h.close();
+  }
+});
+
+test('normal runtime startup refuses an existing vault after its journal is lost', async () => {
+  const h = await startHttpHarness();
+  const client = await h.connect(h.token, 'lost-journal-seed');
+  try {
+    const captured = await call(client, 'brain_capture', captureArgs(randomUUID()));
+    expect(captured.isError).toBeFalsy();
+  } finally {
+    await client.close();
+    await h.runtime.close();
+  }
+  for (const suffix of ['', '-wal', '-shm']) {
+    await rm(`${h.config.mounts.state}/journal.db${suffix}`, { force: true });
+  }
+  const backend = new FakeBackend({
+    root: h.config.mounts.vault,
+    projects: h.config.scopes.map((scope) => scope.backend_project)
+  });
+  await expect(createRuntime(h.config, { backend })).rejects.toMatchObject({
+    code: 'RECOVERY_REQUIRED'
+  });
+  await expect(rm(`${h.config.mounts.state}/journal.db`)).rejects.toMatchObject({ code: 'ENOENT' });
+  await backend.close().catch(() => undefined);
+  await h.close();
+});
+
+test('enforces the configured shared read-concurrency limit', async () => {
+  const h = await startHttpHarness({ concurrent_reads: 2 });
+  const clients = await Promise.all(
+    Array.from({ length: 6 }, (_, index) => h.connect(h.token, `bounded-read-${index}`))
+  );
+  const originalSearch = h.backend.search.bind(h.backend);
+  let active = 0;
+  let maximum = 0;
+  h.backend.search = async (input) => {
+    active += 1;
+    maximum = Math.max(maximum, active);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    try {
+      return await originalSearch(input);
+    } finally {
+      active -= 1;
+    }
+  };
+  try {
+    const results = await Promise.all(
+      clients.map((client) =>
+        call(client, 'brain_recall', {
+          scope: 'freellmapi',
+          query: 'bounded concurrency',
+          mode: 'text'
+        })
+      )
+    );
+    expect(results.every((result) => !result.isError)).toBe(true);
+    expect(maximum).toBe(2);
+  } finally {
+    await Promise.all(clients.map((client) => client.close()));
+    await h.close();
+  }
+});
+
+test('public MCP backend errors redact every rejected credential family', async () => {
+  const h = await startHttpHarness();
+  const client = await h.connect(h.token, 'credential-error-redaction');
+  const secrets = [
+    '-----BEGIN PRIVATE KEY-----\nabc123\n-----END PRIVATE KEY-----',
+    'Bearer abcdefghijklmnopqrstuvwxyz012345',
+    'password=visible-secret-value',
+    'sk-abcdefghijklmnopqrstuvwxyz012345'
+  ];
+  try {
+    for (const secret of secrets) {
+      h.backend.search = async () => {
+        throw new BrainError({ code: 'BACKEND_UNAVAILABLE', message: `upstream exposed ${secret}` });
+      };
+      const result = await call(client, 'brain_recall', {
+        scope: 'freellmapi',
+        query: 'redaction probe',
+        mode: 'text'
+      });
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result)).not.toContain(secret);
+    }
+  } finally {
+    await client.close();
     await h.close();
   }
 });

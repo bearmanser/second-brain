@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import { existsSync } from 'node:fs';
 import { uuidSchema } from '../contracts/content.js';
 import { BrainError, isBrainError } from '../contracts/errors.js';
 import {
@@ -119,6 +120,10 @@ function invalidInput(message: string): BrainError {
 
 function unsupportedSchema(message: string): BrainError {
   return new BrainError({ code: 'UNSUPPORTED_SCHEMA', message });
+}
+
+function recoveryRequired(message: string, cause?: unknown): BrainError {
+  return new BrainError({ code: 'RECOVERY_REQUIRED', message, cause });
 }
 
 function unique(values: string[]): string[] {
@@ -297,6 +302,25 @@ export class RevisionCatalogue implements CataloguePort {
       clock,
       options.approval_provenance
     );
+  }
+
+  static hasPersistedRevisions(path: string): boolean {
+    if (!existsSync(path)) return false;
+    let database: Database.Database;
+    try {
+      database = new Database(path, { readonly: true, fileMustExist: true });
+    } catch (cause) {
+      throw recoveryRequired(`catalogue at ${path} cannot be inspected`, cause);
+    }
+    try {
+      const table = database
+        .prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'catalogue_revisions'")
+        .get() as { present: number } | undefined;
+      if (table === undefined) return false;
+      return database.prepare('SELECT 1 AS present FROM catalogue_revisions LIMIT 1').get() !== undefined;
+    } finally {
+      database.close();
+    }
   }
 
   async reconcile(scope: string): Promise<void> {
@@ -928,7 +952,7 @@ export class RevisionCatalogue implements CataloguePort {
 
   private approvalInvalid(revision: StoredRevision): boolean {
     const approval = revision.approval;
-    if (approval === undefined) return false;
+    if (approval === undefined) return revision.status === 'active';
     if (approval.payload_hash !== payloadHash(revision)) return true;
     const provenance = this.approvalProvenance;
     if (provenance === undefined) return true;
