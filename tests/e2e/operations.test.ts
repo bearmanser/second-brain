@@ -186,6 +186,8 @@ beforeAll(async () => {
   for (const item of COPY_ITEMS) {
     cpSync(join(REPO_ROOT, item), join(workDir, item), { recursive: true });
   }
+  rmSync(join(workDir, 'config', 'brain.yaml'), { force: true });
+  expect(existsSync(join(workDir, 'config', 'brain.yaml'))).toBe(false);
 
   run('bash', ['scripts/setup.sh'], { cwd: workDir, env: env({ VAULT_PATH: vaultPath }) });
   compose(['up', '-d', '--build']);

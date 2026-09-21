@@ -178,6 +178,8 @@ beforeAll(async () => {
   for (const item of COPY_ITEMS) {
     cpSync(join(REPO_ROOT, item), join(workDir, item), { recursive: true });
   }
+  rmSync(join(workDir, 'config/brain.yaml'), { force: true });
+  expect(existsSync(join(workDir, 'config/brain.yaml'))).toBe(false);
   expect(readFileSync(join(workDir, 'compose.yaml'), 'utf8')).toBe(
     readFileSync(join(REPO_ROOT, 'compose.yaml'), 'utf8')
   );

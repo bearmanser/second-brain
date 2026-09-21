@@ -1088,6 +1088,10 @@ export async function startDockerHarness(): Promise<DockerHarness> {
     for (const item of DOCKER_COPY_ITEMS) {
       cpSync(join(DOCKER_REPO_ROOT, item), join(workDir, item), { recursive: true });
     }
+    rmSync(join(workDir, 'config', 'brain.yaml'), { force: true });
+    if (existsSync(join(workDir, 'config', 'brain.yaml'))) {
+      throw new Error('the Docker fixture copied operator-generated config/brain.yaml');
+    }
 
     const setup = spawnSync('bash', ['scripts/setup.sh'], {
       encoding: 'utf8',
