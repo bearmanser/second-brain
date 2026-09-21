@@ -1,11 +1,13 @@
 import { afterEach, expect, test } from 'vitest';
 import Database from 'better-sqlite3';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { BrainError } from '../../src/contracts/errors.js';
 import type { Clock, IdSource, MutationReceipt, PlannedWrite } from '../../src/core/types.js';
 import {
   Journal,
+  MIGRATIONS_DIRECTORY,
   applyMigrations,
   loadMigrations,
   type FeedbackWrite,
@@ -388,11 +390,234 @@ test('applies versioned migrations in order and reruns them idempotently', () =>
     { version: 4 },
     { version: 5 },
     { version: 6 },
-    { version: 7 }
+    { version: 7 },
+    { version: 8 }
   ]);
   expect(second.get(record.record.operation_id)?.idempotency_key).toBe('c1');
   probe.close();
   second.close();
+});
+
+test('reserves repository projects idempotently with generated storage mappings', () => {
+  const clock = new TestClock('2026-09-21T09:00:00.000Z');
+  const journal = Journal.open(':memory:', { clock });
+  const input = {
+    repository_identity: 'github.com/bearmanser/second-brain',
+    scope: 'second-brain',
+    created_by_principal_id: 'reviewer-a',
+    creation_operation_id: fixtureIds.idempotencyKey
+  };
+
+  const first = journal.reserveProject(input);
+  expect(first.kind).toBe('new');
+  expect(first.project).toMatchObject({
+    ...input,
+    backend_project: 'second-brain',
+    relative_root: 'Projects/second-brain',
+    state: 'provisioning',
+    created_at: '2026-09-21T09:00:00.000Z',
+    updated_at: '2026-09-21T09:00:00.000Z'
+  });
+  expect(journal.reserveProject(input)).toEqual({ kind: 'replay', project: first.project });
+  expect(journal.getProjectByIdentity(input.repository_identity)).toEqual(first.project);
+  expect(journal.getProjectByScope(input.scope)).toEqual(first.project);
+  journal.close();
+});
+
+test('enforces unique repository identity and scope bindings', () => {
+  const journal = Journal.open(':memory:');
+  journal.reserveProject({
+    repository_identity: 'github.com/bearmanser/second-brain',
+    scope: 'second-brain',
+    created_by_principal_id: 'worker-a',
+    creation_operation_id: fixtureIds.idempotencyKey
+  });
+  expect(() =>
+    journal.reserveProject({
+      repository_identity: 'github.com/other/different',
+      scope: 'second-brain',
+      created_by_principal_id: 'worker-a',
+      creation_operation_id: fixtureIds.revision
+    })
+  ).toThrow(/CONFLICT/);
+  expect(() =>
+    journal.reserveProject({
+      repository_identity: 'github.com/bearmanser/second-brain',
+      scope: 'different',
+      created_by_principal_id: 'worker-a',
+      creation_operation_id: fixtureIds.revision
+    })
+  ).toThrow(/CONFLICT/);
+  journal.close();
+});
+
+test('persists ready projects and principal grants across reopen and token rotation', () => {
+  const directory = temporaryDirectory();
+  const path = join(directory, 'journal.db');
+  const principalId = 'reviewer-a';
+  const tokenDigests = ['first-token', 'rotated-token'].map((token) =>
+    createHash('sha256').update(token, 'utf8').digest('hex')
+  );
+  expect(new Set(tokenDigests).size).toBe(2);
+
+  const journal = Journal.open(path);
+  journal.reserveProject({
+    repository_identity: 'github.com/bearmanser/second-brain',
+    scope: 'second-brain',
+    created_by_principal_id: principalId,
+    creation_operation_id: fixtureIds.idempotencyKey
+  });
+  journal.grantProject({
+    principal_id: principalId,
+    scope: 'second-brain',
+    can_read: true,
+    can_write: true,
+    can_review: true
+  });
+  const ready = journal.markProjectReady('github.com/bearmanser/second-brain');
+  expect(ready.state).toBe('ready');
+  expect(journal.listReadyProjects()).toEqual([ready]);
+  journal.close();
+
+  const reopened = Journal.open(path, { requireExisting: true });
+  for (const _tokenDigest of tokenDigests) {
+    expect(reopened.listProjectGrants(principalId)).toContainEqual({
+      principal_id: principalId,
+      scope: 'second-brain',
+      can_read: true,
+      can_write: true,
+      can_review: true
+    });
+  }
+  expect(reopened.listProjectGrants('different-principal')).toEqual([]);
+  expect(reopened.listReadyProjects()).toHaveLength(1);
+  reopened.close();
+});
+
+test('upserts grants and stores only bounded recovery diagnostics', () => {
+  const journal = Journal.open(':memory:');
+  journal.reserveProject({
+    repository_identity: 'github.com/bearmanser/second-brain',
+    scope: 'second-brain',
+    created_by_principal_id: 'worker-a',
+    creation_operation_id: fixtureIds.idempotencyKey
+  });
+  journal.grantProject({
+    principal_id: 'worker-a',
+    scope: 'second-brain',
+    can_read: true,
+    can_write: true,
+    can_review: false
+  });
+  journal.grantProject({
+    principal_id: 'worker-a',
+    scope: 'second-brain',
+    can_read: true,
+    can_write: true,
+    can_review: true
+  });
+  expect(journal.listProjectGrants('worker-a')).toEqual([
+    {
+      principal_id: 'worker-a',
+      scope: 'second-brain',
+      can_read: true,
+      can_write: true,
+      can_review: true
+    }
+  ]);
+
+  const recovery = journal.markProjectRecoveryRequired(
+    'github.com/bearmanser/second-brain',
+    'backend_verify',
+    'PATH_MISMATCH'
+  );
+  expect(recovery).toMatchObject({
+    state: 'recovery_required',
+    failure_stage: 'backend_verify',
+    failure_code: 'PATH_MISMATCH'
+  });
+  expect(journal.listReadyProjects()).toEqual([]);
+  expect(() =>
+    journal.markProjectRecoveryRequired(
+      'github.com/bearmanser/second-brain',
+      'backend_verify',
+      'token=secret-value'
+    )
+  ).toThrow(/INVALID_INPUT/);
+  journal.close();
+});
+
+test('upgrades a migration-7 database without changing prior operation rows', () => {
+  const root = temporaryDirectory();
+  const legacyMigrations = join(root, 'migrations');
+  mkdirSync(legacyMigrations);
+  for (let version = 1; version <= 7; version += 1) {
+    const migration = loadMigrations(MIGRATIONS_DIRECTORY).find((item) => item.version === version);
+    if (migration === undefined) throw new Error(`missing migration ${version}`);
+    copyFileSync(join(MIGRATIONS_DIRECTORY, migration.name), join(legacyMigrations, migration.name));
+  }
+  const path = join(root, 'journal.db');
+  const database = new Database(path);
+  applyMigrations(database, legacyMigrations, '2026-09-20T00:00:00.000Z');
+  database
+    .prepare(
+      `INSERT INTO operations (
+        operation_id, principal_id, idempotency_key, tool, scope, payload_hash,
+        payload_json, state, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      'legacy-operation',
+      'agent-a',
+      'legacy-key',
+      'brain_capture',
+      'freellmapi',
+      'a'.repeat(64),
+      '{}',
+      'prepared',
+      '2026-09-20T00:00:00.000Z',
+      '2026-09-20T00:00:00.000Z'
+    );
+  database.close();
+
+  const upgraded = Journal.open(path, { requireExisting: true });
+  expect(upgraded.get('legacy-operation')).toMatchObject({ idempotency_key: 'legacy-key' });
+  const probe = new Database(path);
+  expect(probe.prepare('SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1').get()).toEqual({
+    version: 8
+  });
+  expect(
+    probe.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'repository_projects'").get()
+  ).toEqual({ name: 'repository_projects' });
+  probe.close();
+  upgraded.close();
+});
+
+test('fails closed when stored project states or capabilities are malformed', () => {
+  const path = join(temporaryDirectory(), 'journal.db');
+  const journal = Journal.open(path);
+  journal.reserveProject({
+    repository_identity: 'github.com/bearmanser/second-brain',
+    scope: 'second-brain',
+    created_by_principal_id: 'worker-a',
+    creation_operation_id: fixtureIds.idempotencyKey
+  });
+  journal.grantProject({
+    principal_id: 'worker-a',
+    scope: 'second-brain',
+    can_read: true,
+    can_write: true,
+    can_review: false
+  });
+  const corruptor = new Database(path);
+  corruptor.pragma('ignore_check_constraints = ON');
+  corruptor.prepare("UPDATE repository_projects SET state = 'alien'").run();
+  expect(() => journal.getProjectByScope('second-brain')).toThrow(/RECOVERY_REQUIRED/);
+  corruptor.prepare("UPDATE repository_projects SET state = 'provisioning'").run();
+  corruptor.prepare('UPDATE dynamic_project_grants SET can_write = 7').run();
+  expect(() => journal.listProjectGrants('worker-a')).toThrow(/RECOVERY_REQUIRED/);
+  corruptor.close();
+  journal.close();
 });
 
 test('requires explicit recovery instead of silently starting fresh', () => {

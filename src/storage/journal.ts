@@ -12,9 +12,12 @@ import {
   type Clock,
   type FeedbackVerdict,
   type IdSource,
+  type DynamicProjectGrant,
   type MutationReceipt,
   type PlannedWrite,
-  type RecallMode
+  type RecallMode,
+  type RepositoryProjectRecord,
+  type RepositoryProjectState
 } from '../core/types.js';
 import { containsCredentials } from '../security/redact.js';
 
@@ -89,6 +92,17 @@ export interface JournalOptions {
   ids?: IdSource;
   requireExisting?: boolean;
 }
+
+export interface RepositoryProjectReservation {
+  repository_identity: string;
+  scope: string;
+  created_by_principal_id: string;
+  creation_operation_id: string;
+}
+
+export type ProjectReservationResult =
+  | { kind: 'new'; project: RepositoryProjectRecord }
+  | { kind: 'replay'; project: RepositoryProjectRecord };
 
 export interface Migration {
   version: number;
@@ -221,6 +235,28 @@ interface OperationRow {
   updated_at: string;
 }
 
+interface RepositoryProjectRow {
+  repository_identity: string;
+  scope: string;
+  backend_project: string;
+  relative_root: string;
+  state: string;
+  created_by_principal_id: string;
+  creation_operation_id: string;
+  failure_stage: string | null;
+  failure_code: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface DynamicProjectGrantRow {
+  principal_id: string;
+  scope: string;
+  can_read: number;
+  can_write: number;
+  can_review: number;
+}
+
 function recoveryRequired(message: string, cause?: unknown): BrainError {
   return new BrainError({ code: 'RECOVERY_REQUIRED', message, cause });
 }
@@ -248,6 +284,84 @@ function isTerminal(state: OperationState): boolean {
 function requireState(value: string, operation_id: string): OperationState {
   if ((OPERATION_STATES as readonly string[]).includes(value)) return value as OperationState;
   throw recoveryRequired(`operation ${operation_id} has an unknown stored state`);
+}
+
+const REPOSITORY_PROJECT_STATES = [
+  'provisioning',
+  'ready',
+  'recovery_required'
+] as const satisfies readonly RepositoryProjectState[];
+const FAILURE_STAGE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
+const FAILURE_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
+
+function requireProjectState(value: string): RepositoryProjectState {
+  if ((REPOSITORY_PROJECT_STATES as readonly string[]).includes(value)) {
+    return value as RepositoryProjectState;
+  }
+  throw recoveryRequired('repository project has an unknown stored state');
+}
+
+function requireProjectText(value: string, field: string): string {
+  if (value.length === 0 || value.length > 2048 || CONTROL_OR_LINE_BREAK.test(value)) {
+    throw recoveryRequired(`repository project has malformed ${field}`);
+  }
+  return value;
+}
+
+const CONTROL_OR_LINE_BREAK = /[\u0000-\u001f\u007f]/;
+
+function toRepositoryProject(row: RepositoryProjectRow): RepositoryProjectRecord {
+  const scope = requireProjectText(row.scope, 'scope');
+  if (!SCOPE_ID_PATTERN.test(scope)) throw recoveryRequired('repository project has malformed scope');
+  if (row.backend_project !== scope || row.relative_root !== `Projects/${scope}`) {
+    throw recoveryRequired('repository project has an inconsistent storage mapping');
+  }
+  if (!RFC3339_PATTERN.test(row.created_at) || !RFC3339_PATTERN.test(row.updated_at)) {
+    throw recoveryRequired('repository project has malformed timestamps');
+  }
+  const failureFieldsMatch =
+    (row.failure_stage === null && row.failure_code === null) ||
+    (row.failure_stage !== null && row.failure_code !== null);
+  if (!failureFieldsMatch) throw recoveryRequired('repository project has incomplete failure data');
+  if (
+    row.failure_stage !== null &&
+    (!FAILURE_STAGE_PATTERN.test(row.failure_stage) ||
+      row.failure_code === null ||
+      !FAILURE_CODE_PATTERN.test(row.failure_code))
+  ) {
+    throw recoveryRequired('repository project has unsafe failure data');
+  }
+  return {
+    repository_identity: requireProjectText(row.repository_identity, 'identity'),
+    scope,
+    backend_project: row.backend_project,
+    relative_root: row.relative_root,
+    state: requireProjectState(row.state),
+    created_by_principal_id: requireProjectText(row.created_by_principal_id, 'creator'),
+    creation_operation_id: requireProjectText(row.creation_operation_id, 'operation'),
+    ...(row.failure_stage === null ? {} : { failure_stage: row.failure_stage }),
+    ...(row.failure_code === null ? {} : { failure_code: row.failure_code }),
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+function storedCapability(value: number, field: string): boolean {
+  if (value !== 0 && value !== 1) {
+    throw recoveryRequired(`dynamic project grant has malformed ${field}`);
+  }
+  return value === 1;
+}
+
+function toDynamicProjectGrant(row: DynamicProjectGrantRow): DynamicProjectGrant {
+  if (row.can_read !== 1) throw recoveryRequired('dynamic project grant must retain read access');
+  return {
+    principal_id: requireProjectText(row.principal_id, 'grant principal'),
+    scope: requireProjectText(row.scope, 'grant scope'),
+    can_read: true,
+    can_write: storedCapability(row.can_write, 'write capability'),
+    can_review: storedCapability(row.can_review, 'review capability')
+  };
 }
 
 function hasTable(database: Database.Database, name: string): boolean {
@@ -700,6 +814,186 @@ export class Journal {
     return run.immediate(input);
   }
 
+  reserveProject(input: RepositoryProjectReservation): ProjectReservationResult {
+    this.assertOpen();
+    const repositoryIdentity = requireProjectText(input.repository_identity, 'identity');
+    const scope = requireProjectText(input.scope, 'scope');
+    const principalId = requireProjectText(input.created_by_principal_id, 'creator');
+    const operationId = requireProjectText(input.creation_operation_id, 'operation');
+    if (
+      repositoryIdentity.includes('://') ||
+      repositoryIdentity.includes('@') ||
+      containsCredentials(repositoryIdentity) ||
+      !SCOPE_ID_PATTERN.test(scope)
+    ) {
+      throw invalidInput('repository project reservation is not normalized');
+    }
+    const normalized: RepositoryProjectReservation = {
+      repository_identity: repositoryIdentity,
+      scope,
+      created_by_principal_id: principalId,
+      creation_operation_id: operationId
+    };
+    const run = this.database.transaction((): ProjectReservationResult => {
+      const byIdentity = this.getProjectByIdentity(repositoryIdentity);
+      if (byIdentity !== undefined) {
+        return this.reconcileProjectReservation(normalized, byIdentity);
+      }
+      const byScope = this.getProjectByScope(scope);
+      if (byScope !== undefined) {
+        throw conflict(`scope ${scope} is already bound to another repository`, operationId);
+      }
+      const timestamp = this.timestamp();
+      this.database
+        .prepare(
+          `INSERT INTO repository_projects (
+            repository_identity, scope, backend_project, relative_root, state,
+            created_by_principal_id, creation_operation_id, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, 'provisioning', ?, ?, ?, ?)`
+        )
+        .run(
+          repositoryIdentity,
+          scope,
+          scope,
+          `Projects/${scope}`,
+          principalId,
+          operationId,
+          timestamp,
+          timestamp
+        );
+      const project = this.getProjectByIdentity(repositoryIdentity);
+      if (project === undefined) throw recoveryRequired('repository project was not persisted');
+      this.clearOperationalLossAcknowledgement();
+      return { kind: 'new', project };
+    });
+    return run.immediate();
+  }
+
+  getProjectByIdentity(repositoryIdentity: string): RepositoryProjectRecord | undefined {
+    this.assertOpen();
+    const row = this.database
+      .prepare('SELECT * FROM repository_projects WHERE repository_identity = ?')
+      .get(repositoryIdentity) as RepositoryProjectRow | undefined;
+    return row === undefined ? undefined : toRepositoryProject(row);
+  }
+
+  getProjectByScope(scope: string): RepositoryProjectRecord | undefined {
+    this.assertOpen();
+    const row = this.database
+      .prepare('SELECT * FROM repository_projects WHERE scope = ?')
+      .get(scope) as RepositoryProjectRow | undefined;
+    return row === undefined ? undefined : toRepositoryProject(row);
+  }
+
+  listReadyProjects(): RepositoryProjectRecord[] {
+    this.assertOpen();
+    const rows = this.database
+      .prepare(
+        `SELECT * FROM repository_projects
+         WHERE state = 'ready' ORDER BY created_at ASC, repository_identity ASC`
+      )
+      .all() as RepositoryProjectRow[];
+    return rows.map(toRepositoryProject);
+  }
+
+  markProjectReady(repositoryIdentity: string): RepositoryProjectRecord {
+    this.assertOpen();
+    const run = this.database.transaction((): RepositoryProjectRecord => {
+      const project = this.requireProject(repositoryIdentity);
+      if (project.state === 'ready') return project;
+      const timestamp = this.timestamp();
+      this.database
+        .prepare(
+          `UPDATE repository_projects
+           SET state = 'ready', failure_stage = NULL, failure_code = NULL, updated_at = ?
+           WHERE repository_identity = ?`
+        )
+        .run(timestamp, repositoryIdentity);
+      return this.requireProject(repositoryIdentity);
+    });
+    return run.immediate();
+  }
+
+  markProjectRecoveryRequired(
+    repositoryIdentity: string,
+    failureStage: string,
+    failureCode: string
+  ): RepositoryProjectRecord {
+    this.assertOpen();
+    if (!FAILURE_STAGE_PATTERN.test(failureStage) || !FAILURE_CODE_PATTERN.test(failureCode)) {
+      throw invalidInput('project recovery diagnostics must use sanitized codes');
+    }
+    const run = this.database.transaction((): RepositoryProjectRecord => {
+      const project = this.requireProject(repositoryIdentity);
+      if (project.state === 'ready') {
+        throw conflict('a ready repository project cannot enter provisioning recovery', project.creation_operation_id);
+      }
+      this.database
+        .prepare(
+          `UPDATE repository_projects
+           SET state = 'recovery_required', failure_stage = ?, failure_code = ?, updated_at = ?
+           WHERE repository_identity = ?`
+        )
+        .run(failureStage, failureCode, this.timestamp(), repositoryIdentity);
+      return this.requireProject(repositoryIdentity);
+    });
+    return run.immediate();
+  }
+
+  grantProject(grant: DynamicProjectGrant): DynamicProjectGrant {
+    this.assertOpen();
+    if (grant.can_read !== true) throw invalidInput('dynamic project grants require read access');
+    const principalId = requireProjectText(grant.principal_id, 'grant principal');
+    const scope = requireProjectText(grant.scope, 'grant scope');
+    const run = this.database.transaction((): DynamicProjectGrant => {
+      if (this.getProjectByScope(scope) === undefined) {
+        throw invalidInput(`dynamic project scope ${scope} does not exist`);
+      }
+      const timestamp = this.timestamp();
+      this.database
+        .prepare(
+          `INSERT INTO dynamic_project_grants (
+            principal_id, scope, can_read, can_write, can_review, created_at, updated_at
+          ) VALUES (?, ?, 1, ?, ?, ?, ?)
+          ON CONFLICT(principal_id, scope) DO UPDATE SET
+            can_read = 1,
+            can_write = excluded.can_write,
+            can_review = excluded.can_review,
+            updated_at = excluded.updated_at`
+        )
+        .run(
+          principalId,
+          scope,
+          grant.can_write ? 1 : 0,
+          grant.can_review ? 1 : 0,
+          timestamp,
+          timestamp
+        );
+      const row = this.database
+        .prepare('SELECT * FROM dynamic_project_grants WHERE principal_id = ? AND scope = ?')
+        .get(principalId, scope) as DynamicProjectGrantRow | undefined;
+      if (row === undefined) throw recoveryRequired('dynamic project grant was not persisted');
+      this.clearOperationalLossAcknowledgement();
+      return toDynamicProjectGrant(row);
+    });
+    return run.immediate();
+  }
+
+  listProjectGrants(principalId?: string): DynamicProjectGrant[] {
+    this.assertOpen();
+    const rows =
+      principalId === undefined
+        ? (this.database
+            .prepare('SELECT * FROM dynamic_project_grants ORDER BY principal_id ASC, scope ASC')
+            .all() as DynamicProjectGrantRow[])
+        : (this.database
+            .prepare(
+              'SELECT * FROM dynamic_project_grants WHERE principal_id = ? ORDER BY scope ASC'
+            )
+            .all(principalId) as DynamicProjectGrantRow[]);
+    return rows.map(toDynamicProjectGrant);
+  }
+
   savePlan(id: string, plan: PlannedWrite): void {
     this.assertOpen();
     const payload = JSON.stringify(plan);
@@ -1116,6 +1410,31 @@ export class Journal {
       });
     }
     return { kind: 'replay', record: existing };
+  }
+
+  private reconcileProjectReservation(
+    value: RepositoryProjectReservation,
+    existing: RepositoryProjectRecord
+  ): ProjectReservationResult {
+    if (
+      existing.scope !== value.scope ||
+      existing.created_by_principal_id !== value.created_by_principal_id ||
+      existing.creation_operation_id !== value.creation_operation_id
+    ) {
+      throw conflict(
+        'repository identity is already bound to a different project reservation',
+        existing.creation_operation_id
+      );
+    }
+    return { kind: 'replay', project: existing };
+  }
+
+  private requireProject(repositoryIdentity: string): RepositoryProjectRecord {
+    const project = this.getProjectByIdentity(repositoryIdentity);
+    if (project === undefined) {
+      throw invalidInput('repository project does not exist');
+    }
+    return project;
   }
 
   private persistApprovalProvenance(id: string, plan: PlannedWrite): void {

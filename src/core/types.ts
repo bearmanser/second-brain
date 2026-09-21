@@ -87,6 +87,30 @@ export interface ProjectEnsureResult {
   warnings: string[];
 }
 
+export type RepositoryProjectState = 'provisioning' | 'ready' | 'recovery_required';
+
+export interface RepositoryProjectRecord {
+  repository_identity: string;
+  scope: string;
+  backend_project: string;
+  relative_root: string;
+  state: RepositoryProjectState;
+  created_by_principal_id: string;
+  creation_operation_id: string;
+  failure_stage?: string;
+  failure_code?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DynamicProjectGrant {
+  principal_id: string;
+  scope: string;
+  can_read: true;
+  can_write: boolean;
+  can_review: boolean;
+}
+
 export interface RecallRequest {
   scope: string;
   query: string;
