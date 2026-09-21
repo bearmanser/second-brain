@@ -161,7 +161,6 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const root = '/volume';
 const lines = [];
-let escaping = null;
 const walk = (directory) => {
   const entries = fs
     .readdirSync(directory, { withFileTypes: true })
@@ -172,15 +171,6 @@ const walk = (directory) => {
     const info = fs.lstatSync(absolute);
     if (info.isSymbolicLink()) {
       const target = fs.readlinkSync(absolute);
-      let resolved;
-      try {
-        resolved = fs.realpathSync(absolute);
-      } catch {
-        process.stderr.write(`broken symbolic link: ${relative} -> ${target}\n`);
-        process.exit(3);
-      }
-      const inside = resolved === root || resolved.startsWith(`${root}${path.sep}`);
-      if (!inside && escaping === null) escaping = `${relative} -> ${target}`;
       lines.push(`L ${relative} -> ${target}`);
       continue;
     }
@@ -195,10 +185,6 @@ const walk = (directory) => {
   }
 };
 walk(root);
-if (escaping !== null) {
-  process.stderr.write(`escaping or broken symbolic link outside the volume root: ${escaping}\n`);
-  process.exit(3);
-}
 process.stdout.write(lines.join('\n'));
 VOLUME_SNAPSHOT
 }
@@ -206,6 +192,11 @@ VOLUME_SNAPSHOT
 if ! docker image inspect second-brain:local >/dev/null 2>&1; then
   fail "the second-brain:local image is required for volume snapshots and the versioned manifest; run scripts/setup.sh"
 fi
+
+validate_live_store() {
+  docker run --rm --user 0:0 -v "$1":/store:ro --entrypoint node second-brain:local \
+    /app/dist/cli.js validate-store-links --root /store --mode "$2"
+}
 
 validate_created_archive() {
   local archive="$1" mode="$2" store="$3" relative output
@@ -223,10 +214,9 @@ validate_created_archive() {
   fi
 }
 
-note "scanning the vault for symbolic links"
-VAULT_SYMLINK="$(find "$VAULT_ABS" -type l -print -quit 2>/dev/null || true)"
-if [ -n "$VAULT_SYMLINK" ]; then
-  fail "the vault contains a symbolic link, which is never archived: $VAULT_SYMLINK"
+note "validating vault links"
+if ! VAULT_LINKS="$(validate_live_store "$VAULT_ABS" vault 2>&1)"; then
+  fail "the vault cannot be archived: $VAULT_LINKS"
 fi
 
 STORES=("vault")
@@ -241,8 +231,13 @@ if [ -n "$TEST_INJECT" ]; then
 fi
 tar -cf "$DESTINATION/vault.tar" -C "$VAULT_ABS" .
 validate_created_archive "$DESTINATION/vault.tar" vault vault
+if ! VAULT_LINKS="$(validate_live_store "$VAULT_ABS" vault 2>&1)"; then
+  rm -f "$DESTINATION/vault.tar"
+  fail "the vault changed into an unsafe state while it was being copied: $VAULT_LINKS"
+fi
 AFTER_VAULT="$(snapshot_dir "$VAULT_ABS")"
 if [ "$BEFORE_VAULT" != "$AFTER_VAULT" ]; then
+  rm -f "$DESTINATION/vault.tar"
   fail "the vault changed while it was being copied; aborting because the backup is inconsistent (is Obsidian/sync really paused?)"
 fi
 
@@ -251,16 +246,20 @@ if [ "$NOTES_ONLY" = "0" ]; then
     key="${entry%%$'\t'*}"
     volume="${entry#*$'\t'}"
     note "archiving named volume $key ($volume)"
-    if ! BEFORE="$(volume_snapshot "$volume" 2>&1)"; then
-      fail "volume $key ($volume) cannot be archived: $BEFORE"
+    if ! LINK_CHECK="$(validate_live_store "$volume" volume 2>&1)"; then
+      fail "volume $key ($volume) cannot be archived: $LINK_CHECK"
     fi
+    BEFORE="$(volume_snapshot "$volume")"
     docker run --rm --user 0:0 -v "$volume":/volume:ro -v "$DESTINATION/volumes":/backup \
       --entrypoint tar "$NODE_IMAGE" -C /volume -cf "/backup/$key.tar" .
     validate_created_archive "$DESTINATION/volumes/$key.tar" volume "volume $key"
-    if ! AFTER="$(volume_snapshot "$volume" 2>&1)"; then
-      fail "volume $key ($volume) changed into an unsafe state while it was being copied: $AFTER"
+    if ! LINK_CHECK="$(validate_live_store "$volume" volume 2>&1)"; then
+      rm -f "$DESTINATION/volumes/$key.tar"
+      fail "volume $key ($volume) changed into an unsafe state while it was being copied: $LINK_CHECK"
     fi
+    AFTER="$(volume_snapshot "$volume")"
     if [ "$BEFORE" != "$AFTER" ]; then
+      rm -f "$DESTINATION/volumes/$key.tar"
       fail "volume $key ($volume) changed while it was being copied; aborting because the backup is inconsistent"
     fi
     STORES+=("$key")

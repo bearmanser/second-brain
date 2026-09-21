@@ -92,6 +92,32 @@ run_verifier() {
   fail "no manifest verifier is available; run npm run build or set BRAIN_VERIFY_COMMAND"
 }
 
+validate_volume_links() {
+  local root="$1" output
+  if [ -n "${BRAIN_VERIFY_COMMAND:-}" ]; then
+    if output="$(cd "$ROOT_DIR" && $BRAIN_VERIFY_COMMAND validate-store-links --root "$root" --mode volume 2>&1)"; then
+      return 0
+    fi
+  elif [ -f "$ROOT_DIR/dist/cli.js" ] && command -v node >/dev/null 2>&1; then
+    if output="$(node "$ROOT_DIR/dist/cli.js" validate-store-links --root "$root" --mode volume 2>&1)"; then
+      return 0
+    fi
+  elif command -v npx >/dev/null 2>&1 && [ -d "$ROOT_DIR/node_modules/tsx" ]; then
+    if output="$(cd "$ROOT_DIR" && npx --no-install tsx src/cli.ts validate-store-links --root "$root" --mode volume 2>&1)"; then
+      return 0
+    fi
+  elif command -v docker >/dev/null 2>&1 && docker image inspect second-brain:local >/dev/null 2>&1; then
+    if output="$(docker run --rm --user 0:0 -v "$root":/store:ro --entrypoint node second-brain:local \
+      /app/dist/cli.js validate-store-links --root /store --mode volume 2>&1)"; then
+      return 0
+    fi
+  else
+    output="no symbolic link verifier is available"
+  fi
+  printf 'restore: restored volume failed symbolic link validation: %s\n' "$output" >&2
+  return 1
+}
+
 FORMAT_VERSION="$(read_number_field "$BACKUP/manifest.json" format_version || true)"
 [ -n "$FORMAT_VERSION" ] || fail "backup manifest.json has no readable format_version"
 [ "$FORMAT_VERSION" = "$BACKUP_FORMAT" ] || fail "unsupported backup format version $FORMAT_VERSION (this release supports $BACKUP_FORMAT)"
@@ -111,26 +137,6 @@ if [ -f "$BACKUP/checksums.sha256" ]; then
   fi
 fi
 
-validate_volume_links() {
-  local root link target
-  root="$(cd "$1" && pwd -P)"
-  while IFS= read -r -d '' link; do
-    target="$(readlink -f "$link" 2>/dev/null || true)"
-    if [ -z "$target" ]; then
-      printf 'restore: broken symbolic link in a restored volume: %s\n' "$link" >&2
-      return 1
-    fi
-    case "$target" in
-      "$root" | "$root"/*) ;;
-      *)
-        printf 'restore: symbolic link escapes the restored volume: %s -> %s\n' "$link" "$target" >&2
-        return 1
-        ;;
-    esac
-  done < <(find "$root" -type l -print0)
-  return 0
-}
-
 verify_archive() {
   local archive="$1" mode="$2" member
   [ -f "$archive" ] || fail "backup archive is missing: $archive"
@@ -143,10 +149,8 @@ verify_archive() {
       */../*) fail "archive member contains traversal: $member" ;;
     esac
   done < <(tar -tf "$archive")
-  if tar -tvf "$archive" | grep -Eq '^l'; then
-    if [ "$mode" = "vault" ]; then
-      fail "the vault archive contains a symbolic link member: $archive"
-    fi
+  if [ "$mode" = "vault" ] && tar -tvf "$archive" | grep -Eq '^l'; then
+    fail "the vault archive contains a symbolic link member: $archive"
   fi
 }
 
@@ -169,19 +173,6 @@ for archive in "${ARCHIVES[@]}"; do
     volumes/*.tar) mode="volume" ;;
   esac
   verify_archive "$archive" "$mode"
-  if [ "$mode" = "volume" ] && tar -tvf "$archive" | grep -Eq '^l'; then
-    temporary="$(mktemp -d)"
-    if ! tar -xf "$archive" -C "$temporary" --no-same-owner --no-same-permissions; then
-      rm -rf "$temporary"
-      fail "a named-volume archive could not be inspected: $relative"
-    fi
-    if ! validate_volume_links "$temporary" >/dev/null 2>&1; then
-      validate_volume_links "$temporary" || true
-      rm -rf "$temporary"
-      fail "a named-volume archive contains a symbolic link that escapes the volume root: $relative"
-    fi
-    rm -rf "$temporary"
-  fi
 done
 
 if [ -e "$NEW_ROOT" ] || [ -L "$NEW_ROOT" ]; then
@@ -217,7 +208,7 @@ for archive in "$BACKUP"/volumes/*.tar; do
   tar -xf "$archive" -C "$NEW_ROOT/volumes/$key" --no-same-owner --no-same-permissions
   if ! validate_volume_links "$NEW_ROOT/volumes/$key"; then
     rm -rf "$NEW_ROOT"
-    fail "the restored volume $key contains a symbolic link that escapes its root; the restore was discarded"
+    fail "the restored volume $key contains an invalid symbolic link; the restore was discarded"
   fi
 done
 if [ -f "$BACKUP/secrets.tar" ]; then

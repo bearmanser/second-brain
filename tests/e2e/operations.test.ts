@@ -465,13 +465,14 @@ describe('disposable Compose operations', () => {
     await waitForHealth(300_000);
   }, 600_000);
 
-  test('backup.sh rejects a symlink found only in the produced archive and removes it', async () => {
+  test('backup.sh rejects archive-only non-directory link traversal and removes the archive', async () => {
     const destination = join(workDir, 'archive-link-backup');
     const inject = [
-      'if [ "$BRAIN_BACKUP_STORE" = vault ]; then',
+      'if [ "$BRAIN_BACKUP_STORE" = "volume model-cache" ]; then',
       'scratch="$(mktemp -d)"',
-      'ln -s missing-target "$scratch/archive-only-link"',
-      'tar -rf "$BRAIN_BACKUP_ARCHIVE" -C "$scratch" archive-only-link',
+      'printf file > "$scratch/archive-only-regular-file"',
+      'ln -s archive-only-regular-file/.. "$scratch/archive-only-nondirectory-link"',
+      'tar -rf "$BRAIN_BACKUP_ARCHIVE" -C "$scratch" archive-only-regular-file archive-only-nondirectory-link',
       'rm -rf "$scratch"',
       'fi'
     ].join('\n');
@@ -489,9 +490,21 @@ describe('disposable Compose operations', () => {
     );
     expect(result.status).not.toBe(0);
     expect(`${result.stdout}${result.stderr}`).toMatch(/archive.*inconsistent|inconsistent.*archive/i);
-    expect(`${result.stdout}${result.stderr}`).toContain('archive-only-link');
-    expect(existsSync(join(destination, 'vault.tar'))).toBe(false);
-    expect(existsSync(join(vaultPath, 'archive-only-link'))).toBe(false);
+    expect(`${result.stdout}${result.stderr}`).toContain('archive-only-nondirectory-link');
+    expect(existsSync(join(destination, 'volumes', 'model-cache.tar'))).toBe(false);
+    const source = run('docker', [
+      'run',
+      '--rm',
+      '--user',
+      '0:0',
+      '-v',
+      `${project}_model-cache:/cache`,
+      nodeImage,
+      'sh',
+      '-c',
+      'test ! -e /cache/archive-only-nondirectory-link && test ! -L /cache/archive-only-nondirectory-link'
+    ]);
+    expect(source.status).toBe(0);
     await waitForHealth(300_000);
   }, 600_000);
 

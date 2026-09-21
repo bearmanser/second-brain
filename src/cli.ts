@@ -15,6 +15,7 @@ import {
   collectManifestFiles,
   readManifestFile,
   validateBackupArchive,
+  validateStoreLinks,
   verifyManifest,
   writeManifestFile
 } from './operations/backup.js';
@@ -34,6 +35,7 @@ export type CliCommand =
   | 'rebuild-catalogue'
   | 'backup-manifest'
   | 'validate-archive'
+  | 'validate-store-links'
   | 'verify-backup';
 
 export const CLI_COMMANDS: readonly CliCommand[] = [
@@ -45,6 +47,7 @@ export const CLI_COMMANDS: readonly CliCommand[] = [
   'rebuild-catalogue',
   'backup-manifest',
   'validate-archive',
+  'validate-store-links',
   'verify-backup'
 ];
 
@@ -59,7 +62,7 @@ const systemIds: IdSource = { next: () => randomUUID() };
 
 const USAGE = [
   'usage: node dist/cli.js <command> [options]',
-  'commands: serve | setup | health | recover | recover-state | rebuild-catalogue | backup-manifest | validate-archive | verify-backup'
+  'commands: serve | setup | health | recover | recover-state | rebuild-catalogue | backup-manifest | validate-archive | validate-store-links | verify-backup'
 ].join('\n');
 
 function invalidInput(message: string): BrainError {
@@ -389,6 +392,18 @@ async function runValidateArchive(parsed: ParsedArguments): Promise<number> {
   return 0;
 }
 
+async function runValidateStoreLinks(parsed: ParsedArguments): Promise<number> {
+  const root = flagString(parsed.flags, 'root');
+  const mode = flagString(parsed.flags, 'mode');
+  if (root === undefined) throw invalidInput('validate-store-links requires --root');
+  if (mode !== 'vault' && mode !== 'volume') {
+    throw invalidInput('validate-store-links requires --mode vault or --mode volume');
+  }
+  await validateStoreLinks(root, mode);
+  process.stdout.write(`validated ${mode} store links: ${root}\n`);
+  return 0;
+}
+
 export async function runCli(
   argv: readonly string[],
   env: NodeJS.ProcessEnv = process.env
@@ -415,6 +430,8 @@ export async function runCli(
       return runBackupManifest(parsed);
     case 'validate-archive':
       return runValidateArchive(parsed);
+    case 'validate-store-links':
+      return runValidateStoreLinks(parsed);
     case 'verify-backup':
       return runVerifyBackup(parsed);
   }

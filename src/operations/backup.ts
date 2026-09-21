@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { lstat, open, readdir, readFile, writeFile, type FileHandle } from 'node:fs/promises';
+import { lstat, open, readdir, readFile, readlink, writeFile, type FileHandle } from 'node:fs/promises';
 import { join, posix, relative, resolve, sep } from 'node:path';
 
 export const BACKUP_FORMAT_VERSION = 1;
@@ -47,6 +47,15 @@ interface ArchiveEntry {
   type: string;
   linkTarget?: string;
 }
+
+type StoreEntry =
+  | { kind: 'directory' }
+  | { kind: 'other' }
+  | { kind: 'symlink'; target: string };
+
+type LinkResolution = 'inside' | 'broken' | 'escaping';
+
+const MAX_SYMLINK_TRAVERSALS = 40;
 
 function sha256(buffer: Buffer): string {
   return createHash('sha256').update(buffer).digest('hex');
@@ -202,17 +211,22 @@ function parentPaths(path: string): string[] {
   return parents;
 }
 
-function resolveArchivedLink(
-  entry: ArchiveEntry,
-  byPath: Map<string, ArchiveEntry>,
-  knownPaths: Set<string>
-): 'inside' | 'broken' | 'escaping' {
-  const initialTarget = entry.linkTarget ?? '';
+function absoluteLinkTarget(target: string): boolean {
+  return posix.isAbsolute(target) || target.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(target);
+}
+
+function resolveStoreLink(
+  linkPath: string,
+  initialTarget: string,
+  entries: ReadonlyMap<string, StoreEntry>
+): LinkResolution {
   if (initialTarget.length === 0) return 'broken';
-  if (initialTarget.startsWith('/')) return 'escaping';
+  if (absoluteLinkTarget(initialTarget)) return 'escaping';
   const pending = initialTarget.split('/');
-  const resolved = posix.dirname(entry.path) === '.' ? [] : posix.dirname(entry.path).split('/');
+  const parent = posix.dirname(linkPath);
+  const resolved = parent === '.' ? [] : parent.split('/');
   const followed = new Set<string>();
+  let traversals = 0;
   while (pending.length > 0) {
     const component = pending.shift() ?? '';
     if (component.length === 0 || component === '.') continue;
@@ -221,53 +235,119 @@ function resolveArchivedLink(
       resolved.pop();
       continue;
     }
-    resolved.push(component);
-    const candidate = resolved.join('/');
-    const nested = byPath.get(candidate);
-    if (nested?.type === '2') {
+    const candidate = [...resolved, component].join('/');
+    const nested = entries.get(candidate);
+    if (nested === undefined) return 'broken';
+    if (nested.kind === 'symlink') {
+      traversals += 1;
+      if (traversals > MAX_SYMLINK_TRAVERSALS) return 'broken';
       if (followed.has(candidate)) return 'broken';
       followed.add(candidate);
-      const target = nested.linkTarget ?? '';
+      const target = nested.target;
       if (target.length === 0) return 'broken';
-      if (target.startsWith('/')) return 'escaping';
+      if (absoluteLinkTarget(target)) return 'escaping';
       const parent = posix.dirname(candidate);
       resolved.splice(0, resolved.length, ...(parent === '.' ? [] : parent.split('/')));
       pending.unshift(...target.split('/'));
       continue;
     }
-    if (!knownPaths.has(candidate)) return 'broken';
+    resolved.push(component);
+    if (pending.length > 0 && nested.kind !== 'directory') return 'broken';
   }
-  return knownPaths.has(resolved.join('/')) ? 'inside' : 'broken';
+  return entries.has(resolved.join('/')) ? 'inside' : 'broken';
+}
+
+function archiveStoreEntries(entries: readonly ArchiveEntry[]): Map<string, StoreEntry> {
+  const storeEntries = new Map<string, StoreEntry>([['', { kind: 'directory' }]]);
+  for (const entry of entries) {
+    storeEntries.set(
+      entry.path,
+      entry.type === '2'
+        ? { kind: 'symlink', target: entry.linkTarget ?? '' }
+        : entry.type === '5'
+          ? { kind: 'directory' }
+          : { kind: 'other' }
+    );
+  }
+  for (const entry of entries) {
+    for (const parent of parentPaths(entry.path)) {
+      if (!storeEntries.has(parent)) storeEntries.set(parent, { kind: 'directory' });
+    }
+  }
+  return storeEntries;
+}
+
+async function liveStoreEntries(root: string): Promise<Map<string, StoreEntry>> {
+  const base = resolve(root);
+  const rootInfo = await lstat(base).catch(() => undefined);
+  if (rootInfo === undefined) throw backupError(`store root does not exist: ${root}`);
+  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) {
+    throw backupError(`store root is not a directory: ${root}`);
+  }
+  const entries = new Map<string, StoreEntry>([['', { kind: 'directory' }]]);
+  async function walk(directory: string): Promise<void> {
+    const children = await readdir(directory, { withFileTypes: true });
+    children.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+    for (const child of children) {
+      const absolute = join(directory, child.name);
+      const path = relative(base, absolute).split(sep).join('/');
+      const info = await lstat(absolute);
+      if (info.isSymbolicLink()) {
+        entries.set(path, { kind: 'symlink', target: await readlink(absolute) });
+        continue;
+      }
+      if (info.isDirectory()) {
+        entries.set(path, { kind: 'directory' });
+        await walk(absolute);
+        continue;
+      }
+      entries.set(path, { kind: 'other' });
+    }
+  }
+  await walk(base);
+  return entries;
+}
+
+function assertStoreLinks(entries: ReadonlyMap<string, StoreEntry>, mode: BackupArchiveMode, label: string): void {
+  for (const [path, entry] of entries) {
+    if (entry.kind !== 'symlink') continue;
+    if (mode === 'vault') {
+      throw backupError(`${label} contains symbolic link: ${path}`);
+    }
+    const result = resolveStoreLink(path, entry.target, entries);
+    if (result === 'broken') {
+      throw backupError(`${label} contains broken symbolic link: ${path} -> ${entry.target}`);
+    }
+    if (result === 'escaping') {
+      throw backupError(`${label} contains escaping symbolic link: ${path} -> ${entry.target}`);
+    }
+  }
+}
+
+export async function validateStoreLinks(root: string, mode: BackupArchiveMode): Promise<void> {
+  assertStoreLinks(await liveStoreEntries(root), mode, mode === 'vault' ? 'vault store' : 'named-volume store');
 }
 
 export async function validateBackupArchive(path: string, mode: BackupArchiveMode): Promise<void> {
   const entries = await readArchiveEntries(path);
   const byPath = new Map<string, ArchiveEntry>();
-  const knownPaths = new Set<string>(['']);
   for (const entry of entries) {
     if (byPath.has(entry.path)) throw backupError(`archive contains a duplicate member: ${entry.path}`);
     byPath.set(entry.path, entry);
-    knownPaths.add(entry.path);
-    for (const parent of parentPaths(entry.path)) knownPaths.add(parent);
   }
+  const storeEntries = archiveStoreEntries(entries);
   for (const entry of entries) {
     for (const parent of parentPaths(entry.path)) {
-      if (byPath.get(parent)?.type === '2') {
+      const parentEntry = storeEntries.get(parent);
+      if (parentEntry?.kind === 'symlink') {
         throw backupError(`archive member is nested beneath a symbolic link: ${entry.path}`);
       }
-    }
-    if (entry.type !== '2') continue;
-    if (mode === 'vault') {
-      throw backupError(`vault archive contains symbolic link member: ${entry.path}`);
-    }
-    const result = resolveArchivedLink(entry, byPath, knownPaths);
-    if (result === 'broken') {
-      throw backupError(`named-volume archive contains broken symbolic link: ${entry.path} -> ${entry.linkTarget ?? ''}`);
-    }
-    if (result === 'escaping') {
-      throw backupError(`named-volume archive contains escaping symbolic link: ${entry.path} -> ${entry.linkTarget ?? ''}`);
+      if (parentEntry?.kind === 'other') {
+        throw backupError(`archive member is nested beneath a non-directory: ${entry.path}`);
+      }
     }
   }
+  assertStoreLinks(storeEntries, mode, mode === 'vault' ? 'vault archive' : 'named-volume archive');
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

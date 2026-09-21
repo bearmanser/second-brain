@@ -113,17 +113,17 @@ per-store:
 - **Vault:** any symbolic link is an error. The backup fails with the precise offending
   path, matching `FileVault`, which ignores links.
 - **Named volumes** (for example `model-cache`, which legitimately contains cache links):
-  links are preserved as links. Before archiving, every link target is validated to stay
-  inside that volume root; an escaping or broken link fails the backup with the precise
-  path. The before/after consistency snapshot includes link entries, so a link that
-  appears while copying aborts the backup.
+  links are preserved as links. One TypeScript resolver validates both the stopped live
+  volume and the produced archive, walking each target component, requiring every
+  intermediate component to be a directory, bounding link chains, and rejecting missing,
+  absolute, or root-escaping targets with the precise link path. The before/after
+  consistency snapshot includes link entries, so a link that appears while copying aborts
+  the backup.
 - **Restore** applies the same rule: symlink members in the vault archive are rejected;
   named-volume archives recreate links only when their targets stay inside the restored
   volume root, and a broken or escaping link discards the restore.
 
-`--check` validates the manifest/hashes and archive members, and for named-volume
-archives that contain symlinks it extracts them to a temporary directory to validate the
-link targets, then removes it.
+`--check` validates the manifest, hashes, and archive members without extracting them.
 
 Stores and secrets:
 

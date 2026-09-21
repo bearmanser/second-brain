@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect, test } from 'vitest';
@@ -9,7 +10,9 @@ import {
   buildManifest,
   collectManifestFiles,
   resolveBackupPath,
+  validateBackupArchive,
   validateManifest,
+  validateStoreLinks,
   verifyManifest,
   type BackupManifest,
   type VersionManifest
@@ -211,4 +214,128 @@ test('collects a directory snapshot that verifies as a manifest', async () => {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+async function withLinkStore(
+  setup: (workspace: string, store: string) => Promise<void>,
+  assertion: (store: string, archive: string) => Promise<void>
+): Promise<void> {
+  const workspace = await mkdtemp(join(tmpdir(), 'brain-archive-link-'));
+  const archive = join(workspace, 'volume.tar');
+  const store = join(workspace, 'store');
+  try {
+    await mkdir(store);
+    await setup(workspace, store);
+    const packed = spawnSync('tar', ['-cf', archive, '-C', store, '.'], { encoding: 'utf8' });
+    expect(packed.status, packed.stderr).toBe(0);
+    await assertion(store, archive);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+}
+
+test('live and archive validation reject a link that traverses through a regular file', async () => {
+  await withLinkStore(
+    async (_workspace, store) => {
+      await writeFile(join(store, 'regular-file'), 'not a directory');
+      await symlink('regular-file/..', join(store, 'non-directory-link'));
+    },
+    async (store, archive) => {
+      await expect(validateStoreLinks(store, 'volume')).rejects.toThrow(/non-directory-link/);
+      await expect(validateBackupArchive(archive, 'volume')).rejects.toThrow(/non-directory-link/);
+    }
+  );
+});
+
+test('live and archive validation reject a simple missing link target', async () => {
+  await withLinkStore(
+    async (_workspace, store) => {
+      await symlink('missing-target', join(store, 'missing-link'));
+    },
+    async (store, archive) => {
+      await expect(validateStoreLinks(store, 'volume')).rejects.toThrow(/missing-link/);
+      await expect(validateBackupArchive(archive, 'volume')).rejects.toThrow(/missing-link/);
+    }
+  );
+});
+
+test('live and archive validation reject dot-dot escaping the store root', async () => {
+  await withLinkStore(
+    async (workspace, store) => {
+      await writeFile(join(workspace, 'outside'), 'outside');
+      await symlink('../outside', join(store, 'escaping-link'));
+    },
+    async (store, archive) => {
+      await expect(validateStoreLinks(store, 'volume')).rejects.toThrow(/escaping-link/);
+      await expect(validateBackupArchive(archive, 'volume')).rejects.toThrow(/escaping-link/);
+    }
+  );
+});
+
+test('live and archive validation reject absolute link targets', async () => {
+  await withLinkStore(
+    async (_workspace, store) => {
+      await symlink('/etc/passwd', join(store, 'absolute-link'));
+    },
+    async (store, archive) => {
+      await expect(validateStoreLinks(store, 'volume')).rejects.toThrow(/absolute-link/);
+      await expect(validateBackupArchive(archive, 'volume')).rejects.toThrow(/absolute-link/);
+    }
+  );
+});
+
+test('live and archive validation reject symbolic link cycles', async () => {
+  await withLinkStore(
+    async (_workspace, store) => {
+      await symlink('cycle-b', join(store, 'cycle-a'));
+      await symlink('cycle-a', join(store, 'cycle-b'));
+    },
+    async (store, archive) => {
+      await expect(validateStoreLinks(store, 'volume')).rejects.toThrow(/cycle-a/);
+      await expect(validateBackupArchive(archive, 'volume')).rejects.toThrow(/cycle-a/);
+    }
+  );
+});
+
+test('live and archive validation reject excessive symbolic link traversal', async () => {
+  await withLinkStore(
+    async (_workspace, store) => {
+      await mkdir(join(store, 'target'));
+      for (let index = 41; index >= 0; index -= 1) {
+        await symlink(index === 41 ? 'target' : `depth-${index + 1}`, join(store, `depth-${index}`));
+      }
+    },
+    async (store, archive) => {
+      await expect(validateStoreLinks(store, 'volume')).rejects.toThrow(/depth-0/);
+      await expect(validateBackupArchive(archive, 'volume')).rejects.toThrow(/depth-0/);
+    }
+  );
+});
+
+test('live and archive validation accept a bounded symlink chain to an internal directory', async () => {
+  await withLinkStore(
+    async (_workspace, store) => {
+      await mkdir(join(store, 'target'));
+      await writeFile(join(store, 'target', 'value'), 'inside');
+      await symlink('target', join(store, 'second-link'));
+      await symlink('second-link', join(store, 'first-link'));
+    },
+    async (store, archive) => {
+      await expect(validateStoreLinks(store, 'volume')).resolves.toBeUndefined();
+      await expect(validateBackupArchive(archive, 'volume')).resolves.toBeUndefined();
+    }
+  );
+});
+
+test('live and archive validation reject symbolic links in a vault store', async () => {
+  await withLinkStore(
+    async (_workspace, store) => {
+      await writeFile(join(store, 'target'), 'inside');
+      await symlink('target', join(store, 'vault-link'));
+    },
+    async (store, archive) => {
+      await expect(validateStoreLinks(store, 'vault')).rejects.toThrow(/vault-link/);
+      await expect(validateBackupArchive(archive, 'vault')).rejects.toThrow(/vault-link/);
+    }
+  );
 });
