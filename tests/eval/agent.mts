@@ -89,6 +89,8 @@ export interface ParsedAgentEvents {
   tool_timeline: string[];
   retrieved_ids: string[];
   recall_before_substantive_work: boolean;
+  project_ensured: boolean;
+  ensure_before_recall: boolean;
   candidates_captured: number;
   review_performed: boolean;
   memory_call_events: { tool: string; event_index: number }[];
@@ -101,6 +103,7 @@ export function parseAgentEvents(stdout: string): ParsedAgentEvents {
   const memoryCalls: { tool: string; event_index: number }[] = [];
   let firstSubstantive = Number.POSITIVE_INFINITY;
   let firstRecall = Number.POSITIVE_INFINITY;
+  let firstEnsure = Number.POSITIVE_INFINITY;
   let captured = 0;
   let reviewed = false;
   let eventIndex = 0;
@@ -137,6 +140,8 @@ export function parseAgentEvents(stdout: string): ParsedAgentEvents {
             } catch {}
           }
           collectItemIds(output, retrieved);
+        } else if (part.tool === 'brain_project_ensure') {
+          firstEnsure = Math.min(firstEnsure, eventIndex);
         } else if (part.tool === 'brain_capture') {
           captured += 1;
         } else if (part.tool === 'brain_review') {
@@ -151,6 +156,8 @@ export function parseAgentEvents(stdout: string): ParsedAgentEvents {
     tool_timeline: timeline,
     retrieved_ids: [...retrieved],
     recall_before_substantive_work: Number.isFinite(firstRecall) && firstRecall < firstSubstantive,
+    project_ensured: Number.isFinite(firstEnsure),
+    ensure_before_recall: Number.isFinite(firstEnsure) && firstEnsure < firstRecall,
     candidates_captured: captured,
     review_performed: reviewed,
     memory_call_events: memoryCalls
@@ -170,6 +177,8 @@ interface PilotRunRecord {
   instructions_received: boolean | null;
   tools_available: string[];
   recall_before_substantive_work: boolean;
+  project_ensured: boolean;
+  ensure_before_recall: boolean;
   candidates_captured: number;
   review_performed: boolean;
   memory_call_events: { tool: string; event_index: number }[];
@@ -285,9 +294,35 @@ async function runOne(
   const workDir = await mkdtemp(join(tmpdir(), 'brain-agent-'));
   try {
     harness.backend.search = makeLexicalSearch(harness.backend.root);
+    const repositoryNumber = (runIndex % 2) + 1;
+    const repositoryScope = `evaluation-repository-${repositoryNumber}`;
+    const repositoryRemote = `https://github.com/second-brain-eval/${repositoryScope}.git`;
     if (condition === 'enabled') {
+      for (const [token, name] of [
+        [harness.token, 'evaluation-worker'],
+        [harness.reviewerToken, 'evaluation-reviewer']
+      ] as const) {
+        const client = await harness.connect(token, name);
+        try {
+          const ensured = await client.callTool({
+            name: 'brain_project_ensure',
+            arguments: { idempotency_key: randomUUID(), remote_url: repositoryRemote }
+          });
+          if ((ensured as { isError?: boolean }).isError === true) {
+            throw new Error(`evaluation project provisioning failed for ${name}`);
+          }
+        } finally {
+          await client.close();
+        }
+      }
       const registry: SeedRegistry = { by_id: new Map(), by_key: new Map(), timeline: [] };
-      await seedCorpus(httpSeedProvider(harness), corpus, registry, { keys: task.memory_keys });
+      const repositoryCorpus: CorpusFile = {
+        ...corpus,
+        notes: corpus.notes.map((entry) =>
+          entry.scope === 'freellmapi' ? { ...entry, scope: repositoryScope } : entry
+        )
+      };
+      await seedCorpus(httpSeedProvider(harness), repositoryCorpus, registry, { keys: task.memory_keys });
     }
     const writeConfig = async (servers: Record<string, unknown>): Promise<void> => {
       await writeFile(
@@ -310,6 +345,10 @@ async function runOne(
     await writeConfig(condition === 'enabled' ? { 'second-brain': ownServer } : {});
     await runCommand('git', ['init', '-q'], { cwd: workDir, timeout_ms: 30_000 });
     await runCommand('git', ['commit', '--allow-empty', '-q', '-m', 'init'], {
+      cwd: workDir,
+      timeout_ms: 30_000
+    });
+    await runCommand('git', ['remote', 'add', 'origin', repositoryRemote], {
       cwd: workDir,
       timeout_ms: 30_000
     });
@@ -356,6 +395,8 @@ async function runOne(
         instructions_received: null,
         tools_available: [],
         recall_before_substantive_work: false,
+        project_ensured: false,
+        ensure_before_recall: false,
         candidates_captured: 0,
         review_performed: false,
         memory_call_events: [],
@@ -402,6 +443,8 @@ async function runOne(
       instructions_received: null,
       tools_available: [...new Set(events.tool_timeline)],
       recall_before_substantive_work: events.recall_before_substantive_work,
+      project_ensured: events.project_ensured,
+      ensure_before_recall: events.ensure_before_recall,
       candidates_captured: events.candidates_captured,
       review_performed: events.review_performed,
       memory_call_events: events.memory_call_events,

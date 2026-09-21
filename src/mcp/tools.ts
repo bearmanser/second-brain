@@ -286,7 +286,7 @@ const statusResultSchema: Record<string, unknown> = {
         }
       }
     },
-    operation: mutationReceiptSchema,
+    operation: { oneOf: [mutationReceiptSchema, projectEnsureResultSchema] },
     schemas: { type: 'object' }
   }
 };

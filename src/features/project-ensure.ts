@@ -146,7 +146,8 @@ function scopeFor(project: RepositoryProjectRecord): ScopeConfig {
 async function finalizePlan(
   record: OperationRecord,
   plan: ProjectProvisioningPlan,
-  deps: MutationDeps
+  deps: MutationDeps,
+  allowOwnerRepair = false
 ): Promise<ProjectEnsureResult> {
   let project = deps.journal.getProjectByIdentity(plan.repository_identity);
   if (project === undefined) {
@@ -163,7 +164,7 @@ async function finalizePlan(
   if (project.scope !== plan.scope) {
     throw failure('CONFLICT', 'repository project mapping changed', record.operation_id);
   }
-  if (project.state === 'recovery_required') {
+  if (project.state === 'recovery_required' && !allowOwnerRepair) {
     throw failure('RECOVERY_REQUIRED', 'repository project requires owner recovery', record.operation_id);
   }
   if (project.state === 'ready') {
@@ -277,7 +278,12 @@ export async function ensureProject(
           : parsePlan(record);
       if (record.plan_json === undefined) deps.journal.saveProjectPlan(record.operation_id, plan);
       if (record.state === 'prepared') deps.journal.mark(record.operation_id, 'submitted');
-      return finalizePlan(deps.journal.get(record.operation_id) ?? record, plan, deps);
+      return finalizePlan(
+        deps.journal.get(record.operation_id) ?? record,
+        plan,
+        deps,
+        ctx.principal.role === 'owner'
+      );
     });
     try {
       deps.journal.appendAudit({

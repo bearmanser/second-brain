@@ -133,6 +133,13 @@ test('ensures a repository scope and uses it immediately across principals and r
     expect(ensured.isError).toBeFalsy();
     const scope = record(ensured.structuredContent).scope as string;
     expect(scope).toBe('runtime-project');
+    const ensuredStatus = await call(worker, 'brain_status', {
+      operation_id: record(ensured.structuredContent).operation_id
+    });
+    expect(record(record(ensuredStatus.structuredContent).operation)).toMatchObject({
+      repository_identity: 'github.com/example/runtime-project',
+      scope
+    });
 
     const captured = await call(worker, 'brain_capture', {
       idempotency_key: randomUUID(),

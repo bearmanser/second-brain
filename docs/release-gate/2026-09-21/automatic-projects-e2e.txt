@@ -1,0 +1,23 @@
+# Automatic repository projects: Docker end-to-end transcript
+# Recorded 2026-09-21T10:20:59Z
+# node v24.21.0; npm 11.19.0; Docker Engine 29.7.2; Docker Compose v5.5.0
+
+$ npm run test:e2e
+exit 0
+5 files passed; 66 tests passed; duration 350.75s
+
+tests/e2e/recovery.test.ts: 16 passed
+tests/e2e/docker.test.ts: 7 passed
+tests/e2e/operations.test.ts: 11 passed
+tests/e2e/lifecycle.test.ts: 13 passed
+tests/e2e/security.test.ts: 19 passed
+
+Automatic-project evidence exercised by this run:
+- real missing-project creation through the public MCP gateway and private pinned backend
+- immediate capture/recall with the returned dynamic scope
+- role-derived worker, reviewer, and owner grants with principal isolation
+- restart, cold backup/restore, and catalogue rebuild persistence for mappings and grants
+- concurrent mixed-principal requests without authorization crossover
+- secret-bearing and reserved remote rejection without input disclosure
+- backend outage recovery and owner repair after an exact path conflict
+- gateway published on loopback only and no public Basic Memory port

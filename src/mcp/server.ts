@@ -156,7 +156,7 @@ const statusOutputSchema = z.strictObject({
       })
     )
     .optional(),
-  operation: mutationReceiptOutputSchema.optional(),
+  operation: z.union([mutationReceiptOutputSchema, projectEnsureOutputSchema]).optional(),
   schemas: z.record(z.string(), z.unknown()).optional()
 });
 

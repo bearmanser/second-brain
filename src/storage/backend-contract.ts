@@ -184,7 +184,8 @@ export const searchResponseSchema = z.object({
 export type SearchResponse = z.infer<typeof searchResponseSchema>;
 
 export const projectSchema = z.object({
-  name: z.string()
+  name: z.string(),
+  path: z.string()
 });
 
 export const projectsResponseSchema = z.object({
@@ -259,6 +260,14 @@ export function decodeProjectNames(value: unknown): string[] {
     throw protocolError('list_memory_projects response did not match the observed backend shape');
   }
   return parsed.data.projects.map((project) => project.name);
+}
+
+export function decodeProjects(value: unknown): Array<{ name: string; path: string }> {
+  const parsed = projectsResponseSchema.safeParse(value);
+  if (!parsed.success) {
+    throw protocolError('list_memory_projects response did not match the observed backend shape');
+  }
+  return parsed.data.projects.map((project) => ({ name: project.name, path: project.path }));
 }
 
 export function decodeProjectCreateResponse(

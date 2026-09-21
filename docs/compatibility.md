@@ -225,9 +225,9 @@ digest-pinned images recorded above.
   `<root>/<name>`. The one-shot seeding helper therefore runs with
   `BASIC_MEMORY_PROJECT_ROOT` unset, which records the documented nested paths
   `/app/data/Projects/freellmapi`, `/app/data/Shared`, and `/app/data/Profile`.
-  The long-running service keeps `BASIC_MEMORY_PROJECT_ROOT=/app/data`; it loads
-  those explicit paths unchanged, and the vault layout matches the scope
-  `relative_root` values.
+  The long-running service uses `BASIC_MEMORY_PROJECT_ROOT=/app/data/Projects`;
+  it loads the explicit reserved paths unchanged and constrains dynamically
+  created repository projects beneath `Projects/`.
 - **Host header allowlist.** The gateway matches the `Host` header by hostname
   only (`src/mcp/http.ts`), so the generated `config/brain.yaml` uses bare
   `127.0.0.1` and `localhost`. The port-qualified entries in the documented
@@ -450,3 +450,15 @@ Sanitized committed transcripts:
   (the local stdio probe worked). The remote transport remains the production
   path and must be re-verified on the target deployment.
 - **24-run agent pilot**: NOT RUN (same budget/provider blocker as Task 19).
+
+### Automatic repository projects release gate
+
+The 2026-09-21 automatic-project gate used Node 24.21.0, npm 11.19.0,
+Docker Engine 29.7.2, and Docker Compose 5.5.0. `npm run verify` passed 334
+unit/contract tests, `npm run test:integration` passed 290 tests, and the full
+Docker suite passed 66 tests. Retrieval run
+`retrieval-2026-09-21T10:19:50.919Z-6d44deb5` passed with recall@5 0.9286 and
+zero leakage events. Compose interpolation confirmed the gateway is published
+only at loopback port 7331, the backend has no published port, the gateway
+vault mount remains read-only, and the backend project root is
+`/app/data/Projects`. See the `automatic-projects-*.txt` release-gate records.

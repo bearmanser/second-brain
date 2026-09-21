@@ -279,7 +279,7 @@ test('the published tool contract is pinned', () => {
       {
         "input": "30dee43261cae830a7ada8821f20d78e4dfb002fc0df30205749ed54295b0e4f",
         "name": "brain_status",
-        "output": "6a735fbcdbd4c0dda0f460b5d82cd6c70b3bc213d3f4bfde929af352bec3f564",
+        "output": "e1902e65bfb87367bef3eab6b347ed98f1985f6124c986a93c17e66edd56c730",
       },
     ]
   `);
@@ -416,125 +416,192 @@ test('representative tool schemas are pinned in full', () => {
           "type": "object",
         },
         "operation": {
-          "additionalProperties": false,
-          "properties": {
-            "etag": {
-              "pattern": "^[a-f0-9]{64}$",
-              "type": "string",
-            },
-            "id": {
-              "format": "uuid",
-              "type": "string",
-            },
-            "indexed": {
-              "type": "boolean",
-            },
-            "materialized": {
-              "type": "boolean",
-            },
-            "operation_id": {
-              "format": "uuid",
-              "type": "string",
-            },
-            "outcome": {
-              "enum": [
-                "stored",
-                "stored_conflict",
-                "pending",
-              ],
-              "type": "string",
-            },
-            "possible_duplicates": {
-              "items": {
-                "additionalProperties": false,
-                "properties": {
-                  "etag": {
-                    "pattern": "^[a-f0-9]{64}$",
-                    "type": "string",
-                  },
-                  "id": {
-                    "format": "uuid",
-                    "type": "string",
-                  },
-                  "kind": {
-                    "enum": [
-                      "lesson",
-                      "decision",
-                      "playbook",
-                      "fact",
-                      "preference",
-                      "session",
-                      "note",
-                    ],
-                    "type": "string",
-                  },
-                  "relative_path": {
-                    "type": "string",
-                  },
-                  "revision_id": {
-                    "format": "uuid",
-                    "type": "string",
-                  },
-                  "scope": {
-                    "pattern": "^[a-z][a-z0-9-]{0,63}$",
-                    "type": "string",
-                  },
-                  "status": {
-                    "enum": [
-                      "candidate",
-                      "active",
-                      "superseded",
-                      "archived",
-                    ],
-                    "type": "string",
-                  },
-                  "title": {
-                    "type": "string",
-                  },
-                  "warnings": {
-                    "items": {
-                      "type": "string",
-                    },
-                    "type": "array",
-                  },
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "etag": {
+                  "pattern": "^[a-f0-9]{64}$",
+                  "type": "string",
                 },
-                "required": [
-                  "id",
-                  "revision_id",
-                  "scope",
-                  "title",
-                  "kind",
-                  "status",
-                  "etag",
-                  "relative_path",
-                  "warnings",
-                ],
-                "type": "object",
+                "id": {
+                  "format": "uuid",
+                  "type": "string",
+                },
+                "indexed": {
+                  "type": "boolean",
+                },
+                "materialized": {
+                  "type": "boolean",
+                },
+                "operation_id": {
+                  "format": "uuid",
+                  "type": "string",
+                },
+                "outcome": {
+                  "enum": [
+                    "stored",
+                    "stored_conflict",
+                    "pending",
+                  ],
+                  "type": "string",
+                },
+                "possible_duplicates": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "etag": {
+                        "pattern": "^[a-f0-9]{64}$",
+                        "type": "string",
+                      },
+                      "id": {
+                        "format": "uuid",
+                        "type": "string",
+                      },
+                      "kind": {
+                        "enum": [
+                          "lesson",
+                          "decision",
+                          "playbook",
+                          "fact",
+                          "preference",
+                          "session",
+                          "note",
+                        ],
+                        "type": "string",
+                      },
+                      "relative_path": {
+                        "type": "string",
+                      },
+                      "revision_id": {
+                        "format": "uuid",
+                        "type": "string",
+                      },
+                      "scope": {
+                        "pattern": "^[a-z][a-z0-9-]{0,63}$",
+                        "type": "string",
+                      },
+                      "status": {
+                        "enum": [
+                          "candidate",
+                          "active",
+                          "superseded",
+                          "archived",
+                        ],
+                        "type": "string",
+                      },
+                      "title": {
+                        "type": "string",
+                      },
+                      "warnings": {
+                        "items": {
+                          "type": "string",
+                        },
+                        "type": "array",
+                      },
+                    },
+                    "required": [
+                      "id",
+                      "revision_id",
+                      "scope",
+                      "title",
+                      "kind",
+                      "status",
+                      "etag",
+                      "relative_path",
+                      "warnings",
+                    ],
+                    "type": "object",
+                  },
+                  "type": "array",
+                },
+                "revision_id": {
+                  "format": "uuid",
+                  "type": "string",
+                },
+                "warnings": {
+                  "items": {
+                    "type": "string",
+                  },
+                  "type": "array",
+                },
               },
-              "type": "array",
+              "required": [
+                "operation_id",
+                "id",
+                "revision_id",
+                "outcome",
+                "materialized",
+                "indexed",
+                "possible_duplicates",
+                "warnings",
+              ],
+              "type": "object",
             },
-            "revision_id": {
-              "format": "uuid",
-              "type": "string",
-            },
-            "warnings": {
-              "items": {
-                "type": "string",
+            {
+              "additionalProperties": false,
+              "properties": {
+                "backend_ready": {
+                  "type": "boolean",
+                },
+                "created": {
+                  "type": "boolean",
+                },
+                "materialized": {
+                  "type": "boolean",
+                },
+                "operation_id": {
+                  "format": "uuid",
+                  "type": "string",
+                },
+                "permissions": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "can_read": {
+                      "const": true,
+                      "type": "boolean",
+                    },
+                    "can_review": {
+                      "type": "boolean",
+                    },
+                    "can_write": {
+                      "type": "boolean",
+                    },
+                  },
+                  "required": [
+                    "can_read",
+                    "can_write",
+                    "can_review",
+                  ],
+                  "type": "object",
+                },
+                "repository_identity": {
+                  "type": "string",
+                },
+                "scope": {
+                  "pattern": "^[a-z][a-z0-9-]{0,63}$",
+                  "type": "string",
+                },
+                "warnings": {
+                  "items": {
+                    "type": "string",
+                  },
+                  "type": "array",
+                },
               },
-              "type": "array",
+              "required": [
+                "operation_id",
+                "repository_identity",
+                "scope",
+                "created",
+                "permissions",
+                "backend_ready",
+                "materialized",
+                "warnings",
+              ],
+              "type": "object",
             },
-          },
-          "required": [
-            "operation_id",
-            "id",
-            "revision_id",
-            "outcome",
-            "materialized",
-            "indexed",
-            "possible_duplicates",
-            "warnings",
           ],
-          "type": "object",
         },
         "pending_operations": {
           "type": "number",
@@ -884,7 +951,7 @@ test('status returns an operation only to its submitter or an allowed owner', as
       outcome: 'stored'
     });
     const owner = await status(ownerContext, { operation_id: receipt.operation_id }, harness.deps);
-    expect(owner.operation?.revision_id).toBe(receipt.revision_id);
+    expect((owner.operation as MutationReceipt | undefined)?.revision_id).toBe(receipt.revision_id);
 
     const denied = await status(
       reviewerContext,
@@ -912,7 +979,7 @@ test('status reports a pending owned operation and a recovering gateway', async 
     );
     expect(receipt.outcome).toBe('pending');
     const result = await status(workerContext, { operation_id: receipt.operation_id }, harness.deps);
-    expect(result.operation?.outcome).toBe('pending');
+    expect((result.operation as MutationReceipt | undefined)?.outcome).toBe('pending');
     expect(result.operation?.materialized).toBe(false);
     expect(result.pending_operations).toBe(1);
     expect(result.health.gateway).toBe('recovering');
@@ -969,7 +1036,7 @@ test('an owner with review permission can inspect an operation in that scope', a
       signal: new AbortController().signal
     };
     const view = await status(context, { operation_id: receipt.operation_id }, harness.deps);
-    expect(view.operation?.revision_id).toBe(receipt.revision_id);
+    expect((view.operation as MutationReceipt | undefined)?.revision_id).toBe(receipt.revision_id);
   } finally {
     await harness.close();
   }
@@ -1036,8 +1103,8 @@ test('status validates plan identity and returns the receipt when it is consiste
     };
     const view = await status(workerContext, { operation_id: consistent.operation_id }, deps);
     expect(view.operation?.operation_id).toBe(consistent.operation_id);
-    expect(view.operation?.id).toBe(fixtureIds.note);
-    expect(view.operation?.revision_id).toBe(fixtureIds.revision);
+    expect((view.operation as MutationReceipt | undefined)?.id).toBe(fixtureIds.note);
+    expect((view.operation as MutationReceipt | undefined)?.revision_id).toBe(fixtureIds.revision);
   } finally {
     await harness.close();
   }

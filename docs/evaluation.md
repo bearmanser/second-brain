@@ -229,6 +229,17 @@ per-run case, condition, model identifier, client version, tool timeline,
 retrieved note IDs, isolation/preflight evidence, outcome, elapsed time, and
 reported token usage (null when unavailable).
 
+### Automatic repository provisioning pilot: NOT RUN
+
+The gated agent pilot now creates real temporary Git repositories with two
+distinct `origin` remotes, provisions the corresponding project for worker and
+reviewer identities, seeds project notes into the returned dynamic scope, and
+records whether the client called `brain_project_ensure` before recall. The
+model-driven run was not executed because no external-model budget was
+approved. No claim is made that the installed client followed initialization
+instructions automatically; run with `--allow-model --model <provider/model>`
+only after explicit approval.
+
 ## OpenCode configuration verification
 
 `opencode --version` on the execution host: **opencode v2.0.10**.
@@ -340,3 +351,23 @@ precision@5 = 0.5262.
 No model-dependent test is reported as green. The retrieval evaluator, which
 runs against the real disposable Docker Brain and does not invoke a chat model,
 passed with recall@5 = 0.9286.
+
+## Automatic repository provisioning release gate
+
+Recorded on 2026-09-21 against the pinned Docker images. The complete
+non-model gate exited 0: `npm run verify` (334 tests),
+`npm run test:integration` (290 tests), `npm run test:e2e` (66 tests), and
+`npm run eval:retrieval`. Retrieval run
+`retrieval-2026-09-21T10:19:50.919Z-6d44deb5` scored recall@5 0.9286,
+precision@5 0.8536, 9/9 negative queries empty, and zero leakage events.
+
+The Docker suite created unknown repository projects through the public MCP
+gateway, used returned scopes for capture/recall, verified role-derived grants,
+and preserved mappings and grants through restart and operational recovery.
+The detailed evidence is in `docs/release-gate/2026-09-21/automatic-projects-*.txt`.
+
+The automatic-use instruction/agent pilot remains **NOT RUN** because no
+external chat-model budget was approved. The evaluator now supports two
+distinct real temporary Git repository remotes and records whether ensure was
+called before recall, but that unexecuted client behavior is not reported as
+green.

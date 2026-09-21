@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { verifyManifest } from '../../src/operations/backup.js';
@@ -124,6 +124,90 @@ describe('release-candidate lifecycle (real Docker gateway)', () => {
     expect((read.structured as { markdown?: string }).markdown).toContain('restart durability marker delta');
   }, 900_000);
 
+  test('a dynamically ensured project and reviewer grant survive restart', async () => {
+    const ensured = await h.ensureAs(
+      'project-reviewer',
+      'https://github.com/example/lifecycle-dynamic.git'
+    );
+    expect(ensured.structured).toMatchObject({
+      scope: 'lifecycle-dynamic',
+      permissions: { can_read: true, can_write: true, can_review: true }
+    });
+    const note = lessonNote('Dynamic restart durability', 'dynamic repository restart marker');
+    const approved = await approveNote(h, 'lifecycle-dynamic', 'project-reviewer', note);
+
+    await h.restartBrain();
+
+    const status = await h.callAs('project-reviewer', 'brain_status', {});
+    expect((status.structured as { scopes?: unknown[] }).scopes).toContainEqual({
+      id: 'lifecycle-dynamic', can_write: true, can_review: true
+    });
+    const recall = await recallWhenReady(
+      h,
+      'project-reviewer',
+      'lifecycle-dynamic',
+      'dynamic repository restart marker'
+    );
+    expect(JSON.stringify(recall.structured)).toContain(approved.id);
+    expect(h.projectState().projects).toContainEqual({
+      repository_identity: 'github.com/example/lifecycle-dynamic',
+      scope: 'lifecycle-dynamic',
+      state: 'ready'
+    });
+  }, 900_000);
+
+  test('backend unavailability leaves a recoverable project that completes after restart', async () => {
+    const key = randomUUID();
+    h.compose(['stop', 'memory']);
+    const unavailable = await h.ensureAs(
+      'project-reviewer',
+      'https://github.com/example/backend-recovery.git',
+      key
+    );
+    expect(unavailable.isError).toBe(true);
+    expect(JSON.stringify(unavailable.structured)).toMatch(/BACKEND_UNAVAILABLE/);
+
+    h.compose(['start', 'memory']);
+    await h.restartBrain();
+    const recovered = await h.ensureAs(
+      'project-reviewer',
+      'git@github.com:example/backend-recovery.git',
+      key
+    );
+    expect(recovered.isError).toBe(false);
+    expect(recovered.structured).toMatchObject({ scope: 'backend-recovery', backend_ready: true });
+  }, 900_000);
+
+  test('a conflicting backend path is quarantined for explicit owner recovery', async () => {
+    h.compose(['stop', 'memory']);
+    await mkdir(join(h.vaultPath, 'Projects', 'not-path-mismatch'), { recursive: true });
+    const script = [
+      "const fs=require('node:fs')",
+      "const path='/cfg/config.json'",
+      "const config=JSON.parse(fs.readFileSync(path,'utf8'))",
+      "config.projects['path-mismatch']={path:'/app/data/Projects/not-path-mismatch',mode:'local',workspace_id:null,local_sync_path:null,bisync_initialized:false,last_sync:null}",
+      "fs.writeFileSync(path,JSON.stringify(config,null,2)+'\\n')"
+    ].join(';');
+    const seeded = h.docker([
+      'run', '--rm', '--user', '0:0',
+      '-v', `${h.project}_memory-state:/cfg`,
+      '--entrypoint', 'node', 'second-brain:local', '-e', script
+    ], true);
+    expect(seeded.status, `${seeded.stdout}${seeded.stderr}`).toBe(0);
+    h.compose(['start', 'memory']);
+    await h.restartBrain();
+    const mismatched = await h.ensureAs(
+      'project-reviewer',
+      'https://github.com/example/path-mismatch.git'
+    );
+    expect(mismatched.isError).toBe(true);
+    expect(JSON.stringify(mismatched.structured)).toMatch(/RECOVERY_REQUIRED/);
+    const ownerStatus = await h.callAs('owner', 'brain_status', { scope: 'path-mismatch' });
+    expect((ownerStatus.structured as { projects?: unknown[] }).projects).toContainEqual({
+      scope: 'path-mismatch', state: 'recovery_required'
+    });
+  }, 600_000);
+
   test('a SIGKILL and container recreation reclaims the retained instance lock', async () => {
     const note = lessonNote('Crash lock recovery', 'sigkill retained lock marker');
     const approved = await approveNote(h, 'freellmapi', 'project-reviewer', note);
@@ -203,7 +287,7 @@ describe('release-candidate lifecycle (real Docker gateway)', () => {
         replacement_id: second.id
       }
     });
-    expect(supersede.isError).toBe(false);
+    expect(supersede.isError, JSON.stringify(supersede)).toBe(false);
 
     const oldAuthority = await h.recallAs('project-reviewer', 'freellmapi', 'authority marker alpha');
     expect(oldAuthority.isError).toBe(false);

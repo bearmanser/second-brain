@@ -392,7 +392,7 @@ async function assertReplacement(
   if (operation.replacement_id === operation.id) {
     throw invalidInput('a note cannot supersede itself');
   }
-  if (!ctx.principal.read_scopes.includes(scope.id)) {
+  if (!deps.scopeRegistry.permissions(ctx.principal, scope.id).can_read) {
     throw forbidden('the replacement note is not readable by this principal');
   }
   const replacement = await requireChainHead(scope.id, operation.replacement_id, deps);
@@ -426,8 +426,9 @@ async function listAction(
   const scope = readScope(ctx, requested, deps);
   await deps.catalogue.reconcile(scope.id);
   const page = await deps.catalogue.list(scope.id, operation.filter, operation.cursor);
-  const readable = new Set(ctx.principal.read_scopes);
-  const items = page.items.filter((item) => readable.has(item.scope));
+  const items = page.items.filter(
+    (item) => deps.scopeRegistry.permissions(ctx.principal, item.scope).can_read
+  );
   return page.next_cursor === undefined ? { items } : { items, next_cursor: page.next_cursor };
 }
 

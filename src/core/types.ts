@@ -257,7 +257,7 @@ export interface StatusResult {
   };
   pending_operations: number;
   projects?: { scope: string; state: RepositoryProjectState }[];
-  operation?: MutationReceipt;
+  operation?: MutationReceipt | ProjectEnsureResult;
   schemas?: Record<string, unknown>;
 }
 

@@ -13,6 +13,7 @@ import {
   NOTE_KINDS,
   type MutationReceipt,
   type Principal,
+  type ProjectEnsureResult,
   type RequestContext,
   type ScopeConfig,
   type StatusRequest,
@@ -52,6 +53,21 @@ const mutationReceiptSchema = z.strictObject({
   indexed: z.boolean(),
   etag: etagSchema.optional(),
   possible_duplicates: z.array(sourceRefSchema),
+  warnings: z.array(z.string())
+});
+
+const projectEnsureResultSchema = z.strictObject({
+  operation_id: uuidSchema,
+  repository_identity: z.string(),
+  scope: scopeIdSchema,
+  created: z.boolean(),
+  permissions: z.strictObject({
+    can_read: z.literal(true),
+    can_write: z.boolean(),
+    can_review: z.boolean()
+  }),
+  backend_ready: z.boolean(),
+  materialized: z.boolean(),
   warnings: z.array(z.string())
 });
 
@@ -168,7 +184,21 @@ function plannedIdentity(record: OperationRecord): PlannedIdentity | undefined {
   };
 }
 
-function receiptFromRecord(record: OperationRecord): MutationReceipt | undefined {
+function receiptFromRecord(record: OperationRecord): MutationReceipt | ProjectEnsureResult | undefined {
+  if (record.tool === 'brain_project_ensure') {
+    if (record.receipt_json === undefined) return undefined;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(record.receipt_json);
+    } catch (cause) {
+      throw recoveryRequired(record.operation_id, cause);
+    }
+    const result = projectEnsureResultSchema.safeParse(parsed);
+    if (!result.success || result.data.operation_id !== record.operation_id || result.data.scope !== record.scope) {
+      throw recoveryRequired(record.operation_id);
+    }
+    return result.data;
+  }
   const plan = plannedIdentity(record);
   if (record.receipt_json !== undefined) {
     let parsed: unknown;
@@ -208,9 +238,10 @@ function receiptFromRecord(record: OperationRecord): MutationReceipt | undefined
 
 function filterReadableDuplicates(
   principal: Principal,
-  receipt: MutationReceipt,
+  receipt: MutationReceipt | ProjectEnsureResult,
   registry: ScopeRegistry
-): MutationReceipt {
+): MutationReceipt | ProjectEnsureResult {
+  if (!('possible_duplicates' in receipt)) return receipt;
   if (receipt.possible_duplicates.length === 0) return receipt;
   const visible = receipt.possible_duplicates.filter(
     (entry) => registry.permissions(principal, entry.scope).can_read

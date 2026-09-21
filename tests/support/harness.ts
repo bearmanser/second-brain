@@ -645,6 +645,11 @@ export interface DockerFixtureReceipt {
   warnings: string[];
 }
 
+export interface DockerProjectState {
+  projects: Array<{ repository_identity: string; scope: string; state: string }>;
+  grants: Array<{ principal_id: string; scope: string; can_read: number; can_write: number; can_review: number }>;
+}
+
 export interface DockerHarness {
   workDir: string;
   project: string;
@@ -654,6 +659,8 @@ export interface DockerHarness {
   principalIds: readonly string[];
   timeoutMs: number;
   callAs(principalId: string, tool: string, args: unknown): Promise<DockerToolResponse>;
+  ensureAs(principalId: string, remoteUrl: string, idempotencyKey?: string): Promise<DockerToolResponse>;
+  projectState(): DockerProjectState;
   connect(principalId: string, name?: string): Promise<Client>;
   listToolsAs(principalId: string): Promise<string[]>;
   captureAs(
@@ -823,7 +830,7 @@ export async function startDockerHarness(): Promise<DockerHarness> {
   const credentials = principalNames.map((name) => {
     const token = newToken();
     tokens.set(name, token);
-    const scopes = ['freellmapi', 'shared', 'profile'];
+    const scopes = ['shared', 'profile'];
     const principal =
       name === 'owner'
         ? {
@@ -837,16 +844,16 @@ export async function startDockerHarness(): Promise<DockerHarness> {
           ? {
               id: randomUUID(),
               role: 'worker' as const,
-              read_scopes: ['freellmapi', 'shared'],
-              write_scopes: ['freellmapi'],
+              read_scopes: ['shared'],
+              write_scopes: [] as string[],
               review_scopes: [] as string[]
             }
           : {
               id: randomUUID(),
               role: 'reviewer' as const,
-              read_scopes: ['freellmapi', 'shared'],
-              write_scopes: ['freellmapi'],
-              review_scopes: ['freellmapi']
+              read_scopes: ['shared'],
+              write_scopes: [] as string[],
+              review_scopes: [] as string[]
             };
     return { token_sha256: tokenDigest(token), principal };
   });
@@ -927,6 +934,16 @@ export async function startDockerHarness(): Promise<DockerHarness> {
     extra: Record<string, unknown> = {}
   ): Promise<DockerToolResponse> =>
     callAs(principalId, 'brain_recall', { scope, query, ...extra });
+
+  const ensureAs = (
+    principalId: string,
+    remoteUrl: string,
+    idempotencyKey = randomUUID()
+  ): Promise<DockerToolResponse> =>
+    callAs(principalId, 'brain_project_ensure', {
+      idempotency_key: idempotencyKey,
+      remote_url: remoteUrl
+    });
 
   const statusOperation = async (
     principalId: string,
@@ -1130,6 +1147,12 @@ export async function startDockerHarness(): Promise<DockerHarness> {
 
     compose(['up', '-d', '--build']);
     await waitForHealth();
+    for (const principalId of ['project-worker', 'project-reviewer', 'owner']) {
+      const ensured = await ensureAs(principalId, 'https://github.com/example/freellmapi.git');
+      if (ensured.isError || (ensured.structured as { scope?: unknown } | undefined)?.scope !== 'freellmapi') {
+        throw new Error(`automatic project setup failed for ${principalId}: ${JSON.stringify(ensured)}`);
+      }
+    }
   } catch (error) {
     try {
       compose(['down', '-v', '--remove-orphans'], true);
@@ -1149,6 +1172,24 @@ export async function startDockerHarness(): Promise<DockerHarness> {
     principalIds: principalNames,
     timeoutMs: DOCKER_SUITE_TIMEOUT_MS,
     callAs,
+    ensureAs,
+    projectState(): DockerProjectState {
+      const script = [
+        "const fs=require('node:fs')",
+        "fs.mkdirSync('/tmp/journal-copy',{recursive:true})",
+        "for(const name of ['journal.db','journal.db-wal','journal.db-shm']){const source='/state/'+name;if(fs.existsSync(source))fs.copyFileSync(source,'/tmp/journal-copy/'+name)}",
+        "const Database=require('/app/node_modules/better-sqlite3')",
+        "const db=new Database('/tmp/journal-copy/journal.db',{readonly:true})",
+        "const projects=db.prepare('SELECT repository_identity,scope,state FROM repository_projects ORDER BY scope').all()",
+        "const grants=db.prepare('SELECT principal_id,scope,can_read,can_write,can_review FROM dynamic_project_grants ORDER BY scope,principal_id').all()",
+        "process.stdout.write(JSON.stringify({projects,grants}))"
+      ].join(';');
+      const result = runDocker([
+        'run', '--rm', '--user', '0:0', '-v', `${project}_brain-state:/state:ro`,
+        '--entrypoint', 'node', 'second-brain:local', '-e', script
+      ]);
+      return JSON.parse(result.stdout) as DockerProjectState;
+    },
     connect: (principalId, name) => connectAs(principalId, name),
     async listToolsAs(principalId: string): Promise<string[]> {
       const client = await connectAs(principalId, 'second-brain-docker-tools');

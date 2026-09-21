@@ -204,6 +204,19 @@ beforeAll(async () => {
 
   token = readFileSync(join(workDir, 'secrets/brain-token'), 'utf8').trim();
   client = await connect();
+  const ensured = await client.callTool({
+    name: 'brain_project_ensure',
+    arguments: {
+      idempotency_key: randomUUID(),
+      remote_url: 'https://github.com/example/freellmapi.git'
+    }
+  });
+  expect((ensured as { isError?: boolean }).isError ?? false).toBe(false);
+  expect((ensured as { structuredContent?: { scope?: string; permissions?: unknown } }).structuredContent)
+    .toMatchObject({
+      scope: 'freellmapi',
+      permissions: { can_read: true, can_write: true, can_review: true }
+    });
 }, SUITE_TIMEOUT);
 
 afterAll(async () => {

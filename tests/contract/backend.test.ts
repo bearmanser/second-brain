@@ -309,7 +309,12 @@ test('ensureProject creates a missing project and verifies it by exact name', as
     if (name === 'list_memory_projects') {
       listCalls += 1;
       return envelope({
-        projects: listCalls === 1 ? [{ name: 'probe' }] : [{ name: 'probe' }, { name: 'second-brain' }]
+        projects: listCalls === 1
+          ? [{ name: 'probe', path: '/data/probe' }]
+          : [
+              { name: 'probe', path: '/data/probe' },
+              { name: 'second-brain', path: '/app/data/Projects/second-brain' }
+            ]
       });
     }
     return envelope({
@@ -336,7 +341,7 @@ test('ensureProject creates a missing project and verifies it by exact name', as
 
 test('ensureProject returns without creating when the exact project already exists', async () => {
   const { backend, connections } = scriptedBackend(async () =>
-    envelope({ projects: [{ name: 'second-brain' }] })
+    envelope({ projects: [{ name: 'second-brain', path: '/app/data/Projects/second-brain' }] })
   );
   await backend.connect();
 
@@ -344,6 +349,28 @@ test('ensureProject returns without creating when the exact project already exis
     backend.ensureProject('second-brain', '/app/data/Projects/second-brain')
   ).resolves.toEqual({ created: false });
   expect(connections[0].calls.map((call) => call.name)).toEqual(['list_memory_projects']);
+});
+
+test('ensureProject accepts the backend project-root-relative path representation', async () => {
+  const { backend } = scriptedBackend(async () =>
+    envelope({ projects: [{ name: 'second-brain', path: '/Projects/second-brain' }] })
+  );
+  await backend.connect();
+
+  await expect(
+    backend.ensureProject('second-brain', '/app/data/Projects/second-brain')
+  ).resolves.toEqual({ created: false });
+});
+
+test('ensureProject rejects an existing project whose path differs', async () => {
+  const { backend } = scriptedBackend(async () =>
+    envelope({ projects: [{ name: 'second-brain', path: '/app/data/Projects/wrong' }] })
+  );
+  await backend.connect();
+
+  await expect(
+    backend.ensureProject('second-brain', '/app/data/Projects/second-brain')
+  ).rejects.toMatchObject({ code: 'BACKEND_PROTOCOL_ERROR' });
 });
 
 test('ensureProject fails closed on tool errors without leaking the backend payload', async () => {

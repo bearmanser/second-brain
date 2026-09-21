@@ -184,7 +184,7 @@ async function findPossibleDuplicates(
   note: NoteInput,
   deps: BrainDeps
 ): Promise<DuplicateLookup> {
-  if (!ctx.principal.read_scopes.includes(scope.id)) {
+  if (!deps.scopeRegistry.permissions(ctx.principal, scope.id).can_read) {
     return { duplicates: [], warnings: [DUPLICATE_CHECK_UNAVAILABLE] };
   }
   let hits: BackendHit[];
@@ -220,11 +220,13 @@ async function findPossibleDuplicates(
 
 function filterReadableDuplicates(
   ctx: RequestContext,
-  receipt: MutationReceipt
+  receipt: MutationReceipt,
+  deps: BrainDeps
 ): MutationReceipt {
   if (receipt.possible_duplicates.length === 0) return receipt;
-  const readable = new Set(ctx.principal.read_scopes);
-  const visible = receipt.possible_duplicates.filter((entry) => readable.has(entry.scope));
+  const visible = receipt.possible_duplicates.filter(
+    (entry) => deps.scopeRegistry.permissions(ctx.principal, entry.scope).can_read
+  );
   if (visible.length === receipt.possible_duplicates.length) return receipt;
   const warnings = [...receipt.warnings];
   if (!warnings.includes(DUPLICATE_DETAILS_WITHHELD)) warnings.push(DUPLICATE_DETAILS_WITHHELD);
@@ -275,5 +277,5 @@ export async function capture(
     extra_markdown: ''
   });
 
-  return filterReadableDuplicates(ctx, await deps.mutations.commit(ctx, intent, build));
+  return filterReadableDuplicates(ctx, await deps.mutations.commit(ctx, intent, build), deps);
 }

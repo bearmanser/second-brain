@@ -243,7 +243,10 @@ reconstruct retry history, feedback, repository mappings, or grants, does not
 recover a corrupt vault, and does not repair a damaged revision graph. Those
 require a backup or explicit owner recovery. A repository project in
 `recovery_required` must remain unavailable until an owner verifies backend,
-vault, mapping, and grant state and completes explicit recovery.
+vault, mapping, and grant state. After correcting the underlying Basic Memory
+name/path conflict, the owner calls `brain_project_ensure` for the same remote
+with a new idempotency key; only successful exact-path verification returns the
+project to `ready`.
 
 ## Logs and status
 

@@ -185,7 +185,10 @@ project. One principal ensuring a project does not grant unrelated principals
 access. Provisioning is bounded by per-principal and global minute limits and a
 configured total-project cap. A failed ambiguous provision is reported as
 `recovery_required` to its creator and owners and requires explicit owner
-recovery; it is never silently treated as ready.
+recovery; it is never silently treated as ready. After the owner corrects the
+Basic Memory mapping or path conflict, the owner re-runs
+`brain_project_ensure` for the same remote with a new idempotency key. The
+gateway re-verifies the exact mapping before marking the project ready.
 
 The server publishes this workflow in MCP initialization instructions, but a
 client may ignore those instructions. Configure equivalent repository-startup

@@ -175,6 +175,27 @@ test('marks a mismatched backend mapping for explicit recovery', async () => {
   } finally { await h.close(); }
 });
 
+test('lets an owner re-verify and repair a recovery-required project with a new operation', async () => {
+  const h = await createHarness();
+  try {
+    const remote = 'https://github.com/example/repairable.git';
+    const originalEnsure = h.backend.ensureProject.bind(h.backend);
+    h.backend.ensureProject = async () => {
+      throw new BrainError({ code: 'BACKEND_PROTOCOL_ERROR', message: 'backend project response did not match' });
+    };
+    await expect(ensureProject(reviewerContext, request(remote), h.deps))
+      .rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(h.deps.journal.getProjectByIdentity('github.com/example/repairable')?.state).toBe('recovery_required');
+
+    h.backend.ensureProject = originalEnsure;
+    await expect(ensureProject(reviewerContext, request(remote), h.deps))
+      .rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    const repaired = await ensureProject(ownerContext, request(remote), h.deps);
+    expect(repaired).toMatchObject({ scope: 'repairable', backend_ready: true, materialized: true });
+    expect(h.deps.journal.getProjectByIdentity('github.com/example/repairable')?.state).toBe('ready');
+  } finally { await h.close(); }
+});
+
 test('recovers a ready project whose receipt commit was interrupted', async () => {
   const h = await createHarness();
   try {

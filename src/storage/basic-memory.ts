@@ -16,6 +16,7 @@ import {
   decodeCreateResponse,
   decodeProjectCreateResponse,
   decodeProjectNames,
+  decodeProjects,
   decodeSearchResponse,
   invalidInput,
   protocolError
@@ -27,6 +28,12 @@ const DEFAULT_READ_ATTEMPTS = 3;
 const DEFAULT_READ_RETRY_DELAY_MS = 100;
 const ERROR_DETAIL_MAX_CHARS = 200;
 const ERROR_MESSAGE_MAX_CHARS = 400;
+const BACKEND_VAULT_ROOT = '/app/data';
+
+function projectPathMatches(actual: string, expected: string): boolean {
+  if (actual === expected) return true;
+  return actual.startsWith('/') && `${BACKEND_VAULT_ROOT}${actual}` === expected;
+}
 
 const EMBEDDING_ERROR_PATTERN =
   /(embedding|fastembed|sentence[- ]?transformer|semantic (?:search|index)|vector (?:index|search)|model (?:is )?(?:unavailable|missing|not found))/i;
@@ -259,8 +266,14 @@ export class BasicMemoryBackend implements BackendPort {
   }
 
   async ensureProject(project: string, projectPath: string): Promise<{ created: boolean }> {
-    const existing = await this.listProjectNames();
-    if (existing.includes(project)) return { created: false };
+    const existing = await this.listProjects();
+    const existingProject = existing.find((entry) => entry.name === project);
+    if (existingProject !== undefined) {
+      if (!projectPathMatches(existingProject.path, projectPath)) {
+        throw protocolError('existing backend project path did not match the expected mapping');
+      }
+      return { created: false };
+    }
 
     const connection = this.requireConnection(CREATE_MEMORY_PROJECT_TOOL);
     let payload: unknown;
@@ -275,8 +288,8 @@ export class BasicMemoryBackend implements BackendPort {
       throw projectCreateFailure(cause);
     }
     const result = decodeProjectCreateResponse(payload, project, projectPath);
-    const confirmed = await this.listProjectNames();
-    if (!confirmed.includes(project)) {
+    const confirmed = await this.listProjects();
+    if (!confirmed.some((entry) => entry.name === project && projectPathMatches(entry.path, projectPath))) {
       throw protocolError('create_memory_project did not make the exact project available');
     }
     return result;
@@ -325,6 +338,17 @@ export class BasicMemoryBackend implements BackendPort {
         this.timeoutMs
       );
       return decodeProjectNames(normalizeToolResponse(raw));
+    });
+  }
+
+  private async listProjects(): Promise<Array<{ name: string; path: string }>> {
+    return this.read(LIST_MEMORY_PROJECTS_TOOL, async (connection) => {
+      const raw = await connection.call(
+        LIST_MEMORY_PROJECTS_TOOL,
+        { output_format: 'json' },
+        this.timeoutMs
+      );
+      return decodeProjects(normalizeToolResponse(raw));
     });
   }
 

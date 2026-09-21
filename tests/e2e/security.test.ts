@@ -107,12 +107,59 @@ describe('release-candidate security (real Docker gateway)', () => {
     assertNoLeak(write);
   }, 300_000);
 
-  test('raw knowledge operations are not exposed outside the six gateway tools', async () => {
+  test('automatic projects grant only the ensuring principal according to its role', async () => {
+    const remote = 'git@github.com:example/security-dynamic.git';
+    const reviewer = await h.ensureAs('project-reviewer', remote);
+    expect(reviewer.isError).toBe(false);
+    expect(reviewer.structured).toMatchObject({
+      repository_identity: 'github.com/example/security-dynamic',
+      scope: 'security-dynamic',
+      permissions: { can_read: true, can_write: true, can_review: true }
+    });
+
+    const isolated = await h.recallAs('project-worker', 'security-dynamic', 'anything');
+    expect(isolated.isError).toBe(true);
+    expect(JSON.stringify(isolated.structured)).toMatch(/FORBIDDEN/);
+
+    const worker = await h.ensureAs('project-worker', 'https://github.com/example/security-dynamic.git');
+    expect(worker.structured).toMatchObject({
+      scope: 'security-dynamic',
+      created: false,
+      permissions: { can_read: true, can_write: true, can_review: false }
+    });
+    expect(h.projectState().projects).toContainEqual({
+      repository_identity: 'github.com/example/security-dynamic',
+      scope: 'security-dynamic',
+      state: 'ready'
+    });
+  }, 600_000);
+
+  test('reserved and secret-bearing remotes fail closed without disclosing credentials', async () => {
+    const secret = 'do-not-disclose-this-token';
+    const credentialed = await h.ensureAs(
+      'project-reviewer',
+      `https://user:${secret}@github.com/example/private.git`
+    );
+    expect(credentialed.isError).toBe(true);
+    expect(JSON.stringify(credentialed)).not.toContain(secret);
+
+    const reserved = await h.ensureAs(
+      'project-reviewer',
+      'https://github.com/example/shared.git'
+    );
+    expect(reserved.isError).toBe(true);
+    expect(JSON.stringify(reserved.structured)).toMatch(/INVALID_INPUT/);
+    assertNoLeak(credentialed);
+    assertNoLeak(reserved);
+  }, 300_000);
+
+  test('raw knowledge operations are not exposed outside the seven gateway tools', async () => {
     const listed = await h.listToolsAs('project-reviewer');
     expect(listed.sort()).toEqual(
       [
         'brain_capture',
         'brain_feedback',
+        'brain_project_ensure',
         'brain_read',
         'brain_recall',
         'brain_review',
