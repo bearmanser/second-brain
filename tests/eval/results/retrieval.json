@@ -1,0 +1,854 @@
+{
+  "run_id": "retrieval-2026-09-21T02:03:15.063Z-4fed9666",
+  "mode": "retrieval",
+  "generated_at": "2026-09-21T02:03:23.055Z",
+  "client": {
+    "name": "second-brain-eval",
+    "version": "0.1.0"
+  },
+  "model_identifier": null,
+  "opencode_version": null,
+  "backend": "lexical-fixture",
+  "corpus": {
+    "notes": 11,
+    "seeded_keys": [
+      "streaming-lesson",
+      "routing-decision",
+      "cache-warm-playbook",
+      "batching-hypothesis",
+      "quota-expired-fact",
+      "profile-secret",
+      "handoff-session",
+      "misleading-note",
+      "ttft-paraphrase",
+      "shared-handoff-playbook",
+      "legacy-routing-superseded"
+    ]
+  },
+  "seeding": {
+    "tool_timeline": [
+      "brain_capture:streaming-lesson",
+      "brain_review:approve:streaming-lesson",
+      "brain_capture:routing-decision",
+      "brain_review:approve:routing-decision",
+      "brain_capture:cache-warm-playbook",
+      "brain_review:approve:cache-warm-playbook",
+      "brain_capture:batching-hypothesis",
+      "brain_capture:quota-expired-fact",
+      "brain_review:approve:quota-expired-fact",
+      "brain_capture:profile-secret",
+      "brain_review:approve:profile-secret",
+      "brain_capture:handoff-session",
+      "brain_review:approve:handoff-session",
+      "brain_capture:misleading-note",
+      "brain_review:approve:misleading-note",
+      "brain_capture:ttft-paraphrase",
+      "brain_review:approve:ttft-paraphrase",
+      "brain_capture:shared-handoff-playbook",
+      "brain_review:approve:shared-handoff-playbook",
+      "brain_capture:legacy-routing-superseded",
+      "brain_review:approve:legacy-routing-superseded",
+      "brain_review:supersede:legacy-routing-superseded"
+    ],
+    "elapsed_ms": 5850
+  },
+  "metrics": {
+    "cases": 23,
+    "positive_cases": 14,
+    "negative_cases": 9,
+    "recall_at_5": 1,
+    "precision_at_5": 0.5262,
+    "recall_target_met": true,
+    "negative_cases_passed": 9,
+    "negative_cases_failed": 0,
+    "leakage_events": 0,
+    "mean_elapsed_ms": 85.2
+  },
+  "target_recall_at_5": 0.8,
+  "forbidden_markers": [
+    "ZYPHERQUARTZ-9Z",
+    "MORVEXPLUME-4K"
+  ],
+  "cases": [
+    {
+      "case_id": "r01",
+      "category": "streaming-lesson",
+      "label": "positive",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "streaming first token latency proxied",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [
+        "877d96ef-9f72-4a08-b03b-4fb8f082240b",
+        "28861dc8-e9a5-4a7f-b866-f6ef03e6be98",
+        "24a953c1-51de-4bac-938a-61d65057bb78",
+        "e5582387-3ef1-4e92-bd3e-eb153f4f4d45"
+      ],
+      "retrieved_keys": [
+        "ttft-paraphrase",
+        "misleading-note",
+        "streaming-lesson",
+        "routing-decision"
+      ],
+      "relevant_keys": [
+        "streaming-lesson",
+        "ttft-paraphrase"
+      ],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 214,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 0.5,
+      "leaked": false
+    },
+    {
+      "case_id": "r02",
+      "category": "streaming-lesson",
+      "label": "positive",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "direct proxied benchmark measurement",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [
+        "24a953c1-51de-4bac-938a-61d65057bb78",
+        "877d96ef-9f72-4a08-b03b-4fb8f082240b",
+        "e5582387-3ef1-4e92-bd3e-eb153f4f4d45"
+      ],
+      "retrieved_keys": [
+        "streaming-lesson",
+        "ttft-paraphrase",
+        "routing-decision"
+      ],
+      "relevant_keys": [
+        "streaming-lesson"
+      ],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 109,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 0.3333333333333333,
+      "leaked": false
+    },
+    {
+      "case_id": "r03",
+      "category": "routing-decision",
+      "label": "positive",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "regional edge routing decision",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [
+        "e5582387-3ef1-4e92-bd3e-eb153f4f4d45",
+        "24a953c1-51de-4bac-938a-61d65057bb78"
+      ],
+      "retrieved_keys": [
+        "routing-decision",
+        "streaming-lesson"
+      ],
+      "relevant_keys": [
+        "routing-decision"
+      ],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 89,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 0.5,
+      "leaked": false
+    },
+    {
+      "case_id": "r04",
+      "category": "routing-decision",
+      "label": "positive",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "edge gateway rationale alternatives",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [
+        "e5582387-3ef1-4e92-bd3e-eb153f4f4d45"
+      ],
+      "retrieved_keys": [
+        "routing-decision"
+      ],
+      "relevant_keys": [
+        "routing-decision"
+      ],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 61,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 1,
+      "leaked": false
+    },
+    {
+      "case_id": "r05",
+      "category": "current-playbook",
+      "label": "positive",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "warm model cache offline rollout",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [
+        "5c3d9c8d-dcbc-471f-aa8a-9f9d6e7e8ad4",
+        "28861dc8-e9a5-4a7f-b866-f6ef03e6be98",
+        "877d96ef-9f72-4a08-b03b-4fb8f082240b"
+      ],
+      "retrieved_keys": [
+        "cache-warm-playbook",
+        "misleading-note",
+        "ttft-paraphrase"
+      ],
+      "relevant_keys": [
+        "cache-warm-playbook"
+      ],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 81,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 0.3333333333333333,
+      "leaked": false
+    },
+    {
+      "case_id": "r06",
+      "category": "current-playbook",
+      "label": "positive",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "embedding cache playbook",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [
+        "5c3d9c8d-dcbc-471f-aa8a-9f9d6e7e8ad4",
+        "28861dc8-e9a5-4a7f-b866-f6ef03e6be98"
+      ],
+      "retrieved_keys": [
+        "cache-warm-playbook",
+        "misleading-note"
+      ],
+      "relevant_keys": [
+        "cache-warm-playbook"
+      ],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 63,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 0.5,
+      "leaked": false
+    },
+    {
+      "case_id": "r07",
+      "category": "same-concept-paraphrase",
+      "label": "positive",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "initial token latency connection pool",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [
+        "877d96ef-9f72-4a08-b03b-4fb8f082240b",
+        "24a953c1-51de-4bac-938a-61d65057bb78",
+        "e5582387-3ef1-4e92-bd3e-eb153f4f4d45",
+        "28861dc8-e9a5-4a7f-b866-f6ef03e6be98"
+      ],
+      "retrieved_keys": [
+        "ttft-paraphrase",
+        "streaming-lesson",
+        "routing-decision",
+        "misleading-note"
+      ],
+      "relevant_keys": [
+        "ttft-paraphrase",
+        "streaming-lesson"
+      ],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 211,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 0.5,
+      "leaked": false
+    },
+    {
+      "case_id": "r08",
+      "category": "candidate-hypothesis",
+      "label": "positive",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "batching prompts variance",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": true,
+        "session_id": null
+      },
+      "retrieved_ids": [
+        "b5fcfbfb-e31b-4a5d-b877-b6cf5083b8a5"
+      ],
+      "retrieved_keys": [
+        "batching-hypothesis"
+      ],
+      "relevant_keys": [
+        "batching-hypothesis"
+      ],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 42,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 1,
+      "leaked": false
+    },
+    {
+      "case_id": "r09",
+      "category": "session-handoff",
+      "label": "positive",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "session handoff streaming investigation",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": "sess-2026-09-20-streaming-handoff"
+      },
+      "retrieved_ids": [
+        "90d703dd-28a0-4887-8f69-65898ab0990b",
+        "e5582387-3ef1-4e92-bd3e-eb153f4f4d45",
+        "24a953c1-51de-4bac-938a-61d65057bb78",
+        "28861dc8-e9a5-4a7f-b866-f6ef03e6be98",
+        "877d96ef-9f72-4a08-b03b-4fb8f082240b"
+      ],
+      "retrieved_keys": [
+        "handoff-session",
+        "routing-decision",
+        "streaming-lesson",
+        "misleading-note",
+        "ttft-paraphrase"
+      ],
+      "relevant_keys": [
+        "handoff-session"
+      ],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 250,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 0.2,
+      "leaked": false
+    },
+    {
+      "case_id": "r10",
+      "category": "streaming-lesson",
+      "label": "positive",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "streaming latency direct proxied regression",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [
+        "24a953c1-51de-4bac-938a-61d65057bb78",
+        "e5582387-3ef1-4e92-bd3e-eb153f4f4d45",
+        "877d96ef-9f72-4a08-b03b-4fb8f082240b",
+        "28861dc8-e9a5-4a7f-b866-f6ef03e6be98"
+      ],
+      "retrieved_keys": [
+        "streaming-lesson",
+        "routing-decision",
+        "ttft-paraphrase",
+        "misleading-note"
+      ],
+      "relevant_keys": [
+        "streaming-lesson"
+      ],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 232,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 0.25,
+      "leaked": false
+    },
+    {
+      "case_id": "r11",
+      "category": "current-playbook",
+      "label": "positive",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "rollout verification internal network",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [
+        "5c3d9c8d-dcbc-471f-aa8a-9f9d6e7e8ad4"
+      ],
+      "retrieved_keys": [
+        "cache-warm-playbook"
+      ],
+      "relevant_keys": [
+        "cache-warm-playbook"
+      ],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 68,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 1,
+      "leaked": false
+    },
+    {
+      "case_id": "r12",
+      "category": "routing-decision",
+      "label": "positive",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "regional edge routing policy",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [
+        "e5582387-3ef1-4e92-bd3e-eb153f4f4d45",
+        "24a953c1-51de-4bac-938a-61d65057bb78"
+      ],
+      "retrieved_keys": [
+        "routing-decision",
+        "streaming-lesson"
+      ],
+      "relevant_keys": [
+        "routing-decision"
+      ],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 94,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 0.5,
+      "leaked": false
+    },
+    {
+      "case_id": "r13",
+      "category": "same-concept-paraphrase",
+      "label": "positive",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "paraphrase token latency warmed pool",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [
+        "877d96ef-9f72-4a08-b03b-4fb8f082240b",
+        "24a953c1-51de-4bac-938a-61d65057bb78",
+        "e5582387-3ef1-4e92-bd3e-eb153f4f4d45",
+        "28861dc8-e9a5-4a7f-b866-f6ef03e6be98"
+      ],
+      "retrieved_keys": [
+        "ttft-paraphrase",
+        "streaming-lesson",
+        "routing-decision",
+        "misleading-note"
+      ],
+      "relevant_keys": [
+        "ttft-paraphrase"
+      ],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 167,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 0.25,
+      "leaked": false
+    },
+    {
+      "case_id": "r14",
+      "category": "current-playbook",
+      "label": "positive",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "pinned image cache volume prerequisites",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [
+        "5c3d9c8d-dcbc-471f-aa8a-9f9d6e7e8ad4",
+        "28861dc8-e9a5-4a7f-b866-f6ef03e6be98"
+      ],
+      "retrieved_keys": [
+        "cache-warm-playbook",
+        "misleading-note"
+      ],
+      "relevant_keys": [
+        "cache-warm-playbook"
+      ],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 81,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 0.5,
+      "leaked": false
+    },
+    {
+      "case_id": "n01",
+      "category": "superseded-decision",
+      "label": "negative",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "legacy monolith dispatcher",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [],
+      "retrieved_keys": [],
+      "relevant_keys": [],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 40,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 0,
+      "leaked": false
+    },
+    {
+      "case_id": "n02",
+      "category": "expired-fact",
+      "label": "negative",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "quota requests per minute",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [],
+      "retrieved_keys": [],
+      "relevant_keys": [],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 27,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 0,
+      "leaked": false
+    },
+    {
+      "case_id": "n03",
+      "category": "candidate-hypothesis",
+      "label": "negative",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "batching prompts variance",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [],
+      "retrieved_keys": [],
+      "relevant_keys": [],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 22,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 0,
+      "leaked": false
+    },
+    {
+      "case_id": "n04",
+      "category": "session-handoff",
+      "label": "negative",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "blockers session handoff",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [],
+      "retrieved_keys": [],
+      "relevant_keys": [],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 29,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 0,
+      "leaked": false
+    },
+    {
+      "case_id": "n05",
+      "category": "cross-project-marker",
+      "label": "negative",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "ZYPHERQUARTZ-9Z",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [],
+      "retrieved_keys": [],
+      "relevant_keys": [],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 18,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 0,
+      "leaked": false
+    },
+    {
+      "case_id": "n06",
+      "category": "shared-marker-without-include-shared",
+      "label": "negative",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "MORVEXPLUME-4K",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [],
+      "retrieved_keys": [],
+      "relevant_keys": [],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 15,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 0,
+      "leaked": false
+    },
+    {
+      "case_id": "n07",
+      "category": "kind-scoping",
+      "label": "negative",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "impressions marketing dashboard",
+      "filters": {
+        "kinds": [
+          "decision"
+        ],
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [],
+      "retrieved_keys": [],
+      "relevant_keys": [],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 17,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 0,
+      "leaked": false
+    },
+    {
+      "case_id": "n08",
+      "category": "scope-isolation",
+      "label": "negative",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "profile",
+      "query": "model cache offline rollout",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [],
+      "retrieved_keys": [],
+      "relevant_keys": [],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 10,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 0,
+      "leaked": false
+    },
+    {
+      "case_id": "n09",
+      "category": "unrelated-scope-token",
+      "label": "negative",
+      "memory_condition": "enabled",
+      "model_identifier": null,
+      "client": "second-brain-eval/0.1.0",
+      "scope": "freellmapi",
+      "query": "patient data export",
+      "filters": {
+        "kinds": null,
+        "include_shared": false,
+        "include_candidates": false,
+        "session_id": null
+      },
+      "retrieved_ids": [],
+      "retrieved_keys": [],
+      "relevant_keys": [],
+      "tool_timeline": [
+        "brain_recall"
+      ],
+      "outcome": "pass",
+      "elapsed_ms": 19,
+      "token_usage": null,
+      "recall_at_k": 1,
+      "precision_at_k": 0,
+      "leaked": false
+    }
+  ]
+}

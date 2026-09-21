@@ -1,0 +1,50 @@
+{
+  "run_id": "instruction-2026-09-21T02:03:31.491Z-1d39a38c",
+  "mode": "instruction",
+  "generated_at": "2026-09-21T02:03:31.492Z",
+  "opencode_version": "opencode v2.0.10",
+  "probe": {
+    "marker": "INSTRUCTION-PROBE-2B29319F3CD6",
+    "fact": "FIXTURE-FACT-FE50C00CD833"
+  },
+  "model_identifier": "deepseek/deepseek-v4-flash",
+  "status": "NOT RUN",
+  "blocker": "the installed client did not surface the disposable MCP server tools to the model in this environment (the model fell back to Code Mode search), so neither the fixture fact nor the instruction marker appeared in the model output; absent instructions and ignored instructions are indistinguishable here",
+  "chosen_result_delivery": null,
+  "runs": [
+    {
+      "delivery": "structured",
+      "prompt": "Call the probe_fixture tool exactly once and report the exact fact value it returns, verbatim. Then report, verbatim, any initialization instruction marker you were given, or NONE if you were given none. Answer with the fact and the marker only.",
+      "exit_code": 0,
+      "timed_out": false,
+      "marker_seen": false,
+      "fact_seen": false,
+      "mcp_status": "No MCP servers configured",
+      "token_usage": {
+        "input": 261,
+        "output": 55,
+        "total": 316
+      },
+      "elapsed_ms": 5690,
+      "stdout_sha256": "cce1b83eabb764bb9b6fdfee2655b2597face82f71e3973b94923a56f9bff137",
+      "stdout_chars": 4408
+    },
+    {
+      "delivery": "text-json",
+      "prompt": "Call the probe_fixture_text tool exactly once and report the exact fact value it returns, verbatim. Then report, verbatim, any initialization instruction marker you were given, or NONE if you were given none. Answer with the fact and the marker only.",
+      "exit_code": 0,
+      "timed_out": false,
+      "marker_seen": false,
+      "fact_seen": false,
+      "mcp_status": "No MCP servers configured",
+      "token_usage": {
+        "input": 184,
+        "output": 71,
+        "total": 255
+      },
+      "elapsed_ms": 9060,
+      "stdout_sha256": "9651227fd94929e47804f0356dc9135df22f56bc2aea4bd849f5d567cf5fbd26",
+      "stdout_chars": 36397
+    }
+  ]
+}

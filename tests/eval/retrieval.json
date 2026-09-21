@@ -1,0 +1,246 @@
+{
+  "version": 1,
+  "k": 5,
+  "forbidden_markers": [
+    "ZYPHERQUARTZ-9Z",
+    "MORVEXPLUME-4K"
+  ],
+  "queries": [
+    {
+      "id": "r01",
+      "label": "positive",
+      "category": "streaming-lesson",
+      "scope": "freellmapi",
+      "query": "streaming first token latency proxied",
+      "phase": "debugging",
+      "mode": "text",
+      "limit": 5,
+      "relevant": ["streaming-lesson", "ttft-paraphrase"]
+    },
+    {
+      "id": "r02",
+      "label": "positive",
+      "category": "streaming-lesson",
+      "scope": "freellmapi",
+      "query": "direct proxied benchmark measurement",
+      "mode": "text",
+      "limit": 5,
+      "relevant": ["streaming-lesson"]
+    },
+    {
+      "id": "r03",
+      "label": "positive",
+      "category": "routing-decision",
+      "scope": "freellmapi",
+      "query": "regional edge routing decision",
+      "phase": "planning",
+      "mode": "text",
+      "limit": 5,
+      "relevant": ["routing-decision"]
+    },
+    {
+      "id": "r04",
+      "label": "positive",
+      "category": "routing-decision",
+      "scope": "freellmapi",
+      "query": "edge gateway rationale alternatives",
+      "mode": "text",
+      "limit": 5,
+      "relevant": ["routing-decision"]
+    },
+    {
+      "id": "r05",
+      "label": "positive",
+      "category": "current-playbook",
+      "scope": "freellmapi",
+      "query": "warm model cache offline rollout",
+      "mode": "text",
+      "limit": 5,
+      "relevant": ["cache-warm-playbook"]
+    },
+    {
+      "id": "r06",
+      "label": "positive",
+      "category": "current-playbook",
+      "scope": "freellmapi",
+      "query": "embedding cache playbook",
+      "mode": "text",
+      "limit": 5,
+      "relevant": ["cache-warm-playbook"]
+    },
+    {
+      "id": "r07",
+      "label": "positive",
+      "category": "same-concept-paraphrase",
+      "scope": "freellmapi",
+      "query": "initial token latency connection pool",
+      "mode": "text",
+      "limit": 5,
+      "relevant": ["ttft-paraphrase", "streaming-lesson"]
+    },
+    {
+      "id": "r08",
+      "label": "positive",
+      "category": "candidate-hypothesis",
+      "scope": "freellmapi",
+      "query": "batching prompts variance",
+      "mode": "text",
+      "limit": 5,
+      "include_candidates": true,
+      "relevant": ["batching-hypothesis"]
+    },
+    {
+      "id": "r09",
+      "label": "positive",
+      "category": "session-handoff",
+      "scope": "freellmapi",
+      "query": "session handoff streaming investigation",
+      "phase": "handoff",
+      "mode": "text",
+      "limit": 5,
+      "session_id": "sess-2026-09-20-streaming-handoff",
+      "relevant": ["handoff-session"]
+    },
+    {
+      "id": "r10",
+      "label": "positive",
+      "category": "streaming-lesson",
+      "scope": "freellmapi",
+      "query": "streaming latency direct proxied regression",
+      "mode": "text",
+      "limit": 5,
+      "relevant": ["streaming-lesson"]
+    },
+    {
+      "id": "r11",
+      "label": "positive",
+      "category": "current-playbook",
+      "scope": "freellmapi",
+      "query": "rollout verification internal network",
+      "mode": "text",
+      "limit": 5,
+      "relevant": ["cache-warm-playbook"]
+    },
+    {
+      "id": "r12",
+      "label": "positive",
+      "category": "routing-decision",
+      "scope": "freellmapi",
+      "query": "regional edge routing policy",
+      "mode": "text",
+      "limit": 5,
+      "relevant": ["routing-decision"]
+    },
+    {
+      "id": "r13",
+      "label": "positive",
+      "category": "same-concept-paraphrase",
+      "scope": "freellmapi",
+      "query": "paraphrase token latency warmed pool",
+      "mode": "text",
+      "limit": 5,
+      "relevant": ["ttft-paraphrase"]
+    },
+    {
+      "id": "r14",
+      "label": "positive",
+      "category": "current-playbook",
+      "scope": "freellmapi",
+      "query": "pinned image cache volume prerequisites",
+      "mode": "text",
+      "limit": 5,
+      "relevant": ["cache-warm-playbook"]
+    },
+    {
+      "id": "n01",
+      "label": "negative",
+      "category": "superseded-decision",
+      "scope": "freellmapi",
+      "query": "legacy monolith dispatcher",
+      "mode": "text",
+      "limit": 5,
+      "relevant": []
+    },
+    {
+      "id": "n02",
+      "label": "negative",
+      "category": "expired-fact",
+      "scope": "freellmapi",
+      "query": "quota requests per minute",
+      "mode": "text",
+      "limit": 5,
+      "relevant": []
+    },
+    {
+      "id": "n03",
+      "label": "negative",
+      "category": "candidate-hypothesis",
+      "scope": "freellmapi",
+      "query": "batching prompts variance",
+      "mode": "text",
+      "limit": 5,
+      "relevant": []
+    },
+    {
+      "id": "n04",
+      "label": "negative",
+      "category": "session-handoff",
+      "scope": "freellmapi",
+      "query": "blockers session handoff",
+      "mode": "text",
+      "limit": 5,
+      "relevant": []
+    },
+    {
+      "id": "n05",
+      "label": "negative",
+      "category": "cross-project-marker",
+      "scope": "freellmapi",
+      "query": "ZYPHERQUARTZ-9Z",
+      "mode": "text",
+      "limit": 5,
+      "relevant": []
+    },
+    {
+      "id": "n06",
+      "label": "negative",
+      "category": "shared-marker-without-include-shared",
+      "scope": "freellmapi",
+      "query": "MORVEXPLUME-4K",
+      "mode": "text",
+      "limit": 5,
+      "relevant": []
+    },
+    {
+      "id": "n07",
+      "label": "negative",
+      "category": "kind-scoping",
+      "scope": "freellmapi",
+      "query": "impressions marketing dashboard",
+      "mode": "text",
+      "limit": 5,
+      "kinds": ["decision"],
+      "relevant": []
+    },
+    {
+      "id": "n08",
+      "label": "negative",
+      "category": "scope-isolation",
+      "scope": "profile",
+      "query": "model cache offline rollout",
+      "mode": "text",
+      "limit": 5,
+      "relevant": []
+    },
+    {
+      "id": "n09",
+      "label": "negative",
+      "category": "unrelated-scope-token",
+      "scope": "freellmapi",
+      "query": "patient data export",
+      "mode": "text",
+      "limit": 5,
+      "relevant": []
+    }
+  ]
+}

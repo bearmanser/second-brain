@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "tasks": [
+    {
+      "id": "t1",
+      "title": "Quote the streaming first-token lesson",
+      "prompt": "Use the project memory to find the measured lesson about direct versus proxied streaming first-token latency, then quote its lesson text exactly. If no remembered lesson exists, say that no memory is available.",
+      "expected_signal": "Measure the direct and proxied streaming request",
+      "memory_keys": ["streaming-lesson"]
+    },
+    {
+      "id": "t2",
+      "title": "Report the streaming routing decision",
+      "prompt": "Use the project memory to find the current decision that governs how streaming traffic is routed, then quote the decision text. If no remembered decision exists, say that no memory is available.",
+      "expected_signal": "Route streaming traffic through the regional edge gateway",
+      "memory_keys": ["routing-decision"]
+    },
+    {
+      "id": "t3",
+      "title": "Recite the offline cache rollout playbook",
+      "prompt": "Use the project memory to find the playbook for warming the model cache before an offline rollout, then list its steps. If no remembered playbook exists, say that no memory is available.",
+      "expected_signal": "Issue one semantic query",
+      "memory_keys": ["cache-warm-playbook"]
+    },
+    {
+      "id": "t4",
+      "title": "Resume the streaming latency handoff",
+      "prompt": "Use the project memory to find the recorded session handoff for the streaming latency investigation, then report its next actions. If no remembered session exists, say that no memory is available.",
+      "expected_signal": "Re-run the benchmark with the cache warm",
+      "memory_keys": ["handoff-session"]
+    },
+    {
+      "id": "t5",
+      "title": "Assess the batching hypothesis",
+      "prompt": "Use the project memory to find any candidate hypothesis about batching prompts, and state whether it has been approved or is still a candidate. If no remembered hypothesis exists, say that no memory is available.",
+      "expected_signal": "batching",
+      "memory_keys": ["batching-hypothesis"]
+    },
+    {
+      "id": "t6",
+      "title": "Find the legacy routing replacement",
+      "prompt": "Use the project memory to identify what replaced the legacy monolith dispatcher decision, and quote the replacement decision text. If no remembered replacement exists, say that no memory is available.",
+      "expected_signal": "regional edge gateway",
+      "memory_keys": ["routing-decision", "legacy-routing-superseded"]
+    }
+  ]
+}

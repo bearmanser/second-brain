@@ -1,0 +1,21 @@
+{
+  // V2 client configuration for the second-brain MCP gateway.
+  // Verified against the installed CLI: opencode v2.0.10 (`opencode --version`).
+  // V2 stores servers under `mcp.servers.<name>`; it does not accept a server
+  // name directly under `mcp`. `codemode: false` exposes the MCP tools on the
+  // model's native tool list instead of through Code Mode.
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "second-brain": {
+        "type": "remote",
+        "url": "http://127.0.0.1:7331/mcp",
+        "oauth": false,
+        "headers": {
+          "Authorization": "Bearer {env:SECOND_BRAIN_TOKEN}"
+        },
+        "codemode": false
+      }
+    }
+  }
+}

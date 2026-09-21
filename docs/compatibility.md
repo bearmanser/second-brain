@@ -239,3 +239,49 @@ digest-pinned images recorded above.
   and no published backend port; `docker compose exec brain node dist/cli.js
   health` exited 0; a restart preserved captured state; the gateway vault mount
   was read-only; both containers ran as uid 1000.
+
+## Task 19 client and model observations
+
+Observed on the execution host on 2026-09-21 with the installed OpenCode binary
+at `/root/.opencode/bin/opencode`.
+
+| Field | Observed value |
+|---|---|
+| `opencode --version` | `opencode v2.0.10` |
+| `opencode run` syntax | `opencode run [flags] [<message...>]`; flags include `--model provider/model`, `--format default\|json`, `--auto`, `--session`, `--continue`, `--standalone`, `--agent`, `--file`, `--thinking` |
+| `opencode mcp` syntax | `opencode mcp list`, `opencode mcp add <name> --url <url> [--header k=v] [--global]`, `opencode mcp auth`, `opencode mcp logout` |
+| Config file | project `opencode.jsonc` (or `opencode.json`), merged over `~/.config/opencode/opencode.json(c)` |
+| MCP shape | `mcp.servers.<name>` with `type: "remote"`, `url`, `oauth: false`, `headers`, `codemode`, `timeout`, `protocol`, `disabled` |
+
+`opencode debug config` in a disposable project listed the project document and
+preserved the `mcp.servers.<name>` block, so the documented V2 shape is accepted
+by the installed CLI. The V2 MCP guide states that a server name is not placed
+directly under `mcp`, and that `codemode: false` exposes a server's tools on the
+provider's native tool list (Code Mode is the default). The `$schema` URL
+`https://opencode.ai/config.json` describes V1 even though V2 files include it
+for editor validation; V2 field names were confirmed against the V2
+documentation and the installed binary, not against that schema.
+
+### Chat provider observations
+
+- `opencode run --model freellmapi/auto` exited with `Error: Invalid API key`.
+  `FREELLMAPI_API_KEY` was not exported. The FreeLLMAPI provider is the configured
+  default but is unusable in this environment.
+- `opencode run --model deepseek/deepseek-v4-flash` completed with stored
+  credentials. The model catalog records a non-zero cost for the DeepSeek
+  provider, so it is treated as a priced provider and was not used for the
+  24-run memory pilot.
+
+### Instruction delivery and pilot status
+
+- The deterministic SDK test proves a disposable gateway sends initialization
+  guidance over real MCP.
+- The live model probe is **NOT RUN**: in a disposable project with a verified
+  probe MCP server, `opencode mcp list` reported `No MCP servers configured` and
+  the model's Code Mode catalog never contained the probe tools, so neither the
+  random instruction marker nor the fixture fact appeared in model output.
+- The 24-run memory pilot is **NOT RUN**: the only working provider is priced and
+  unapproved, and the configured free provider rejects its key.
+
+Full detail and raw sanitized results: `docs/evaluation.md` and
+`tests/eval/results/`.
