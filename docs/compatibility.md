@@ -103,6 +103,8 @@ fresh disposable data sets; both runs passed with the same shapes.
 | Custom fields | `type`, tags, unique permalink, namespaced metadata survive read/write | Pass. `note_type: "decision"` stored as `type: decision`; tags `["alpha","beta"]`; project-scoped permalink; nested metadata (`nested.level`, `nested.flag`) and `brain_*` keys round-tripped through `read_note`. |
 | Search | Keyword, hybrid, note-kind filters, metadata filtering | Pass. `search_type: "text"`, `"hybrid"`, `note_types: ["note"]`, `metadata_filters: {"brain_status":"candidate"}`, and `tags: ["alpha"]` each returned the expected note. |
 | Project mapping | Two projects → different folders; explicit project call stays in-project | Pass. `probe` → `/app/data/probe` (vault-a), `probe-b` → `/app/data/probe-b` (vault-b); writes landed only in the requested project's vault. |
+| Dynamic project creation path | `create_memory_project` must preserve `/app/data/Projects/<generated-project>` exactly | **Fail (2026-09-21 hard gate).** Pinned Basic Memory 0.23.2 returned `created: true` but normalized the path to `/app/data/<generated-project>` and created the directory at the vault root. Automatic provisioning remains disabled pending an architecture/configuration revision. |
+| Revised dynamic project root | Repeat with `BASIC_MEMORY_PROJECT_ROOT=/app/data/Projects`, preserving the read-only gateway mount | Pass in a disposable pinned Basic Memory 0.23.2 container. The create response preserved `/app/data/Projects/<generated-project>`, the directory materialized under `Projects`, and `list_memory_projects` returned the exact generated name. |
 | Materialization | Record whether the write response precedes file materialization and index readiness | Response precedes file materialization. Write returned in ~74 ms with `action: "created"` and `file_path`, but the file was **not** present on disk at response time; it materialized ~100 ms later. The note was already returned by a text search at response time (index readiness at/just after the response). |
 | Manual edit | Changed file discoverable after indexing without restarting Obsidian | Pass. A manually created file became discoverable ~500 ms after write; a content edit became discoverable ~250 ms later; `read_note` returned the edited content. No restart. |
 | Model assets | Determine and persist the actual embedding cache path; repeat offline | Pass. Cache path `/home/appuser/.basic-memory/fastembed_cache` (persisted in the mounted home volume, ~65 MB, `models--qdrant--bge-small-en-v1.5-onnx-q`). Hybrid and vector search succeeded in a `--network none` container using the cached model. |
@@ -120,8 +122,8 @@ list_workspaces, list_memory_projects, create_memory_project, delete_project, se
 fetch, schema_validate, schema_infer, schema_diff
 ```
 
-The capability assertion requires `write_note`, `search_notes`, `read_note`, and
-`list_memory_projects`; all four are present. The sanitized `inputSchema` for every tool
+The capability assertion requires `write_note`, `search_notes`, `read_note`,
+`list_memory_projects`, and `create_memory_project`; all five are present. The sanitized `inputSchema` for every tool
 is committed in `tests/fixtures/backend/tools-list.json`.
 
 ## Wire shapes
@@ -137,6 +139,7 @@ Sanitized captures committed under `tests/fixtures/backend/`:
 | `search-notes.json` | Same envelope, `result` = `{ results, current_page, page_size, total, total_is_exact, has_more }` |
 | `read-note.json` | Same envelope, `result` = `{ title, permalink, file_path, content, frontmatter }` |
 | `list-memory-projects.json` | Same envelope, `result` = `{ projects, default_project, constrained_project }` |
+| `create-memory-project.json` | Same envelope, `result` includes exact `{ name, path, created, already_exists }` plus sanitized external ID and indexing metadata |
 
 FastMCP wraps every tool result with `_meta.fastmcp.wrap_result: true`, a `content`
 text block containing the JSON string, and a parallel `structuredContent.result`.
@@ -447,4 +450,3 @@ Sanitized committed transcripts:
   (the local stdio probe worked). The remote transport remains the production
   path and must be re-verified on the target deployment.
 - **24-run agent pilot**: NOT RUN (same budget/provider blocker as Task 19).
-

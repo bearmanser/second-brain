@@ -43,6 +43,7 @@
 - Modify: `tests/contract/backend.test.ts`
 - Modify: `scripts/probe-compatibility.mts`
 - Modify: `docs/compatibility.md`
+- Modify: `compose.yaml`
 
 **Interfaces:**
 - Produces: `BackendPort.ensureProject(project: string, projectPath: string): Promise<{ created: boolean }>`
@@ -79,6 +80,8 @@ ensureProject(project: string, projectPath: string): Promise<{ created: boolean 
 ```
 
 Require `create_memory_project` in `REQUIRED_BACKEND_TOOLS`. `ensureProject` first lists projects, returns `{ created: false }` when present, otherwise calls only `create_memory_project`, then lists again and requires the exact generated name. Do not expose workspace, `set_default`, arbitrary path, or delete operations through public input.
+
+Set `BASIC_MEMORY_PROJECT_ROOT=/app/data/Projects` for the memory service. The pinned backend normalizes created projects beneath this root; leaving it at `/app/data` would silently move dynamic projects outside the generated Projects subtree.
 
 - [ ] **Step 4: Run the contract suite green**
 

@@ -40,7 +40,7 @@ services:
     environment:
       BASIC_MEMORY_CONFIG_DIR: /home/appuser/.basic-memory
       BASIC_MEMORY_HOME: /home/appuser/.basic-memory/home
-      BASIC_MEMORY_PROJECT_ROOT: /app/data
+      BASIC_MEMORY_PROJECT_ROOT: /app/data/Projects
       BASIC_MEMORY_INDEX_CHANGES: "true"
       BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED: "true"
       BASIC_MEMORY_SEMANTIC_EMBEDDING_PROVIDER: fastembed

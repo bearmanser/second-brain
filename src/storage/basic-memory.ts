@@ -4,14 +4,17 @@ import { BrainError, isBrainError } from '../contracts/errors.js';
 import { BACKEND_TIMEOUT_MS } from '../core/limits.js';
 import type { BackendHit, BackendPort, BackendSearch, PlannedWrite } from '../core/types.js';
 import {
+  CREATE_MEMORY_PROJECT_TOOL,
   LIST_MEMORY_PROJECTS_TOOL,
   SEARCH_NOTES_TOOL,
   WRITE_NOTE_TOOL,
   argumentsForCreate,
   argumentsForIndexedLookup,
+  argumentsForProjectCreate,
   argumentsForSearch,
   assertRequiredBackendTools,
   decodeCreateResponse,
+  decodeProjectCreateResponse,
   decodeProjectNames,
   decodeSearchResponse,
   invalidInput,
@@ -232,6 +235,30 @@ export class BasicMemoryBackend implements BackendPort {
     return decodeCreateResponse(normalizeToolResponse(raw));
   }
 
+  async ensureProject(project: string, projectPath: string): Promise<{ created: boolean }> {
+    const existing = await this.listProjectNames();
+    if (existing.includes(project)) return { created: false };
+
+    const connection = this.requireConnection(CREATE_MEMORY_PROJECT_TOOL);
+    let payload: unknown;
+    try {
+      const raw = await connection.call(
+        CREATE_MEMORY_PROJECT_TOOL,
+        argumentsForProjectCreate(project, projectPath),
+        this.timeoutMs
+      );
+      payload = normalizeToolResponse(raw);
+    } catch (cause) {
+      throw projectCreateFailure(cause);
+    }
+    const result = decodeProjectCreateResponse(payload, project, projectPath);
+    const confirmed = await this.listProjectNames();
+    if (!confirmed.includes(project)) {
+      throw protocolError('create_memory_project did not make the exact project available');
+    }
+    return result;
+  }
+
   async search(input: BackendSearch): Promise<{ hits: BackendHit[]; has_more: boolean }> {
     this.assertProject(input.project);
     const argumentsForRequest = argumentsForSearch(input);
@@ -265,6 +292,17 @@ export class BasicMemoryBackend implements BackendPort {
     if (!this.projects.includes(project)) {
       throw invalidInput(`backend project ${project} is not configured`);
     }
+  }
+
+  private async listProjectNames(): Promise<string[]> {
+    return this.read(LIST_MEMORY_PROJECTS_TOOL, async (connection) => {
+      const raw = await connection.call(
+        LIST_MEMORY_PROJECTS_TOOL,
+        { output_format: 'json' },
+        this.timeoutMs
+      );
+      return decodeProjectNames(normalizeToolResponse(raw));
+    });
   }
 
   private requireConnection(operation: string): BackendConnection {
@@ -315,6 +353,14 @@ function writeFailure(cause: unknown): BrainError {
   return new BrainError({
     code: 'BACKEND_UNAVAILABLE',
     message: `write_note did not confirm persistence (${detail}); the mutation reconciler must verify materialization`,
+    cause
+  });
+}
+
+function projectCreateFailure(cause: unknown): BrainError {
+  return new BrainError({
+    code: 'BACKEND_UNAVAILABLE',
+    message: 'create_memory_project failed without a verified project',
     cause
   });
 }

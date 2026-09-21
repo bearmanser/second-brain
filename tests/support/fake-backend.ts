@@ -28,7 +28,13 @@ interface MaterialisedNote {
 }
 
 const FAKE_SERVER_VERSION = '4.0.0b1';
-const FAKE_TOOLS = ['read_note', 'search_notes', 'write_note', 'list_memory_projects'];
+const FAKE_TOOLS = [
+  'read_note',
+  'search_notes',
+  'write_note',
+  'list_memory_projects',
+  'create_memory_project'
+];
 const EXCERPT_MAX_CHARS = 240;
 
 const unavailable = (message: string): BrainError =>
@@ -61,7 +67,7 @@ const toPosix = (value: string): string => value.split(sep).join('/');
 
 export class FakeBackend implements BackendPort {
   readonly root: string;
-  readonly projects: readonly string[];
+  private readonly configuredProjects: string[];
   readonly create_calls: PlannedWrite[] = [];
   fail_once?: FakeBackendFault;
   on_create?: (write: PlannedWrite) => void | Promise<void>;
@@ -70,7 +76,7 @@ export class FakeBackend implements BackendPort {
 
   constructor(options: FakeBackendOptions) {
     this.root = options.root;
-    this.projects = [...(options.projects ?? [])];
+    this.configuredProjects = [...(options.projects ?? [])];
   }
 
   async connect(): Promise<void> {
@@ -88,6 +94,14 @@ export class FakeBackend implements BackendPort {
   async probe(): Promise<{ server_version: string; tools: string[] }> {
     this.record();
     return { server_version: FAKE_SERVER_VERSION, tools: [...FAKE_TOOLS] };
+  }
+
+  async ensureProject(project: string, projectPath: string): Promise<{ created: boolean }> {
+    this.record();
+    if (this.configuredProjects.includes(project)) return { created: false };
+    mkdirSync(projectPath, { recursive: true });
+    this.configuredProjects.push(project);
+    return { created: true };
   }
 
   async create(write: PlannedWrite): Promise<{ permalink: string; relative_path?: string }> {
@@ -172,7 +186,7 @@ export class FakeBackend implements BackendPort {
   }
 
   private assertProject(project: string): void {
-    if (this.projects.length > 0 && !this.projects.includes(project)) {
+    if (this.configuredProjects.length > 0 && !this.configuredProjects.includes(project)) {
       throw invalidInput(`fake backend does not know the project ${project}`);
     }
   }

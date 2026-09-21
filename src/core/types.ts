@@ -296,6 +296,7 @@ export interface BackendSearch {
 export interface BackendPort {
   connect(): Promise<void>;
   probe(): Promise<{ server_version: string; tools: string[] }>;
+  ensureProject(project: string, projectPath: string): Promise<{ created: boolean }>;
   create(write: PlannedWrite): Promise<{ permalink: string; relative_path?: string }>;
   search(input: BackendSearch): Promise<{ hits: BackendHit[]; has_more: boolean }>;
   isIndexed(project: string, revision_id: string): Promise<boolean>;

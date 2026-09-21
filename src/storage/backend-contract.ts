@@ -14,12 +14,14 @@ export const WRITE_NOTE_TOOL = 'write_note';
 export const SEARCH_NOTES_TOOL = 'search_notes';
 export const READ_NOTE_TOOL = 'read_note';
 export const LIST_MEMORY_PROJECTS_TOOL = 'list_memory_projects';
+export const CREATE_MEMORY_PROJECT_TOOL = 'create_memory_project';
 
 export const REQUIRED_BACKEND_TOOLS = [
   WRITE_NOTE_TOOL,
   SEARCH_NOTES_TOOL,
   READ_NOTE_TOOL,
-  LIST_MEMORY_PROJECTS_TOOL
+  LIST_MEMORY_PROJECTS_TOOL,
+  CREATE_MEMORY_PROJECT_TOOL
 ] as const;
 
 export const BRAIN_STATUS_KEY = 'brain_status';
@@ -67,6 +69,25 @@ export interface IndexedLookupArguments {
   page: 1;
   page_size: 1;
   metadata_filters: { brain_revision_id: string };
+}
+
+export interface CreateMemoryProjectArguments {
+  project_name: string;
+  project_path: string;
+  set_default: false;
+  output_format: 'json';
+}
+
+export function argumentsForProjectCreate(
+  project: string,
+  projectPath: string
+): CreateMemoryProjectArguments {
+  return {
+    project_name: project,
+    project_path: projectPath,
+    set_default: false,
+    output_format: 'json'
+  };
 }
 
 export function argumentsForCreate(write: PlannedWrite): WriteNoteArguments {
@@ -170,6 +191,13 @@ export const projectsResponseSchema = z.object({
   projects: z.array(projectSchema)
 });
 
+export const projectCreateResponseSchema = z.object({
+  name: z.string(),
+  path: z.string(),
+  created: z.boolean(),
+  already_exists: z.boolean()
+});
+
 const metadataString = (
   metadata: Record<string, unknown> | undefined,
   key: string
@@ -231,6 +259,24 @@ export function decodeProjectNames(value: unknown): string[] {
     throw protocolError('list_memory_projects response did not match the observed backend shape');
   }
   return parsed.data.projects.map((project) => project.name);
+}
+
+export function decodeProjectCreateResponse(
+  value: unknown,
+  expectedProject: string,
+  expectedPath: string
+): { created: boolean } {
+  const parsed = projectCreateResponseSchema.safeParse(value);
+  if (!parsed.success) {
+    throw protocolError('create_memory_project response did not match the observed backend shape');
+  }
+  if (parsed.data.name !== expectedProject || parsed.data.path !== expectedPath) {
+    throw protocolError('create_memory_project returned an unexpected project identity');
+  }
+  if (parsed.data.created === parsed.data.already_exists) {
+    throw protocolError('create_memory_project returned an inconsistent creation state');
+  }
+  return { created: parsed.data.created };
 }
 
 export function assertRequiredBackendTools(tools: readonly string[]): void {

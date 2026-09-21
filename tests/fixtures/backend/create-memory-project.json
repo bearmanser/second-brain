@@ -1,0 +1,26 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "<sanitized structured project result>"
+    }
+  ],
+  "structuredContent": {
+    "result": {
+      "name": "<generated-project>",
+      "external_id": "<uuid>",
+      "path": "/app/data/Projects/<generated-project>",
+      "is_default": false,
+      "created": true,
+      "already_exists": false,
+      "indexing": {
+        "total_files": 0,
+        "enqueued_files": 0,
+        "enqueued_batches": 0,
+        "deleted_files": 0,
+        "state": "completed"
+      }
+    }
+  },
+  "isError": false
+}

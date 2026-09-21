@@ -204,6 +204,10 @@ arbitrary backend tool names, workspaces, paths, or `set_default` behavior. A
 compatibility test must first prove that the pinned backend creates a missing
 project directory at the supplied path. If it does not, implementation stops for
 an architecture revision rather than making the gateway vault mount writable.
+Basic Memory 0.23.2 constrains project creation beneath
+`BASIC_MEMORY_PROJECT_ROOT`, so the memory service sets that root to
+`/app/data/Projects`. Existing static project mappings remain explicit, while
+new dynamic projects cannot be normalized into the vault root.
 
 An existing project returns `created: false`. If the same principal lacks a
 grant, ensuring it adds the role-matched grant only after confirming that the

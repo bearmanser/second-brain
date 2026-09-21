@@ -13,10 +13,11 @@ const fixtureNames = [
   'write-note-duplicate',
   'search-notes',
   'read-note',
-  'list-memory-projects'
+  'list-memory-projects',
+  'create-memory-project'
 ];
 
-test('requires create, search, read, and project discovery tools', () => {
+test('requires note and project creation, search, read, and project discovery tools', () => {
   expect(() => assertBackendCapabilities([
     { name: 'search_notes', inputSchema: {} }
   ])).toThrow(/write_note/);
@@ -44,6 +45,13 @@ test('pins validated image digests consistently across images.env and the depend
     expect(env.get(name)).toBe(lock.images[name]);
     expect(env.get(name)).toMatch(/@sha256:[a-f0-9]{64}$/);
   }
+});
+
+test('constrains backend-created projects to the Projects subtree', () => {
+  const compose = readText('compose.yaml');
+  expect(compose).toContain('BASIC_MEMORY_PROJECT_ROOT: /app/data/Projects');
+  expect(compose).toContain('${VAULT_PATH:-./vault}:/vault:ro');
+  expect(compose).toContain('${VAULT_PATH:-./vault}:/app/data');
 });
 
 test('records exact resolved dependency versions and the Node 24 engine range', () => {
@@ -78,6 +86,15 @@ test('ships sanitized fixtures for the observed backend wire responses', () => {
     'tests/fixtures/backend/write-note-duplicate.json'
   );
   expect(duplicate.structuredContent.result).toMatchObject({ action: 'conflict', error: 'NOTE_ALREADY_EXISTS' });
+  const projectCreate = readJson<{
+    structuredContent: { result: { name: string; path: string; created: boolean; already_exists: boolean } };
+  }>('tests/fixtures/backend/create-memory-project.json');
+  expect(projectCreate.structuredContent.result).toMatchObject({
+    name: '<generated-project>',
+    path: '/app/data/Projects/<generated-project>',
+    created: true,
+    already_exists: false
+  });
   expect(combined).not.toMatch(/Bearer\s/);
   expect(combined).not.toMatch(/\/home\/appuser/);
   expect(combined).not.toMatch(/api[_-]?key/i);
