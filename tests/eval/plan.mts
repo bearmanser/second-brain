@@ -164,10 +164,35 @@ export function effectiveMcpServers(documents: unknown[]): McpServerView[] {
   return [...merged.values()];
 }
 
-export function secondBrainServers(servers: McpServerView[]): McpServerView[] {
-  return servers.filter(
-    (server) => /second[-_ ]?brain/i.test(server.name) && server.disabled !== true
-  );
+export function enabledMcpServers(servers: McpServerView[]): McpServerView[] {
+  return servers.filter((server) => server.disabled !== true);
+}
+
+export interface DisabledIsolation {
+  ok: boolean;
+  enabled: string[];
+}
+
+export function disabledIsolationOk(servers: McpServerView[]): DisabledIsolation {
+  const enabled = enabledMcpServers(servers).map((server) => server.name);
+  return { ok: enabled.length === 0, enabled };
+}
+
+export interface PilotRunOutcome {
+  outcome: string;
+}
+
+export interface PilotOutcome {
+  status: 'RUN' | 'INVALID';
+  failed: boolean;
+  reasons: string[];
+}
+
+export function pilotOutcome(runs: PilotRunOutcome[]): PilotOutcome {
+  const invalid = runs.filter((entry) => entry.outcome === 'invalid_isolation').length;
+  const reasons: string[] = [];
+  if (invalid > 0) reasons.push(`invalid isolation runs: ${invalid}`);
+  return { status: invalid > 0 ? 'INVALID' : 'RUN', failed: invalid > 0, reasons };
 }
 
 export interface InstructionEvidence {

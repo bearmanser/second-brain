@@ -8,11 +8,13 @@ import {
   MIN_NEGATIVE_QUERIES,
   MIN_POSITIVE_QUERIES,
   RECALL_TARGET,
+  disabledIsolationOk,
   effectiveMcpServers,
+  enabledMcpServers,
   instructionStatus,
+  pilotOutcome,
   planPilotRuns,
   retrievalGate,
-  secondBrainServers,
   validateCaseRecord,
   validateCorpus,
   validateRetrieval,
@@ -20,6 +22,7 @@ import {
   type RetrievalLike
 } from '../eval/plan.mjs';
 import { startHttpHarness } from '../support/harness.js';
+import { modelTextFromEvents } from '../eval/instruction.mjs';
 
 const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 
@@ -157,15 +160,52 @@ test('effective MCP servers merge later documents over earlier ones', () => {
   ]);
 });
 
-test('second-brain servers are detected only when enabled', () => {
-  expect(
-    secondBrainServers([
-      { name: 'second-brain', disabled: true },
-      { name: 'second_brain', disabled: false },
-      { name: 'browsermcp', disabled: false }
-    ]).map((server) => server.name)
-  ).toEqual(['second_brain']);
-  expect(secondBrainServers([{ name: 'browsermcp', disabled: false }])).toEqual([]);
+test('enabled MCP servers are detected regardless of alias, and disabled isolation requires zero', () => {
+  const withAlias = [
+    { name: 'browsermcp', disabled: false },
+    { name: 'my-brain-endpoint', disabled: false }
+  ];
+  expect(enabledMcpServers(withAlias).map((server) => server.name)).toEqual([
+    'browsermcp',
+    'my-brain-endpoint'
+  ]);
+  expect(disabledIsolationOk(withAlias)).toEqual({
+    ok: false,
+    enabled: ['browsermcp', 'my-brain-endpoint']
+  });
+  const fullyDisabled = [
+    { name: 'browsermcp', disabled: true },
+    { name: 'my-brain-endpoint', disabled: true }
+  ];
+  expect(disabledIsolationOk(fullyDisabled)).toEqual({ ok: true, enabled: [] });
+  expect(disabledIsolationOk([])).toEqual({ ok: true, enabled: [] });
+});
+
+test('an invalid isolation run makes the pilot aggregate non-RUN and failed', () => {
+  expect(pilotOutcome([{ outcome: 'matched' }, { outcome: 'missed' }])).toEqual({
+    status: 'RUN',
+    failed: false,
+    reasons: []
+  });
+  const invalid = pilotOutcome([{ outcome: 'matched' }, { outcome: 'invalid_isolation' }]);
+  expect(invalid.status).not.toBe('RUN');
+  expect(invalid.failed).toBe(true);
+  expect(invalid.reasons.join(' ')).toContain('invalid isolation');
+});
+
+test('instruction evidence is read from the model text, not raw tool payloads', () => {
+  const stdout = [
+    JSON.stringify({ type: 'tool_use', part: { tool: 'x', state: { output: 'FACT-LEAK-1' } } }),
+    JSON.stringify({ type: 'text', part: { type: 'text', text: 'the fact is FACT-REPORTED' } })
+  ].join('\n');
+  const text = modelTextFromEvents(stdout);
+  expect(text).toContain('FACT-REPORTED');
+  expect(text).not.toContain('FACT-LEAK-1');
+  const onlyTool = JSON.stringify({
+    type: 'tool_use',
+    part: { tool: 'x', state: { output: 'FACT-LEAK-2' } }
+  });
+  expect(modelTextFromEvents(onlyTool)).not.toContain('FACT-LEAK-2');
 });
 
 test('instruction RUN requires preflight, a clean exit, and the marker', () => {

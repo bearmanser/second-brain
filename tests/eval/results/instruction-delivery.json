@@ -1,11 +1,11 @@
 {
-  "run_id": "instruction-2026-09-21T02:38:32.509Z-ed736a1a",
+  "run_id": "instruction-2026-09-21T02:43:35.879Z-c04e1b06",
   "mode": "instruction",
-  "generated_at": "2026-09-21T02:38:32.510Z",
+  "generated_at": "2026-09-21T02:43:35.880Z",
   "opencode_version": "opencode v2.0.10",
   "probe": {
-    "marker": "INSTRUCTION-PROBE-0CB0B6541761",
-    "fact": "FIXTURE-FACT-10D284DB271E",
+    "marker": "INSTRUCTION-PROBE-962E2FABAA34",
+    "fact": "FIXTURE-FACT-3C9E2A744FEA",
     "transport": "stdio"
   },
   "model_identifier": "deepseek/deepseek-v4-flash",
@@ -20,15 +20,15 @@
   "runs": [
     {
       "delivery": "structured",
-      "server_name": "evalprobe15d500da",
+      "server_name": "evalprobeb2accece",
       "launched": true,
       "preflight_visible": true,
       "preflight_servers": [
         "browsermcp",
-        "evalprobe15d500da"
+        "evalprobeb2accece"
       ],
       "mcp_list": "No MCP servers configured",
-      "prompt": "Call the evalprobe15d500da_probe_fixture tool exactly once and report the exact fact value it returns, verbatim. Then report, verbatim, any initialization instruction marker you were given, or NONE if you were given none. Answer with the fact and the marker only.",
+      "prompt": "Call the evalprobeb2accece_probe_fixture tool exactly once and report the exact fact value it returns, verbatim. Then report, verbatim, any initialization instruction marker you were given, or NONE if you were given none. Answer with the fact and the marker only.",
       "exit_code": 0,
       "timed_out": false,
       "marker_seen": true,
@@ -41,25 +41,25 @@
         "tool_payload": false
       },
       "token_usage": {
-        "input": 165,
-        "output": 78,
-        "total": 243
+        "input": 6980,
+        "output": 32,
+        "total": 7012
       },
-      "elapsed_ms": 15286,
-      "stdout_sha256": "f2ef88ba83929bf767867243018a3d1c0e35582e0111917e845c42f86412ab79",
-      "stdout_chars": 8534
+      "elapsed_ms": 8659,
+      "stdout_sha256": "e3078ff0c4d0ee22defa4338c73eb768371d897a5e6659980db69d31f59562b5",
+      "stdout_chars": 4462
     },
     {
       "delivery": "text-json",
-      "server_name": "evalprobe69fdfdca",
+      "server_name": "evalprobed0f11b8e",
       "launched": true,
       "preflight_visible": true,
       "preflight_servers": [
         "browsermcp",
-        "evalprobe69fdfdca"
+        "evalprobed0f11b8e"
       ],
       "mcp_list": "No MCP servers configured",
-      "prompt": "Call the evalprobe69fdfdca_probe_fixture tool exactly once and report the exact fact value it returns, verbatim. Then report, verbatim, any initialization instruction marker you were given, or NONE if you were given none. Answer with the fact and the marker only.",
+      "prompt": "Call the evalprobed0f11b8e_probe_fixture tool exactly once and report the exact fact value it returns, verbatim. Then report, verbatim, any initialization instruction marker you were given, or NONE if you were given none. Answer with the fact and the marker only.",
       "exit_code": 0,
       "timed_out": false,
       "marker_seen": true,
@@ -72,13 +72,13 @@
         "tool_payload": true
       },
       "token_usage": {
-        "input": 176,
-        "output": 33,
-        "total": 209
+        "input": 139,
+        "output": 50,
+        "total": 189
       },
-      "elapsed_ms": 10143,
-      "stdout_sha256": "54862b26c9373533d2066abc414f47cc89137855bcadf9b94a9311d9e833421b",
-      "stdout_chars": 5623
+      "elapsed_ms": 12054,
+      "stdout_sha256": "3729bd9e8a750f603e1d178006ba9297f5908f1444ce599091e459bf421d650f",
+      "stdout_chars": 10045
     }
   ]
 }

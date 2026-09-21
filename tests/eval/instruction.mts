@@ -96,6 +96,23 @@ function extractUsage(stdout: string): { input: number; output: number; total: n
   return { input, output, total: input + output };
 }
 
+export function modelTextFromEvents(stdout: string): string {
+  const parts: string[] = [];
+  for (const line of stdout.split('\n')) {
+    if (!line.startsWith('{')) continue;
+    let event: unknown;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const envelope = event as { type?: unknown; part?: { type?: unknown; text?: unknown } };
+    if (envelope.type !== 'text') continue;
+    if (typeof envelope.part?.text === 'string') parts.push(envelope.part.text);
+  }
+  return parts.join('\n');
+}
+
 interface ProbeRun {
   delivery: 'structured' | 'text-json';
   server_name: string;
@@ -217,8 +234,9 @@ async function runProbeOnce(
     );
     const elapsed = Date.now() - started;
     const combined = `${outcome.stdout}\n${outcome.stderr}`;
-    const markerSeen = outcome.stdout.includes(marker);
-    const factSeen = outcome.stdout.includes(fact);
+    const answer = modelTextFromEvents(outcome.stdout);
+    const markerSeen = answer.includes(marker);
+    const factSeen = answer.includes(fact);
     const decision = instructionStatus({
       preflight_visible: true,
       exit_code: outcome.code,

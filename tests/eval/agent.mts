@@ -7,7 +7,7 @@ import { makeLexicalSearch } from './lexical-backend.mjs';
 import { seedCorpus, type CorpusFile, type SeedRegistry } from './seed.mjs';
 import { REPO_ROOT, readJson, writeJson } from './io.mjs';
 import { OPENCODE_BIN, mcpPreflight, runCommand } from './instruction.mjs';
-import { MAX_PILOT_RUNS, planPilotRuns, secondBrainServers } from './plan.mjs';
+import { MAX_PILOT_RUNS, disabledIsolationOk, pilotOutcome, planPilotRuns } from './plan.mjs';
 
 export { MAX_PILOT_RUNS };
 export const AGENT_TIMEOUT_MS = 420_000;
@@ -167,8 +167,11 @@ export async function runAgentPilot(
   const disabled = runs.filter((entry) => entry.memory_condition === 'disabled');
   const matched = (entries: PilotRunRecord[]): number =>
     entries.filter((entry) => entry.outcome === 'matched').length;
+  const aggregate = pilotOutcome(runs);
   record.runs = runs;
-  record.status = 'RUN';
+  record.status = aggregate.status;
+  record.failed = aggregate.failed;
+  record.blocker = aggregate.reasons.length > 0 ? aggregate.reasons.join('; ') : null;
   record.summary = {
     enabled_matched: matched(enabled),
     enabled_total: enabled.length,
@@ -181,9 +184,11 @@ export async function runAgentPilot(
   };
   await writeJson(outPath, record);
   const summaryRecord = record.summary as Record<string, number>;
+  const invalidNote =
+    aggregate.failed && record.blocker !== null ? `; ${String(record.blocker)}` : '';
   return {
-    summary: `agent pilot: RUN (${runs.length} runs); enabled matched ${summaryRecord.enabled_matched}/${summaryRecord.enabled_total}; disabled matched ${summaryRecord.disabled_matched}/${summaryRecord.disabled_total}`,
-    failed: false
+    summary: `agent pilot: ${aggregate.status} (${runs.length} runs); enabled matched ${summaryRecord.enabled_matched}/${summaryRecord.enabled_total}; disabled matched ${summaryRecord.disabled_matched}/${summaryRecord.disabled_total}${invalidNote}`,
+    failed: aggregate.failed
   };
 }
 
@@ -231,17 +236,16 @@ async function runOne(
     const env: NodeJS.ProcessEnv = { ...process.env, PWD: workDir };
     const inherited = await mcpPreflight(workDir, env);
     if (condition === 'disabled') {
-      const offenders = secondBrainServers(inherited.servers);
-      if (offenders.length > 0) {
-        const overrides: Record<string, unknown> = {};
-        for (const offender of offenders) {
-          overrides[offender.name] = {
-            type: 'remote',
-            url: 'http://127.0.0.1:1/mcp',
-            oauth: false,
-            disabled: true
-          };
-        }
+      const overrides: Record<string, unknown> = {};
+      for (const server of inherited.servers) {
+        overrides[server.name] = {
+          type: 'remote',
+          url: 'http://127.0.0.1:1/mcp',
+          oauth: false,
+          disabled: true
+        };
+      }
+      if (Object.keys(overrides).length > 0) {
         await writeConfig(overrides);
       }
     }
@@ -250,10 +254,11 @@ async function runOne(
       env,
       condition === 'enabled' ? 'second-brain' : undefined
     );
-    const isolationOk =
+    const isolation =
       condition === 'enabled'
-        ? preflight.ok
-        : preflight.ok && secondBrainServers(preflight.servers).length === 0;
+        ? { ok: preflight.ok, enabled: [] as string[] }
+        : disabledIsolationOk(preflight.servers);
+    const isolationOk = preflight.ok && isolation.ok;
     const preflightServers = preflight.servers.map(
       (server) => `${server.name}${server.disabled ? ' (disabled)' : ''}`
     );

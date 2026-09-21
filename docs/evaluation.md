@@ -68,7 +68,7 @@ backend remains the production path.
 
 ### Results
 
-Run `retrieval-2026-09-21T02:38:22.185Z-d97f30f6` (23 queries, 11 notes):
+Run `retrieval-2026-09-21T02:42:12.396Z-28a14147` (23 queries, 11 notes):
 
 | Metric | Value |
 |---|---|
@@ -78,8 +78,8 @@ Run `retrieval-2026-09-21T02:38:22.185Z-d97f30f6` (23 queries, 11 notes):
 | Negative/scoping queries | 9 |
 | Negative queries with an empty result | 9 / 9 |
 | Forbidden-marker leakage events | 0 |
-| Mean recall elapsed time | 55.1 ms |
-| Corpus seeding (capture + review) | 3996 ms, 22 tool calls |
+| Mean recall elapsed time | 50.1 ms |
+| Corpus seeding (capture + review) | 3498 ms, 22 tool calls |
 | Functional gate | pass |
 
 The recall target is at least 0.8 at five. The result clears it on this 14-query
@@ -152,6 +152,10 @@ Observed result for `deepseek/deepseek-v4-flash` on opencode `v2.0.10`:
 - A missing response must not be read as proof that instructions are absent.
   Here both values were positively observed, so delivery is confirmed for this
   client and model combination.
+- Evidence is read only from the model's own `text` output events, never from the
+  raw tool-call payloads in the event stream. A tool result embedded in an event
+  but not surfaced to the model would otherwise be a false green; a unit test
+  covers that guard (`modelTextFromEvents`).
 - `opencode mcp list` still reports `No MCP servers configured` for disposable
   projects even when `debug config` and the run itself show the server, so the
   effective-config preflight is authoritative and the `mcp list` text is kept as
@@ -191,19 +195,24 @@ A memory-disabled run must not inherit a second-brain MCP server from the user o
 global configuration. Each run performs an effective-config preflight with
 `opencode debug config`, merging every `mcp.servers` entry in document order:
 
-- Disabled runs first write a project configuration with no second-brain server,
-  then read the inherited server list. Any inherited server whose name matches
-  `/second[-_ ]?brain/i` is explicitly overridden with `disabled: true` in the
-  project configuration.
-- A second preflight must then prove that **no enabled second-brain server**
-  remains. If it does, the run is recorded as `invalid_isolation` and the model
-  is **not launched**; it is never presented as a valid disabled comparison.
+- Disabled runs first write a project configuration with no MCP servers, then
+  read the inherited server list and explicitly override **every inherited
+  server by name** with `disabled: true`. Isolation is not name-filtered: an
+  inherited Brain endpoint under any alias is caught because the rule disables
+  all inherited servers.
+- A second preflight must then prove that the effective configuration contains
+  **zero enabled MCP servers of any name**. If any enabled server remains, the
+  run is recorded as `invalid_isolation` and the model is **not launched**; it is
+  never presented as a valid disabled comparison.
 - Enabled runs must show the project `second-brain` server enabled in the
   preflight, otherwise they are also recorded as `invalid_isolation`.
+- If any run in the pilot has `invalid_isolation`, the aggregate pilot status is
+  `INVALID` and `failed: true`, never `RUN`.
 
 The same preflight helper backs the instruction probe, so both model-driven
-paths prove MCP visibility before launching a model. Unit tests cover the merge
-and detection logic (`effectiveMcpServers`, `secondBrainServers`).
+paths prove MCP visibility before launching a model. Unit tests cover the merge,
+the zero-enabled rule (including an aliased Brain server), and the aggregate
+gating (`effectiveMcpServers`, `disabledIsolationOk`, `pilotOutcome`).
 
 ### Result: NOT RUN
 

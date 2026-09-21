@@ -298,9 +298,12 @@ documentation and the installed binary, not against that schema.
   connect in this environment (the client timed out before sending a request);
   the local stdio transport connected reliably. The remote transport remains the
   production path and should be re-verified on the target deployment.
-- Memory-disabled pilot runs must prove MCP isolation: inherited second-brain
-  servers are explicitly disabled in the project config and the preflight must
-  show none enabled, or the run is recorded as `invalid_isolation`.
+- Memory-disabled pilot runs must prove MCP isolation: every inherited server is
+  explicitly disabled and the preflight must show **zero enabled MCP servers of
+  any name**, or the run is recorded as `invalid_isolation`. Any such run makes
+  the pilot aggregate `INVALID` with `failed: true`.
+- Instruction evidence is read from the model's own text output, not raw tool
+  payloads, so an unexposed tool result cannot be counted as delivered.
 - The 24-run memory pilot is **NOT RUN**: the only working provider is priced and
   unapproved, and the configured free provider rejects its key.
 

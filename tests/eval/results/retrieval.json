@@ -1,7 +1,7 @@
 {
-  "run_id": "retrieval-2026-09-21T02:38:22.185Z-d97f30f6",
+  "run_id": "retrieval-2026-09-21T02:42:12.396Z-28a14147",
   "mode": "retrieval",
-  "generated_at": "2026-09-21T02:38:27.610Z",
+  "generated_at": "2026-09-21T02:42:17.205Z",
   "client": {
     "name": "second-brain-eval",
     "version": "0.1.0"
@@ -50,7 +50,7 @@
       "brain_review:approve:legacy-routing-superseded",
       "brain_review:supersede:legacy-routing-superseded"
     ],
-    "elapsed_ms": 3996
+    "elapsed_ms": 3498
   },
   "metrics": {
     "cases": 23,
@@ -62,7 +62,7 @@
     "negative_cases_passed": 9,
     "negative_cases_failed": 0,
     "leakage_events": 0,
-    "mean_elapsed_ms": 55.1
+    "mean_elapsed_ms": 50.1
   },
   "gate": {
     "ok": true,
@@ -90,10 +90,10 @@
         "session_id": null
       },
       "retrieved_ids": [
-        "c9543048-986b-4bf7-b85e-b9806cfd3981",
-        "39637460-b635-40da-949d-c198e1fc0a5d",
-        "54edb7c1-ec7d-4dea-8e5e-7d4ab8b5f1ab",
-        "c1e224d2-8b0c-476f-b738-8e003844584c"
+        "3d647d18-cc61-4ad5-80f8-091fda3ceecd",
+        "9dbf1f29-d835-43a3-96e6-95a37db329b2",
+        "490b4796-90d2-4052-af93-c777fd8b9b33",
+        "d6cd6d5f-b2de-4122-8435-cc107b17f941"
       ],
       "retrieved_keys": [
         "ttft-paraphrase",
@@ -109,7 +109,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 109,
+      "elapsed_ms": 116,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 0.5,
@@ -131,9 +131,9 @@
         "session_id": null
       },
       "retrieved_ids": [
-        "54edb7c1-ec7d-4dea-8e5e-7d4ab8b5f1ab",
-        "c9543048-986b-4bf7-b85e-b9806cfd3981",
-        "c1e224d2-8b0c-476f-b738-8e003844584c"
+        "490b4796-90d2-4052-af93-c777fd8b9b33",
+        "3d647d18-cc61-4ad5-80f8-091fda3ceecd",
+        "d6cd6d5f-b2de-4122-8435-cc107b17f941"
       ],
       "retrieved_keys": [
         "streaming-lesson",
@@ -169,8 +169,8 @@
         "session_id": null
       },
       "retrieved_ids": [
-        "c1e224d2-8b0c-476f-b738-8e003844584c",
-        "54edb7c1-ec7d-4dea-8e5e-7d4ab8b5f1ab"
+        "d6cd6d5f-b2de-4122-8435-cc107b17f941",
+        "490b4796-90d2-4052-af93-c777fd8b9b33"
       ],
       "retrieved_keys": [
         "routing-decision",
@@ -183,7 +183,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 74,
+      "elapsed_ms": 68,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 0.5,
@@ -205,7 +205,7 @@
         "session_id": null
       },
       "retrieved_ids": [
-        "c1e224d2-8b0c-476f-b738-8e003844584c"
+        "d6cd6d5f-b2de-4122-8435-cc107b17f941"
       ],
       "retrieved_keys": [
         "routing-decision"
@@ -217,7 +217,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 49,
+      "elapsed_ms": 44,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 1,
@@ -239,9 +239,9 @@
         "session_id": null
       },
       "retrieved_ids": [
-        "9e1728d0-67ef-4922-aeb6-dbe25213f777",
-        "39637460-b635-40da-949d-c198e1fc0a5d",
-        "c9543048-986b-4bf7-b85e-b9806cfd3981"
+        "dbd26e25-574b-441a-8a97-21824a369405",
+        "9dbf1f29-d835-43a3-96e6-95a37db329b2",
+        "3d647d18-cc61-4ad5-80f8-091fda3ceecd"
       ],
       "retrieved_keys": [
         "cache-warm-playbook",
@@ -255,7 +255,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 63,
+      "elapsed_ms": 60,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 0.3333333333333333,
@@ -277,8 +277,8 @@
         "session_id": null
       },
       "retrieved_ids": [
-        "9e1728d0-67ef-4922-aeb6-dbe25213f777",
-        "39637460-b635-40da-949d-c198e1fc0a5d"
+        "dbd26e25-574b-441a-8a97-21824a369405",
+        "9dbf1f29-d835-43a3-96e6-95a37db329b2"
       ],
       "retrieved_keys": [
         "cache-warm-playbook",
@@ -291,7 +291,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 65,
+      "elapsed_ms": 53,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 0.5,
@@ -313,10 +313,10 @@
         "session_id": null
       },
       "retrieved_ids": [
-        "c9543048-986b-4bf7-b85e-b9806cfd3981",
-        "54edb7c1-ec7d-4dea-8e5e-7d4ab8b5f1ab",
-        "c1e224d2-8b0c-476f-b738-8e003844584c",
-        "39637460-b635-40da-949d-c198e1fc0a5d"
+        "3d647d18-cc61-4ad5-80f8-091fda3ceecd",
+        "490b4796-90d2-4052-af93-c777fd8b9b33",
+        "d6cd6d5f-b2de-4122-8435-cc107b17f941",
+        "9dbf1f29-d835-43a3-96e6-95a37db329b2"
       ],
       "retrieved_keys": [
         "ttft-paraphrase",
@@ -332,7 +332,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 113,
+      "elapsed_ms": 100,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 0.5,
@@ -354,7 +354,7 @@
         "session_id": null
       },
       "retrieved_ids": [
-        "04e2df86-8625-4897-9ddc-0c691a1553b0"
+        "bd017568-756c-45c6-b488-1c8cd37c4b9b"
       ],
       "retrieved_keys": [
         "batching-hypothesis"
@@ -366,7 +366,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 23,
+      "elapsed_ms": 22,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 1,
@@ -388,11 +388,11 @@
         "session_id": "sess-2026-09-20-streaming-handoff"
       },
       "retrieved_ids": [
-        "b80acfcb-bead-4f03-a45c-36cde54da069",
-        "c1e224d2-8b0c-476f-b738-8e003844584c",
-        "54edb7c1-ec7d-4dea-8e5e-7d4ab8b5f1ab",
-        "39637460-b635-40da-949d-c198e1fc0a5d",
-        "c9543048-986b-4bf7-b85e-b9806cfd3981"
+        "fa076a55-fd45-42be-8450-c29bbf59a570",
+        "d6cd6d5f-b2de-4122-8435-cc107b17f941",
+        "490b4796-90d2-4052-af93-c777fd8b9b33",
+        "9dbf1f29-d835-43a3-96e6-95a37db329b2",
+        "3d647d18-cc61-4ad5-80f8-091fda3ceecd"
       ],
       "retrieved_keys": [
         "handoff-session",
@@ -408,7 +408,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 112,
+      "elapsed_ms": 105,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 0.2,
@@ -430,10 +430,10 @@
         "session_id": null
       },
       "retrieved_ids": [
-        "54edb7c1-ec7d-4dea-8e5e-7d4ab8b5f1ab",
-        "c1e224d2-8b0c-476f-b738-8e003844584c",
-        "c9543048-986b-4bf7-b85e-b9806cfd3981",
-        "39637460-b635-40da-949d-c198e1fc0a5d"
+        "490b4796-90d2-4052-af93-c777fd8b9b33",
+        "d6cd6d5f-b2de-4122-8435-cc107b17f941",
+        "3d647d18-cc61-4ad5-80f8-091fda3ceecd",
+        "9dbf1f29-d835-43a3-96e6-95a37db329b2"
       ],
       "retrieved_keys": [
         "streaming-lesson",
@@ -448,7 +448,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 118,
+      "elapsed_ms": 96,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 0.25,
@@ -470,7 +470,7 @@
         "session_id": null
       },
       "retrieved_ids": [
-        "9e1728d0-67ef-4922-aeb6-dbe25213f777"
+        "dbd26e25-574b-441a-8a97-21824a369405"
       ],
       "retrieved_keys": [
         "cache-warm-playbook"
@@ -482,7 +482,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 34,
+      "elapsed_ms": 30,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 1,
@@ -504,8 +504,8 @@
         "session_id": null
       },
       "retrieved_ids": [
-        "c1e224d2-8b0c-476f-b738-8e003844584c",
-        "54edb7c1-ec7d-4dea-8e5e-7d4ab8b5f1ab"
+        "d6cd6d5f-b2de-4122-8435-cc107b17f941",
+        "490b4796-90d2-4052-af93-c777fd8b9b33"
       ],
       "retrieved_keys": [
         "routing-decision",
@@ -518,7 +518,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 60,
+      "elapsed_ms": 55,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 0.5,
@@ -540,10 +540,10 @@
         "session_id": null
       },
       "retrieved_ids": [
-        "c9543048-986b-4bf7-b85e-b9806cfd3981",
-        "54edb7c1-ec7d-4dea-8e5e-7d4ab8b5f1ab",
-        "c1e224d2-8b0c-476f-b738-8e003844584c",
-        "39637460-b635-40da-949d-c198e1fc0a5d"
+        "3d647d18-cc61-4ad5-80f8-091fda3ceecd",
+        "490b4796-90d2-4052-af93-c777fd8b9b33",
+        "d6cd6d5f-b2de-4122-8435-cc107b17f941",
+        "9dbf1f29-d835-43a3-96e6-95a37db329b2"
       ],
       "retrieved_keys": [
         "ttft-paraphrase",
@@ -558,7 +558,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 103,
+      "elapsed_ms": 99,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 0.25,
@@ -580,8 +580,8 @@
         "session_id": null
       },
       "retrieved_ids": [
-        "9e1728d0-67ef-4922-aeb6-dbe25213f777",
-        "39637460-b635-40da-949d-c198e1fc0a5d"
+        "dbd26e25-574b-441a-8a97-21824a369405",
+        "9dbf1f29-d835-43a3-96e6-95a37db329b2"
       ],
       "retrieved_keys": [
         "cache-warm-playbook",
@@ -594,7 +594,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 49,
+      "elapsed_ms": 53,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 0.5,
@@ -622,7 +622,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 38,
+      "elapsed_ms": 35,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 0,
@@ -650,7 +650,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 25,
+      "elapsed_ms": 24,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 0,
@@ -678,7 +678,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 21,
+      "elapsed_ms": 19,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 0,
@@ -706,7 +706,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 29,
+      "elapsed_ms": 24,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 0,
@@ -734,7 +734,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 20,
+      "elapsed_ms": 14,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 0,
@@ -762,7 +762,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 22,
+      "elapsed_ms": 14,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 0,
@@ -792,7 +792,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 20,
+      "elapsed_ms": 13,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 0,
@@ -820,7 +820,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 14,
+      "elapsed_ms": 9,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 0,
@@ -848,7 +848,7 @@
         "brain_recall"
       ],
       "outcome": "pass",
-      "elapsed_ms": 24,
+      "elapsed_ms": 17,
       "token_usage": null,
       "recall_at_k": 1,
       "precision_at_k": 0,
