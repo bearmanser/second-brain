@@ -120,6 +120,116 @@ test('lists the seven tools and completes a status call with structured content'
   }
 });
 
+test('ensures a repository scope and uses it immediately across principals and reconnects', async () => {
+  const h = await startHttpHarness();
+  const worker = await h.connect(h.token, 'project-worker');
+  const reviewer = await h.connect(h.reviewerToken, 'project-reviewer');
+  try {
+    const remote = 'https://github.com/example/runtime-project.git';
+    const ensured = await call(worker, 'brain_project_ensure', {
+      idempotency_key: randomUUID(),
+      remote_url: remote
+    });
+    expect(ensured.isError).toBeFalsy();
+    const scope = record(ensured.structuredContent).scope as string;
+    expect(scope).toBe('runtime-project');
+
+    const captured = await call(worker, 'brain_capture', {
+      idempotency_key: randomUUID(),
+      scope,
+      note: lessonFixture
+    });
+    expect(captured.isError).toBeFalsy();
+    const recalled = await call(worker, 'brain_recall', {
+      scope,
+      query: 'proxied request',
+      include_candidates: true
+    });
+    expect(record(recalled.structuredContent).items).toHaveLength(1);
+
+    const isolated = await call(reviewer, 'brain_recall', {
+      scope,
+      query: 'proxied request',
+      include_candidates: true
+    });
+    expect(isolated.isError).toBe(true);
+    const reviewerEnsure = await call(reviewer, 'brain_project_ensure', {
+      idempotency_key: randomUUID(),
+      remote_url: 'git@github.com:example/runtime-project.git'
+    });
+    expect(record(reviewerEnsure.structuredContent).permissions).toEqual({
+      can_read: true,
+      can_write: true,
+      can_review: true
+    });
+    expect(h.auditedEvents().some((event) => event.tool === 'brain_project_ensure')).toBe(true);
+
+    await worker.close();
+    const reconnected = await h.connect(h.rotatedToken, 'project-worker-reconnected');
+    try {
+      const status = await call(reconnected, 'brain_status', {});
+      expect(record(status.structuredContent).scopes).toContainEqual({
+        id: scope,
+        can_write: true,
+        can_review: false
+      });
+    } finally {
+      await reconnected.close();
+    }
+  } finally {
+    await reviewer.close();
+    await worker.close().catch(() => undefined);
+    await h.close();
+  }
+});
+
+test('sanitizes secret-bearing repository remotes in MCP errors and diagnostics', async () => {
+  const h = await startHttpHarness();
+  const client = await h.connect(h.token);
+  const secret = 'never-log-this-secret';
+  try {
+    const result = await call(client, 'brain_project_ensure', {
+      idempotency_key: randomUUID(),
+      remote_url: `https://user:${secret}@github.com/example/private.git`
+    });
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(h.loggedDiagnostics().join('\n')).not.toContain(secret);
+  } finally {
+    await client.close();
+    await h.close();
+  }
+});
+
+test('status reveals a failed provisioning only to its caller and owners', async () => {
+  const h = await startHttpHarness();
+  const worker = await h.connect(h.token);
+  const reviewer = await h.connect(h.reviewerToken);
+  const owner = await h.connect(h.ownerToken);
+  try {
+    h.backend.ensure_project_fail_once = true;
+    const failed = await call(worker, 'brain_project_ensure', {
+      idempotency_key: randomUUID(),
+      remote_url: 'https://github.com/example/pending-project.git'
+    });
+    expect(failed.isError).toBe(true);
+
+    const workerStatus = record((await call(worker, 'brain_status', {})).structuredContent);
+    expect(workerStatus.projects).toEqual([{ scope: 'pending-project', state: 'provisioning' }]);
+    expect(workerStatus.pending_operations).toBe(1);
+
+    const reviewerStatus = record((await call(reviewer, 'brain_status', {})).structuredContent);
+    expect(reviewerStatus.projects).toBeUndefined();
+    expect(reviewerStatus.pending_operations).toBe(0);
+
+    const ownerStatus = record((await call(owner, 'brain_status', {})).structuredContent);
+    expect(ownerStatus.projects).toEqual([{ scope: 'pending-project', state: 'provisioning' }]);
+  } finally {
+    await Promise.all([worker.close(), reviewer.close(), owner.close()]);
+    await h.close();
+  }
+});
+
 test('text-json delivery serializes the complete result once in the text block', async () => {
   const h = await startHttpHarness({ result_delivery: 'text-json' });
   const client = await h.connect(h.token);

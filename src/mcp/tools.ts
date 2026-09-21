@@ -274,6 +274,18 @@ const statusResultSchema: Record<string, unknown> = {
       }
     },
     pending_operations: { type: 'number' },
+    projects: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['scope', 'state'],
+        properties: {
+          scope: SCOPE,
+          state: { type: 'string', enum: ['provisioning', 'ready', 'recovery_required'] }
+        }
+      }
+    },
     operation: mutationReceiptSchema,
     schemas: { type: 'object' }
   }

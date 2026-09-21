@@ -233,46 +233,78 @@ export async function ensureProject(
   request: ProjectEnsureRequest,
   deps: BrainDeps
 ): Promise<ProjectEnsureResult> {
-  const parsed = projectEnsureRequestSchema.safeParse(request);
-  if (!parsed.success) {
-    throw new BrainError({ code: 'INVALID_INPUT', message: 'invalid project ensure request' });
-  }
-  if (ctx.signal.aborted) throw new BrainError({ code: 'CANCELLED', message: 'request cancelled' });
-  const identity = normalizeRepositoryIdentity(parsed.data.remote_url);
-  consumeLimit(ctx, parsed.data, deps);
-  return deps.mutations.serialize(async () => {
-    const scope = chooseScope(identity, deps);
-    if (
-      deps.journal.getProjectByIdentity(identity) === undefined &&
-      deps.journal.countProjects() >= deps.config.limits.dynamic_projects_max
-    ) {
-      throw failure('LIMIT_EXCEEDED', 'dynamic project limit reached');
+  const started = Date.now();
+  try {
+    const parsed = projectEnsureRequestSchema.safeParse(request);
+    if (!parsed.success) {
+      throw new BrainError({ code: 'INVALID_INPUT', message: 'invalid project ensure request' });
     }
-    const reservation = deps.journal.reserve({
-      principal_id: ctx.principal.id,
-      idempotency_key: parsed.data.idempotency_key,
-      tool: TOOL,
-      scope,
-      payload_hash: digest(identity),
-      payload_json: JSON.stringify({ repository_identity: identity })
-    });
-    if (reservation.kind === 'replay') {
-      if (reservation.record.state === 'complete') return parseResult(reservation.record);
-      if (reservation.record.state === 'conflict' || reservation.record.state === 'failed') {
-        throw failure(
-          'RECOVERY_REQUIRED',
-          'project provisioning did not complete',
-          reservation.record.operation_id
-        );
+    if (ctx.signal.aborted) {
+      throw new BrainError({ code: 'CANCELLED', message: 'request cancelled' });
+    }
+    const identity = normalizeRepositoryIdentity(parsed.data.remote_url);
+    consumeLimit(ctx, parsed.data, deps);
+    const result = await deps.mutations.serialize(async () => {
+      const scope = chooseScope(identity, deps);
+      if (
+        deps.journal.getProjectByIdentity(identity) === undefined &&
+        deps.journal.countProjects() >= deps.config.limits.dynamic_projects_max
+      ) {
+        throw failure('LIMIT_EXCEEDED', 'dynamic project limit reached');
       }
+      const reservation = deps.journal.reserve({
+        principal_id: ctx.principal.id,
+        idempotency_key: parsed.data.idempotency_key,
+        tool: TOOL,
+        scope,
+        payload_hash: digest(identity),
+        payload_json: JSON.stringify({ repository_identity: identity })
+      });
+      if (reservation.kind === 'replay') {
+        if (reservation.record.state === 'complete') return parseResult(reservation.record);
+        if (reservation.record.state === 'conflict' || reservation.record.state === 'failed') {
+          throw failure(
+            'RECOVERY_REQUIRED',
+            'project provisioning did not complete',
+            reservation.record.operation_id
+          );
+        }
+      }
+      const record = reservation.record;
+      const plan =
+        record.plan_json === undefined
+          ? planFor(identity, scope, ctx.principal)
+          : parsePlan(record);
+      if (record.plan_json === undefined) deps.journal.saveProjectPlan(record.operation_id, plan);
+      if (record.state === 'prepared') deps.journal.mark(record.operation_id, 'submitted');
+      return finalizePlan(deps.journal.get(record.operation_id) ?? record, plan, deps);
+    });
+    try {
+      deps.journal.appendAudit({
+        request_id: ctx.request_id,
+        tool: TOOL,
+        outcome: 'ok',
+        duration_ms: Math.max(0, Date.now() - started),
+        note_count: 0
+      });
+    } catch {
+      // Audit persistence cannot change the already durable provisioning result.
     }
-    const record = reservation.record;
-    const plan =
-      record.plan_json === undefined ? planFor(identity, scope, ctx.principal) : parsePlan(record);
-    if (record.plan_json === undefined) deps.journal.saveProjectPlan(record.operation_id, plan);
-    if (record.state === 'prepared') deps.journal.mark(record.operation_id, 'submitted');
-    return finalizePlan(deps.journal.get(record.operation_id) ?? record, plan, deps);
-  });
+    return result;
+  } catch (error) {
+    try {
+      deps.journal.appendAudit({
+        request_id: ctx.request_id,
+        tool: TOOL,
+        outcome: 'error',
+        duration_ms: Math.max(0, Date.now() - started),
+        note_count: 0
+      });
+    } catch {
+      // Preserve the original provisioning error.
+    }
+    throw error;
+  }
 }
 
 export async function recoverProjectOperation(

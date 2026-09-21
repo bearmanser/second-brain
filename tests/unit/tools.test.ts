@@ -279,7 +279,7 @@ test('the published tool contract is pinned', () => {
       {
         "input": "30dee43261cae830a7ada8821f20d78e4dfb002fc0df30205749ed54295b0e4f",
         "name": "brain_status",
-        "output": "a65ec18ce12a9088a323d34dfb14ccbbbeee72538a64eb1826de5ce823893b85",
+        "output": "6a735fbcdbd4c0dda0f460b5d82cd6c70b3bc213d3f4bfde929af352bec3f564",
       },
     ]
   `);
@@ -538,6 +538,31 @@ test('representative tool schemas are pinned in full', () => {
         },
         "pending_operations": {
           "type": "number",
+        },
+        "projects": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "scope": {
+                "pattern": "^[a-z][a-z0-9-]{0,63}$",
+                "type": "string",
+              },
+              "state": {
+                "enum": [
+                  "provisioning",
+                  "ready",
+                  "recovery_required",
+                ],
+                "type": "string",
+              },
+            },
+            "required": [
+              "scope",
+              "state",
+            ],
+            "type": "object",
+          },
+          "type": "array",
         },
         "protocol_version": {
           "const": "2025-11-25",

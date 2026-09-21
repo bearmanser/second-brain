@@ -3,7 +3,7 @@ import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import type { ResultDelivery } from '../config/schema.js';
-import { BrainError, isBrainError } from '../contracts/errors.js';
+import { isBrainError } from '../contracts/errors.js';
 import { ETAG_PATTERN, SCOPE_ID_PATTERN } from '../core/limits.js';
 import {
   LIFECYCLES,
@@ -12,6 +12,8 @@ import {
   type FeedbackRequest,
   type FeedbackResult,
   type MutationReceipt,
+  type ProjectEnsureRequest,
+  type ProjectEnsureResult,
   type ReadRequest,
   type ReadResult,
   type RecallRequest,
@@ -41,6 +43,7 @@ export interface BrainServices {
   recall(ctx: RequestContext, request: RecallRequest): Promise<RecallResult>;
   read(ctx: RequestContext, request: ReadRequest): Promise<ReadResult>;
   feedback(ctx: RequestContext, request: FeedbackRequest): Promise<FeedbackResult>;
+  projectEnsure(ctx: RequestContext, request: ProjectEnsureRequest): Promise<ProjectEnsureResult>;
   status(ctx: RequestContext, request: StatusRequest): Promise<StatusResult>;
   readonly result_delivery?: ResultDelivery;
   readonly reportDiagnostic?: (message: string) => void;
@@ -113,6 +116,21 @@ const feedbackOutputSchema = z.strictObject({
   recorded: z.literal(true)
 });
 
+const projectEnsureOutputSchema = z.strictObject({
+  operation_id: uuidOutputSchema,
+  repository_identity: z.string(),
+  scope: scopeIdOutputSchema,
+  created: z.boolean(),
+  permissions: z.strictObject({
+    can_read: z.literal(true),
+    can_write: z.boolean(),
+    can_review: z.boolean()
+  }),
+  backend_ready: z.boolean(),
+  materialized: z.boolean(),
+  warnings: stringListOutputSchema
+});
+
 const statusOutputSchema = z.strictObject({
   version: z.string(),
   protocol_version: z.string(),
@@ -130,6 +148,14 @@ const statusOutputSchema = z.strictObject({
     embeddings: z.enum(['ready', 'unavailable', 'unknown'])
   }),
   pending_operations: z.number(),
+  projects: z
+    .array(
+      z.strictObject({
+        scope: scopeIdOutputSchema,
+        state: z.enum(['provisioning', 'ready', 'recovery_required'])
+      })
+    )
+    .optional(),
   operation: mutationReceiptOutputSchema.optional(),
   schemas: z.record(z.string(), z.unknown()).optional()
 });
@@ -137,6 +163,7 @@ const statusOutputSchema = z.strictObject({
 const TOOL_OUTPUT_SCHEMAS: Partial<Record<ToolName, z.ZodType>> = {
   brain_capture: mutationReceiptOutputSchema,
   brain_feedback: feedbackOutputSchema,
+  brain_project_ensure: projectEnsureOutputSchema,
   brain_read: readOutputSchema,
   brain_recall: recallOutputSchema,
   brain_status: statusOutputSchema
@@ -171,12 +198,8 @@ type ToolInvoker = (
 const TOOL_HANDLERS: Record<ToolName, ToolInvoker> = {
   brain_capture: (services, ctx, args) => services.capture(ctx, args as CaptureRequest),
   brain_feedback: (services, ctx, args) => services.feedback(ctx, args as FeedbackRequest),
-  brain_project_ensure: async () => {
-    throw new BrainError({
-      code: 'BACKEND_UNAVAILABLE',
-      message: 'repository project provisioning is not initialized'
-    });
-  },
+  brain_project_ensure: (services, ctx, args) =>
+    services.projectEnsure(ctx, args as ProjectEnsureRequest),
   brain_read: (services, ctx, args) => services.read(ctx, args as ReadRequest),
   brain_recall: (services, ctx, args) => services.recall(ctx, args as RecallRequest),
   brain_review: async (services, ctx, args) =>

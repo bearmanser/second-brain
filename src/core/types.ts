@@ -256,6 +256,7 @@ export interface StatusResult {
     embeddings: 'ready' | 'unavailable' | 'unknown';
   };
   pending_operations: number;
+  projects?: { scope: string; state: RepositoryProjectState }[];
   operation?: MutationReceipt;
   schemas?: Record<string, unknown>;
 }

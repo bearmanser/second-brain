@@ -251,9 +251,23 @@ export async function status(
   const request = parseRequest(input);
 
   const authorized = deps.scopeRegistry.visibleTo(ctx.principal);
+  const projectRecords =
+    typeof deps.journal.listProjects === 'function' ? deps.journal.listProjects() : [];
+  const visibleProjects = projectRecords
+    .filter(
+      (project) =>
+        project.state !== 'ready' &&
+        (ctx.principal.role === 'owner' || project.created_by_principal_id === ctx.principal.id)
+    );
+  const requestedProject =
+    request.scope === undefined
+      ? undefined
+      : visibleProjects.find((project) => project.scope === request.scope);
   const scopes =
     request.scope === undefined
       ? authorized.map((scope) => scopeEntry(ctx.principal, scope, deps.scopeRegistry))
+      : requestedProject !== undefined
+        ? []
       : [
           scopeEntry(
             ctx.principal,
@@ -263,7 +277,10 @@ export async function status(
         ];
 
   const scopeIds = new Set(scopes.map((entry) => entry.id));
-  const pending = deps.journal.pending().filter((record) => scopeIds.has(record.scope));
+  const visibleProjectScopes = new Set(visibleProjects.map((project) => project.scope));
+  const pending = deps.journal
+    .pending()
+    .filter((record) => scopeIds.has(record.scope) || visibleProjectScopes.has(record.scope));
 
   const backend = await backendHealth(deps);
   const gateway = backend === 'unavailable' ? 'degraded' : pending.length > 0 ? 'recovering' : 'ready';
@@ -276,6 +293,12 @@ export async function status(
     health: { gateway, backend, embeddings: 'unknown' },
     pending_operations: pending.length
   };
+  if (visibleProjects.length > 0) {
+    result.projects = visibleProjects.map((project) => ({
+      scope: project.scope,
+      state: project.state
+    }));
+  }
 
   if (request.operation_id !== undefined) {
     const record = deps.journal.get(request.operation_id);

@@ -85,6 +85,7 @@ export function wrapJournal(journal: Journal, scheduler: FaultScheduler): Journa
     grantProject: journal.grantProject.bind(journal),
     listProjectGrants: journal.listProjectGrants.bind(journal),
     listReadyProjects: journal.listReadyProjects.bind(journal),
+    listProjects: journal.listProjects.bind(journal),
     get(id: string): OperationRecord | undefined {
       return journal.get(id);
     },

@@ -489,6 +489,7 @@ function recordingServices(
     recall: track('brain_recall', services.recall),
     read: track('brain_read', services.read),
     feedback: track('brain_feedback', services.feedback),
+    projectEnsure: track('brain_project_ensure', services.projectEnsure),
     status: track('brain_status', services.status)
   };
 }

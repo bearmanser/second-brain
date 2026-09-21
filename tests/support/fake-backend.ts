@@ -143,7 +143,7 @@ export class FakeBackend implements BackendPort {
       throw unavailable('fake backend lost the request before writing');
     }
     const relativePath = `${write.directory}/${slugify(write.storage_title)}.md`;
-    const absolutePath = join(this.root, write.backend_project, relativePath);
+    const absolutePath = join(this.projectRoot(write.backend_project), relativePath);
     if (existsSync(absolutePath)) {
       throw conflict(`fake backend already materialised ${relativePath}`);
     }
@@ -231,7 +231,7 @@ export class FakeBackend implements BackendPort {
   }
 
   private readMaterialised(project: string): MaterialisedNote[] {
-    const projectRoot = join(this.root, project);
+    const projectRoot = this.projectRoot(project);
     const notes: MaterialisedNote[] = [];
     for (const absolutePath of this.walk(projectRoot)) {
       let raw: string;
@@ -259,6 +259,13 @@ export class FakeBackend implements BackendPort {
     }
     notes.sort((left, right) => left.relative_path.localeCompare(right.relative_path));
     return notes;
+  }
+
+  private projectRoot(project: string): string {
+    const mapping = [...this.scopeMappings.values()].find(
+      (candidate) => candidate.backend_project === project && candidate.relative_root.length > 0
+    );
+    return join(this.root, mapping?.relative_root ?? project);
   }
 
   private walk(directory: string): string[] {

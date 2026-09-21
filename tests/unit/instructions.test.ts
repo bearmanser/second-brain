@@ -11,6 +11,8 @@ const key = '00000000-0000-4000-8000-0000000000aa';
 test('instructions are short and reference the controlled tools', () => {
   const text = buildInstructions();
   expect(text).toContain('brain_recall');
+  expect(text.slice(0, 512)).toContain('git remote get-url origin');
+  expect(text.slice(0, 512)).toContain('brain_project_ensure');
   expect(text).toContain('candidate');
   expect(countReferenceTokens(text)).toBeLessThan(700);
 });

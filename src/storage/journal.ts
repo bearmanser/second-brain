@@ -898,6 +898,14 @@ export class Journal {
     return rows.map(toRepositoryProject);
   }
 
+  listProjects(): RepositoryProjectRecord[] {
+    this.assertOpen();
+    const rows = this.database
+      .prepare('SELECT * FROM repository_projects ORDER BY created_at ASC, repository_identity ASC')
+      .all() as RepositoryProjectRow[];
+    return rows.map(toRepositoryProject);
+  }
+
   countProjects(): number {
     this.assertOpen();
     const row = this.database.prepare('SELECT COUNT(*) AS count FROM repository_projects').get() as {

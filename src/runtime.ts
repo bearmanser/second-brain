@@ -13,6 +13,7 @@ import type {
   Clock,
   IdSource,
   MutationReceipt,
+  ProjectEnsureResult,
   ReadResult,
   RecallResult,
   StatusResult,
@@ -21,6 +22,7 @@ import type {
 import { RECONCILE_INTERVAL_MS } from './core/limits.js';
 import { capture } from './features/capture.js';
 import { feedback, retrievalEventFromRecall } from './features/feedback.js';
+import { ensureProject } from './features/project-ensure.js';
 import { read } from './features/read.js';
 import { recall } from './features/recall.js';
 import { review } from './features/review.js';
@@ -111,6 +113,7 @@ function buildServices(
     read: (ctx, request): Promise<ReadResult> => read(ctx, request, deps),
     status: (ctx, request): Promise<StatusResult> => status(ctx, request, deps),
     feedback: (ctx, request) => feedback(ctx, request, deps),
+    projectEnsure: (ctx, request): Promise<ProjectEnsureResult> => ensureProject(ctx, request, deps),
     recall: async (ctx, request): Promise<RecallResult> => {
       const started = Date.now();
       const result = await recall(ctx, request, deps);
@@ -151,6 +154,7 @@ function trackedServices(
     recall: (ctx, request) => readGuard(ctx.signal, () => services.recall(ctx, request)),
     read: (ctx, request) => readGuard(ctx.signal, () => services.read(ctx, request)),
     feedback: (ctx, request) => guard(() => services.feedback(ctx, request)),
+    projectEnsure: (ctx, request) => guard(() => services.projectEnsure(ctx, request)),
     status: (ctx, request) => readGuard(ctx.signal, () => services.status(ctx, request))
   };
 }
