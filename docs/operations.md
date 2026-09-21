@@ -97,13 +97,15 @@ The script:
    `volumes/brain-state.tar`), recording the resolved Compose-key-to-actual-volume-name
    mapping in the manifest's `volumes` object (for example
    `{"brain-state": "second-brain_brain-state"}`);
-6. computes a source snapshot before and after each copy **including symbolic-link
+6. enumerates and validates every produced archive before accepting it, removing the
+   archive and failing as inconsistent if its members violate the store's link rule;
+7. computes a source snapshot before and after each copy **including symbolic-link
    entries** and **aborts the backup as inconsistent** if anything changed, so a link
    introduced mid-backup is detected;
-7. writes `checksums.sha256` and a versioned `manifest.json` (format version, creation
+8. writes `checksums.sha256` and a versioned `manifest.json` (format version, creation
    time, software/image versions, included stores, the volume mapping, sensitivity, and
    file entries) via `node dist/cli.js backup-manifest`;
-8. restarts both services from an `EXIT` trap **even if backup creation fails**.
+9. restarts both services from an `EXIT` trap **even if backup creation fails**.
 
 Symbolic links are **never dereferenced** (`tar` runs without `-h`). The rule is
 per-store:
@@ -117,7 +119,7 @@ per-store:
   appears while copying aborts the backup.
 - **Restore** applies the same rule: symlink members in the vault archive are rejected;
   named-volume archives recreate links only when their targets stay inside the restored
-  volume root, and an escaping link discards the restore.
+  volume root, and a broken or escaping link discards the restore.
 
 `--check` validates the manifest/hashes and archive members, and for named-volume
 archives that contain symlinks it extracts them to a temporary directory to validate the
@@ -169,8 +171,8 @@ The script rejects:
   **every** file declared in `manifest.json`, and `restore.sh` additionally rejects any
   extractable `*.tar` that is not declared);
 - `../` traversal members and absolute paths inside any archive;
-- symbolic-link members in the vault archive, and named-volume symlinks whose targets
-  escape the restored volume root (internal volume links are preserved as links);
+- symbolic-link members in the vault archive, and broken or escaping named-volume
+  symlinks (internal non-broken volume links are preserved as links);
 - an unsupported backup format version;
 - a backup whose application-state schema is newer than this release supports;
 - an existing `NEW_ROOT` (including an empty directory or a symlink) — restore creates

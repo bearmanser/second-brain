@@ -14,6 +14,7 @@ import {
   buildManifest,
   collectManifestFiles,
   readManifestFile,
+  validateBackupArchive,
   verifyManifest,
   writeManifestFile
 } from './operations/backup.js';
@@ -32,6 +33,7 @@ export type CliCommand =
   | 'recover-state'
   | 'rebuild-catalogue'
   | 'backup-manifest'
+  | 'validate-archive'
   | 'verify-backup';
 
 export const CLI_COMMANDS: readonly CliCommand[] = [
@@ -42,6 +44,7 @@ export const CLI_COMMANDS: readonly CliCommand[] = [
   'recover-state',
   'rebuild-catalogue',
   'backup-manifest',
+  'validate-archive',
   'verify-backup'
 ];
 
@@ -56,7 +59,7 @@ const systemIds: IdSource = { next: () => randomUUID() };
 
 const USAGE = [
   'usage: node dist/cli.js <command> [options]',
-  'commands: serve | setup | health | recover | recover-state | rebuild-catalogue | backup-manifest | verify-backup'
+  'commands: serve | setup | health | recover | recover-state | rebuild-catalogue | backup-manifest | validate-archive | verify-backup'
 ].join('\n');
 
 function invalidInput(message: string): BrainError {
@@ -374,6 +377,18 @@ async function runVerifyBackup(parsed: ParsedArguments): Promise<number> {
   return 0;
 }
 
+async function runValidateArchive(parsed: ParsedArguments): Promise<number> {
+  const archive = flagString(parsed.flags, 'archive');
+  const mode = flagString(parsed.flags, 'mode');
+  if (archive === undefined) throw invalidInput('validate-archive requires --archive');
+  if (mode !== 'vault' && mode !== 'volume') {
+    throw invalidInput('validate-archive requires --mode vault or --mode volume');
+  }
+  await validateBackupArchive(archive, mode);
+  process.stdout.write(`validated ${mode} archive: ${archive}\n`);
+  return 0;
+}
+
 export async function runCli(
   argv: readonly string[],
   env: NodeJS.ProcessEnv = process.env
@@ -398,6 +413,8 @@ export async function runCli(
       return runRebuildCatalogue(parsed, env);
     case 'backup-manifest':
       return runBackupManifest(parsed);
+    case 'validate-archive':
+      return runValidateArchive(parsed);
     case 'verify-backup':
       return runVerifyBackup(parsed);
   }

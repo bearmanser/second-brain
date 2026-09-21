@@ -176,7 +176,8 @@ const walk = (directory) => {
       try {
         resolved = fs.realpathSync(absolute);
       } catch {
-        resolved = path.resolve(path.dirname(absolute), target);
+        process.stderr.write(`broken symbolic link: ${relative} -> ${target}\n`);
+        process.exit(3);
       }
       const inside = resolved === root || resolved.startsWith(`${root}${path.sep}`);
       if (!inside && escaping === null) escaping = `${relative} -> ${target}`;
@@ -206,6 +207,22 @@ if ! docker image inspect second-brain:local >/dev/null 2>&1; then
   fail "the second-brain:local image is required for volume snapshots and the versioned manifest; run scripts/setup.sh"
 fi
 
+validate_created_archive() {
+  local archive="$1" mode="$2" store="$3" relative output
+  relative="${archive#"$DESTINATION"/}"
+  if [ -n "$ARCHIVE_TEST_INJECT" ]; then
+    if ! BRAIN_BACKUP_ARCHIVE="$archive" BRAIN_BACKUP_STORE="$store" sh -c "$ARCHIVE_TEST_INJECT"; then
+      rm -f "$archive"
+      fail "test archive injection failed for $store"
+    fi
+  fi
+  if ! output="$(docker run --rm --user 0:0 -v "$DESTINATION":/backup:ro --entrypoint node second-brain:local \
+    /app/dist/cli.js validate-archive --archive "/backup/$relative" --mode "$mode" 2>&1)"; then
+    rm -f "$archive"
+    fail "produced archive is inconsistent for $store: $output"
+  fi
+}
+
 note "scanning the vault for symbolic links"
 VAULT_SYMLINK="$(find "$VAULT_ABS" -type l -print -quit 2>/dev/null || true)"
 if [ -n "$VAULT_SYMLINK" ]; then
@@ -215,6 +232,7 @@ fi
 STORES=("vault")
 VOLUME_MAP=""
 TEST_INJECT="${BRAIN_BACKUP_TEST_INJECT:-}"
+ARCHIVE_TEST_INJECT="${BRAIN_BACKUP_TEST_ARCHIVE_INJECT:-}"
 
 note "archiving the host vault"
 BEFORE_VAULT="$(snapshot_dir "$VAULT_ABS")"
@@ -222,6 +240,7 @@ if [ -n "$TEST_INJECT" ]; then
   sh -c "$TEST_INJECT"
 fi
 tar -cf "$DESTINATION/vault.tar" -C "$VAULT_ABS" .
+validate_created_archive "$DESTINATION/vault.tar" vault vault
 AFTER_VAULT="$(snapshot_dir "$VAULT_ABS")"
 if [ "$BEFORE_VAULT" != "$AFTER_VAULT" ]; then
   fail "the vault changed while it was being copied; aborting because the backup is inconsistent (is Obsidian/sync really paused?)"
@@ -237,6 +256,7 @@ if [ "$NOTES_ONLY" = "0" ]; then
     fi
     docker run --rm --user 0:0 -v "$volume":/volume:ro -v "$DESTINATION/volumes":/backup \
       --entrypoint tar "$NODE_IMAGE" -C /volume -cf "/backup/$key.tar" .
+    validate_created_archive "$DESTINATION/volumes/$key.tar" volume "volume $key"
     if ! AFTER="$(volume_snapshot "$volume" 2>&1)"; then
       fail "volume $key ($volume) changed into an unsafe state while it was being copied: $AFTER"
     fi
@@ -253,6 +273,7 @@ if [ "$INCLUDE_SECRETS" = "1" ]; then
   [ -d "$ROOT_DIR/secrets" ] || fail "--include-secrets was requested but secrets/ does not exist"
   note "archiving host token files (labeled sensitive)"
   tar -cf "$DESTINATION/secrets.tar" -C "$ROOT_DIR" secrets
+  validate_created_archive "$DESTINATION/secrets.tar" vault secrets
   STORES+=("secrets")
   SENSITIVE=1
 fi

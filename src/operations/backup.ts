@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
-import { lstat, readdir, readFile, writeFile } from 'node:fs/promises';
-import { join, relative, resolve, sep } from 'node:path';
+import { lstat, open, readdir, readFile, writeFile, type FileHandle } from 'node:fs/promises';
+import { join, posix, relative, resolve, sep } from 'node:path';
 
 export const BACKUP_FORMAT_VERSION = 1;
 export const SUPPORTED_BACKUP_FORMATS: readonly number[] = [1];
@@ -40,12 +40,234 @@ export interface BackupManifest {
   files: ManifestFile[];
 }
 
+export type BackupArchiveMode = 'vault' | 'volume';
+
+interface ArchiveEntry {
+  path: string;
+  type: string;
+  linkTarget?: string;
+}
+
 function sha256(buffer: Buffer): string {
   return createHash('sha256').update(buffer).digest('hex');
 }
 
 function backupError(message: string): Error {
   return new Error(message);
+}
+
+function tarString(buffer: Buffer, offset: number, length: number): string {
+  const field = buffer.subarray(offset, offset + length);
+  const end = field.indexOf(0);
+  return field.subarray(0, end < 0 ? field.length : end).toString('utf8');
+}
+
+function tarNumber(buffer: Buffer, offset: number, length: number): number {
+  const field = buffer.subarray(offset, offset + length);
+  if ((field[0] ?? 0) & 0x80) {
+    const bytes = Buffer.from(field);
+    bytes[0] = (bytes[0] ?? 0) & 0x7f;
+    let value = 0n;
+    for (const byte of bytes) value = (value << 8n) | BigInt(byte);
+    const result = Number(value);
+    if (!Number.isSafeInteger(result)) throw backupError('archive contains an unsupported member size');
+    return result;
+  }
+  const raw = field.toString('ascii').replace(/\0.*$/s, '').trim();
+  if (raw.length === 0) return 0;
+  if (!/^[0-7]+$/.test(raw)) throw backupError('archive contains an invalid numeric header');
+  const result = Number.parseInt(raw, 8);
+  if (!Number.isSafeInteger(result)) throw backupError('archive contains an unsupported member size');
+  return result;
+}
+
+function tarChecksum(header: Buffer): number {
+  let total = 0;
+  for (let index = 0; index < header.length; index += 1) {
+    total += index >= 148 && index < 156 ? 32 : (header[index] ?? 0);
+  }
+  return total;
+}
+
+function parsePax(buffer: Buffer): Map<string, string> {
+  const fields = new Map<string, string>();
+  let offset = 0;
+  while (offset < buffer.length) {
+    const space = buffer.indexOf(32, offset);
+    if (space < 0) throw backupError('archive contains an invalid extended header');
+    const length = Number.parseInt(buffer.subarray(offset, space).toString('ascii'), 10);
+    if (!Number.isSafeInteger(length) || length <= space - offset + 2 || offset + length > buffer.length) {
+      throw backupError('archive contains an invalid extended header');
+    }
+    const record = buffer.subarray(space + 1, offset + length - 1).toString('utf8');
+    const equals = record.indexOf('=');
+    if (equals > 0) fields.set(record.slice(0, equals), record.slice(equals + 1));
+    offset += length;
+  }
+  return fields;
+}
+
+async function readAt(handle: FileHandle, length: number, position: number): Promise<Buffer> {
+  const buffer = Buffer.alloc(length);
+  let offset = 0;
+  while (offset < length) {
+    const result = await handle.read(buffer, offset, length - offset, position + offset);
+    if (result.bytesRead === 0) throw backupError('archive ended in the middle of a member');
+    offset += result.bytesRead;
+  }
+  return buffer;
+}
+
+function archivePath(value: string): string {
+  const original = value;
+  if (value.includes('\0')) throw backupError('archive member contains a null byte');
+  if (value.startsWith('/') || value.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(value)) {
+    throw backupError(`archive member is an absolute path: ${original}`);
+  }
+  const segments: string[] = [];
+  for (const segment of value.split('/')) {
+    if (segment.length === 0 || segment === '.') continue;
+    if (segment === '..') throw backupError(`archive member contains traversal: ${original}`);
+    segments.push(segment);
+  }
+  return segments.join('/');
+}
+
+async function readArchiveEntries(path: string): Promise<ArchiveEntry[]> {
+  const handle = await open(path, 'r').catch(() => undefined);
+  if (handle === undefined) throw backupError(`backup archive cannot be read: ${path}`);
+  const entries: ArchiveEntry[] = [];
+  let offset = 0;
+  let localPax = new Map<string, string>();
+  const globalPax = new Map<string, string>();
+  let longName: string | undefined;
+  let longLink: string | undefined;
+  try {
+    const stat = await handle.stat();
+    while (offset + 512 <= stat.size) {
+      const header = await readAt(handle, 512, offset);
+      if (header.every((byte) => byte === 0)) break;
+      const expectedChecksum = tarNumber(header, 148, 8);
+      if (expectedChecksum !== tarChecksum(header)) {
+        throw backupError(`archive has an invalid header at byte ${offset}`);
+      }
+      const size = tarNumber(header, 124, 12);
+      const type = String.fromCharCode(header[156] ?? 0) || '0';
+      const payloadOffset = offset + 512;
+      const nextOffset = payloadOffset + Math.ceil(size / 512) * 512;
+      if (nextOffset > stat.size) throw backupError('archive ended in the middle of a member');
+      if (type === 'x' || type === 'g' || type === 'L' || type === 'K') {
+        if (size > 16 * 1024 * 1024) throw backupError('archive extended header is too large');
+        const payload = await readAt(handle, size, payloadOffset);
+        if (type === 'x') localPax = parsePax(payload);
+        if (type === 'g') {
+          for (const [key, value] of parsePax(payload)) globalPax.set(key, value);
+        }
+        if (type === 'L') longName = payload.toString('utf8').replace(/[\0\n]+$/g, '');
+        if (type === 'K') longLink = payload.toString('utf8').replace(/[\0\n]+$/g, '');
+        offset = nextOffset;
+        continue;
+      }
+      const name = tarString(header, 0, 100);
+      const prefix = tarString(header, 345, 155);
+      const headerPath = prefix.length > 0 ? `${prefix}/${name}` : name;
+      const rawPath = localPax.get('path') ?? globalPax.get('path') ?? longName ?? headerPath;
+      const rawLink = localPax.get('linkpath') ?? globalPax.get('linkpath') ?? longLink ?? tarString(header, 157, 100);
+      const normalized = archivePath(rawPath);
+      if (normalized.length > 0) {
+        entries.push({
+          path: normalized,
+          type: type === '\0' ? '0' : type,
+          ...((type === '2' || type === '1') ? { linkTarget: rawLink } : {})
+        });
+      }
+      localPax = new Map<string, string>();
+      longName = undefined;
+      longLink = undefined;
+      offset = nextOffset;
+    }
+  } finally {
+    await handle.close();
+  }
+  return entries;
+}
+
+function parentPaths(path: string): string[] {
+  const parents: string[] = [];
+  let current = posix.dirname(path);
+  while (current !== '.') {
+    parents.push(current);
+    current = posix.dirname(current);
+  }
+  return parents;
+}
+
+function resolveArchivedLink(
+  entry: ArchiveEntry,
+  byPath: Map<string, ArchiveEntry>,
+  knownPaths: Set<string>
+): 'inside' | 'broken' | 'escaping' {
+  const initialTarget = entry.linkTarget ?? '';
+  if (initialTarget.length === 0) return 'broken';
+  if (initialTarget.startsWith('/')) return 'escaping';
+  const pending = initialTarget.split('/');
+  const resolved = posix.dirname(entry.path) === '.' ? [] : posix.dirname(entry.path).split('/');
+  const followed = new Set<string>();
+  while (pending.length > 0) {
+    const component = pending.shift() ?? '';
+    if (component.length === 0 || component === '.') continue;
+    if (component === '..') {
+      if (resolved.length === 0) return 'escaping';
+      resolved.pop();
+      continue;
+    }
+    resolved.push(component);
+    const candidate = resolved.join('/');
+    const nested = byPath.get(candidate);
+    if (nested?.type === '2') {
+      if (followed.has(candidate)) return 'broken';
+      followed.add(candidate);
+      const target = nested.linkTarget ?? '';
+      if (target.length === 0) return 'broken';
+      if (target.startsWith('/')) return 'escaping';
+      const parent = posix.dirname(candidate);
+      resolved.splice(0, resolved.length, ...(parent === '.' ? [] : parent.split('/')));
+      pending.unshift(...target.split('/'));
+      continue;
+    }
+    if (!knownPaths.has(candidate)) return 'broken';
+  }
+  return knownPaths.has(resolved.join('/')) ? 'inside' : 'broken';
+}
+
+export async function validateBackupArchive(path: string, mode: BackupArchiveMode): Promise<void> {
+  const entries = await readArchiveEntries(path);
+  const byPath = new Map<string, ArchiveEntry>();
+  const knownPaths = new Set<string>(['']);
+  for (const entry of entries) {
+    if (byPath.has(entry.path)) throw backupError(`archive contains a duplicate member: ${entry.path}`);
+    byPath.set(entry.path, entry);
+    knownPaths.add(entry.path);
+    for (const parent of parentPaths(entry.path)) knownPaths.add(parent);
+  }
+  for (const entry of entries) {
+    for (const parent of parentPaths(entry.path)) {
+      if (byPath.get(parent)?.type === '2') {
+        throw backupError(`archive member is nested beneath a symbolic link: ${entry.path}`);
+      }
+    }
+    if (entry.type !== '2') continue;
+    if (mode === 'vault') {
+      throw backupError(`vault archive contains symbolic link member: ${entry.path}`);
+    }
+    const result = resolveArchivedLink(entry, byPath, knownPaths);
+    if (result === 'broken') {
+      throw backupError(`named-volume archive contains broken symbolic link: ${entry.path} -> ${entry.linkTarget ?? ''}`);
+    }
+    if (result === 'escaping') {
+      throw backupError(`named-volume archive contains escaping symbolic link: ${entry.path} -> ${entry.linkTarget ?? ''}`);
+    }
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -268,6 +490,12 @@ export async function verifyManifest(root: string, manifest: BackupManifest): Pr
     }
     if (buffer.byteLength !== entry.size || sha256(buffer) !== entry.sha256) {
       throw backupError(`checksum mismatch for ${entry.path}`);
+    }
+    if (entry.path.endsWith('.tar')) {
+      await validateBackupArchive(
+        absolute,
+        entry.path.startsWith('volumes/') ? 'volume' : 'vault'
+      );
     }
   }
 }

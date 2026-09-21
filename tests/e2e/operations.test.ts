@@ -423,6 +423,78 @@ describe('disposable Compose operations', () => {
     await waitForHealth(300_000);
   }, 600_000);
 
+  test('backup.sh refuses a named volume with a broken symbolic link', async () => {
+    const broken = '/cache/check/broken';
+    const destination = join(workDir, 'broken-link-backup');
+    run('docker', [
+      'run',
+      '--rm',
+      '--user',
+      '0:0',
+      '-v',
+      `${project}_model-cache:/cache`,
+      nodeImage,
+      'sh',
+      '-c',
+      `ln -sf missing-target ${broken}`
+    ]);
+    try {
+      const result = run(
+        'bash',
+        ['scripts/backup.sh', destination, '--yes'],
+        { cwd: workDir, env: env({ VAULT_PATH: vaultPath }), allowFailure: true }
+      );
+      expect(result.status).not.toBe(0);
+      expect(`${result.stdout}${result.stderr}`).toMatch(/broken symbolic link/);
+      expect(`${result.stdout}${result.stderr}`).toContain('check/broken');
+      expect(existsSync(join(destination, 'volumes', 'model-cache.tar'))).toBe(false);
+    } finally {
+      run('docker', [
+        'run',
+        '--rm',
+        '--user',
+        '0:0',
+        '-v',
+        `${project}_model-cache:/cache`,
+        nodeImage,
+        'sh',
+        '-c',
+        'rm -f /cache/check/broken'
+      ]);
+    }
+    await waitForHealth(300_000);
+  }, 600_000);
+
+  test('backup.sh rejects a symlink found only in the produced archive and removes it', async () => {
+    const destination = join(workDir, 'archive-link-backup');
+    const inject = [
+      'if [ "$BRAIN_BACKUP_STORE" = vault ]; then',
+      'scratch="$(mktemp -d)"',
+      'ln -s missing-target "$scratch/archive-only-link"',
+      'tar -rf "$BRAIN_BACKUP_ARCHIVE" -C "$scratch" archive-only-link',
+      'rm -rf "$scratch"',
+      'fi'
+    ].join('\n');
+    const result = run(
+      'bash',
+      ['scripts/backup.sh', destination, '--yes'],
+      {
+        cwd: workDir,
+        env: env({
+          VAULT_PATH: vaultPath,
+          BRAIN_BACKUP_TEST_ARCHIVE_INJECT: inject
+        }),
+        allowFailure: true
+      }
+    );
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}${result.stderr}`).toMatch(/archive.*inconsistent|inconsistent.*archive/i);
+    expect(`${result.stdout}${result.stderr}`).toContain('archive-only-link');
+    expect(existsSync(join(destination, 'vault.tar'))).toBe(false);
+    expect(existsSync(join(vaultPath, 'archive-only-link'))).toBe(false);
+    await waitForHealth(300_000);
+  }, 600_000);
+
   test('backup.sh aborts when a symlink appears while copying', async () => {
     const injected = join(vaultPath, 'injected-link');
     try {
