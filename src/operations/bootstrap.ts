@@ -24,7 +24,7 @@ import { hasPermission } from './permissions.js';
 
 export interface BootstrapOptions {
   root: string;
-  scope: string;
+  scope?: string;
   vault_path?: string;
   uid?: number;
   gid?: number;
@@ -40,7 +40,6 @@ export interface BootstrapResult {
 
 export const TOKEN_BYTES = 32;
 export const CURSOR_KEY_BYTES = 32;
-export const DEFAULT_SCOPE = 'freellmapi';
 export const DEFAULT_VAULT_MOUNT = '/vault';
 export const DEFAULT_STATE_MOUNT = '/var/lib/second-brain';
 export const DEFAULT_CREDENTIALS_MOUNT = '/run/secrets/brain_credentials';
@@ -81,13 +80,13 @@ function relativeRoot(scope: string): string {
   return SCOPE_RELATIVE_ROOTS[scope] ?? `Projects/${scope}`;
 }
 
-function scopeAliases(scope: string, primary: string): string[] {
-  if (scope !== primary) return [];
+function scopeAliases(scope: string, primary: string | undefined): string[] {
+  if (primary === undefined || scope !== primary) return [];
   return SCOPE_ALIASES[scope] ?? [scope];
 }
 
-function buildScopes(primary: string): ScopeConfig[] {
-  const ids = [primary];
+function buildScopes(primary: string | undefined): ScopeConfig[] {
+  const ids = primary === undefined ? [] : [primary];
   if (!ids.includes('shared')) ids.push('shared');
   if (!ids.includes('profile')) ids.push('profile');
   return ids.map((id) => ({
@@ -208,15 +207,15 @@ async function ensureScopePath(
   }
 }
 
-function reviewerPrincipal(scope: string): Principal {
-  const readScopes = [scope];
-  if (!readScopes.includes('shared')) readScopes.push('shared');
+function reviewerPrincipal(scope: string | undefined): Principal {
+  const readScopes = scope === undefined ? ['shared'] : [scope];
+  if (scope !== undefined && !readScopes.includes('shared')) readScopes.push('shared');
   return {
     id: randomUUID(),
     role: 'reviewer',
     read_scopes: readScopes,
-    write_scopes: [scope],
-    review_scopes: [scope]
+    write_scopes: scope === undefined ? [] : [scope],
+    review_scopes: scope === undefined ? [] : [scope]
   };
 }
 
@@ -259,7 +258,7 @@ async function applyOwnership(path: string, uid?: number, gid?: number): Promise
 
 export async function bootstrap(options: BootstrapOptions): Promise<BootstrapResult> {
   const root = resolve(options.root);
-  const scope = requireScope(options.scope ?? DEFAULT_SCOPE);
+  const scope = options.scope === undefined ? undefined : requireScope(options.scope);
   const uid = options.uid;
   const gid = options.gid;
   const wantOwner = options.owner_credential === true;

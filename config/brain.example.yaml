@@ -44,10 +44,11 @@ allowed_origins:
   - http://127.0.0.1:7331
   - http://localhost:7331
 
-# Logical scopes map to separate Basic Memory projects and vault-relative roots.
-# `repository_aliases` let a repository remote name resolve to exactly one
-# scope; an ambiguous identifier is rejected. Scope membership is granted per
-# principal in the credentials file, never inferred from a folder name.
+# Reserved static scopes map to separate Basic Memory projects and vault roots.
+# Repository projects are normally created dynamically by brain_project_ensure
+# and persisted in journal.db; they do not need entries here. The freellmapi
+# entry below demonstrates compatibility with an explicitly pre-provisioned
+# legacy scope.
 scopes:
   - id: freellmapi
     backend_project: freellmapi

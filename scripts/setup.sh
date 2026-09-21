@@ -6,7 +6,7 @@ cd "$ROOT_DIR"
 
 BRAIN_UID="${BRAIN_UID:-}"
 BRAIN_GID="${BRAIN_GID:-}"
-BRAIN_SCOPE="${BRAIN_SCOPE:-freellmapi}"
+BRAIN_SCOPE="${BRAIN_SCOPE:-}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-second-brain}"
 IMAGES_FILE="$ROOT_DIR/config/images.env"
 
@@ -113,7 +113,7 @@ scope_relative_root() {
 }
 
 required_projects() {
-  printf '%s\n' "$BRAIN_SCOPE"
+  [ -z "$BRAIN_SCOPE" ] || printf '%s\n' "$BRAIN_SCOPE"
   [ "$BRAIN_SCOPE" = "shared" ] || printf 'shared\n'
   [ "$BRAIN_SCOPE" = "profile" ] || printf 'profile\n'
 }
@@ -142,6 +142,8 @@ chown_new_volume() {
 
 main() {
   parse_images_env "$IMAGES_FILE"
+
+  [ -n "$BRAIN_SCOPE" ] || BRAIN_SCOPE="$(read_env_value BRAIN_SCOPE)"
 
   local vault_raw="${VAULT_PATH:-$(read_env_value VAULT_PATH)}"
   vault_raw="${vault_raw:-./vault}"
@@ -176,13 +178,17 @@ main() {
   if [ "${BRAIN_OWNER_CREDENTIAL:-0}" = "1" ]; then
     owner_args+=(-e BRAIN_SETUP_OWNER_CREDENTIAL=1)
   fi
+  local scope_args=()
+  if [ -n "$BRAIN_SCOPE" ]; then
+    scope_args+=(-e "BRAIN_SETUP_SCOPE=$BRAIN_SCOPE")
+  fi
   run_as_root \
     -e BRAIN_SETUP_ROOT=/bootstrap \
-    -e "BRAIN_SETUP_SCOPE=$BRAIN_SCOPE" \
     -e "BRAIN_SETUP_VAULT=$vault_abs" \
     -e "BRAIN_SETUP_UID=$BRAIN_UID" \
     -e "BRAIN_SETUP_GID=$BRAIN_GID" \
     ${owner_args[@]+"${owner_args[@]}"} \
+    ${scope_args[@]+"${scope_args[@]}"} \
     -v "$ROOT_DIR":/bootstrap \
     -v "$vault_abs":"$vault_abs" \
     second-brain:local setup
@@ -215,7 +221,7 @@ main() {
 
   local config_volume="${COMPOSE_PROJECT_NAME}_memory-state"
   local expected_file
-  expected_file="$(mktemp)"
+  expected_file="$(mktemp "$ROOT_DIR/.brain-projects.XXXXXX")"
   local project
   while IFS= read -r project; do
     printf '%s\t%s\n' "$project" "$(expected_project_path "$project")" >> "$expected_file"

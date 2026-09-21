@@ -34,6 +34,7 @@ let backupDir = '';
 let nodeImage = '';
 let memoryImage = '';
 let token = '';
+let dynamicScope = '';
 let client: Client | undefined;
 
 function env(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
@@ -142,6 +143,30 @@ function manifestOf(root: string): {
   };
 }
 
+function projectStateFromDirectory(directory: string): {
+  projects: Array<{ repository_identity: string; scope: string; state: string }>;
+  grants: Array<{ scope: string; can_read: number; can_write: number; can_review: number }>;
+} {
+  const script = [
+    "const fs=require('node:fs')",
+    "fs.mkdirSync('/tmp/journal-copy',{recursive:true})",
+    "for(const name of ['journal.db','journal.db-wal','journal.db-shm']){const source='/state/'+name;if(fs.existsSync(source))fs.copyFileSync(source,'/tmp/journal-copy/'+name)}",
+    "const Database=require('/app/node_modules/better-sqlite3')",
+    "const db=new Database('/tmp/journal-copy/journal.db',{readonly:true})",
+    "const projects=db.prepare('SELECT repository_identity, scope, state FROM repository_projects ORDER BY scope').all()",
+    "const grants=db.prepare('SELECT scope, can_read, can_write, can_review FROM dynamic_project_grants ORDER BY scope').all()",
+    "process.stdout.write(JSON.stringify({projects,grants}))"
+  ].join(';');
+  const result = run('docker', [
+    'run', '--rm', '--user', '0:0', '-v', `${directory}:/state:ro`,
+    '--entrypoint', 'node', 'second-brain:local', '-e', script
+  ]);
+  return JSON.parse(result.stdout) as {
+    projects: Array<{ repository_identity: string; scope: string; state: string }>;
+    grants: Array<{ scope: string; can_read: number; can_write: number; can_review: number }>;
+  };
+}
+
 beforeAll(async () => {
   run('docker', ['version', '--format', '{{.Server.Version}}'], { cwd: REPO_ROOT });
 
@@ -168,11 +193,21 @@ beforeAll(async () => {
 
   token = readFileSync(join(workDir, 'secrets/brain-token'), 'utf8').trim();
   client = await connect();
+  const ensured = await client.callTool({
+    name: 'brain_project_ensure',
+    arguments: {
+      idempotency_key: randomUUID(),
+      remote_url: 'git@github.com:example/operations-dynamic.git'
+    }
+  });
+  const ensuredContent = (ensured as { structuredContent?: { scope?: string } }).structuredContent;
+  dynamicScope = ensuredContent?.scope ?? '';
+  expect(dynamicScope).toBe('operations-dynamic');
   const captured = await client.callTool({
     name: 'brain_capture',
     arguments: {
       idempotency_key: randomUUID(),
-      scope: 'freellmapi',
+      scope: dynamicScope,
       note: {
         title: NOTE_TITLE,
         tags: ['operations'],
@@ -267,6 +302,14 @@ describe('disposable Compose operations', () => {
     });
     expect(extracted.status).toBe(0);
     expect(existsSync(join(restored, 'volumes', 'brain-state', 'journal.db'))).toBe(true);
+    expect(projectStateFromDirectory(join(restored, 'volumes', 'brain-state'))).toMatchObject({
+      projects: [{
+        repository_identity: 'github.com/example/operations-dynamic',
+        scope: dynamicScope,
+        state: 'ready'
+      }],
+      grants: [{ scope: dynamicScope, can_read: 1, can_write: 1, can_review: 1 }]
+    });
     expect(existsSync(join(restored, 'vault'))).toBe(true);
     const restoredLink = join(restored, 'volumes', 'model-cache', 'check', 'link.txt');
     expect(lstatSync(restoredLink).isSymbolicLink()).toBe(true);
@@ -305,13 +348,13 @@ describe('disposable Compose operations', () => {
     });
     expect(rebuilt.status).toBe(0);
     expect(`${rebuilt.stdout}${rebuilt.stderr}`).toMatch(/rebuilding the gateway catalogue/);
-    expect(`${rebuilt.stdout}${rebuilt.stderr}`).toMatch(/capturing the pre-rebuild journal and feedback state/);
+    expect(`${rebuilt.stdout}${rebuilt.stderr}`).toMatch(/capturing the pre-rebuild journal, feedback, repository project, and grant state/);
     expect(`${rebuilt.stdout}${rebuilt.stderr}`).toMatch(/rows are byte-for-byte unchanged/);
     expect(`${rebuilt.stdout}${rebuilt.stderr}`).toMatch(/NOT full operational recovery/);
     await waitForHealth(300_000);
   }, 900_000);
 
-  test('rebuild.sh refuses without acknowledgment, refuses a missing journal, and completes an acknowledged loss', async () => {
+  test('rebuild.sh refuses acknowledgment-free, missing, and unsafe lossy dynamic-project rebuilds', async () => {
     const noAck = run('bash', ['scripts/rebuild.sh', '--search'], {
       cwd: workDir,
       env: env({ VAULT_PATH: vaultPath }),
@@ -356,10 +399,16 @@ describe('disposable Compose operations', () => {
       ['scripts/rebuild.sh', '--acknowledge', '--accept-operational-loss', '--search'],
       { cwd: workDir, env: env({ VAULT_PATH: vaultPath }), allowFailure: true }
     );
-    expect(accepted.status, `${accepted.stdout}${accepted.stderr}`).toBe(0);
+    expect(accepted.status, `${accepted.stdout}${accepted.stderr}`).not.toBe(0);
     expect(`${accepted.stdout}${accepted.stderr}`).toMatch(/operational loss was explicitly accepted/);
-    expect(`${accepted.stdout}${accepted.stderr}`).toMatch(/freshly initialized operation journal/);
-    expect(`${accepted.stdout}${accepted.stderr}`).toMatch(/not full operational recovery/);
+    expect(`${accepted.stdout}${accepted.stderr}`).toMatch(/dynamic repository project.*restore.*journal/i);
+
+    run('docker', [
+      'run', '--rm', '--user', '0:0',
+      '-v', `${join(workDir, 'restored', 'volumes', 'brain-state')}:/backup:ro`,
+      '-v', `${project}_brain-state:/state`,
+      nodeImage, 'sh', '-c', 'cp /backup/journal.db /state/journal.db'
+    ]);
 
     compose(['up', '-d', 'brain']);
     await waitForHealth(300_000);

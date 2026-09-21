@@ -31,10 +31,11 @@ writes, and adapts to Basic Memory.
 - Cold backup, restore verification, and index rebuild procedures.
 - Offline hybrid search after the local embedding model has been warmed once.
 
-## The six tools
+## The seven tools
 
 | Tool | Purpose |
 |---|---|
+| `brain_project_ensure` | Canonicalize the current repository remote, create or reuse its project, and grant role-matched access. |
 | `brain_recall` | Scoped text/hybrid retrieval with phase, kind, and budget options. |
 | `brain_read` | Current or explicit historical revision with bounded pagination and an etag. |
 | `brain_capture` | Create a structured candidate with evidence and an idempotency key. |
@@ -63,6 +64,11 @@ Then register the gateway with your MCP client. A verified OpenCode v2 snippet i
 in `config/opencode.example.jsonc`. Full detail, prerequisites, token loading in
 WSL, Obsidian setup, operations, and limitations are in
 [docs/setup.md](docs/setup.md).
+
+On first use in a Git repository, the client should run
+`git remote get-url origin` locally and pass that value to
+`brain_project_ensure`. The gateway creates the project idempotently; no manual
+project setup is required.
 
 ## Documentation
 

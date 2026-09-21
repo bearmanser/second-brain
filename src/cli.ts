@@ -146,7 +146,7 @@ function flagPairs(flags: Map<string, string | boolean>, name: string): Record<s
 
 async function runSetup(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promise<number> {
   const root = flagString(parsed.flags, 'root') ?? env.BRAIN_SETUP_ROOT ?? process.cwd();
-  const scope = flagString(parsed.flags, 'scope') ?? env.BRAIN_SETUP_SCOPE ?? 'freellmapi';
+  const scope = flagString(parsed.flags, 'scope') ?? env.BRAIN_SETUP_SCOPE;
   const vault = flagString(parsed.flags, 'vault') ?? env.BRAIN_SETUP_VAULT;
   const uid = flagNumber(parsed.flags, 'uid') ?? (env.BRAIN_SETUP_UID === undefined ? undefined : Number(env.BRAIN_SETUP_UID));
   const gid = flagNumber(parsed.flags, 'gid') ?? (env.BRAIN_SETUP_GID === undefined ? undefined : Number(env.BRAIN_SETUP_GID));
@@ -154,7 +154,7 @@ async function runSetup(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promis
     flagBoolean(parsed.flags, 'owner-credential') || env.BRAIN_SETUP_OWNER_CREDENTIAL === '1';
   const result = await bootstrap({
     root,
-    scope,
+    ...(scope === undefined ? {} : { scope }),
     ...(vault === undefined ? {} : { vault_path: vault }),
     ...(uid === undefined ? {} : { uid }),
     ...(gid === undefined ? {} : { gid }),

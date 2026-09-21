@@ -74,7 +74,7 @@ for (const name of ['journal.db', 'journal.db-wal', 'journal.db-shm']) {
 }
 const db = new Database(`${directory}/journal.db`, { readonly: true });
 const parts = [];
-for (const table of ['operations', 'feedback_records']) {
+for (const table of ['operations', 'feedback_records', 'repository_projects', 'dynamic_project_grants']) {
   const rows = db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all();
   const hash = crypto.createHash('sha256');
   for (const row of rows) hash.update(JSON.stringify(row));
@@ -88,7 +88,7 @@ JOURNAL_STATE
 state_volume="$(resolve_volume brain-state)"
 
 JOURNAL_LOST=0
-note "checking that the operation journal and feedback store are present"
+note "checking that the operation journal, feedback store, repository projects, and grants are present"
 if ! docker run --rm --user 0:0 -v "$state_volume":/state:ro --entrypoint test "$NODE_IMAGE" -f /state/journal.db; then
   if [ "$ACCEPT_LOSS" != "yes" ]; then
     fail "the operation database (journal.db) is missing from volume $state_volume; restore it from a backup first, or re-run with --accept-operational-loss to permanently discard retry and feedback history"
@@ -104,6 +104,15 @@ fi
 VAULT_PATH="${VAULT_PATH:-./vault}"
 [ -d "$VAULT_PATH" ] || fail "vault path does not exist: $VAULT_PATH"
 VAULT_ABS="$(cd "$VAULT_PATH" && pwd -P)"
+if [ "$JOURNAL_LOST" = "1" ] && [ -d "$VAULT_ABS/Projects" ]; then
+  while IFS= read -r project_dir; do
+    relative="Projects/$(basename "$project_dir")"
+    if find "$project_dir" -type f -name '*.md' -print -quit | grep -q . \
+      && ! grep -Fq "relative_root: $relative" "$ROOT_DIR/config/brain.yaml"; then
+      fail "a dynamic repository project exists at $relative; operational-loss rebuild cannot reconstruct its repository identity or grants, so restore journal.db from backup"
+    fi
+  done < <(find "$VAULT_ABS/Projects" -mindepth 1 -maxdepth 1 -type d -print)
+fi
 MARKDOWN_COUNT="$(find "$VAULT_ABS" -type f -name '*.md' -exec grep -l '^brain_revision_id:' {} + 2>/dev/null | wc -l | tr -d ' ')"
 note "Markdown revision files visible before rebuild: $MARKDOWN_COUNT"
 
@@ -129,7 +138,7 @@ fi
 
 BEFORE_STATE=""
 if [ "$JOURNAL_LOST" = "0" ]; then
-  note "capturing the pre-rebuild journal and feedback state"
+  note "capturing the pre-rebuild journal, feedback, repository project, and grant state"
   BEFORE_STATE="$(journal_state)" || fail "could not read the journal before the rebuild"
   note "pre-rebuild state: $BEFORE_STATE"
 fi
@@ -185,11 +194,11 @@ if [ "$CONFLICTS" != "0" ] || [ "$MALFORMED" != "0" ] || [ "$UNSUPPORTED" != "0"
 fi
 
 if [ "$JOURNAL_LOST" = "0" ]; then
-  note "confirming the operation journal and feedback rows were preserved"
+  note "confirming the operation journal, feedback, repository project, and grant rows were preserved"
   AFTER_STATE="$(journal_state)" || fail "could not read the journal after the rebuild"
   note "post-rebuild state: $AFTER_STATE"
-  [ "$BEFORE_STATE" = "$AFTER_STATE" ] || fail "the operation journal or feedback records changed across the rebuild (before '$BEFORE_STATE', after '$AFTER_STATE')"
-  note "operation journal and feedback rows are byte-for-byte unchanged ($AFTER_STATE)"
+  [ "$BEFORE_STATE" = "$AFTER_STATE" ] || fail "the operation journal, feedback, repository project, or grant records changed across the rebuild (before '$BEFORE_STATE', after '$AFTER_STATE')"
+  note "operation journal, feedback, repository project, and grant rows are byte-for-byte unchanged ($AFTER_STATE)"
 else
   note "WARNING: journal.db was missing and a fresh one was initialized; retry and feedback history is gone, and this rebuild is not full operational recovery"
 fi

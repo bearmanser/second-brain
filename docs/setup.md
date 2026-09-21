@@ -42,8 +42,13 @@ bash scripts/setup.sh
 4. creates the `brain-state`, `memory-state`, and `model-cache` named volumes
    and validates that an existing volume is writable by the runtime UID without
    ever changing ownership of an existing volume;
-5. seeds the Basic Memory project mappings (`freellmapi`, `shared`, `profile`)
-   exactly once.
+5. seeds only the reserved Basic Memory project mappings (`shared`, `profile`)
+   exactly once. Repository projects are created on demand.
+
+For compatibility with a deployment that already uses a statically named
+project, set `BRAIN_SCOPE` explicitly (for example
+`BRAIN_SCOPE=freellmapi bash scripts/setup.sh`). That scope is seeded alongside
+`shared` and `profile`; it is no longer the fresh-install default.
 
 By default `setup.sh` writes a **reviewer** credential. Request an owner
 credential explicitly by setting `BRAIN_OWNER_CREDENTIAL=1` before running it:
@@ -63,7 +68,7 @@ excludes it).
 2. Notes appear under scope roots:
    - `Shared/` — generalized lessons and playbooks (`shared`).
    - `Profile/` — owner-approved preferences and environment facts (`profile`).
-   - `Projects/freellmapi/` — the pilot project (`freellmapi`).
+   - `Projects/<scope>/` — repository projects created on demand.
 3. Within a scope, notes route by kind: `Lessons/`, `Decisions/`, `Playbooks/`,
    `Facts/`, `Preferences/`, `Sessions/`, `Notes/`.
 4. Each logical note has a stable UUID directory and each revision is its own
@@ -116,7 +121,7 @@ Notes verified against the installed client (`opencode v2.0.10`):
 - V2 stores servers under `mcp.servers.<name>`; it does not accept a server name
   directly under `mcp`.
 - `oauth: false` disables the client's OAuth flow for a preconfigured bearer token.
-- `codemode: false` exposes the six tools on the model's native tool list.
+- `codemode: false` exposes the seven tools on the model's native tool list.
 - In the Task 19 probe the model with the default `structured` delivery received
   only the compact pointer, so the verified `result_delivery` mode for this
   client is **`text-json`** (`config/brain.example.yaml`). Confirm which
@@ -151,10 +156,46 @@ export SECOND_BRAIN_TOKEN="$(tr -d '\n' < secrets/brain-token)"
   gateway (the gateway watches the credentials file and also reloads on
   `SIGHUP`); remove the old record afterwards.
 
-## The six tools
+## Automatic repository projects
+
+In each Git checkout, the agent should first obtain the configured origin
+without sending repository contents:
+
+```sh
+git remote get-url origin
+```
+
+It then calls `brain_project_ensure` with a new UUID `idempotency_key` and that
+`remote_url`. Equivalent HTTPS and SSH remotes resolve to the same canonical
+identity (for example `https://github.com/acme/widget.git` and
+`git@github.com:acme/widget.git` both identify `github.com/acme/widget`). The
+gateway strips the optional `.git`, lowercases the host, rejects credentials,
+query strings, fragments, local paths, and malformed remotes, and never logs the
+raw URL.
+
+The returned `scope` is used for subsequent recall, capture, and review calls.
+If there is no `origin`, the client must ask the user for a remote or explicit
+repository identity; it must not invent one from the directory name. Scope-name
+collisions are resolved deterministically with a short identity-derived suffix.
+Repeated calls are idempotent and reuse the same project.
+
+Access follows the authenticated role: a worker receives read/write, a reviewer
+receives read/write/review, and an owner has full access to every ready dynamic
+project. One principal ensuring a project does not grant unrelated principals
+access. Provisioning is bounded by per-principal and global minute limits and a
+configured total-project cap. A failed ambiguous provision is reported as
+`recovery_required` to its creator and owners and requires explicit owner
+recovery; it is never silently treated as ready.
+
+The server publishes this workflow in MCP initialization instructions, but a
+client may ignore those instructions. Configure equivalent repository-startup
+guidance in that client's own instruction file when necessary.
+
+## The seven tools
 
 | Tool | Use it to |
 |---|---|
+| `brain_project_ensure` | Create or reuse the project for `{ idempotency_key, remote_url }` and receive its role-matched permissions. |
 | `brain_recall` | Find prior knowledge: `{ scope, query, topics?, phase?, kinds?, include_shared?, include_candidates?, session_id?, mode?, allow_text_fallback?, budget_tokens?, limit? }`. |
 | `brain_read` | Read a current or historical revision, or the next page: `{ scope, id, revision_id?, cursor?, budget_tokens? }`. |
 | `brain_capture` | Submit a candidate: `{ idempotency_key, scope, note }`. |
@@ -223,9 +264,10 @@ logical note's UUID directory. Consequences:
 ## Owner versus worker credentials
 
 Credentials are static bearer tokens in `secrets/credentials.json`; each record
-maps a token digest to a principal with explicit `read_scopes`, `write_scopes`,
-and `review_scopes`. Roles and scopes are configured, never inferred from a
-tool request or a folder name.
+maps a token digest to a principal with a role and reserved static scopes.
+Repository-project grants are persisted in `journal.db` when
+`brain_project_ensure` succeeds. They are derived from the authenticated role,
+never from a role or scope supplied in tool arguments.
 
 - **Worker:** capture into its project scope; read its project plus permitted
   shared scope; cannot review.
@@ -233,7 +275,7 @@ tool request or a folder name.
 - **Owner:** all scopes plus protected review and owner-only operational
   commands (`recover-state`, backup/restore/rebuild helpers).
 
-A token for one scope cannot read or write another. There is no
+A token cannot read or write an unrelated repository project. There is no
 `search_all_projects` pass-through.
 
 ## Logs, status, and permissions
@@ -286,8 +328,9 @@ scripts/restore.sh /srv/backups/second-brain-<date> /srv/restore/test --acknowle
 
 A cold backup stops both services, archives the vault and every named volume
 (with a manifest and checksums), and restarts them from an `EXIT` trap. The
-operation journal and feedback live in `brain-state` (`journal.db`) and must be
-backed up: an index rebuild cannot reconstruct them.
+operation journal, feedback, repository mappings, and dynamic grants live in
+`brain-state` (`journal.db`) and must be backed up: an index rebuild cannot
+reconstruct them.
 
 ## Index rebuild (not a restore)
 

@@ -14,9 +14,11 @@ full recovery.
 | Basic Memory search index and embeddings | `memory-state` + `model-cache` volumes | Derived search index | Yes, with `basic-memory reindex` |
 | Operation journal | `brain-state` volume: `journal.db` | Separate persistent state: idempotency, recovery, retry history | No — restore from backup |
 | Feedback, retrieval, audit records | `brain-state` volume: `journal.db` | Separate persistent state | No — restore from backup |
+| Repository mappings and dynamic role grants | `brain-state` volume: `journal.db` | Separate persistent authorization state | No — restore from backup |
 
-Because the journal and feedback live in `journal.db`, an index or catalogue rebuild
-never reconstructs them. A missing `journal.db` triggers explicit recovery mode; the
+Because the journal, feedback, repository mappings, and grants live in
+`journal.db`, an index or catalogue rebuild never reconstructs them. A missing
+`journal.db` triggers explicit recovery mode; the
 gateway never silently initialises a fresh database on a non-empty vault.
 
 ## Startup recovery
@@ -208,7 +210,10 @@ The script:
    without it: the script prints a loud warning, and `rebuild-catalogue` is invoked with
    `--accept-operational-loss`, which initializes a fresh operation journal and labels
    the result as lossy. Retry and feedback history is permanently discarded and the
-   result is **not** full operational recovery;
+   result is **not** full operational recovery. This escape hatch is refused when the
+   vault contains a dynamic repository project not declared in `brain.yaml`, because
+   its canonical identity and grants cannot be reconstructed from Markdown; restore
+   `journal.db` instead;
 2. requires explicit owner acknowledgment (`--acknowledge` /
    `BRAIN_REBUILD_ACKNOWLEDGE=yes`) so nobody mistakes an index rebuild for operational
    recovery;
@@ -223,18 +228,22 @@ The script:
 6. compares the catalogue's `scanned` count against the Markdown revision count and
    **fails loudly** unless they match and `conflicts`/`malformed`/`unsupported_schema`
    are all zero (a head-graph problem is never silently accepted);
-7. captures the pre-rebuild `operations`/`feedback_records` row counts and content
-   digest and repeats the measurement after the rebuild, **failing** unless they are
-   byte-for-byte identical (in the acknowledged-loss mode there is no pre-state to
-   compare, and the lossy label is printed instead);
+7. captures the pre-rebuild `operations`, `feedback_records`,
+   `repository_projects`, and `dynamic_project_grants` row counts and content
+   digests and repeats the measurement after the rebuild, **failing** unless
+   they are byte-for-byte identical (in the acknowledged-loss mode there is no
+   pre-state to compare, and the lossy label is printed instead);
 8. restarts the gateway from an `EXIT` trap.
 
 Rebuilding never revives an archived or superseded head: the catalogue marks heads by
 graph position, and retrieval continues to exclude archived and superseded statuses.
 
 **Limits.** An index rebuild restores derived search/catalogue state only. It does not
-reconstruct retry history or feedback, does not recover a corrupt vault, and does not
-repair a damaged revision graph. Those require a backup or explicit owner recovery.
+reconstruct retry history, feedback, repository mappings, or grants, does not
+recover a corrupt vault, and does not repair a damaged revision graph. Those
+require a backup or explicit owner recovery. A repository project in
+`recovery_required` must remain unavailable until an owner verifies backend,
+vault, mapping, and grant state and completes explicit recovery.
 
 ## Logs and status
 

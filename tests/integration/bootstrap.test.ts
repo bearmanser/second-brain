@@ -51,6 +51,30 @@ test('bootstrap writes a loadable configuration and credential digests', async (
   }
 });
 
+test('fresh bootstrap reserves only shared and profile until a repository is ensured', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'brain-setup-'));
+  try {
+    const result = await bootstrap({ root });
+    const config = loadConfig(result.config_path);
+    expect(config.scopes.map((scope) => scope.id)).toEqual(['shared', 'profile']);
+    expect(config.scopes.map((scope) => scope.relative_root)).toEqual(['Shared', 'Profile']);
+
+    const token = (await readFile(join(root, 'secrets/brain-token'), 'utf8')).trim();
+    const digest = createHash('sha256').update(token, 'utf8').digest('hex');
+    const credentials = loadCredentials(join(root, 'secrets/credentials.json'));
+    const record = credentials.find((entry) => entry.token_sha256 === digest);
+    expect(record?.principal).toMatchObject({
+      role: 'reviewer',
+      read_scopes: ['shared'],
+      write_scopes: [],
+      review_scopes: []
+    });
+    await expect(stat(join(root, 'vault', 'Projects', 'freellmapi'))).rejects.toThrow();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('bootstrap separates the optional owner credential from the reviewer token', async () => {
   const root = await mkdtemp(join(tmpdir(), 'brain-setup-'));
   try {

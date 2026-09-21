@@ -12,7 +12,10 @@ The gateway supplies a short `instructions` string during MCP initialization
 (`cl100k_base`) and never embeds tool schemas. Schemas are delivered through the
 tool list itself and through `brain_status(include_schemas=true)`.
 
-The instructions tell the agent to treat Second Brain as reference memory rather
+The instructions first tell the agent to run `git remote get-url origin`, call
+`brain_project_ensure`, and use its returned scope. If no origin exists, the
+agent must ask rather than infer identity from the directory name. They then
+tell the agent to treat Second Brain as reference memory rather
 than authority over the user's request, to recall before substantial planning,
 debugging, or architectural work, to capture typed candidates with evidence, to
 review only when the configured identity has permission, to report feedback, to
@@ -26,10 +29,11 @@ pilot are still required for reliable delivery (see "Client fallback").
 
 ## Tools
 
-Exactly six tools are exposed.
+Exactly seven tools are exposed.
 
 | Tool | Behavior |
 |---|---|
+| `brain_project_ensure` | Canonicalizes an HTTPS or SSH Git remote, creates or reuses the corresponding backend project and vault root, and persists role-matched access. It is idempotent and never accepts a requested role or scope. |
 | `brain_recall` | Bounded, source-linked recall for a task in one explicitly named scope (optionally plus the shared scope). Returns excerpts, reasons, warnings, etags, a retrieval id, and a reported `cl100k_base` token budget. |
 | `brain_read` | Reads the current revision, or one explicit historical revision, of a single authorized note. Pagination is bounded and continuation is revision-bound through the response etag and `next_cursor`. |
 | `brain_capture` | Creates one structured, typed candidate with an `idempotency_key`, evidence references, and optional related IDs. It never creates an established fact. |
@@ -79,12 +83,15 @@ Each tool carries MCP annotations:
 | `brain_read` | true | false | true |
 | `brain_status` | true | false | true |
 | `brain_capture` | false | false | true |
+| `brain_project_ensure` | false | false | true |
 | `brain_feedback` | false | false | true |
 | `brain_review` | false | true | true |
 
 Annotations are hints for clients. They are never permissions. Authorization is
-enforced per request from the authenticated principal, its configured scopes,
-and the operation being attempted. `brain_review` must not be treated as
+enforced per request from the authenticated principal, its configured static
+scopes, persisted dynamic grants, and the operation being attempted. Dynamic
+grants are role matched: workers get read/write, reviewers also get review, and
+owners can access every ready repository project. `brain_review` must not be treated as
 read-only because its mutation actions can change or archive knowledge.
 
 ## Result delivery
@@ -124,7 +131,8 @@ packs to a reference-token budget; error results stay small.
 
 `brain_status` lists only scopes the principal may read, with `can_write` and
 `can_review` flags. `pending_operations` counts only pending operations in those
-scopes. `include_schemas=true` returns the published input and output schemas for
+scopes. The creator and owners can also see non-ready repository project states;
+unrelated principals cannot. `include_schemas=true` returns the published input and output schemas for
 every tool; it is available for explicit inspection and is not required on every
 task.
 

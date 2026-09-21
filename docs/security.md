@@ -34,14 +34,22 @@ rejected before method handling; non-`/mcp` paths return `404`.
 
 ## Authorization
 
-Scope resolution happens **before** any backend call. A principal carries explicit
-`read_scopes`, `write_scopes`, and `review_scopes`. Requests for another scope,
-another project's alias, or an unconfigured scope fail closed with `FORBIDDEN`.
+Scope resolution happens **before** any knowledge backend call. A principal
+carries explicit reserved static scopes, while ready repository projects and
+their grants are loaded from `journal.db`. Requests for another scope or an
+ungranted dynamic project fail closed with `FORBIDDEN`.
 `include_shared` can only widen to a shared scope the principal is already
 allowed to read.
 
-- Worker scopes cannot review; review scopes cannot be fabricated in a tool
-  argument.
+- `brain_project_ensure` canonicalizes the supplied Git remote, rejects secrets
+  and local/file remotes, provisions only under `Projects/<server-scope>`, and
+  grants from the authenticated role: worker read/write, reviewer
+  read/write/review, owner full. Roles and scope names cannot be fabricated in
+  a tool argument.
+- Equivalent SSH/HTTPS identities converge; deterministic suffixes prevent two
+  different identities with the same repository basename from sharing a scope.
+- Provisioning has per-principal/global rate limits and a persisted project cap.
+  Non-ready states are visible only to the creator and owners.
 - Protected notes (preferences, `shared`/`profile` scopes, and decisions with an
   approved ancestor) require owner review.
 - Related-note links are resolved only within the caller's read scopes.
