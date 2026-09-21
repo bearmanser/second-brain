@@ -635,6 +635,7 @@ export interface DockerHarness {
   principalIds: readonly string[];
   timeoutMs: number;
   callAs(principalId: string, tool: string, args: unknown): Promise<DockerToolResponse>;
+  connect(principalId: string, name?: string): Promise<Client>;
   listToolsAs(principalId: string): Promise<string[]>;
   captureAs(
     principalId: string,
@@ -840,6 +841,20 @@ export async function startDockerHarness(): Promise<DockerHarness> {
   };
 
   let closed = false;
+
+  const connectAs = async (
+    principalId: string,
+    name = 'second-brain-docker-client'
+  ): Promise<Client> => {
+    const token = tokenFor(principalId);
+    const client = new Client({ name, version: '1.0.0' });
+    await client.connect(
+      new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), {
+        requestInit: { headers: { Authorization: `Bearer ${token}` } }
+      })
+    );
+    return client;
+  };
 
   const callAs = async (
     principalId: string,
@@ -1115,15 +1130,10 @@ export async function startDockerHarness(): Promise<DockerHarness> {
     principalIds: principalNames,
     timeoutMs: DOCKER_SUITE_TIMEOUT_MS,
     callAs,
+    connect: (principalId, name) => connectAs(principalId, name),
     async listToolsAs(principalId: string): Promise<string[]> {
-      const token = tokenFor(principalId);
-      const client = new Client({ name: 'second-brain-docker-tools', version: '1.0.0' });
+      const client = await connectAs(principalId, 'second-brain-docker-tools');
       try {
-        await client.connect(
-          new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), {
-            requestInit: { headers: { Authorization: `Bearer ${token}` } }
-          })
-        );
         const listed = await client.listTools();
         return listed.tools.map((tool) => tool.name);
       } finally {

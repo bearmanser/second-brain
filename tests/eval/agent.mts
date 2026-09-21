@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { startHttpHarness } from '../support/harness.js';
 import { makeLexicalSearch } from './lexical-backend.mjs';
-import { seedCorpus, type CorpusFile, type SeedRegistry } from './seed.mjs';
+import { seedCorpus, httpSeedProvider, type CorpusFile, type SeedRegistry } from './seed.mjs';
 import { REPO_ROOT, readJson, writeJson } from './io.mjs';
 import { OPENCODE_BIN, mcpPreflight, runCommand } from './instruction.mjs';
 import { MAX_PILOT_RUNS, disabledIsolationOk, pilotOutcome, planPilotRuns } from './plan.mjs';
@@ -207,7 +207,7 @@ async function runOne(
     harness.backend.search = makeLexicalSearch(harness.backend.root);
     if (condition === 'enabled') {
       const registry: SeedRegistry = { by_id: new Map(), by_key: new Map(), timeline: [] };
-      await seedCorpus(harness, corpus, registry, { keys: task.memory_keys });
+      await seedCorpus(httpSeedProvider(harness), corpus, registry, { keys: task.memory_keys });
     }
     const writeConfig = async (servers: Record<string, unknown>): Promise<void> => {
       await writeFile(

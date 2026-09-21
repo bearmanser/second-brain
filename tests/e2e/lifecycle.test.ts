@@ -265,7 +265,7 @@ describe('release-candidate lifecycle (real Docker gateway)', () => {
 });
 
 describe('lifecycle recovery and restore verification', () => {
-  test('process death mid-write is recovered without replaying or duplicating the note', async () => {
+  test('process death mid-write recovers to a terminal, non-duplicated revision', async () => {
     const h: MemoryHarness = await createHarness();
     try {
       h.backend.fail_once = 'before_write';
@@ -273,18 +273,53 @@ describe('lifecycle recovery and restore verification', () => {
       const first = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
       expect(first.outcome).toBe('pending');
       expect(h.backend.create_calls).toHaveLength(1);
-      const pending = h.deps.journal.pending();
-      expect(pending).toHaveLength(1);
-      const operationId = pending[0].operation_id;
 
       await h.restart();
+      const afterRestart = await recoverPending(h.deps);
+      expect(afterRestart.operations).toHaveLength(1);
+      expect(afterRestart.operations[0].outcome).toBe('pending');
       expect(h.backend.create_calls).toHaveLength(1);
 
-      const report = await recoverPending(h.deps);
-      expect(report.operations).toHaveLength(1);
-      expect(report.operations[0].outcome).toBe('pending');
-      expect(h.deps.journal.get(operationId)?.state).not.toBe('failed');
+      const completed = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+      expect(completed.outcome).toBe('stored');
+      expect(completed.operation_id).toBe(first.operation_id);
+      expect(h.deps.journal.get(first.operation_id)?.state).toBe('complete');
+
+      const replay = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+      expect(replay.outcome).toBe('stored');
+      expect(replay.revision_id).toBe(completed.revision_id);
+
+      const files = (await h.deps.vault.list('freellmapi')).filter((path) => path.endsWith('.md'));
+      expect(files).toHaveLength(1);
+      const candidates = await h.deps.catalogue.list('freellmapi', 'candidate');
+      expect(candidates.items.filter((item) => item.id === completed.id)).toHaveLength(1);
+      expect(h.backend.create_calls).toHaveLength(2);
+    } finally {
+      await h.close();
+    }
+  }, 120_000);
+
+  test('a persisted but unacknowledged write is finalized by recovery exactly once', async () => {
+    const h: MemoryHarness = await createHarness();
+    try {
+      h.backend.fail_once = 'after_write';
+      const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
+      const first = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+      expect(['pending', 'stored']).toContain(first.outcome);
       expect(h.backend.create_calls).toHaveLength(1);
+
+      await h.restart();
+      const report = await recoverPending(h.deps);
+      if (first.outcome === 'pending') expect(report.finalized).toBe(1);
+      expect(h.deps.journal.get(first.operation_id)?.state).toBe('complete');
+
+      const replay = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
+      expect(replay.outcome).toBe('stored');
+      expect(replay.revision_id).toBe(first.revision_id);
+      expect(h.backend.create_calls).toHaveLength(1);
+
+      const files = (await h.deps.vault.list('freellmapi')).filter((path) => path.endsWith('.md'));
+      expect(files).toHaveLength(1);
     } finally {
       await h.close();
     }

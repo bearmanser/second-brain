@@ -1,10 +1,17 @@
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import type { RecallRequest } from '../../src/core/types.js';
-import { startHttpHarness } from '../support/harness.js';
+import { startDockerHarness, startHttpHarness } from '../support/harness.js';
 import { scoreRetrieval, summariseRetrieval, type ScoredRetrievalCase } from './analyse.mjs';
 import { makeLexicalSearch } from './lexical-backend.mjs';
-import { seedCorpus, type CorpusFile, type SeedRegistry } from './seed.mjs';
+import {
+  dockerSeedProvider,
+  httpSeedProvider,
+  seedCorpus,
+  type CorpusFile,
+  type SeedConnectionProvider,
+  type SeedRegistry
+} from './seed.mjs';
 import {
   RECALL_TARGET,
   retrievalGate,
@@ -68,6 +75,8 @@ function recallArguments(query: RetrievalQuery): RecallRequest {
   return request;
 }
 
+export type RetrievalBackend = 'basic-memory-docker' | 'lexical-fixture';
+
 export interface RetrievalRunOutput {
   run_id: string;
   mode: 'retrieval';
@@ -75,7 +84,9 @@ export interface RetrievalRunOutput {
   client: { name: string; version: string };
   model_identifier: null;
   opencode_version: string | null;
-  backend: 'lexical-fixture';
+  backend: RetrievalBackend;
+  release_gate_backend: 'basic-memory-docker';
+  release_gate_metric: boolean;
   corpus: { notes: number; seeded_keys: string[] };
   seeding: { tool_timeline: string[]; elapsed_ms: number };
   metrics: ReturnType<typeof summariseRetrieval>;
@@ -103,20 +114,36 @@ export async function runRetrieval(
     throw new Error(`evaluation fixtures are invalid: ${fixtureErrors.join('; ')}`);
   }
   const runId = `retrieval-${new Date().toISOString()}-${randomUUID().slice(0, 8)}`;
+  const backendArg = args.get('backend') ?? 'basic-memory-docker';
+  if (backendArg !== 'basic-memory-docker' && backendArg !== 'lexical-fixture') {
+    throw new Error(`unknown retrieval backend: ${backendArg}`);
+  }
+  const backend: RetrievalBackend = backendArg;
 
-  const harness = await startHttpHarness();
+  let provider: SeedConnectionProvider;
+  let closeTarget: () => Promise<void>;
+  if (backend === 'basic-memory-docker') {
+    const docker = await startDockerHarness();
+    provider = dockerSeedProvider(docker);
+    closeTarget = () => docker.close();
+  } else {
+    const http = await startHttpHarness();
+    http.backend.search = makeLexicalSearch(http.backend.root);
+    provider = httpSeedProvider(http);
+    closeTarget = () => http.close();
+  }
+
   const registry: SeedRegistry = { by_id: new Map(), by_key: new Map(), timeline: [] };
   const cases: Array<Record<string, unknown>> = [];
   try {
-    harness.backend.search = makeLexicalSearch(harness.backend.root);
     const seedStarted = Date.now();
-    await seedCorpus(harness, corpus, registry);
+    await seedCorpus(provider, corpus, registry);
     const seedElapsed = Date.now() - seedStarted;
 
     const clients = {
-      worker: await harness.connect(harness.token, 'second-brain-eval-worker'),
-      reviewer: await harness.connect(harness.reviewerToken, 'second-brain-eval-reviewer'),
-      owner: await harness.connect(harness.ownerToken, 'second-brain-eval-owner')
+      worker: await provider.connect('worker', 'second-brain-eval-worker'),
+      reviewer: await provider.connect('reviewer', 'second-brain-eval-reviewer'),
+      owner: await provider.connect('owner', 'second-brain-eval-owner')
     };
     try {
       for (const query of retrieval.queries) {
@@ -208,7 +235,9 @@ export async function runRetrieval(
       client: { name: EVAL_CLIENT_NAME, version: EVAL_CLIENT_VERSION },
       model_identifier: null,
       opencode_version: opencodeVersion,
-      backend: 'lexical-fixture',
+      backend,
+      release_gate_backend: 'basic-memory-docker',
+      release_gate_metric: backend === 'basic-memory-docker',
       corpus: { notes: corpus.notes.length, seeded_keys: [...registry.by_key.keys()] },
       seeding: { tool_timeline: registry.timeline, elapsed_ms: seedElapsed },
       metrics,
@@ -217,18 +246,20 @@ export async function runRetrieval(
       forbidden_markers: retrieval.forbidden_markers,
       cases
     };
-    const outPath = args.get('out') ?? join(REPO_ROOT, 'tests/eval/results/retrieval.json');
+    const defaultName =
+      backend === 'basic-memory-docker' ? 'retrieval.json' : 'retrieval-lexical-fixture.json';
+    const outPath = args.get('out') ?? join(REPO_ROOT, 'tests/eval/results', defaultName);
     await writeJson(outPath, output);
     return { output, failed: !gate.ok };
   } finally {
-    await harness.close();
+    await closeTarget();
   }
 }
 
 export function formatRetrievalSummary(output: RetrievalRunOutput): string {
   const lines = [
     `run ${output.run_id}`,
-    `backend ${output.backend}; notes ${output.corpus.notes}; queries ${output.metrics.cases}`,
+    `backend ${output.backend}${output.release_gate_metric ? '' : ` (offline fallback; release-gate backend is ${output.release_gate_backend})`}; notes ${output.corpus.notes}; queries ${output.metrics.cases}`,
     `recall@5 ${output.metrics.recall_at_5} (target ${output.target_recall_at_5}); precision@5 ${output.metrics.precision_at_5}`,
     `positive ${output.metrics.positive_cases}; negative ${output.metrics.negative_cases}; negative passed ${output.metrics.negative_cases_passed}; negative failed ${output.metrics.negative_cases_failed}`,
     `leakage events ${output.metrics.leakage_events}`,

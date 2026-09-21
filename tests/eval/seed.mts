@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import type { CaptureRequest, NoteInput } from '../../src/core/types.js';
-import type { HttpHarness } from '../support/harness.js';
 import { structuredContent } from './io.mjs';
 
 export interface CorpusNote {
@@ -28,14 +27,20 @@ export interface SeedOptions {
   keys?: string[];
 }
 
-interface SeedClients {
-  worker: Client;
-  reviewer: Client;
-  owner: Client;
+export type SeedRole = 'worker' | 'reviewer' | 'owner';
+
+export interface SeedConnectionProvider {
+  connect(role: SeedRole, name?: string): Promise<Client>;
 }
 
-function scopeClient(entry: CorpusNote, clients: SeedClients): Client {
-  return entry.scope === 'freellmapi' ? clients.worker : clients.owner;
+type SeedClients = Record<SeedRole, Client>;
+
+function scopeRole(entry: CorpusNote): SeedRole {
+  return entry.scope === 'freellmapi' ? 'worker' : 'owner';
+}
+
+function approverRole(entry: CorpusNote): SeedRole {
+  return entry.scope === 'freellmapi' ? 'reviewer' : 'owner';
 }
 
 async function captureNote(client: Client, entry: CorpusNote): Promise<Record<string, unknown>> {
@@ -109,15 +114,14 @@ async function seedNote(
   registry: SeedRegistry,
   clients: SeedClients
 ): Promise<void> {
-  const captured = await captureNote(scopeClient(entry, clients), entry);
+  const captured = await captureNote(clients[scopeRole(entry)], entry);
   const id = String(captured.id);
   registry.timeline.push(`brain_capture:${entry.key}`);
   registry.by_id.set(id, entry.key);
   registry.by_key.set(entry.key, id);
   if (entry.status === 'candidate') return;
 
-  const approveClient = entry.scope === 'freellmapi' ? clients.reviewer : clients.owner;
-  const approved = await approveNote(approveClient, entry, id, String(captured.etag));
+  const approved = await approveNote(clients[approverRole(entry)], entry, id, String(captured.etag));
   registry.timeline.push(`brain_review:approve:${entry.key}`);
   if (entry.status !== 'superseded') return;
 
@@ -143,14 +147,14 @@ async function seedNote(
 }
 
 export async function seedCorpus(
-  harness: HttpHarness,
+  provider: SeedConnectionProvider,
   corpus: CorpusFile,
   registry: SeedRegistry,
   options: SeedOptions = {}
 ): Promise<void> {
-  const worker = await harness.connect(harness.token, 'second-brain-eval-seed-worker');
-  const reviewer = await harness.connect(harness.reviewerToken, 'second-brain-eval-seed-reviewer');
-  const owner = await harness.connect(harness.ownerToken, 'second-brain-eval-seed-owner');
+  const worker = await provider.connect('worker', 'second-brain-eval-seed-worker');
+  const reviewer = await provider.connect('reviewer', 'second-brain-eval-seed-reviewer');
+  const owner = await provider.connect('owner', 'second-brain-eval-seed-owner');
   try {
     const selected =
       options.keys === undefined
@@ -166,4 +170,33 @@ export async function seedCorpus(
   } finally {
     await Promise.allSettled([worker.close(), reviewer.close(), owner.close()]);
   }
+}
+
+export function httpSeedProvider(harness: {
+  token: string;
+  reviewerToken: string;
+  ownerToken: string;
+  connect(token: string, name?: string): Promise<Client>;
+}): SeedConnectionProvider {
+  const tokenFor: Record<SeedRole, string> = {
+    worker: harness.token,
+    reviewer: harness.reviewerToken,
+    owner: harness.ownerToken
+  };
+  return {
+    connect: (role: SeedRole, name?: string) => harness.connect(tokenFor[role], name)
+  };
+}
+
+export function dockerSeedProvider(harness: {
+  connect(principalId: string, name?: string): Promise<Client>;
+}): SeedConnectionProvider {
+  const principalFor: Record<SeedRole, string> = {
+    worker: 'project-worker',
+    reviewer: 'project-reviewer',
+    owner: 'owner'
+  };
+  return {
+    connect: (role: SeedRole, name?: string) => harness.connect(principalFor[role], name)
+  };
 }

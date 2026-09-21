@@ -1,0 +1,37 @@
+# Release gate transcript: npm run eval:retrieval (real disposable Docker Brain, no chat model)
+# node v24.21.0, docker 28.0.1, 2026-09-21T04:05:18Z
+
+
+> second-brain@0.1.0 eval:retrieval
+> tsx tests/eval/run.mts --mode retrieval
+
+run retrieval-2026-09-21T04:01:51.235Z-26e4801c
+backend basic-memory-docker; notes 11; queries 23
+recall@5 0.9286 (target 0.8); precision@5 0.8536
+positive 14; negative 9; negative passed 9; negative failed 0
+leakage events 0
+gate pass
+mean elapsed 76 ms
+  [pass] r01 positive retrieved=["streaming-lesson"] relevant=["streaming-lesson","ttft-paraphrase"] recall=0.5 precision=1 leaked=false
+  [pass] r02 positive retrieved=["streaming-lesson"] relevant=["streaming-lesson"] recall=1 precision=1 leaked=false
+  [pass] r03 positive retrieved=["routing-decision"] relevant=["routing-decision"] recall=1 precision=1 leaked=false
+  [pass] r04 positive retrieved=["routing-decision"] relevant=["routing-decision"] recall=1 precision=1 leaked=false
+  [pass] r05 positive retrieved=["cache-warm-playbook"] relevant=["cache-warm-playbook"] recall=1 precision=1 leaked=false
+  [pass] r06 positive retrieved=["cache-warm-playbook"] relevant=["cache-warm-playbook"] recall=1 precision=1 leaked=false
+  [pass] r07 positive retrieved=["ttft-paraphrase"] relevant=["ttft-paraphrase","streaming-lesson"] recall=0.5 precision=1 leaked=false
+  [pass] r08 positive retrieved=["batching-hypothesis"] relevant=["batching-hypothesis"] recall=1 precision=1 leaked=false
+  [pass] r09 positive retrieved=["handoff-session"] relevant=["handoff-session"] recall=1 precision=1 leaked=false
+  [pass] r10 positive retrieved=["streaming-lesson","routing-decision","cache-warm-playbook","misleading-note","ttft-paraphrase"] relevant=["streaming-lesson"] recall=1 precision=0.2 leaked=false
+  [pass] r11 positive retrieved=["cache-warm-playbook"] relevant=["cache-warm-playbook"] recall=1 precision=1 leaked=false
+  [pass] r12 positive retrieved=["streaming-lesson","routing-decision"] relevant=["routing-decision"] recall=1 precision=0.5 leaked=false
+  [pass] r13 positive retrieved=["streaming-lesson","routing-decision","misleading-note","ttft-paraphrase"] relevant=["ttft-paraphrase"] recall=1 precision=0.25 leaked=false
+  [pass] r14 positive retrieved=["cache-warm-playbook"] relevant=["cache-warm-playbook"] recall=1 precision=1 leaked=false
+  [pass] n01 negative retrieved=[] relevant=[] recall=1 precision=0 leaked=false
+  [pass] n02 negative retrieved=[] relevant=[] recall=1 precision=0 leaked=false
+  [pass] n03 negative retrieved=[] relevant=[] recall=1 precision=0 leaked=false
+  [pass] n04 negative retrieved=[] relevant=[] recall=1 precision=0 leaked=false
+  [pass] n05 negative retrieved=[] relevant=[] recall=1 precision=0 leaked=false
+  [pass] n06 negative retrieved=[] relevant=[] recall=1 precision=0 leaked=false
+  [pass] n07 negative retrieved=[] relevant=[] recall=1 precision=0 leaked=false
+  [pass] n08 negative retrieved=[] relevant=[] recall=1 precision=0 leaked=false
+  [pass] n09 negative retrieved=[] relevant=[] recall=1 precision=0 leaked=false

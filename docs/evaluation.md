@@ -258,7 +258,10 @@ reported token usage (null when unavailable).
 ## Reproduce
 
 ```bash
+# Release-gate retrieval: real disposable Docker Brain, no chat model. Needs Docker.
 npx tsx tests/eval/run.mts --mode retrieval
+# Offline fallback only (no Docker); not the release-gate metric.
+npx tsx tests/eval/run.mts --mode retrieval --backend lexical-fixture
 npx tsx tests/eval/run.mts --mode instruction --allow-model --model deepseek/deepseek-v4-flash
 npx tsx tests/eval/run.mts --mode agent
 npm test -- tests/unit/evaluation.test.ts
@@ -275,8 +278,13 @@ pass without a chat model.
 - These are synthetic fixtures. They support the deterministic gates (zero scope
   leaks, label-based scoring, lifecycle exclusion), not general performance
   claims.
-- Retrieval quality is measured with a lexical fixture ranker, not Basic
-  Memory's embedding search.
+- The Task 19 retrieval numbers used a lexical fixture ranker. From Task 20
+  fix round 1 the release-gate retrieval metric uses the real disposable
+  Docker Brain (pinned Basic Memory); the lexical ranker remains only as an
+  explicitly labelled offline fallback.
+- Retrieved quality is still measured against a small synthetic labeled corpus,
+  so it supports the deterministic gate (zero leaks, lifecycle exclusion, target
+  recall) rather than broad semantic-quality claims.
 - Instruction delivery and tool-payload visibility were demonstrated for one
   client/model pair (`opencode v2.0.10` + `deepseek/deepseek-v4-flash`) over a
   local stdio probe. A remote Streamable HTTP MCP server did not connect in this
@@ -288,25 +296,38 @@ pass without a chat model.
 
 Recorded on the execution host on 2026-09-21.
 
-### Retrieval gate
+### Retrieval gate (real Docker Brain)
 
 `npm run eval:retrieval` exited 0 with `gate pass`. Run
-`retrieval-2026-09-21T03:34:10.928Z-0d9d2d58`:
+`retrieval-2026-09-21T04:01:51.235Z-26e4801c` executed with the default
+`--backend basic-memory-docker`: a real disposable Docker gateway plus the
+pinned Basic Memory backend, reachable over real MCP, with **no chat model**.
 
 | Metric | Value |
 |---|---|
+| Backend | `basic-memory-docker` (pinned Basic Memory; real embeddings/index) |
 | Notes / queries | 11 / 23 |
-| Recall at five | 1.0 (target >= 0.8) |
-| Precision at five | 0.5262 |
+| Recall at five | 0.9286 (target >= 0.8) |
+| Precision at five | 0.8536 |
 | Positive queries | 14 |
 | Negative/scoping queries with an empty result | 9 / 9 |
 | Forbidden-marker leakage events | 0 |
-| Mean elapsed per query | 58.4 ms |
+| Mean elapsed per query | 76 ms |
 
-This is the same deterministic lexical fixture ranker as the earlier Task 19
-run, not Basic Memory embedding search. The committed raw result is
-`tests/eval/results/retrieval.json` from the Task 19 run; this Task 20 run
-reproduced the identical gate metrics.
+The committed raw result is `tests/eval/results/retrieval.json` and now records
+`backend: basic-memory-docker` with `release_gate_metric: true`.
+`release_gate_backend` is always `basic-memory-docker`.
+
+### Offline lexical fallback
+
+The deterministic lexical fixture ranker is retained only for environments
+without Docker. It is reachable with
+`npx tsx tests/eval/run.mts --mode retrieval --backend lexical-fixture`, writes
+to a separate file (`tests/eval/results/retrieval-lexical-fixture.json`), and is
+labelled in its output as `offline fallback; release-gate backend is
+basic-memory-docker`. It is **not** used for the release-gate claim. For
+reference, the same corpus under that fallback scored recall@5 = 1.0 and
+precision@5 = 0.5262.
 
 ### Model-dependent items
 
@@ -317,4 +338,5 @@ reproduced the identical gate metrics.
 | Remote Streamable-HTTP MCP transport | NOT VERIFIED | The client did not connect in this sandbox; local stdio worked. Re-verify on the target deployment. |
 
 No model-dependent test is reported as green. The retrieval evaluator, which
-does not invoke a chat model, passed.
+runs against the real disposable Docker Brain and does not invoke a chat model,
+passed with recall@5 = 0.9286.

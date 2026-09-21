@@ -1,0 +1,15 @@
+# Release gate transcript: npm run test:integration (node v24.21.0, 2026-09-21T04:05:18Z)
+
+ ✓ tests/integration/recall.test.ts (35 tests) 8487ms
+ ✓ tests/integration/review.test.ts (40 tests) 10147ms
+ ✓ tests/integration/mutation.test.ts (36 tests) 6779ms
+ ✓ tests/integration/read.test.ts (28 tests) 5107ms
+ ✓ tests/integration/capture.test.ts (22 tests) 4187ms
+ ✓ tests/integration/mcp.test.ts (16 tests) 4153ms
+ ✓ tests/integration/feedback.test.ts (23 tests) 3428ms
+ ✓ tests/integration/manual-edits.test.ts (21 tests) 3162ms
+ ✓ tests/integration/http-security.test.ts (22 tests) 2281ms
+ ✓ tests/integration/bootstrap.test.ts (9 tests) 210ms
+ Test Files  10 passed (10)
+      Tests  252 passed (252)
+   Duration  57.09s (tests 86%, import 12%, transform 1%)

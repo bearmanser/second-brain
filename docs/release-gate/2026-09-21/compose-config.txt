@@ -1,0 +1,15 @@
+# Release gate transcript: docker compose config (sanitized)
+# docker compose 2.33.1, 2026-09-21T04:05:18Z
+
+1:name: secondbrain-fix
+38:        host_ip: 127.0.0.1
+39:        target: 7331
+40:        published: "7331"
+86:    image: ghcr.io/basicmachines-co/basic-memory@sha256:939f1173d96626c280763e14622f2381d49fbbb7db17cae2e832f4f639405643
+108:    name: secondbrain-fix_default
+111:    name: secondbrain-fix_brain-state
+113:    name: secondbrain-fix_memory-state
+115:    name: secondbrain-fix_model-cache
+118:    name: secondbrain-fix_brain_credentials
+121:    name: secondbrain-fix_brain_cursor
+124:    name: secondbrain-fix_brain_token

@@ -340,7 +340,7 @@ was used.
 | `npm run verify` | Exit 0. `tsc --noEmit` clean; 278 unit + contract tests passed in 16 files; production build succeeded. |
 | `npm run test:integration` | Exit 0. 252 tests passed in 10 files (59.68 s). |
 | `npm run test:e2e` | Exit 0. 57 tests passed in 5 files (770.56 s): `operations` 11, `docker` 7, `security` 15, `lifecycle` 8, `recovery` 16. |
-| `npm run eval:retrieval` | Exit 0, gate pass. Run `retrieval-2026-09-21T03:34:10.928Z-0d9d2d58`: 11 notes, 23 queries, recall@5 = 1 (target >= 0.8), precision@5 = 0.5262, 14 positives, 9/9 negatives empty, 0 leakage events, mean 58.4 ms. This is a lexical fixture ranker, not Basic Memory embeddings. |
+| `npm run eval:retrieval` | Exit 0, gate pass. Run `retrieval-2026-09-21T04:01:51.235Z-26e4801c` against the **real disposable Docker Brain/gateway** (`backend basic-memory-docker`, pinned Basic Memory, no chat model): 11 notes, 23 queries, recall@5 = 0.9286 (target >= 0.8), precision@5 = 0.8536, 14 positives, 9/9 negatives empty, 0 leakage events, mean 76 ms. The offline lexical fixture ranker is retained only as `--backend lexical-fixture` and is not the release-gate metric. |
 | `docker compose config` | Exit 0. Interpolated the pinned digests; one published port `host_ip: 127.0.0.1`, `published: "7331"`, `target: 7331`; the backend had no published port. |
 | `docker compose up -d --build` | Exit 0. Built the gateway image and started `brain` and `memory` with synthetic volumes. |
 | `docker compose exec brain node dist/cli.js health` | First attempt returned `the health check failed: fetch failed` while the gateway was still starting; the next poll returned `healthy` (exit 0). |
@@ -388,6 +388,56 @@ the approved head, so the edit changed a parent and produced a real
 `parent_hash_mismatch` conflict. The test now targets the approved revision
 file by its revision ID, and the final full run above is green. No product code
 changed for this.
+
+### Fix round 1: real-backend retrieval and hardened lifecycle/concurrency tests
+
+Observed on the execution host on 2026-09-21. The retrieval gate now runs
+against a real disposable Docker Brain/gateway instead of the in-process
+lexical fixture, and the review findings were addressed.
+
+| Command | Actual result |
+|---|---|
+| `npm run verify` | Exit 0. `tsc --noEmit` clean; 278 unit + contract tests passed; production build succeeded. |
+| `npx vitest run tests/e2e/security.test.ts tests/e2e/lifecycle.test.ts` | Exit 0. 26 tests passed in 2 files (172.37 s): `security` 17, `lifecycle` 9. The full e2e suite now contains 60 tests (`operations` 11, `docker` 7, `security` 17, `lifecycle` 9, `recovery` 16); this fix round re-ran the two affected files. |
+| `npm run eval:retrieval` (real Docker Brain) | Exit 0, gate pass. Run `retrieval-2026-09-21T04:01:51.235Z-26e4801c`: `backend basic-memory-docker`, 11 notes, 23 queries, recall@5 = 0.9286, precision@5 = 0.8536, 14 positives, 9/9 negatives empty, 0 leakage, mean 76 ms. |
+| `npm run eval:retrieval -- --backend lexical-fixture` | Exit 0, gate pass, but explicitly labelled `offline fallback; release-gate backend is basic-memory-docker` and written to `retrieval-lexical-fixture.json`. Not a release-gate metric. |
+| `npm run test:integration` | Exit 0. 252 tests passed in 10 files (57.09 s). |
+| `docker compose config` | Exit 0. One published port `host_ip: 127.0.0.1`, `published: "7331"`, `target: 7331`; pinned Basic Memory digest interpolated; backend unpublished. |
+
+Fix detail:
+
+- **Real retrieval backend.** `tests/eval/run.mts --mode retrieval` now starts
+  `startDockerHarness()` (real Basic Memory over the private Compose network, no
+  chat model) by default and labels the result `backend: basic-memory-docker`.
+  The offline lexical ranker is reachable only with
+  `--backend lexical-fixture`, is labelled as a fallback, and writes a separate
+  result file. `tests/eval/results/retrieval.json` now holds the real run.
+- **Lifecycle recovery.** The process-death test now drives recovery to a
+  terminal `stored` revision via the identical idempotency retry and asserts the
+  journal is `complete`, exactly one materialized Markdown file exists, exactly
+  one catalogue head exists, and a second identical retry returns the same
+  revision without another backend create. A second test covers a write that
+  persisted before the acknowledgment was lost and is finalized by recovery
+  exactly once.
+- **Mixed-principal concurrency.** Concurrent requests now cross authorization
+  boundaries: owner-only `profile`, reviewer `freellmapi`, and a worker attempt
+  on `profile`. Each response is asserted independently (profile items only for
+  the owner, project items only for the reviewer, `FORBIDDEN` for the worker).
+- **Pending and degraded responses.** New MCP-level cases assert a durable
+  `pending` capture receipt (`outcome pending`, `materialized false`) plus its
+  `brain_status.operation.outcome`, and embedding degradation both as a typed
+  `EMBEDDINGS_UNAVAILABLE` failure without fallback and as an explicit
+  `mode: text`, `partial: true`,
+  `embeddings_unavailable_text_fallback` degraded result with fallback allowed.
+- **CI inputs.** `NODE_VERSION` is pinned to the locked patch `24.21.0`, the
+  runner is `ubuntu-24.04`, and Actions are pinned by commit SHA
+  (`actions/checkout@11bd7190`, `actions/setup-node@49933ea5`,
+  `actions/cache@1bd1e32a`, `actions/upload-artifact@65c4c4a1`). The real
+  retrieval gate moved to the Docker job; the fast job reports it as NOT RUN.
+  The Docker job uploads sanitized gate transcripts as a CI artifact.
+
+Sanitized committed transcripts:
+`docs/release-gate/2026-09-21/{verify,integration,e2e-security-lifecycle,eval-retrieval-real,compose-config}.txt`.
 
 ### Not run
 

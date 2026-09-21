@@ -84,7 +84,7 @@ WSL, Obsidian setup, operations, and limitations are in
 | `npm run test:contract` | Pinned backend wire-contract tests (offline fixtures). |
 | `npm run test:integration` | In-process gateway integration suites. |
 | `npm run test:e2e` | Docker end-to-end, security, lifecycle, and operations suites. |
-| `npm run eval:retrieval` | Labeled retrieval evaluation against a disposable Brain (no chat model). |
+| `npm run eval:retrieval` | Labeled retrieval evaluation against a real disposable Docker Brain and pinned Basic Memory backend (no chat model). Needs Docker; the offline lexical fallback is not the release-gate metric. |
 
 Docker-dependent suites are explicit jobs, not silent skips. Tests that require
 an external chat model (the instruction/agent pilot) are **NOT RUN** without an

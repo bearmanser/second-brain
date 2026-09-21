@@ -54,6 +54,13 @@ function lessonNote(title: string, lesson: string): unknown {
   };
 }
 
+function structuredOf(result: unknown): Record<string, unknown> {
+  const envelope = result as { structuredContent?: unknown };
+  return typeof envelope.structuredContent === 'object' && envelope.structuredContent !== null
+    ? (envelope.structuredContent as Record<string, unknown>)
+    : {};
+}
+
 describe('release-candidate security (real Docker gateway)', () => {
   let h: DockerHarness;
 
@@ -308,32 +315,256 @@ describe('adversarial backend and concurrency behaviour', () => {
     }
   }, 120_000);
 
-  test('mixed-principal concurrent requests stay isolated', async () => {
+  test('mixed-principal concurrent requests preserve each authorization boundary', async () => {
     const h: HttpHarness = await startHttpHarness();
     try {
-      const client = await h.connect(h.token, 'concurrency-worker');
+      const worker = await h.connect(h.token, 'concurrency-worker');
+      const reviewer = await h.connect(h.reviewerToken, 'concurrency-reviewer');
       const owner = await h.connect(h.ownerToken, 'concurrency-owner');
+      const profileMarker = 'CONCURRENCY_PROFILE_ONLY';
+      const projectMarker = 'CONCURRENCY_PROJECT_ONLY';
       try {
-        const outcomes = await Promise.all(
-          Array.from({ length: 8 }, (_, index) =>
-            (index % 2 === 0 ? client : owner).callTool({
-              name: 'brain_recall',
-              arguments: { scope: 'freellmapi', query: `concurrent probe ${index}` }
-            })
-          )
+        const profileNote = {
+          title: `Concurrency profile marker ${profileMarker}`,
+          tags: ['synthetic-hardening'],
+          content: {
+            kind: 'note',
+            summary: `Concurrency profile marker ${profileMarker}`,
+            body_markdown: `Owner-only profile content ${profileMarker}`
+          },
+          evidence: [],
+          related_ids: []
+        };
+        const profileCapture = structuredOf(
+          await owner.callTool({
+            name: 'brain_capture',
+            arguments: { idempotency_key: randomUUID(), scope: 'profile', note: profileNote }
+          })
         );
-        expect(outcomes).toHaveLength(8);
-        const recorded = h.recordedToolCalls();
-        expect(recorded.filter((call) => call.tool === 'brain_recall')).toHaveLength(8);
-        for (const outcome of outcomes) {
-          const structured = outcome as { structuredContent?: { items?: { scope?: string }[] } };
-          for (const item of structured.structuredContent?.items ?? []) {
-            expect(['freellmapi', 'shared']).toContain(item.scope);
+        const profileApprove = (await owner.callTool({
+          name: 'brain_review',
+          arguments: {
+            scope: 'profile',
+            operation: {
+              action: 'approve',
+              idempotency_key: randomUUID(),
+              id: String(profileCapture.id),
+              expected_etag: String(profileCapture.etag),
+              rationale: 'concurrency fixture'
+            }
           }
+        })) as { isError?: boolean };
+        expect(profileApprove.isError ?? false).toBe(false);
+
+        const projectCapture = structuredOf(
+          await reviewer.callTool({
+            name: 'brain_capture',
+            arguments: {
+              idempotency_key: randomUUID(),
+              scope: 'freellmapi',
+              note: lessonNote(
+                `Concurrency project marker ${projectMarker}`,
+                `Project-only content ${projectMarker}`
+              )
+            }
+          })
+        );
+        const projectApprove = (await reviewer.callTool({
+          name: 'brain_review',
+          arguments: {
+            scope: 'freellmapi',
+            operation: {
+              action: 'approve',
+              idempotency_key: randomUUID(),
+              id: String(projectCapture.id),
+              expected_etag: String(projectCapture.etag),
+              rationale: 'concurrency fixture'
+            }
+          }
+        })) as { isError?: boolean };
+        expect(projectApprove.isError ?? false).toBe(false);
+
+        type RequestKind = 'owner-profile' | 'reviewer-project' | 'worker-profile';
+        const requests: { kind: RequestKind; call: Promise<unknown> }[] = [];
+        for (let index = 0; index < 4; index += 1) {
+          requests.push({
+            kind: 'owner-profile',
+            call: owner.callTool({
+              name: 'brain_recall',
+              arguments: { scope: 'profile', query: 'concurrency profile marker', include_shared: false }
+            })
+          });
+          requests.push({
+            kind: 'reviewer-project',
+            call: reviewer.callTool({
+              name: 'brain_recall',
+              arguments: {
+                scope: 'freellmapi',
+                query: 'concurrency project marker',
+                include_shared: false
+              }
+            })
+          });
+          requests.push({
+            kind: 'worker-profile',
+            call: worker.callTool({
+              name: 'brain_recall',
+              arguments: { scope: 'profile', query: 'concurrency profile marker' }
+            })
+          });
         }
+        const outcomes = await Promise.all(requests.map((request) => request.call));
+        requests.forEach((request, index) => {
+          const outcome = outcomes[index] as {
+            isError?: boolean;
+            structuredContent?: { items?: { scope?: string }[] };
+          };
+          const items = outcome.structuredContent?.items ?? [];
+          const serialized = JSON.stringify(outcome);
+          if (request.kind === 'worker-profile') {
+            expect(outcome.isError, serialized).toBe(true);
+            expect(serialized).toMatch(/FORBIDDEN/);
+            expect(serialized).not.toContain(profileMarker);
+            return;
+          }
+          expect(outcome.isError ?? false, serialized).toBe(false);
+          if (request.kind === 'owner-profile') {
+            expect(items.length).toBeGreaterThan(0);
+            expect(items.every((item) => item.scope === 'profile')).toBe(true);
+            expect(serialized).toContain(profileMarker);
+            expect(serialized).not.toContain(projectMarker);
+          } else {
+            expect(items.length).toBeGreaterThan(0);
+            expect(items.every((item) => item.scope === 'freellmapi')).toBe(true);
+            expect(serialized).toContain(projectMarker);
+            expect(serialized).not.toContain(profileMarker);
+          }
+        });
+        expect(h.recordedToolCalls().filter((call) => call.tool === 'brain_recall')).toHaveLength(12);
+      } finally {
+        await worker.close();
+        await reviewer.close();
+        await owner.close();
+      }
+    } finally {
+      await h.close();
+    }
+  }, 120_000);
+
+  test('a pending mutation is a durable success with explicit availability flags', async () => {
+    const h: HttpHarness = await startHttpHarness();
+    try {
+      h.backend.fail_once = 'before_write';
+      const client = await h.connect(h.reviewerToken, 'pending-receipt');
+      try {
+        const captured = (await client.callTool({
+          name: 'brain_capture',
+          arguments: {
+            idempotency_key: randomUUID(),
+            scope: 'freellmapi',
+            note: lessonNote('Pending receipt', 'pending receipt marker')
+          }
+        })) as {
+          isError?: boolean;
+          structuredContent?: {
+            outcome?: string;
+            materialized?: boolean;
+            indexed?: boolean;
+            operation_id?: string;
+            warnings?: string[];
+          };
+        };
+        const structured = captured.structuredContent ?? {};
+        expect(captured.isError ?? false).toBe(false);
+        expect(structured.outcome).toBe('pending');
+        expect(structured.materialized).toBe(false);
+        expect(structured.indexed).toBe(false);
+        expect(typeof structured.operation_id).toBe('string');
+
+        const status = (await client.callTool({
+          name: 'brain_status',
+          arguments: { operation_id: structured.operation_id }
+        })) as { isError?: boolean; structuredContent?: { operation?: { outcome?: string } } };
+        expect(status.isError ?? false).toBe(false);
+        expect(status.structuredContent?.operation?.outcome).toBe('pending');
+        assertNoLeak(status);
       } finally {
         await client.close();
-        await owner.close();
+      }
+    } finally {
+      await h.close();
+    }
+  }, 120_000);
+
+  test('embedding degradation is an explicit degraded result or a typed failure', async () => {
+    const h: HttpHarness = await startHttpHarness();
+    try {
+      const seeder = await h.connect(h.reviewerToken, 'degraded-seed');
+      try {
+        const captured = structuredOf(
+          await seeder.callTool({
+            name: 'brain_capture',
+            arguments: {
+              idempotency_key: randomUUID(),
+              scope: 'freellmapi',
+              note: lessonNote('Degraded fallback', 'embedding degradation fallback marker')
+            }
+          })
+        );
+        const approved = (await seeder.callTool({
+          name: 'brain_review',
+          arguments: {
+            scope: 'freellmapi',
+            operation: {
+              action: 'approve',
+              idempotency_key: randomUUID(),
+              id: String(captured.id),
+              expected_etag: String(captured.etag),
+              rationale: 'degraded fixture'
+            }
+          }
+        })) as { isError?: boolean };
+        expect(approved.isError ?? false).toBe(false);
+      } finally {
+        await seeder.close();
+      }
+
+      const client = await h.connect(h.token, 'degraded-client');
+      try {
+        h.backend.fail_once = 'embedding_unavailable';
+        const withoutFallback = (await client.callTool({
+          name: 'brain_recall',
+          arguments: {
+            scope: 'freellmapi',
+            query: 'embedding degradation fallback marker',
+            mode: 'hybrid'
+          }
+        })) as { isError?: boolean; structuredContent?: unknown };
+        expect(withoutFallback.isError).toBe(true);
+        expect(JSON.stringify(withoutFallback.structuredContent)).toMatch(/EMBEDDINGS_UNAVAILABLE/);
+
+        h.backend.fail_once = 'embedding_unavailable';
+        const withFallback = (await client.callTool({
+          name: 'brain_recall',
+          arguments: {
+            scope: 'freellmapi',
+            query: 'embedding degradation fallback marker',
+            mode: 'hybrid',
+            allow_text_fallback: true
+          }
+        })) as {
+          isError?: boolean;
+          structuredContent?: { mode?: string; partial?: boolean; warnings?: string[] };
+        };
+        expect(withFallback.isError ?? false).toBe(false);
+        expect(withFallback.structuredContent?.mode).toBe('text');
+        expect(withFallback.structuredContent?.partial).toBe(true);
+        expect(withFallback.structuredContent?.warnings ?? []).toContain(
+          'embeddings_unavailable_text_fallback'
+        );
+        assertNoLeak(withFallback);
+      } finally {
+        await client.close();
       }
     } finally {
       await h.close();
