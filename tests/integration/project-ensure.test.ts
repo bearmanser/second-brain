@@ -1,7 +1,8 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { expect, test } from 'vitest';
 import { BrainError } from '../../src/contracts/errors.js';
 import { ensureProject } from '../../src/features/project-ensure.js';
+import type { ProjectProvisioningPlan } from '../../src/core/types.js';
 import { scopeWithCollisionSuffix } from '../../src/projects/identity.js';
 import { ownerContext, reviewerContext, workerContext } from '../fixtures/principals.js';
 import { armFault, createHarness } from '../support/harness.js';
@@ -220,3 +221,60 @@ test('rejects reuse of one idempotency key for another normalized repository', a
     await h.close();
   }
 });
+
+test.each(['can_write', 'can_review'] as const)(
+  'recovery blocks a V1 project plan missing only grant.%s',
+  async (missing) => {
+    const h = await createHarness();
+    try {
+      const invalidProject = `invalid-legacy-${missing.replace('_', '-')}`;
+      const operations = new Map<string, string>();
+      for (const project of ['valid-legacy-control', invalidProject]) {
+        const identity = `github.com/example/${project}`;
+        const record = h.deps.journal.reserve({
+          principal_id: workerContext.actor.id,
+          idempotency_key: randomUUID(),
+          tool: 'brain_project_ensure',
+          scope: project,
+          payload_hash: createHash('sha256').update(identity).digest('hex'),
+          payload_json: JSON.stringify({ repository_identity: identity })
+        }).record;
+        const grant: Record<string, unknown> = {
+          principal_id: 'legacy-worker',
+          scope: project,
+          can_read: true,
+          can_write: true,
+          can_review: false
+        };
+        if (project !== 'valid-legacy-control') delete grant[missing];
+        h.deps.journal.saveProjectPlan(record.operation_id, {
+          repository_identity: identity,
+          scope: project,
+          backend_project: project,
+          relative_root: `Projects/${project}`,
+          grant
+        } as unknown as ProjectProvisioningPlan);
+        h.deps.journal.mark(record.operation_id, 'submitted');
+        operations.set(project, record.operation_id);
+      }
+
+      const invalidId = operations.get(invalidProject);
+      const controlId = operations.get('valid-legacy-control');
+      if (invalidId === undefined || controlId === undefined) throw new Error('missing fixture operation');
+      const before = h.backend.call_count;
+      const report = await h.deps.mutations.recoverDetailed();
+
+      expect(report.operations).toEqual(expect.arrayContaining([
+        expect.objectContaining({ operation_id: controlId, outcome: 'finalized', blocking: false }),
+        expect.objectContaining({ operation_id: invalidId, outcome: 'pending', blocking: true })
+      ]));
+      expect(report.blocking_operations).toContain(invalidId);
+      expect(h.deps.journal.get(invalidId)?.state).toBe('submitted');
+      expect(h.deps.journal.getProjectById(invalidProject)).toBeUndefined();
+      expect(h.deps.journal.getProjectById('valid-legacy-control')?.state).toBe('ready');
+      expect(h.backend.call_count - before).toBe(1);
+    } finally {
+      await h.close();
+    }
+  }
+);
