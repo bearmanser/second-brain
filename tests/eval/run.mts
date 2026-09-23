@@ -30,7 +30,6 @@ import {
   asRecord,
   isEntryPoint,
   parseArgs,
-  readJson,
   stringArray,
   structuredContent,
   writeJson
@@ -103,8 +102,10 @@ export async function runRetrieval(
 ): Promise<{ output: RetrievalRunOutput; failed: boolean }> {
   const corpusPath = args.get('corpus') ?? join(REPO_ROOT, 'tests/eval/corpus.json');
   const queriesPath = args.get('queries') ?? join(REPO_ROOT, 'tests/eval/retrieval.json');
-  const corpus = await readJson<CorpusFile>(corpusPath);
-  const retrieval = await readJson<RetrievalFile>(queriesPath);
+  const corpusBytes = await readFile(corpusPath);
+  const queryBytes = await readFile(queriesPath);
+  const corpus = JSON.parse(corpusBytes.toString('utf8')) as CorpusFile;
+  const retrieval = JSON.parse(queryBytes.toString('utf8')) as RetrievalFile;
   const corpusErrors = validateCorpus(corpus);
   const retrievalErrors = validateRetrieval(
     retrieval as unknown as RetrievalLike,
@@ -253,7 +254,6 @@ export async function runRetrieval(
     await writeJson(outPath, output);
     const exportPath = args.get('export');
     if (exportPath !== undefined) {
-      const [corpusBytes, queryBytes] = await Promise.all([readFile(corpusPath), readFile(queriesPath)]);
       await writeJson(exportPath, {
         version: 1,
         corpus_sha256: createHash('sha256').update(corpusBytes).digest('hex'),
