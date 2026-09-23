@@ -735,3 +735,89 @@ test('link label metacharacters are escaped and survive a round trip', () => {
   const parsed = parseSources(section);
   expect(parsed.evidence).toEqual(evidence);
 });
+
+test('a fenced ## Sources example inside an open fence is not a heading', () => {
+  const document = [
+    '```markdown',
+    '```ts',
+    '## Sources',
+    '',
+    '- **repository** `fake` — Fake example',
+    '```'
+  ].join('\n');
+  const parsed = parseSources(document);
+  expect(parsed.evidence).toEqual([]);
+  expect(parsed.human.join('\n')).toContain('## Sources');
+  expect(parsed.human.join('\n')).toContain('- **repository** `fake` — Fake example');
+});
+
+test('a real Sources section after a fenced example parses only the real entries', () => {
+  const document = [
+    '```markdown',
+    '```ts',
+    '## Sources',
+    '',
+    '- **repository** `fake` — Fake example',
+    '```',
+    '',
+    '## Sources',
+    '',
+    '- **repository** `real` — Real entry'
+  ].join('\n');
+  const parsed = parseSources(document);
+  expect(parsed.evidence).toEqual([{ kind: 'repository', ref: 'real', description: 'Real entry' }]);
+  expect(parsed.evidence.some((entry) => entry.ref === 'fake')).toBe(false);
+});
+
+test('a revision replaces the generated Related section without duplicating it', () => {
+  const previous: NoteInput = {
+    title: 'Related note',
+    tags: [],
+    related_ids: [referenceId],
+    content: { kind: 'note', summary: 'A summary.', body_markdown: 'Body.' },
+    evidence: []
+  };
+  const base = documentFromNote(previous, { path: 'Related note.md' });
+  const edited = parseDocument(
+    renderDocument({
+      ...base,
+      body: base.body.replace(`- [[${referenceId}]]\n`, `- [[${referenceId}]]\n- [[Knowledge/Laya]]\n`)
+    }),
+    base.path
+  );
+  const next: NoteInput = { ...previous, related_ids: ['44b093c5-71db-4785-b9a5-bb8118304278'] };
+  const revised = reviseDocument(edited, next, { previous });
+  const again = parseDocument(renderDocument(revised), revised.path);
+  expect(again.body.match(/^## Related$/gm) ?? []).toHaveLength(1);
+  expect(again.body).not.toContain(referenceId);
+  expect(again.body).toContain('44b093c5-71db-4785-b9a5-bb8118304278');
+  expect(again.body).toContain('[[Knowledge/Laya]]');
+});
+
+test('a revision removes the generated skeleton when a human edit replaced managed text', () => {
+  const previous: NoteInput = {
+    title: 'Managed decision',
+    tags: [],
+    related_ids: [],
+    content: { kind: 'decision', context: 'Generated context.', decision: 'D.', rationale: 'R.' },
+    evidence: []
+  };
+  const base = documentFromNote(previous, { path: 'Managed decision.md' });
+  const edited = parseDocument(
+    renderDocument({ ...base, body: base.body.replace('Generated context.', 'Human edited context.') }),
+    base.path
+  );
+  const revised = reviseDocument(
+    edited,
+    {
+      ...previous,
+      content: { kind: 'decision', context: 'Updated context.', decision: 'D2.', rationale: 'R2.' }
+    },
+    { previous }
+  );
+  const again = parseDocument(renderDocument(revised), revised.path);
+  expect(again.body.match(/^## Context$/gm) ?? []).toHaveLength(1);
+  expect(again.body).not.toContain('Generated context.');
+  expect(again.body).toContain('Updated context.');
+  expect(again.body).toContain('Human edited context.');
+});

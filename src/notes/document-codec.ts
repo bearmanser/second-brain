@@ -13,6 +13,17 @@ import {
 } from './document.js';
 
 type YamlNode = { tag?: unknown };
+
+interface MarkdownNode {
+  type?: string;
+  depth?: number;
+  children?: MarkdownNode[];
+  position?: {
+    start?: { offset?: number };
+    end?: { offset?: number };
+  };
+}
+
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const RFC3339_PATTERN = /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$/;
@@ -28,9 +39,6 @@ const RECOGNIZED_FRONTMATTER_KEYS: ReadonlySet<string> = new Set([
   'updated'
 ]);
 const FRONTMATTER_DELIMITER_PATTERN = /^---[ \t]*$/;
-const SECTION_BOUNDARY_PATTERN = /^ {0,3}#{1,2}[ \t]/;
-const HEADING_PATTERN = /^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$/;
-const FENCE_OPEN_PATTERN = /^ {0,3}(`{3,}|~{3,})/;
 const LINK_SCHEMES: ReadonlySet<string> = new Set(['http', 'https', 'mailto']);
 const SOURCE_ENTRY_PATTERN =
   /^- \*\*([a-z_]+)\*\* (?:\[((?:\\.|[^\]])*)\]\(<((?:\\.|[^>])*)>\)|\[((?:\\.|[^\]])*)\]\(((?:\\.|[^)\s])+)\)|`((?:\\.|[^`])*)`)(?: \(observed ((?:\\.|[^)])*)\))? \u2014 (.*)$/;
@@ -70,6 +78,14 @@ export interface ParsedSources {
   human: string[];
 }
 
+interface LineInfo {
+  text: string;
+  section: string | undefined;
+  headingDepth: number | undefined;
+  headingTitle: string | undefined;
+  inCode: boolean;
+}
+
 function invalid(message: string, cause?: unknown): BrainError {
   return new BrainError({ code: 'INVALID_INPUT', message, cause });
 }
@@ -104,6 +120,99 @@ function isSafeLink(ref: string): boolean {
   const match = /^([a-z][a-z0-9+.-]*):/i.exec(ref);
   if (match === null) return false;
   return LINK_SCHEMES.has(match[1].toLowerCase());
+}
+
+function topLevelNodes(source: string): MarkdownNode[] {
+  return fromMarkdown(source).children as unknown as MarkdownNode[];
+}
+
+function nodeRange(node: MarkdownNode): [number, number] | undefined {
+  const start = node.position?.start?.offset;
+  const end = node.position?.end?.offset;
+  return start === undefined || end === undefined ? undefined : [start, end];
+}
+
+function headingTitleOf(source: string, node: MarkdownNode): string | undefined {
+  if (node.type !== 'heading') return undefined;
+  const range = nodeRange(node);
+  if (range === undefined) return undefined;
+  return normalizeSectionTitle(
+    source.slice(range[0], range[1]).replace(/^#{1,6}[ \t]*/, '').replace(/\s*#+\s*$/, '').trim()
+  );
+}
+
+function collectCodeRanges(nodes: MarkdownNode[]): [number, number][] {
+  const ranges: [number, number][] = [];
+  const walk = (list: MarkdownNode[]): void => {
+    for (const node of list) {
+      if (node.type === 'code') {
+        const range = nodeRange(node);
+        if (range !== undefined) ranges.push(range);
+      }
+      if (node.children !== undefined) walk(node.children);
+    }
+  };
+  walk(nodes);
+  return ranges;
+}
+
+function isInside(ranges: [number, number][], offset: number): boolean {
+  for (const [start, end] of ranges) {
+    if (offset >= start && offset < end) return true;
+  }
+  return false;
+}
+
+function lineStarts(lines: string[]): number[] {
+  const starts: number[] = [];
+  let offset = 0;
+  for (const line of lines) {
+    starts.push(offset);
+    offset += line.length + 1;
+  }
+  return starts;
+}
+
+function lineIndexAt(offset: number, starts: number[]): number {
+  let index = 0;
+  for (let candidate = 0; candidate < starts.length; candidate += 1) {
+    if (starts[candidate] <= offset) index = candidate;
+    else break;
+  }
+  return index;
+}
+
+function analyzeSource(source: string): LineInfo[] {
+  const lines = source.split('\n');
+  const starts = lineStarts(lines);
+  const children = topLevelNodes(source);
+  const codeRanges = collectCodeRanges(children);
+  const headings: { title: string; depth: number; line: number }[] = [];
+  for (const node of children) {
+    const title = headingTitleOf(source, node);
+    if (title === undefined) continue;
+    const depth = node.depth ?? 1;
+    if (depth > 2) continue;
+    const range = nodeRange(node);
+    if (range === undefined) continue;
+    headings.push({ title, depth, line: lineIndexAt(range[0], starts) });
+  }
+  headings.sort((left, right) => left.line - right.line);
+  const infos: LineInfo[] = [];
+  let cursor = -1;
+  for (let line = 0; line < lines.length; line += 1) {
+    while (cursor + 1 < headings.length && headings[cursor + 1].line <= line) cursor += 1;
+    const heading = cursor >= 0 ? headings[cursor] : undefined;
+    const isHeadingLine = heading !== undefined && heading.line === line;
+    infos.push({
+      text: lines[line],
+      section: heading === undefined ? undefined : heading.title,
+      headingDepth: isHeadingLine ? heading.depth : undefined,
+      headingTitle: isHeadingLine ? heading.title : undefined,
+      inCode: isInside(codeRanges, starts[line])
+    });
+  }
+  return infos;
 }
 
 interface SplitDocument {
@@ -324,57 +433,51 @@ export function renderSources(evidence: readonly Evidence[]): string {
   return `## ${SOURCE_SECTION_TITLE}\n\n${lines.join('\n')}`;
 }
 
-interface FenceState {
-  marker: string;
-  length: number;
-}
-
-function headingTitle(line: string): string | undefined {
-  const match = HEADING_PATTERN.exec(line);
-  return match === null ? undefined : normalizeSectionTitle(match[2]);
-}
-
-function isSourceHeading(line: string): boolean {
-  return HEADING_PATTERN.test(line) && headingTitle(line) === SOURCE_SECTION_TITLE;
-}
-
-function updateFence(state: FenceState | null, line: string): FenceState | null {
-  const match = FENCE_OPEN_PATTERN.exec(line);
-  if (state === null) {
-    return match === null ? null : { marker: match[1][0], length: match[1].length };
+export function parseSources(section: string): ParsedSources {
+  const lines = section.split('\n');
+  const starts = lineStarts(lines);
+  const children = topLevelNodes(section);
+  let headingStart: number | undefined;
+  let headingEnd: number | undefined;
+  for (const node of children) {
+    const title = headingTitleOf(section, node);
+    if (title !== SOURCE_SECTION_TITLE) continue;
+    if ((node.depth ?? 1) > 2) continue;
+    const range = nodeRange(node);
+    if (range === undefined) continue;
+    headingStart = range[0];
+    headingEnd = range[1];
+    break;
   }
-  if (match === null) return state;
-  if (match[1][0] === state.marker && match[1].length >= state.length) return null;
-  return state;
-}
-
-function findSourceHeadingIndex(lines: string[]): number {
-  let fence: FenceState | null = null;
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    if (fence === null && isSourceHeading(line)) return index;
-    fence = updateFence(fence, line);
+  if (headingStart === undefined || headingEnd === undefined) {
+    return { evidence: [], human: [...lines] };
   }
-  return -1;
-}
-
-function collectSourceLines(
-  lines: string[],
-  start: number,
-  stopAtBoundary: boolean,
-  evidence: Evidence[],
-  human: string[]
-): void {
-  let fence: FenceState | null = null;
-  for (let index = start; index < lines.length; index += 1) {
-    const line = lines[index];
-    if (fence === null && stopAtBoundary && SECTION_BOUNDARY_PATTERN.test(line)) return;
-    if (fence !== null) {
-      human.push(line);
-      fence = updateFence(fence, line);
+  let endOffset = section.length;
+  for (const node of children) {
+    const title = headingTitleOf(section, node);
+    if (title === undefined) continue;
+    if ((node.depth ?? 1) > 2) continue;
+    const range = nodeRange(node);
+    if (range === undefined) continue;
+    if (range[0] > headingStart) {
+      endOffset = range[0];
+      break;
+    }
+  }
+  const codeRanges = collectCodeRanges(children);
+  const headingLine = lineIndexAt(headingStart, starts);
+  const endLine = endOffset >= section.length ? lines.length : lineIndexAt(endOffset, starts);
+  const evidence: Evidence[] = [];
+  const human: string[] = [];
+  let start = headingLine + 1;
+  if (start < endLine && lines[start].trim() === '') start += 1;
+  for (let line = start; line < endLine; line += 1) {
+    const text = lines[line];
+    if (isInside(codeRanges, starts[line])) {
+      human.push(text);
       continue;
     }
-    const match = SOURCE_ENTRY_PATTERN.exec(line);
+    const match = SOURCE_ENTRY_PATTERN.exec(text);
     const kind = match?.[1];
     if (match !== null && kind !== undefined && (EVIDENCE_KINDS as readonly string[]).includes(kind)) {
       const observed = match[7];
@@ -386,20 +489,8 @@ function collectSourceLines(
       });
       continue;
     }
-    human.push(line);
-    fence = updateFence(fence, line);
+    human.push(text);
   }
-}
-
-export function parseSources(section: string): ParsedSources {
-  const lines = section.split('\n');
-  const evidence: Evidence[] = [];
-  const human: string[] = [];
-  const headingIndex = findSourceHeadingIndex(lines);
-  if (headingIndex === -1) return { evidence, human: [...lines] };
-  let start = headingIndex + 1;
-  if (start < lines.length && lines[start].trim() === '') start += 1;
-  collectSourceLines(lines, start, true, evidence, human);
   return { evidence, human };
 }
 
@@ -460,76 +551,92 @@ export function documentFromNote(note: NoteInput, meta: DocumentMetadata): Curre
   };
 }
 
-interface HeadingRef {
-  title: string;
-  depth: number;
-  start: number;
-  end: number;
+interface GeneratedSkeleton {
+  headings: Set<string>;
+  lines: Map<string, Map<string, number>>;
 }
 
-function collectLevelOneAndTwoHeadings(body: string): HeadingRef[] {
-  const tree = fromMarkdown(body);
-  const refs: HeadingRef[] = [];
-  for (const node of tree.children) {
-    if (node.type !== 'heading' || (node.depth !== 1 && node.depth !== 2)) continue;
-    const start = node.position?.start.offset;
-    const end = node.position?.end.offset;
-    if (start === undefined || end === undefined) continue;
-    const title = normalizeSectionTitle(
-      body.slice(start, end).replace(/^#{1,6}[ \t]*/, '').replace(/\s*#+\s*$/, '').trim()
-    );
-    refs.push({ title, depth: node.depth, start, end });
+function generatedSkeleton(previous: NoteInput): GeneratedSkeleton {
+  const infos = analyzeSource(renderNoteBody(previous));
+  const headings = new Set<string>();
+  const lines = new Map<string, Map<string, number>>();
+  for (const info of infos) {
+    if (info.headingDepth === 2 && info.headingTitle !== undefined) {
+      headings.add(info.headingTitle);
+      if (!lines.has(info.headingTitle)) lines.set(info.headingTitle, new Map());
+      continue;
+    }
+    if (info.headingDepth !== undefined) continue;
+    if (info.section === undefined) continue;
+    const counts = lines.get(info.section);
+    if (counts === undefined) continue;
+    if (info.text.trim().length === 0) continue;
+    counts.set(info.text, (counts.get(info.text) ?? 0) + 1);
   }
-  return refs;
-}
-
-interface GeneratedRemoval {
-  start: number;
-  end: number;
-  title: string;
-  depth: number;
+  return { headings, lines };
 }
 
 function subtractGenerated(
   body: string,
-  generated: string
+  previous: NoteInput
 ): { general: string[]; sections: Record<string, string[]> } {
-  const headings = collectLevelOneAndTwoHeadings(generated);
-  const removals: GeneratedRemoval[] = [];
-  let cursor = 0;
-  for (let index = 0; index < headings.length; index += 1) {
-    const heading = headings[index];
-    const end = index + 1 < headings.length ? headings[index + 1].start : generated.length;
-    const block = generated.slice(heading.start, end);
-    const found = body.indexOf(block, cursor);
-    if (found === -1) continue;
-    removals.push({
-      start: found,
-      end: found + block.length,
-      title: heading.title,
-      depth: heading.depth
-    });
-    cursor = found + block.length;
-  }
-  const general: string[] = [];
-  const sections: Record<string, string[]> = {};
-  const prefix = removals.length > 0 ? body.slice(0, removals[0].start) : body;
-  const prefixText = trimBlock(prefix);
-  if (prefixText.length > 0) general.push(prefixText);
-  for (let index = 0; index < removals.length; index += 1) {
-    const removal = removals[index];
-    const nextStart = index + 1 < removals.length ? removals[index + 1].start : body.length;
-    const segment = trimBlock(body.slice(removal.end, nextStart));
-    if (segment.length === 0) continue;
-    if (removal.depth === 1) {
-      general.push(segment);
+  const skeleton = generatedSkeleton(previous);
+  const remaining = new Map<string, Map<string, number>>();
+  for (const [title, counts] of skeleton.lines) remaining.set(title, new Map(counts));
+  const infos = analyzeSource(body);
+  const generalLines: string[] = [];
+  const sectionLines = new Map<string, string[]>();
+  const assign = (section: string | undefined, text: string): void => {
+    if (section === undefined) {
+      generalLines.push(text);
+      return;
+    }
+    const existing = sectionLines.get(section);
+    if (existing === undefined) sectionLines.set(section, [text]);
+    else existing.push(text);
+  };
+  let headingRemoved = false;
+  for (const info of infos) {
+    if (info.inCode) {
+      assign(info.section, info.text);
       continue;
     }
-    const existing = sections[removal.title];
-    if (existing === undefined) sections[removal.title] = [segment];
-    else existing.push(segment);
+    if (info.headingDepth === 1) {
+      if (!headingRemoved) {
+        headingRemoved = true;
+        continue;
+      }
+      assign(info.section, info.text);
+      continue;
+    }
+    if (info.headingDepth === 2 && info.headingTitle !== undefined) {
+      if (skeleton.headings.has(info.headingTitle)) continue;
+      assign(info.section, info.text);
+      continue;
+    }
+    if (info.headingDepth !== undefined) {
+      assign(info.section, info.text);
+      continue;
+    }
+    if (info.section !== undefined) {
+      const counts = remaining.get(info.section);
+      if (counts !== undefined) {
+        const count = counts.get(info.text) ?? 0;
+        if (count > 0) {
+          counts.set(info.text, count - 1);
+          continue;
+        }
+      }
+    }
+    assign(info.section, info.text);
   }
-  return { general, sections };
+  const sections: Record<string, string[]> = {};
+  for (const [title, lines] of sectionLines) {
+    const text = trimBlock(lines.join('\n'));
+    if (text.length > 0) sections[title] = [text];
+  }
+  const generalText = trimBlock(generalLines.join('\n'));
+  return { general: generalText.length > 0 ? [generalText] : [], sections };
 }
 
 export interface RevisionOptions {
@@ -543,8 +650,7 @@ export function reviseDocument(
   options: RevisionOptions
 ): CurrentDocument {
   const meta = options.meta ?? {};
-  const generated = renderNoteBody(options.previous);
-  const { general, sections } = subtractGenerated(base.body, generated);
+  const { general, sections } = subtractGenerated(base.body, options.previous);
   const id = meta.id ?? base.id;
   const project = meta.project ?? base.project;
   const created = meta.created ?? base.created;
