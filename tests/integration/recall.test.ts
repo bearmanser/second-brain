@@ -15,6 +15,7 @@ import {
   RECALL_WARNING_BACKEND_PARTIAL,
   RECALL_WARNING_CANDIDATE,
   RECALL_WARNING_DEADLINE_EXCEEDED,
+  RECALL_WARNING_DUPLICATE_IDENTITY,
   RECALL_WARNING_EMBEDDINGS_FALLBACK,
   RECALL_WARNING_HIT_UNRESOLVED,
   RECALL_WARNING_SEARCH_TRUNCATED,
@@ -1079,6 +1080,106 @@ test('fallback telemetry unions hybrid and text attempts', async () => {
     );
     expect(traced.searched_project_ids).toContain('p5');
     expect(traced.searched_project_ids).toContain('p0');
+  } finally {
+    await h.close();
+  }
+});
+
+test('discarded empty fallback still reports every hybrid and text search attempt', async () => {
+  const h = await createHarness();
+  try {
+    const scopes = ['freellmapi', 'p1', 'p2', 'p3', 'p4', 'p5'];
+    const head = await h.seed(lessonFixture, { status: 'active' });
+    h.deps.scopeRegistry.all = () => scopes.map((id) => ({
+      id, backend_project: id,
+      relative_root: id === 'freellmapi' ? 'freellmapi' : `Projects/${id}`,
+      repository_aliases: []
+    }));
+    const realSearch = h.backend.search.bind(h.backend);
+    const hit = (await realSearch({
+      project: 'freellmapi', query: 'streaming', mode: 'hybrid', kinds: ['lesson'],
+      statuses: ['active'], page: 1, page_size: 40
+    })).hits[0];
+    if (hit === undefined) throw new Error('fixture did not produce a backend hit');
+    const attempted: string[] = [];
+    h.backend.search = async (input) => {
+      attempted.push(`${input.mode}:${input.project}`);
+      if (input.mode === 'text') return { hits: [], has_more: false };
+      if (input.project === 'p5') throw new BrainError({ code: 'EMBEDDINGS_UNAVAILABLE', message: 'unavailable' });
+      return { hits: input.project === 'freellmapi' ? [{
+        ...hit, relative_path: head.source.relative_path,
+        logical_id: head.revision.id, revision_id: head.revision.revision_id
+      }] : [], has_more: false };
+    };
+    expect((await h.deps.vault.read('freellmapi', head.source.relative_path)).raw_hash).toBe(head.raw_hash);
+    expect((await h.deps.catalogue.get('freellmapi', head.revision.id)).revision.revision_id).toBe(head.revision.revision_id);
+    const traced = await recallTraced(reviewerContext,
+      { query: 'streaming', allow_text_fallback: true }, h.deps);
+    expect(traced.result.mode).toBe('hybrid');
+    expect(traced.searched_project_ids).toEqual(scopes);
+    expect(traced.result.items, JSON.stringify(traced.result)).toHaveLength(1);
+    expect(attempted).toEqual([...scopes.map((id) => `hybrid:${id}`), 'text:freellmapi', 'text:p1']);
+  } finally {
+    await h.close();
+  }
+});
+
+test.each([
+  { identity: 'divergent', divergent: true },
+  { identity: 'identical', divergent: false }
+] as const)('recall flags $identity cross-project UUID identity through validated hits', async ({ divergent }) => {
+  const h = await createHarness();
+  try {
+    const original = await h.seed(lessonNote('identitycheck same UUID in another project'));
+    const second: StoredRevision = {
+      ...original.revision,
+      scope: 'shared',
+      revision_id: randomUUID(),
+      operation_id: randomUUID()
+    };
+    await writeRevision(h, second);
+    await h.deps.catalogue.reconcile('shared');
+    const shared = await h.deps.catalogue.get('shared', original.revision.id);
+    if (!divergent) {
+      const get = h.deps.catalogue.get.bind(h.deps.catalogue);
+      h.deps.catalogue.get = async (scope, id) => {
+        const head = scope === 'shared' ? shared : await get(scope, id);
+        return scope === 'shared' ? {
+          ...head, raw_hash: original.raw_hash,
+          revision: { ...head.revision, revision_id: original.revision.revision_id },
+          source: { ...head.source, revision_id: original.revision.revision_id }
+        } : head;
+      };
+      const read = h.deps.vault.read.bind(h.deps.vault);
+      h.deps.vault.read = async (scope, path) => {
+        const result = await read(scope, path);
+        return scope === 'shared' ? {
+          ...result, raw_hash: original.raw_hash,
+          raw: result.raw.replaceAll(second.revision_id, original.revision.revision_id)
+        } : result;
+      };
+      const search = h.backend.search.bind(h.backend);
+      h.backend.search = async (input) => {
+        const result = await search(input);
+        return input.project === 'shared'
+          ? { ...result, hits: result.hits.map((hit) => ({ ...hit, relative_path: '', revision_id: '' })) }
+          : result;
+      };
+      const checkedHead = await h.deps.catalogue.get('shared', original.revision.id);
+      const checkedRead = await h.deps.vault.read('shared', checkedHead.source.relative_path);
+      expect(checkedHead.raw_hash).toBe(checkedRead.raw_hash);
+      expect(checkedHead.source.relative_path).toBe(checkedRead.relative_path);
+      expect(checkedRead.raw).toContain(original.revision.revision_id);
+      expect(checkedRead.raw).not.toContain(second.revision_id);
+    }
+    const result = await recall(reviewerContext, {
+      query: 'identitycheck', include_candidates: true
+    }, h.deps);
+    expect(result.items.map((item) => item.scope).sort(), JSON.stringify(result)).toEqual(['freellmapi', 'shared']);
+    expect(result.items.map((item) => item.id)).toEqual([original.revision.id, original.revision.id]);
+    expect(shared.revision.id).toBe(original.revision.id);
+    expect(result.warnings.includes(RECALL_WARNING_DUPLICATE_IDENTITY)).toBe(divergent);
+    expect(result.partial).toBe(divergent);
   } finally {
     await h.close();
   }

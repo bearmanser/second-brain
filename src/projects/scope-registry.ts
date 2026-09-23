@@ -33,10 +33,11 @@ export class ScopeRegistry {
     for (const scope of staticScopes) this.registerStatic(scope);
     if (source !== undefined) {
       for (const project of source.listProjects()) {
+        const binding = source.getProjectBinding(project.project.id);
         this.registerDynamicProject(
           project.project,
-          source.getProjectBinding(project.project.id),
-          project.state !== 'ready'
+          binding,
+          project.state !== 'ready' || binding === undefined
         );
       }
     }
@@ -55,15 +56,16 @@ export class ScopeRegistry {
   }
 
   require(idOrAlias: string): ScopeConfig {
+    const project = this.registry.get(idOrAlias);
+    if (project !== undefined && !this.isUsable(project.id)) {
+      throw new BrainError({
+        code: 'RECOVERY_REQUIRED',
+        message: `project ${project.id} requires recovery before it can be used`
+      });
+    }
     const scope = this.get(idOrAlias);
     if (scope === undefined) {
       throw new BrainError({ code: 'NOT_FOUND', message: `project ${idOrAlias} is not configured` });
-    }
-    if (!this.isUsable(scope.id)) {
-      throw new BrainError({
-        code: 'RECOVERY_REQUIRED',
-        message: `project ${scope.id} requires recovery before it can be used`
-      });
     }
     return scope;
   }

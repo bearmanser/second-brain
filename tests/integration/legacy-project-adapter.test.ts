@@ -117,6 +117,24 @@ test('reads an old provisioning plan without applying its grant', () => {
   ).toThrow(/RECOVERY_REQUIRED/);
 });
 
+test.each(['can_write', 'can_review'] as const)(
+  'rejects a legacy grant when only %s is missing',
+  (missing) => {
+    const grant: Record<string, unknown> = {
+      principal_id: 'legacy-worker', scope: 'legacy',
+      can_read: true, can_write: true, can_review: false
+    };
+    delete grant[missing];
+    const plan_json = JSON.stringify({
+      repository_identity: 'github.com/example/legacy', scope: 'legacy',
+      backend_project: 'legacy', relative_root: 'Projects/legacy', grant
+    });
+    expect(() => parseLegacyProvisioningPlan({ plan_json, operation_id: OPERATION_ID })).toThrow(
+      /RECOVERY_REQUIRED/
+    );
+  }
+);
+
 test('projects a historical ensure receipt while dropping obsolete permissions', () => {
   const raw = JSON.stringify({
     operation_id: OPERATION_ID,

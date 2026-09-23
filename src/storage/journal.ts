@@ -3,11 +3,14 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
-import { uuidSchema } from '../contracts/content.js';
+import { z } from 'zod';
+import { etagSchema, scopeIdSchema, uuidSchema } from '../contracts/content.js';
 import { BrainError, isBrainError } from '../contracts/errors.js';
 import { RECALL_MAX_SCOPES, RECALL_LIMIT_MAX, SCOPE_ID_PATTERN } from '../core/limits.js';
 import {
   FEEDBACK_VERDICTS,
+  LIFECYCLES,
+  NOTE_KINDS,
   RECALL_MODES,
   RETRIEVAL_OUTCOMES_V2,
   SYSTEM_ACTOR,
@@ -66,6 +69,38 @@ export const FEEDBACK_REASON_MAX_LENGTH = 240;
 export const FEEDBACK_REASON_INPUT_MAX_LENGTH = 8000;
 
 const RFC3339_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+const legacySourceRefSchema = z.strictObject({
+  id: uuidSchema,
+  revision_id: uuidSchema,
+  scope: scopeIdSchema,
+  title: z.string(),
+  kind: z.enum(NOTE_KINDS),
+  status: z.enum(LIFECYCLES),
+  etag: etagSchema,
+  relative_path: z.string(),
+  warnings: z.array(z.string())
+});
+const legacyMutationReceiptSchema = z.strictObject({
+  operation_id: uuidSchema,
+  id: uuidSchema,
+  revision_id: uuidSchema,
+  outcome: z.enum(['stored', 'stored_conflict', 'pending']),
+  materialized: z.boolean(),
+  indexed: z.boolean(),
+  etag: etagSchema.optional(),
+  possible_duplicates: z.array(legacySourceRefSchema),
+  warnings: z.array(z.string())
+});
+const legacyProjectReceiptSchema = z.looseObject({
+  operation_id: uuidSchema,
+  repository_identity: z.string().min(1),
+  project_id: scopeIdSchema.optional(),
+  scope: scopeIdSchema.optional(),
+  created: z.boolean(),
+  backend_ready: z.boolean(),
+  materialized: z.boolean(),
+  warnings: z.array(z.string())
+});
 const FEEDBACK_WARNING_MAX_LENGTH = 128;
 
 export const MIGRATIONS_DIRECTORY = fileURLToPath(new URL('./migrations/', import.meta.url));
@@ -1280,29 +1315,48 @@ export class Journal {
         if (receipt !== null) {
           try {
             const parsed = JSON.parse(receipt) as unknown;
-            if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-              throw new Error('receipt is not an object');
-            }
-            const record = parsed as Record<string, unknown>;
-            if (record.operation_id !== row.operation_id) {
-              throw new Error('receipt operation does not match');
-            }
             if (row.tool === 'brain_project_ensure') {
-              if (
-                typeof record.repository_identity !== 'string' ||
-                record.repository_identity.length === 0
-              ) {
-                throw new Error('project receipt identity is invalid');
-              }
+              const record = legacyProjectReceiptSchema.parse(parsed);
               const projectId = record.project_id ?? record.scope;
-              if (typeof projectId !== 'string' || projectId.length === 0) {
-                throw new Error('project receipt scope is invalid');
+              if (
+                record.operation_id !== row.operation_id ||
+                projectId !== row.scope ||
+                (record.project_id !== undefined && record.scope !== undefined && record.project_id !== record.scope)
+              ) {
+                throw new Error('project receipt identity does not match');
               }
-            } else if (
-              typeof record.outcome !== 'string' ||
-              !['stored', 'stored_conflict', 'pending'].includes(record.outcome)
-            ) {
-              throw new Error('receipt outcome is invalid');
+              for (const raw of [row.payload_json, row.plan_json]) {
+                if (raw === undefined || raw.length === 0) continue;
+                const source = JSON.parse(raw) as unknown;
+                if (source === null || typeof source !== 'object' || Array.isArray(source)) {
+                  throw new Error('project identity source is invalid');
+                }
+                const values = source as Record<string, unknown>;
+                if (
+                  (values.repository_identity !== undefined &&
+                    values.repository_identity !== record.repository_identity) ||
+                  (values.project_id !== undefined && values.project_id !== projectId) ||
+                  (values.scope !== undefined && values.scope !== projectId)
+                ) {
+                  throw new Error('project receipt does not match saved identity');
+                }
+              }
+            } else {
+              const record = legacyMutationReceiptSchema.parse(parsed);
+              if (record.operation_id !== row.operation_id) {
+                throw new Error('mutation receipt operation does not match');
+              }
+              if (row.plan_json !== undefined) {
+                const plan = JSON.parse(row.plan_json) as unknown;
+                if (
+                  plan !== null && typeof plan === 'object' &&
+                  'revision' in plan && plan.revision !== null && typeof plan.revision === 'object' &&
+                  (('id' in plan.revision && plan.revision.id !== record.id) ||
+                    ('revision_id' in plan.revision && plan.revision.revision_id !== record.revision_id))
+                ) {
+                  throw new Error('mutation receipt revision does not match plan');
+                }
+              }
             }
             canonical = canonicalJson(receipt);
           } catch (cause) {
@@ -2109,6 +2163,12 @@ export class Journal {
       }
       return { kind: 'replay', entry: toFeedback(row) };
     }
+    if (!feedbackMatches(row, normalized)) {
+      throw new BrainError({
+        code: 'IDEMPOTENCY_CONFLICT',
+        message: `idempotency key ${normalized.idempotency_key} was used for different feedback`
+      });
+    }
     const storedAtBoundary = [...row.reason].length >= FEEDBACK_REASON_MAX_LENGTH;
     const incomingLonger = [...raw.reason].length > FEEDBACK_REASON_MAX_LENGTH;
     if (storedAtBoundary || incomingLonger) {
@@ -2118,12 +2178,6 @@ export class Journal {
         ),
         'recovery_required'
       );
-    }
-    if (!feedbackMatches(row, normalized)) {
-      throw new BrainError({
-        code: 'IDEMPOTENCY_CONFLICT',
-        message: `idempotency key ${normalized.idempotency_key} was used for different feedback`
-      });
     }
     return { kind: 'replay', entry: toFeedback(row) };
   }

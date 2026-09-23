@@ -420,13 +420,13 @@ test('an unprovable truncated feedback reason requires recovery', () => {
       feedback_id: KEY(0x2a),
       principal_id: principalId,
       idempotency_key: idempotencyKey,
-      reason: 'a'.repeat(200),
+      reason: 'a'.repeat(240),
       payload_hash: null
     });
   });
   try {
     expect(
-      codeOf(() => incomingLonger.journal.replayFeedback({ ...base, reason: `${'a'.repeat(200)}${'b'.repeat(80)}` }))
+      codeOf(() => incomingLonger.journal.replayFeedback({ ...base, reason: `${'a'.repeat(240)}${'b'.repeat(40)}` }))
     ).toBe('RECOVERY_REQUIRED');
   } finally {
     dispose(incomingLonger);
@@ -447,6 +447,30 @@ test('an unprovable truncated feedback reason requires recovery', () => {
     ).toBe('RECOVERY_REQUIRED');
   } finally {
     dispose(storedBoundary);
+  }
+
+  const boundaryMismatch = openSeeded((database) => {
+    seedLegacyFeedback(database, {
+      feedback_id: KEY(0x2d),
+      principal_id: principalId,
+      idempotency_key: idempotencyKey,
+      reason: 'a'.repeat(240),
+      payload_hash: null
+    });
+  });
+  try {
+    expect(codeOf(() => boundaryMismatch.journal.replayFeedback({ ...base, reason: `b${'a'.repeat(239)}` }))).toBe(
+      'IDEMPOTENCY_CONFLICT'
+    );
+    expect(codeOf(() => boundaryMismatch.journal.recordFeedback({ ...base, reason: `b${'a'.repeat(239)}` }))).toBe(
+      'IDEMPOTENCY_CONFLICT'
+    );
+    expect(boundaryMismatch.journal.isKeyBlocked(idempotencyKey)).toBe(false);
+    expect(codeOf(() => boundaryMismatch.journal.recordFeedback({ ...base, reason: 'a'.repeat(240) }))).toBe(
+      'RECOVERY_REQUIRED'
+    );
+  } finally {
+    dispose(boundaryMismatch);
   }
 
   const provable = openSeeded((database) => {
@@ -500,6 +524,80 @@ test('classifies a valid historical project-ensure key without a mutation outcom
     expect(fixture.journal.isKeyBlocked(KEY(0x124))).toBe(false);
   } finally {
     dispose(fixture);
+  }
+});
+
+test('quarantines incomplete mutation receipts instead of replaying a matching operation id', () => {
+  const fixture = openSeeded((database) => {
+    seedCapture(database, {
+      operation_id: KEY(0x26), idempotency_key: KEY(0x125),
+      receipt_json: JSON.stringify({ operation_id: KEY(0x26), outcome: 'stored' })
+    });
+  });
+  try {
+    expect(codeOf(() => fixture.journal.reserve(captureInput(KEY(0x125))))).toBe('RECOVERY_REQUIRED');
+    expect(fixture.journal.isKeyBlocked(KEY(0x125))).toBe(true);
+  } finally {
+    dispose(fixture);
+  }
+});
+
+test('quarantines a mutation receipt whose revision identity differs from its saved plan', () => {
+  const fixture = openSeeded((database) => {
+    seedCapture(database, {
+      operation_id: KEY(0x28), idempotency_key: KEY(0x128),
+      plan_json: JSON.stringify({ revision: { id: KEY(0xa1), revision_id: KEY(0xb2) } })
+    });
+  });
+  try {
+    expect(codeOf(() => fixture.journal.reserve(captureInput(KEY(0x128))))).toBe('RECOVERY_REQUIRED');
+  } finally {
+    dispose(fixture);
+  }
+});
+
+test('quarantines a project receipt whose repository identity differs from the original payload', () => {
+  const fixture = openSeeded((database) => {
+    seedLegacyOperation(database, {
+      operation_id: KEY(0x29), idempotency_key: KEY(0x129), tool: 'brain_project_ensure',
+      scope: 'freellmapi', payload_hash: PAYLOAD, state: 'complete',
+      payload_json: JSON.stringify({ repository_identity: 'github.com/example/expected' }),
+      receipt_json: JSON.stringify({
+        operation_id: KEY(0x29), repository_identity: 'github.com/example/other',
+        scope: 'freellmapi', created: true, backend_ready: true, materialized: true, warnings: []
+      })
+    });
+  });
+  try {
+    expect(codeOf(() => fixture.journal.reserve(captureInput(KEY(0x129), { tool: 'brain_project_ensure' })))).toBe(
+      'RECOVERY_REQUIRED'
+    );
+  } finally {
+    dispose(fixture);
+  }
+});
+
+test('quarantines project receipts naming a different project or missing result fields', () => {
+  const base = {
+    operation_id: KEY(0x27), repository_identity: 'github.com/example/legacy',
+    scope: 'other-project', created: true, backend_ready: true, materialized: true, warnings: []
+  };
+  for (const [index, candidate] of [base, { ...base, scope: 'freellmapi', warnings: undefined }].entries()) {
+    const key = KEY(0x126 + index);
+    const fixture = openSeeded((database) => {
+      seedLegacyOperation(database, {
+        operation_id: KEY(0x27), idempotency_key: key, tool: 'brain_project_ensure',
+        scope: 'freellmapi', payload_hash: PAYLOAD, state: 'complete',
+        receipt_json: JSON.stringify(candidate), plan_json: null
+      });
+    });
+    try {
+      expect(codeOf(() => fixture.journal.reserve(captureInput(key, { tool: 'brain_project_ensure' })))).toBe(
+        'RECOVERY_REQUIRED'
+      );
+    } finally {
+      dispose(fixture);
+    }
   }
 });
 

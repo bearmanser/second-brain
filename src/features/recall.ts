@@ -512,6 +512,9 @@ async function runRecall(
   const deadline = Date.now() + (deps.config.limits.backend_timeout_ms ?? BACKEND_TIMEOUT_MS);
 
   let accumulator = await collectProjects(ctx, scopes, searchText, kinds, mode, deps, deadline, 0);
+  const attemptedProjects = new Set(
+    accumulator.projectHits.filter((project) => project.attempted).map((project) => project.scope.id)
+  );
 
   if (
     accumulator.failure !== undefined &&
@@ -532,6 +535,9 @@ async function runRecall(
       accumulator.attemptedCalls,
       accumulator.projectHits.filter((project) => project.attempted).map((project) => project.scope.id)
     );
+    for (const project of fallback.projectHits) {
+      if (project.attempted) attemptedProjects.add(project.scope.id);
+    }
     const fallbackUsable = fallback.failure === undefined && fallback.hits > 0;
     if (fallbackUsable || (!hybridHasState && fallback.failure === undefined)) {
       accumulator = fallback;
@@ -652,9 +658,7 @@ async function runRecall(
   return {
     result,
     filter,
-    searched_project_ids: accumulator.projectHits
-      .filter((project) => project.attempted)
-      .map((project) => project.scope.id),
+    searched_project_ids: scopes.filter((scope) => attemptedProjects.has(scope.id)).map((scope) => scope.id),
     primary_project_id: primaryProjectId
   };
 }

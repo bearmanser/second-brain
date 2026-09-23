@@ -11,6 +11,9 @@ import { TOOL_RESULT_MAX_BYTES } from '../../src/core/limits.js';
 import { lessonFixture } from '../fixtures/content.js';
 import { SYSTEM_ACTOR } from '../../src/core/types.js';
 import { FakeBackend } from '../support/fake-backend.js';
+import Database from 'better-sqlite3';
+import { join } from 'node:path';
+import { Journal } from '../../src/storage/journal.js';
 import { startHttpHarness } from '../support/harness.js';
 
 const TOOL_NAMES = [
@@ -712,6 +715,110 @@ test('startup quarantines one broken dynamic scope while unrelated scopes remain
     });
   } finally {
     await reopened.close();
+    await backend.close().catch(() => undefined);
+    await h.close();
+  }
+});
+
+test('startup quarantines a missing project binding without blocking another project', async () => {
+  const h = await startHttpHarness();
+  const client = await h.connect(h.token);
+  let scope = '';
+  try {
+    const result = await call(client, 'brain_project_ensure', {
+      idempotency_key: randomUUID(), remote_url: 'https://github.com/example/unbound-startup.git'
+    });
+    expect(result.isError).toBeFalsy();
+    scope = record(result.structuredContent).scope as string;
+  } finally {
+    await client.close();
+    await h.runtime.close();
+  }
+  const database = new Database(join(h.config.mounts.state, 'journal.db'));
+  database.prepare('DELETE FROM legacy_project_backend_bindings WHERE project_id = ?').run(scope);
+  database.close();
+  const backend = new FakeBackend({
+    root: h.config.mounts.vault,
+    projects: h.config.scopes.map((item) => item.backend_project)
+  });
+  try {
+    const reopened = await createRuntime(h.config, { backend, token_digest: h.runtime.tokenDigest });
+    try {
+      expect(reopened.ready).toBe(true);
+      expect(reopened.deps.scopeRegistry.all().map((item) => item.id)).toContain('shared');
+      expect(reopened.deps.scopeRegistry.all().map((item) => item.id)).not.toContain(scope);
+      expect(reopened.deps.journal.getProjectById(scope)?.state).toBe('recovery_required');
+      expect(() => reopened.deps.scopeRegistry.require(scope)).toThrow(/RECOVERY_REQUIRED/);
+      expect(reopened.deps.scopeRegistry.require('shared').id).toBe('shared');
+      const context = {
+        actor: SYSTEM_ACTOR, request_id: randomUUID(), signal: new AbortController().signal
+      };
+      expect((await reopened.services.status(context, { project: 'shared' })).scopes).toContainEqual({ id: 'shared' });
+      await expect(reopened.services.status(context, { project: scope })).rejects.toMatchObject({
+        code: 'RECOVERY_REQUIRED'
+      });
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await backend.close().catch(() => undefined);
+    await h.close();
+  }
+});
+
+test('runtime features use independent project ID, name, vault root and backend binding', async () => {
+  const h = await startHttpHarness();
+  await h.runtime.close();
+  const journal = Journal.open(join(h.config.mounts.state, 'journal.db'), { requireExisting: true });
+  try {
+    journal.reserveProject({
+      project_id: 'stable-four', display_name: 'Human Facing Name',
+      relative_root: 'Knowledge/Four', repository_identity: 'github.com/example/four-way-runtime',
+      backend_project: 'storage-four', backend_relative_root: 'BackendData/Four',
+      created_by_actor_id: 'system', creation_operation_id: randomUUID()
+    });
+    journal.markProjectReady('stable-four');
+  } finally {
+    journal.close();
+  }
+  await mkdir(join(h.config.mounts.vault, 'Knowledge/Four'), { recursive: true });
+  const backend = new FakeBackend({
+    root: h.config.mounts.vault,
+    projects: [...h.config.scopes.map((scope) => scope.backend_project), 'storage-four']
+  });
+  const verified: [string, string][] = [];
+  const searched: string[] = [];
+  const originalVerify = backend.verifyProject.bind(backend);
+  const originalSearch = backend.search.bind(backend);
+  backend.verifyProject = async (name, path) => {
+    verified.push([name, path]);
+    return name === 'storage-four' && path === '/app/data/BackendData/Four'
+      ? true : originalVerify(name, path);
+  };
+  backend.search = async (input) => {
+    searched.push(input.project);
+    return input.project === 'storage-four' ? { hits: [], has_more: false } : originalSearch(input);
+  };
+  try {
+    const runtime = await createRuntime(h.config, { backend, token_digest: h.runtime.tokenDigest });
+    try {
+      expect(runtime.deps.journal.getProjectById('stable-four')?.project).toMatchObject({
+        id: 'stable-four', display_name: 'Human Facing Name', relative_root: 'Knowledge/Four'
+      });
+      const recalled = await runtime.services.recall(
+        { actor: SYSTEM_ACTOR, request_id: randomUUID(), signal: new AbortController().signal },
+        { project: 'github.com/example/four-way-runtime', query: 'fixture term', mode: 'text' }
+      );
+      expect(recalled.partial).toBe(false);
+      expect(recalled.items).toEqual([]);
+      expect(searched).toEqual(['storage-four']);
+      expect(verified).toContainEqual(['storage-four', '/app/data/BackendData/Four']);
+      expect(runtime.deps.scopeRegistry.require('stable-four').relative_root).toBe('Knowledge/Four');
+      expect(runtime.deps.scopeRegistry.require('stable-four').backend_project).toBe('storage-four');
+    } finally {
+      await runtime.close();
+    }
+  } finally {
     await backend.close().catch(() => undefined);
     await h.close();
   }
