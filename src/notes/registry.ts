@@ -149,3 +149,7 @@ export function sectionTitle(kind: NoteKind, field: string): string | undefined 
   if (field === 'related_ids') return RELATED_SECTION_TITLE;
   return undefined;
 }
+
+export const V1_EVIDENCE_SECTION_TITLE = EVIDENCE_SECTION_TITLE;
+export const V1_RELATED_SECTION_TITLE = RELATED_SECTION_TITLE;
+export const V1_NOTE_REGISTRY = NOTE_REGISTRY;

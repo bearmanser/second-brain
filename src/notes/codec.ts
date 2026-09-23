@@ -36,7 +36,8 @@ const timestampSchema = z.iso.datetime();
 const lifecycleSchema = z.enum(LIFECYCLES);
 const hashSchema = z.string().regex(/^[a-f0-9]{64}$/);
 
-export const CURRENT_SCHEMA_VERSION = 1;
+export const V1_SCHEMA_VERSION = 1;
+export const CURRENT_SCHEMA_VERSION = V1_SCHEMA_VERSION;
 
 export interface SchemaVersionTransform {
   from: number;
@@ -739,3 +740,8 @@ export function payloadHash(revision: StoredRevision): string {
   });
   return createHash('sha256').update(JSON.stringify(projection), 'utf8').digest('hex');
 }
+
+export const decodeRevisionV1 = decodeRevision;
+export const renderRevisionV1 = renderRevision;
+export const encodeRevisionV1 = encodeRevision;
+export const payloadHashV1 = payloadHash;

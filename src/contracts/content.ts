@@ -86,3 +86,7 @@ export const noteInputSchema = z
   .refine(withinInputBodyLimit, {
     message: 'note input exceeds the 256 KiB input body limit'
   });
+
+export const noteContentSchemaV1 = noteContentSchema;
+export const noteInputSchemaV1 = noteInputSchema;
+export const evidenceSchemaV1 = evidenceSchema;

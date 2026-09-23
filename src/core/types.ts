@@ -490,3 +490,7 @@ export interface RetrievalEventInputV2 {
   duration_ms: number;
   created_at?: string;
 }
+
+export type NoteContentV1 = NoteContent;
+export type NoteInputV1 = NoteInput;
+export type StoredRevisionV1 = StoredRevision;
