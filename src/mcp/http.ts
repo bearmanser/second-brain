@@ -22,6 +22,8 @@ export const OVERFLOW_DRAIN_MS = 1000;
 export const MAX_AUTHORIZATION_HEADER_CHARS = 1024;
 export const MAX_SESSION_ID_CHARS = 256;
 export const SESSION_ID_HEADER = 'Mcp-Session-Id';
+export const DEFAULT_SESSION_CAPACITY = 256;
+export const DEFAULT_SESSION_IDLE_MS = 30 * 60 * 1000;
 
 const HOST_NAME = /^[A-Za-z0-9.-]+$/;
 const HOST_PORT = /^[1-9]\d{0,4}$/;
@@ -287,6 +289,9 @@ export interface AuthenticatedHttpOptions {
   signal: AbortSignal;
   isClosing?: () => boolean;
   reportDiagnostic?: (message: string) => void;
+  session_capacity?: number;
+  session_idle_ms?: number;
+  session_registry?: SessionRegistry;
   dispatch: (
     ctx: AuthenticatedContext,
     req: Request,
@@ -299,9 +304,69 @@ function resolveTokenDigest(source: string | (() => string)): string {
   return typeof source === 'function' ? source() : source;
 }
 
+export interface SessionRegistryOptions {
+  capacity: number;
+  idle_ms: number;
+  generate?: () => string;
+}
+
+export class SessionRegistry {
+  private readonly capacity: number;
+  private readonly idleMs: number;
+  private readonly generate: () => string;
+  private readonly entries = new Map<string, number>();
+
+  constructor(options: SessionRegistryOptions) {
+    this.capacity = Math.max(1, Math.trunc(options.capacity));
+    this.idleMs = Math.max(1, Math.trunc(options.idle_ms));
+    this.generate = options.generate ?? (() => randomUUID());
+  }
+
+  resolve(requested: string | undefined, now: number): string {
+    this.prune(now);
+    if (requested !== undefined && this.entries.has(requested)) {
+      this.entries.set(requested, now);
+      return requested;
+    }
+    const issued = this.generate();
+    this.entries.set(issued, now);
+    this.evict();
+    return issued;
+  }
+
+  revokeAll(): void {
+    this.entries.clear();
+  }
+
+  get size(): number {
+    return this.entries.size;
+  }
+
+  private prune(now: number): void {
+    for (const [id, seen] of this.entries) {
+      if (now - seen > this.idleMs) this.entries.delete(id);
+    }
+  }
+
+  private evict(): void {
+    while (this.entries.size > this.capacity) {
+      let oldestId: string | undefined;
+      let oldestSeen = Number.POSITIVE_INFINITY;
+      for (const [id, seen] of this.entries) {
+        if (seen < oldestSeen) {
+          oldestSeen = seen;
+          oldestId = id;
+        }
+      }
+      if (oldestId === undefined) return;
+      this.entries.delete(oldestId);
+    }
+  }
+}
+
 interface GuardSessionState {
   currentDigest: string;
-  active: Set<string>;
+  sessions: SessionRegistry;
 }
 
 function presentedSessionId(req: Request): string | undefined {
@@ -329,7 +394,7 @@ async function handleAuthenticatedRequest(
 
   const configuredDigest = resolveTokenDigest(options.token_digest);
   if (configuredDigest !== sessions.currentDigest) {
-    sessions.active.clear();
+    sessions.sessions.revokeAll();
     sessions.currentDigest = assertTokenDigest(configuredDigest);
   }
 
@@ -375,12 +440,7 @@ async function handleAuthenticatedRequest(
     return;
   }
 
-  const requestedSession = presentedSessionId(req);
-  const sessionId =
-    requestedSession !== undefined && sessions.active.has(requestedSession)
-      ? requestedSession
-      : randomUUID();
-  if (sessionId !== requestedSession) sessions.active.add(sessionId);
+  const sessionId = sessions.sessions.resolve(presentedSessionId(req), Date.now());
   res.setHeader(SESSION_ID_HEADER, sessionId);
 
   const ctx: AuthenticatedContext = {
@@ -394,7 +454,12 @@ async function handleAuthenticatedRequest(
 export function createAuthenticatedHttpApp(options: AuthenticatedHttpOptions): Express {
   const sessions: GuardSessionState = {
     currentDigest: assertTokenDigest(resolveTokenDigest(options.token_digest)),
-    active: new Set<string>()
+    sessions:
+      options.session_registry ??
+      new SessionRegistry({
+        capacity: options.session_capacity ?? DEFAULT_SESSION_CAPACITY,
+        idle_ms: options.session_idle_ms ?? DEFAULT_SESSION_IDLE_MS
+      })
   };
   const app = express();
   app.disable('x-powered-by');

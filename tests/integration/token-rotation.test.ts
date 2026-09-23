@@ -3,7 +3,11 @@ import { createServer, request as httpRequest, type IncomingHttpHeaders } from '
 import { expect, test } from 'vitest';
 import { BRAIN_TOKEN_ENV, assertTokenDigest, loadTokenDigest } from '../../src/config/load.js';
 import type { AuthenticatedContext } from '../../src/core/types.js';
-import { MAX_AUTHORIZATION_HEADER_CHARS, createAuthenticatedHttpApp } from '../../src/mcp/http.js';
+import {
+  MAX_AUTHORIZATION_HEADER_CHARS,
+  SessionRegistry,
+  createAuthenticatedHttpApp
+} from '../../src/mcp/http.js';
 import { startHttpHarness } from '../support/harness.js';
 
 const digest = (value: string): string =>
@@ -20,7 +24,7 @@ interface GuardHarness {
 
 async function startGuard(
   initialDigest: string,
-  options: { hosts?: string[]; origins?: string[] } = {}
+  options: { hosts?: string[]; origins?: string[]; registry?: SessionRegistry } = {}
 ): Promise<GuardHarness> {
   const source = { digest: initialDigest };
   const contexts: AuthenticatedContext[] = [];
@@ -29,6 +33,7 @@ async function startGuard(
     allowed_hosts: options.hosts ?? ['127.0.0.1'],
     allowed_origins: options.origins ?? [],
     signal: new AbortController().signal,
+    ...(options.registry === undefined ? {} : { session_registry: options.registry }),
     dispatch: (ctx, _req, res) => {
       contexts.push(ctx);
       res
@@ -313,6 +318,29 @@ test('an existing session must reauthenticate after the token rotates', async ()
     expect(rotated.headers['mcp-session-id']).not.toBe(sessionId);
     expect(guard.contexts).toHaveLength(3);
     expect(guard.contexts[2].request_id).not.toBe(firstRequestId);
+  } finally {
+    await guard.close();
+  }
+});
+
+test('retained session state stays bounded under anonymous requests that never reuse a session', async () => {
+  const value = token();
+  let issued = 0;
+  const registry = new SessionRegistry({
+    capacity: 8,
+    idle_ms: 60_000,
+    generate: () => `anonymous-${(issued += 1)}`
+  });
+  const guard = await startGuard(digest(value), { registry });
+  try {
+    for (let index = 0; index < 50; index += 1) {
+      const response = await send(guard.port, { headers: authorized(value), body: '{}' });
+      expect(response.status, `request ${index}`).toBe(200);
+      expect(typeof response.headers['mcp-session-id']).toBe('string');
+    }
+    expect(guard.contexts).toHaveLength(50);
+    expect(registry.size).toBeLessThanOrEqual(8);
+    expect(issued).toBe(50);
   } finally {
     await guard.close();
   }

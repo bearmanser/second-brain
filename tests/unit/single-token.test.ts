@@ -10,6 +10,7 @@ import {
 import { SYSTEM_ACTOR, type AuthenticatedContext } from '../../src/core/types.js';
 import {
   MAX_AUTHORIZATION_HEADER_CHARS,
+  SessionRegistry,
   readAuthorizationHeader
 } from '../../src/mcp/http.js';
 import { generateBearerToken, verifyBearer } from '../../src/security/authenticate.js';
@@ -85,6 +86,50 @@ test('a raw authorization header list rejects duplicates and oversized values', 
   expect(
     readAuthorizationHeader(['Authorization', 'x'.repeat(MAX_AUTHORIZATION_HEADER_CHARS + 1)])
   ).toBeUndefined();
+});
+
+function counterGenerator(prefix: string): () => string {
+  let count = 0;
+  return () => `${prefix}${(count += 1)}`;
+}
+
+test('the session registry retains guard-issued identifiers within a capacity bound', () => {
+  const registry = new SessionRegistry({
+    capacity: 3,
+    idle_ms: 60_000,
+    generate: counterGenerator('session-')
+  });
+  const issued = [
+    registry.resolve(undefined, 0),
+    registry.resolve(undefined, 0),
+    registry.resolve(undefined, 0),
+    registry.resolve(undefined, 0)
+  ];
+  expect(new Set(issued).size).toBe(4);
+  expect(registry.size).toBe(3);
+
+  expect(registry.resolve(issued[3], 10)).toBe(issued[3]);
+  expect(registry.size).toBe(3);
+
+  const chosenByCaller = registry.resolve('caller-chosen-id', 11);
+  expect(chosenByCaller).not.toBe('caller-chosen-id');
+  expect(registry.size).toBe(3);
+});
+
+test('the session registry expires idle identifiers and revokes all on demand', () => {
+  const registry = new SessionRegistry({
+    capacity: 10,
+    idle_ms: 1000,
+    generate: counterGenerator('idle-')
+  });
+  const first = registry.resolve(undefined, 0);
+  expect(registry.size).toBe(1);
+  const afterIdle = registry.resolve(undefined, 5000);
+  expect(afterIdle).not.toBe(first);
+  expect(registry.size).toBe(1);
+
+  registry.revokeAll();
+  expect(registry.size).toBe(0);
 });
 
 test('generated tokens carry at least 32 bytes of entropy and their own digest', () => {
