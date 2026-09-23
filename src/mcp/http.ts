@@ -20,6 +20,8 @@ import { internalDiagnostic } from './tools.js';
 export const MCP_PATH = '/mcp';
 export const OVERFLOW_DRAIN_MS = 1000;
 export const MAX_AUTHORIZATION_HEADER_CHARS = 1024;
+export const MAX_SESSION_ID_CHARS = 256;
+export const SESSION_ID_HEADER = 'Mcp-Session-Id';
 
 const HOST_NAME = /^[A-Za-z0-9.-]+$/;
 const HOST_PORT = /^[1-9]\d{0,4}$/;
@@ -297,8 +299,22 @@ function resolveTokenDigest(source: string | (() => string)): string {
   return typeof source === 'function' ? source() : source;
 }
 
+interface GuardSessionState {
+  currentDigest: string;
+  active: Set<string>;
+}
+
+function presentedSessionId(req: Request): string | undefined {
+  const value = req.headers['mcp-session-id'];
+  if (typeof value !== 'string' || value.length === 0 || value.length > MAX_SESSION_ID_CHARS) {
+    return undefined;
+  }
+  return value;
+}
+
 async function handleAuthenticatedRequest(
   options: AuthenticatedHttpOptions,
+  sessions: GuardSessionState,
   req: Request,
   res: Response
 ): Promise<void> {
@@ -311,8 +327,14 @@ async function handleAuthenticatedRequest(
     return;
   }
 
+  const configuredDigest = resolveTokenDigest(options.token_digest);
+  if (configuredDigest !== sessions.currentDigest) {
+    sessions.active.clear();
+    sessions.currentDigest = assertTokenDigest(configuredDigest);
+  }
+
   const authorization = readAuthorizationHeader(req.rawHeaders);
-  if (authorization === undefined || !verifyBearer(authorization, resolveTokenDigest(options.token_digest))) {
+  if (authorization === undefined || !verifyBearer(authorization, sessions.currentDigest)) {
     res.setHeader('WWW-Authenticate', 'Bearer');
     sendJsonRpcError(res, 401, -32000, 'a valid bearer credential is required');
     return;
@@ -353,6 +375,14 @@ async function handleAuthenticatedRequest(
     return;
   }
 
+  const requestedSession = presentedSessionId(req);
+  const sessionId =
+    requestedSession !== undefined && sessions.active.has(requestedSession)
+      ? requestedSession
+      : randomUUID();
+  if (sessionId !== requestedSession) sessions.active.add(sessionId);
+  res.setHeader(SESSION_ID_HEADER, sessionId);
+
   const ctx: AuthenticatedContext = {
     actor: SYSTEM_ACTOR,
     request_id: randomUUID(),
@@ -362,13 +392,16 @@ async function handleAuthenticatedRequest(
 }
 
 export function createAuthenticatedHttpApp(options: AuthenticatedHttpOptions): Express {
-  assertTokenDigest(resolveTokenDigest(options.token_digest));
+  const sessions: GuardSessionState = {
+    currentDigest: assertTokenDigest(resolveTokenDigest(options.token_digest)),
+    active: new Set<string>()
+  };
   const app = express();
   app.disable('x-powered-by');
   app.set('etag', false);
 
   app.all(MCP_PATH, (req: Request, res: Response): void => {
-    void handleAuthenticatedRequest(options, req, res).catch((error: unknown) => {
+    void handleAuthenticatedRequest(options, sessions, req, res).catch((error: unknown) => {
       options.reportDiagnostic?.(internalDiagnostic(error));
       sendJsonRpcError(res, 500, -32603, 'the gateway could not complete the request');
     });

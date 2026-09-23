@@ -270,21 +270,49 @@ test('an existing session must reauthenticate after the token rotates', async ()
   try {
     const established = await send(guard.port, { headers: authorized(first), body: '{}' });
     expect(established.status).toBe(200);
+    const sessionId = established.headers['mcp-session-id'];
+    expect(typeof sessionId).toBe('string');
     const firstRequestId = guard.contexts[0].request_id;
+
+    const reused = await send(guard.port, {
+      headers: authorized(first, { 'mcp-session-id': sessionId as string }),
+      body: '{}'
+    });
+    expect(reused.status).toBe(200);
+    expect(reused.headers['mcp-session-id']).toBe(sessionId);
+    expect(guard.contexts).toHaveLength(2);
 
     guard.rotate(digest(second));
 
-    const oldToken = await send(guard.port, { headers: authorized(first), body: '{}' });
-    expect(oldToken.status).toBe(401);
-    expect(guard.contexts).toHaveLength(1);
+    const oldSessionNoToken = await send(guard.port, {
+      headers: { 'mcp-session-id': sessionId as string, 'content-type': 'application/json' },
+      body: '{}'
+    });
+    expect(oldSessionNoToken.status).toBe(401);
+
+    const oldSessionOldToken = await send(guard.port, {
+      headers: authorized(first, { 'mcp-session-id': sessionId as string }),
+      body: '{}'
+    });
+    expect(oldSessionOldToken.status).toBe(401);
+
+    const oldSessionForgedCursor = await send(guard.port, {
+      headers: { 'mcp-session-id': sessionId as string, 'content-type': 'application/json' },
+      body: JSON.stringify({ cursor: 'forged-read-cursor' })
+    });
+    expect(oldSessionForgedCursor.status).toBe(401);
+
+    expect(guard.contexts).toHaveLength(2);
 
     const rotated = await send(guard.port, {
-      headers: { authorization: `Bearer ${second}`, 'content-type': 'application/json' },
+      headers: authorized(second, { 'mcp-session-id': sessionId as string }),
       body: '{}'
     });
     expect(rotated.status).toBe(200);
-    expect(guard.contexts).toHaveLength(2);
-    expect(guard.contexts[1].request_id).not.toBe(firstRequestId);
+    expect(rotated.headers['mcp-session-id']).toBeDefined();
+    expect(rotated.headers['mcp-session-id']).not.toBe(sessionId);
+    expect(guard.contexts).toHaveLength(3);
+    expect(guard.contexts[2].request_id).not.toBe(firstRequestId);
   } finally {
     await guard.close();
   }
