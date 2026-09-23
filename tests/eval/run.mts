@@ -1,4 +1,5 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { RecallRequest } from '../../src/core/types.js';
 import { startDockerHarness, startHttpHarness } from '../support/harness.js';
@@ -250,6 +251,18 @@ export async function runRetrieval(
       backend === 'basic-memory-docker' ? 'retrieval.json' : 'retrieval-lexical-fixture.json';
     const outPath = args.get('out') ?? join(REPO_ROOT, 'tests/eval/results', defaultName);
     await writeJson(outPath, output);
+    const exportPath = args.get('export');
+    if (exportPath !== undefined) {
+      const [corpusBytes, queryBytes] = await Promise.all([readFile(corpusPath), readFile(queriesPath)]);
+      await writeJson(exportPath, {
+        version: 1,
+        corpus_sha256: createHash('sha256').update(corpusBytes).digest('hex'),
+        queries_sha256: createHash('sha256').update(queryBytes).digest('hex'),
+        corpus,
+        queries: retrieval,
+        result: output
+      });
+    }
     return { output, failed: !gate.ok };
   } finally {
     await closeTarget();

@@ -1,0 +1,124 @@
+{
+  "version": 1,
+  "description": "Synthetic disposable V1 migration inventory; base64 is authoritative source bytes, hashes are SHA-256 of those bytes.",
+  "files": [
+    {
+      "path": ".obsidian/app.json",
+      "bytes": 27,
+      "sha256": "4c8c70ca6865928c0d7f17d527b800168de408f331016511701f65915e958940",
+      "base64": "eyJhbHdheXNVcGRhdGVMaW5rcyI6dHJ1ZX0K"
+    },
+    {
+      "path": "Attachments/diagram.png",
+      "bytes": 6,
+      "sha256": "ffdb519b788f33bddc8647611c3a24cc5e1a9ef5780c1f6f828a637c309ad8f1",
+      "base64": "iVBORwD/"
+    },
+    {
+      "path": "Knowledge/Human note.md",
+      "bytes": 91,
+      "sha256": "24989091c3a3430377986ce8c42ee72458f0831ddaa0a3e9de4335f0ccd34b65",
+      "base64": "LS0tCmN1c3RvbTogaHVtYW4KLS0tDQoNCiMgQSBub3RlIHdyaXR0ZW4gYnkgaGFuZA0KIVtkaWFncmFtXSguLi9BdHRhY2htZW50cy9kaWFncmFtLnBuZykNCg=="
+    },
+    {
+      "path": "Projects/freellmapi/Lessons/0b8f1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d/Latency observations r4a1b2c3d-5e6f-4a70-8b8c-9d0e1f2a3b4c.md",
+      "bytes": 742,
+      "sha256": "e555a9d2386745c0b7d7d79c4a4209e8951aa59737e4832715d712f3f8c371b7",
+      "base64": "LS0tCnRpdGxlOiBMYXRlbmN5IG9ic2VydmF0aW9ucyByNGExYjJjM2QtNWU2Zi00YTcwLThiOGMtOWQwZTFmMmEzYjRjCnR5cGU6IGxlc3NvbgpwZXJtYWxpbms6IGZyZWVsbG1hcGkvbGVzc29ucy8wYjhmMWMyZC0zZTRmLTRhNWItOGM2ZC03ZThmOWEwYjFjMmQvbGF0ZW5jeS1vYnNlcnZhdGlvbnMtcjRhMWIyYzNkLTVlNmYtNGE3MC04YjhjLTlkMGUxZjJhM2I0Ywp0YWdzOgogIC0gbGF0ZW5jeQpjcmVhdGVkOiAyMDI2LTA5LTAxVDAwOjAwOjAwWgptb2RpZmllZDogMjAyNi0wOS0wMlQwMDowMDowMFoKYnJhaW5fc2NoZW1hX3ZlcnNpb246IDEKYnJhaW5faWQ6IDBiOGYxYzJkLTNlNGYtNGE1Yi04YzZkLTdlOGY5YTBiMWMyZApicmFpbl9yZXZpc2lvbl9pZDogNGExYjJjM2QtNWU2Zi00YTcwLThiOGMtOWQwZTFmMmEzYjRjCmJyYWluX3RpdGxlOiBMYXRlbmN5IG9ic2VydmF0aW9ucwpicmFpbl9zY29wZTogZnJlZWxsbWFwaQpicmFpbl9zdGF0dXM6IGNhbmRpZGF0ZQpicmFpbl9vcGVyYXRpb25faWQ6IDRhMWIyYzNkLTVlNmYtNGE3MC04YjhjLTlkMGUxZjJhM2I0YwpicmFpbl9wYXJlbnRzOiBbXQotLS0KCiMjIFNpdHVhdGlvbgoKUHJveHkgYWRkZWQgbGF0ZW5jeS4KCiMjIExlc3NvbgoKTWVhc3VyZSBib3RoIHJvdXRlcy4KCiMjIEFwcGxpY2FiaWxpdHkKClN5bnRoZXRpYyBiZW5jaG1hcmsuCgojIyBFdmlkZW5jZQoKYGBgeWFtbApbXQpgYGAKCiMjIFJlbGF0ZWQKCmBgYHlhbWwKW10KYGBgCg=="
+    },
+    {
+      "path": "Projects/freellmapi/Lessons/0b8f1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d/Latency observations r5b2c3d4e-6f70-4b81-9c9d-0e1f2a3b4c5d.md",
+      "bytes": 844,
+      "sha256": "87bf514ab672bcfd35dd507c41fb777f5d672aa8a767300c1e534e8d7cfac4af",
+      "base64": "LS0tCnRpdGxlOiBMYXRlbmN5IG9ic2VydmF0aW9ucyByNWIyYzNkNGUtNmY3MC00YjgxLTljOWQtMGUxZjJhM2I0YzVkCnR5cGU6IGxlc3NvbgpwZXJtYWxpbms6IGZyZWVsbG1hcGkvbGVzc29ucy8wYjhmMWMyZC0zZTRmLTRhNWItOGM2ZC03ZThmOWEwYjFjMmQvbGF0ZW5jeS1vYnNlcnZhdGlvbnMtcjViMmMzZDRlLTZmNzAtNGI4MS05YzlkLTBlMWYyYTNiNGM1ZAp0YWdzOgogIC0gbGF0ZW5jeQpjcmVhdGVkOiAyMDI2LTA5LTAxVDAwOjAwOjAwWgptb2RpZmllZDogMjAyNi0wOS0wMlQwMDowMDowMFoKYnJhaW5fc2NoZW1hX3ZlcnNpb246IDEKYnJhaW5faWQ6IDBiOGYxYzJkLTNlNGYtNGE1Yi04YzZkLTdlOGY5YTBiMWMyZApicmFpbl9yZXZpc2lvbl9pZDogNWIyYzNkNGUtNmY3MC00YjgxLTljOWQtMGUxZjJhM2I0YzVkCmJyYWluX3RpdGxlOiBMYXRlbmN5IG9ic2VydmF0aW9ucwpicmFpbl9zY29wZTogZnJlZWxsbWFwaQpicmFpbl9zdGF0dXM6IGNhbmRpZGF0ZQpicmFpbl9vcGVyYXRpb25faWQ6IDViMmMzZDRlLTZmNzAtNGI4MS05YzlkLTBlMWYyYTNiNGM1ZApicmFpbl9wYXJlbnRzOgogIC0gNGExYjJjM2QtNWU2Zi00YTcwLThiOGMtOWQwZTFmMmEzYjRjQGU1NTVhOWQyMzg2NzQ1YzBiN2Q3ZDc5YzRhNDIwOWU4OTUxYWE1OTczN2U0ODMyNzE1ZDcxMmYzZjhjMzcxYjcKLS0tCgojIyBTaXR1YXRpb24KClByb3h5IGFkZGVkIGxhdGVuY3kuCgojIyBMZXNzb24KCkNvbXBhcmUgd2FybSBjYWxscy4KCiMjIEFwcGxpY2FiaWxpdHkKClN5bnRoZXRpYyBiZW5jaG1hcmsuCgojIyBFdmlkZW5jZQoKYGBgeWFtbApbXQpgYGAKCiMjIFJlbGF0ZWQKCmBgYHlhbWwKW10KYGBgCg=="
+    },
+    {
+      "path": "Projects/freellmapi/Lessons/0b8f1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d/Latency observations r6c3d4e5f-7081-4c92-8d0e-1f2a3b4c5d6e.md",
+      "bytes": 844,
+      "sha256": "df8ed97bf76ca67f3603dbd27e96f669e17c5dd51fe2ffb7bd291477b6626690",
+      "base64": "LS0tCnRpdGxlOiBMYXRlbmN5IG9ic2VydmF0aW9ucyByNmMzZDRlNWYtNzA4MS00YzkyLThkMGUtMWYyYTNiNGM1ZDZlCnR5cGU6IGxlc3NvbgpwZXJtYWxpbms6IGZyZWVsbG1hcGkvbGVzc29ucy8wYjhmMWMyZC0zZTRmLTRhNWItOGM2ZC03ZThmOWEwYjFjMmQvbGF0ZW5jeS1vYnNlcnZhdGlvbnMtcjZjM2Q0ZTVmLTcwODEtNGM5Mi04ZDBlLTFmMmEzYjRjNWQ2ZQp0YWdzOgogIC0gbGF0ZW5jeQpjcmVhdGVkOiAyMDI2LTA5LTAxVDAwOjAwOjAwWgptb2RpZmllZDogMjAyNi0wOS0wMlQwMDowMDowMFoKYnJhaW5fc2NoZW1hX3ZlcnNpb246IDEKYnJhaW5faWQ6IDBiOGYxYzJkLTNlNGYtNGE1Yi04YzZkLTdlOGY5YTBiMWMyZApicmFpbl9yZXZpc2lvbl9pZDogNmMzZDRlNWYtNzA4MS00YzkyLThkMGUtMWYyYTNiNGM1ZDZlCmJyYWluX3RpdGxlOiBMYXRlbmN5IG9ic2VydmF0aW9ucwpicmFpbl9zY29wZTogZnJlZWxsbWFwaQpicmFpbl9zdGF0dXM6IGNhbmRpZGF0ZQpicmFpbl9vcGVyYXRpb25faWQ6IDZjM2Q0ZTVmLTcwODEtNGM5Mi04ZDBlLTFmMmEzYjRjNWQ2ZQpicmFpbl9wYXJlbnRzOgogIC0gNGExYjJjM2QtNWU2Zi00YTcwLThiOGMtOWQwZTFmMmEzYjRjQGU1NTVhOWQyMzg2NzQ1YzBiN2Q3ZDc5YzRhNDIwOWU4OTUxYWE1OTczN2U0ODMyNzE1ZDcxMmYzZjhjMzcxYjcKLS0tCgojIyBTaXR1YXRpb24KClByb3h5IGFkZGVkIGxhdGVuY3kuCgojIyBMZXNzb24KCkNvbXBhcmUgY29sZCBjYWxscy4KCiMjIEFwcGxpY2FiaWxpdHkKClN5bnRoZXRpYyBiZW5jaG1hcmsuCgojIyBFdmlkZW5jZQoKYGBgeWFtbApbXQpgYGAKCiMjIFJlbGF0ZWQKCmBgYHlhbWwKW10KYGBgCg=="
+    },
+    {
+      "path": "Projects/freellmapi/Notes/9f607182-a3b4-4fc5-803b-4c5d6e7f8091/Læring fra feilsøking ra0718293-b4c5-40d6-914c-5d6e7f8091a2.md",
+      "bytes": 780,
+      "sha256": "992aec3882020066079de3459ca7f88de791622f69ca003c5fc0cc5fb5027760",
+      "base64": "LS0tCnRpdGxlOiBMw6ZyaW5nIGZyYSBmZWlsc8O4a2luZyByYTA3MTgyOTMtYjRjNS00MGQ2LTkxNGMtNWQ2ZTdmODA5MWEyCnR5cGU6IG5vdGUKcGVybWFsaW5rOiBmcmVlbGxtYXBpL25vdGVzLzlmNjA3MTgyLWEzYjQtNGZjNS04MDNiLTRjNWQ2ZTdmODA5MS9sLXJpbmctZnJhLWZlaWxzLWtpbmctcmEwNzE4MjkzLWI0YzUtNDBkNi05MTRjLTVkNmU3ZjgwOTFhMgp0YWdzOgogIC0gbm9yc2sKY3JlYXRlZDogMjAyNi0wOS0wMVQwMDowMDowMFoKbW9kaWZpZWQ6IDIwMjYtMDktMDJUMDA6MDA6MDBaCmJyYWluX3NjaGVtYV92ZXJzaW9uOiAxCmJyYWluX2lkOiA5ZjYwNzE4Mi1hM2I0LTRmYzUtODAzYi00YzVkNmU3ZjgwOTEKYnJhaW5fcmV2aXNpb25faWQ6IGEwNzE4MjkzLWI0YzUtNDBkNi05MTRjLTVkNmU3ZjgwOTFhMgpicmFpbl90aXRsZTogTMOmcmluZyBmcmEgZmVpbHPDuGtpbmcKYnJhaW5fc2NvcGU6IGZyZWVsbG1hcGkKYnJhaW5fc3RhdHVzOiBjYW5kaWRhdGUKYnJhaW5fb3BlcmF0aW9uX2lkOiBhMDcxODI5My1iNGM1LTQwZDYtOTE0Yy01ZDZlN2Y4MDkxYTIKYnJhaW5fcGFyZW50czogW10KLS0tCgojIyBTdW1tYXJ5CgpTw7hrIGkgZWduZSBub3RhdGVyCgojIyBFdmlkZW5jZQoKYGBgeWFtbApbXQpgYGAKCiMjIFJlbGF0ZWQKCmBgYHlhbWwKW10KYGBgCgojIyBIdW1hbiBvYnNlcnZhdGlvbnMKCkRvIG5vdCByZW1vdmUgdGhpcyBoYW5kd3JpdHRlbiBzZWN0aW9uLgoKIyMgQm9keQoKTm9yc2tlIG5hdm4gb2cgw6bDuMOlIGZvcmJsaXIgaW50YWt0ZS4K"
+    },
+    {
+      "path": "Projects/freellmapi/Preferences/7d4e5f60-8192-4da3-8e1f-2a3b4c5d6e7f/Prefer local notes r8e5f6071-92a3-4eb4-9f2a-3b4c5d6e7f80.md",
+      "bytes": 1073,
+      "sha256": "c6e602c3b85f400be96cae4d9b426b28c15d6645d9aa467b7ab62ed8c3c76345",
+      "base64": "LS0tCnRpdGxlOiBQcmVmZXIgbG9jYWwgbm90ZXMgcjhlNWY2MDcxLTkyYTMtNGViNC05ZjJhLTNiNGM1ZDZlN2Y4MAp0eXBlOiBwcmVmZXJlbmNlCnBlcm1hbGluazogZnJlZWxsbWFwaS9wcmVmZXJlbmNlcy83ZDRlNWY2MC04MTkyLTRkYTMtOGUxZi0yYTNiNGM1ZDZlN2YvcHJlZmVyLWxvY2FsLW5vdGVzLXI4ZTVmNjA3MS05MmEzLTRlYjQtOWYyYS0zYjRjNWQ2ZTdmODAKdGFnczoKICAtIHdvcmtmbG93CmNyZWF0ZWQ6IDIwMjYtMDktMDFUMDA6MDA6MDBaCm1vZGlmaWVkOiAyMDI2LTA5LTAyVDAwOjAwOjAwWgpicmFpbl9zY2hlbWFfdmVyc2lvbjogMQpicmFpbl9pZDogN2Q0ZTVmNjAtODE5Mi00ZGEzLThlMWYtMmEzYjRjNWQ2ZTdmCmJyYWluX3JldmlzaW9uX2lkOiA4ZTVmNjA3MS05MmEzLTRlYjQtOWYyYS0zYjRjNWQ2ZTdmODAKYnJhaW5fdGl0bGU6IFByZWZlciBsb2NhbCBub3RlcwpicmFpbl9zY29wZTogZnJlZWxsbWFwaQpicmFpbl9zdGF0dXM6IGFjdGl2ZQpicmFpbl9vcGVyYXRpb25faWQ6IDhlNWY2MDcxLTkyYTMtNGViNC05ZjJhLTNiNGM1ZDZlN2Y4MApicmFpbl9wYXJlbnRzOiBbXQpicmFpbl9hcHByb3ZlZF9ieTogMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExCmJyYWluX2FwcHJvdmFsX3JhdGlvbmFsZTogU3ludGhldGljIHJldmlld2VyIGFwcHJvdmFsCmJyYWluX2FwcHJvdmFsX3BheWxvYWRfaGFzaDogYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYQotLS0KCiMjIFByZWZlcmVuY2UKClByZWZlciBsb2NhbCBub3RlcyB0byByZW1vdGUgbG9va3VwLgoKIyMgQXBwbGljYWJpbGl0eQoKUGVyc29uYWwgd29ya2Zsb3cuCgojIyBTb3VyY2Ugc3RhdGVtZW50IHJlZgoKc3ludGhldGljLXVzZXItZml4dHVyZQoKIyMgRXZpZGVuY2UKCmBgYHlhbWwKLSBraW5kOiB1c2VyX3N0YXRlbWVudAogIHJlZjogc3ludGhldGljLXVzZXItZml4dHVyZQogIGRlc2NyaXB0aW9uOiBTeW50aGV0aWMgcHJlZmVyZW5jZSBzdGF0ZW1lbnQKYGBgCgojIyBSZWxhdGVkCgpgYGB5YW1sCltdCmBgYAo="
+    }
+  ],
+  "revisions": [
+    {
+      "path": "Projects/freellmapi/Lessons/0b8f1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d/Latency observations r4a1b2c3d-5e6f-4a70-8b8c-9d0e1f2a3b4c.md",
+      "id": "0b8f1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d",
+      "revision_id": "4a1b2c3d-5e6f-4a70-8b8c-9d0e1f2a3b4c",
+      "status": "candidate",
+      "parent_revision_ids": [],
+      "approved": false
+    },
+    {
+      "path": "Projects/freellmapi/Lessons/0b8f1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d/Latency observations r5b2c3d4e-6f70-4b81-9c9d-0e1f2a3b4c5d.md",
+      "id": "0b8f1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d",
+      "revision_id": "5b2c3d4e-6f70-4b81-9c9d-0e1f2a3b4c5d",
+      "status": "candidate",
+      "parent_revision_ids": [
+        "4a1b2c3d-5e6f-4a70-8b8c-9d0e1f2a3b4c"
+      ],
+      "approved": false
+    },
+    {
+      "path": "Projects/freellmapi/Lessons/0b8f1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d/Latency observations r6c3d4e5f-7081-4c92-8d0e-1f2a3b4c5d6e.md",
+      "id": "0b8f1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d",
+      "revision_id": "6c3d4e5f-7081-4c92-8d0e-1f2a3b4c5d6e",
+      "status": "candidate",
+      "parent_revision_ids": [
+        "4a1b2c3d-5e6f-4a70-8b8c-9d0e1f2a3b4c"
+      ],
+      "approved": false
+    },
+    {
+      "path": "Projects/freellmapi/Preferences/7d4e5f60-8192-4da3-8e1f-2a3b4c5d6e7f/Prefer local notes r8e5f6071-92a3-4eb4-9f2a-3b4c5d6e7f80.md",
+      "id": "7d4e5f60-8192-4da3-8e1f-2a3b4c5d6e7f",
+      "revision_id": "8e5f6071-92a3-4eb4-9f2a-3b4c5d6e7f80",
+      "status": "active",
+      "parent_revision_ids": [],
+      "approved": true
+    },
+    {
+      "path": "Projects/freellmapi/Notes/9f607182-a3b4-4fc5-803b-4c5d6e7f8091/Læring fra feilsøking ra0718293-b4c5-40d6-914c-5d6e7f8091a2.md",
+      "id": "9f607182-a3b4-4fc5-803b-4c5d6e7f8091",
+      "revision_id": "a0718293-b4c5-40d6-914c-5d6e7f8091a2",
+      "status": "candidate",
+      "parent_revision_ids": [],
+      "approved": false
+    }
+  ],
+  "logical_heads": [
+    {
+      "id": "0b8f1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d",
+      "heads": [
+        "5b2c3d4e-6f70-4b81-9c9d-0e1f2a3b4c5d",
+        "6c3d4e5f-7081-4c92-8d0e-1f2a3b4c5d6e"
+      ],
+      "resolution": "conflict; do not choose automatically"
+    },
+    {
+      "id": "7d4e5f60-8192-4da3-8e1f-2a3b4c5d6e7f",
+      "heads": [
+        "8e5f6071-92a3-4eb4-9f2a-3b4c5d6e7f80"
+      ],
+      "resolution": "approved active preference"
+    },
+    {
+      "id": "9f607182-a3b4-4fc5-803b-4c5d6e7f8091",
+      "heads": [
+        "a0718293-b4c5-40d6-914c-5d6e7f8091a2"
+      ],
+      "resolution": "candidate"
+    }
+  ]
+}
