@@ -243,10 +243,6 @@ export async function bootstrap(options: BootstrapOptions): Promise<BootstrapRes
   const uid = options.uid;
   const gid = options.gid;
 
-  await mkdir(root, { recursive: true });
-  await mkdir(join(root, 'config'), { recursive: true });
-  await mkdir(join(root, 'secrets'), { recursive: true, mode: 0o700 });
-
   const configPath = join(root, CONFIG_RELATIVE);
   const tokenPath = join(root, TOKEN_RELATIVE);
   const cursorPath = join(root, CURSOR_KEY_RELATIVE);
@@ -269,6 +265,35 @@ export async function bootstrap(options: BootstrapOptions): Promise<BootstrapRes
       throw invalidInput(`setup secrets must not live inside the vault: ${secretPath}`);
     }
   }
+
+  const existingEnvPeek = await readIfExists(envPath);
+  const envDigestsPeek = existingEnvPeek === undefined ? [] : parseEnvDigests(existingEnvPeek, envPath);
+  if (envDigestsPeek.length > 1) {
+    throw invalidInput(`${envPath} assigns ${TOKEN_ENV_KEY} more than once`);
+  }
+  const existingConfigPeek = await readIfExists(configPath);
+  if (existingConfigPeek !== undefined && /credentials_file\s*:/u.test(existingConfigPeek)) {
+    throw invalidInput(
+      `legacy credentials configuration at ${configPath} requires explicit conversion before rerunning setup`
+    );
+  }
+  const legacyIndicators: string[] = [];
+  if ((await readIfExists(legacyCredentialsPath)) !== undefined) {
+    legacyIndicators.push(legacyCredentialsPath);
+  }
+  if ((await readIfExists(ownerTokenPath)) !== undefined) {
+    legacyIndicators.push(ownerTokenPath);
+  }
+  if (legacyIndicators.length > 0 && envDigestsPeek.length === 0) {
+    throw invalidInput(
+      `legacy credentials found at ${legacyIndicators.join(', ')}; select one digest explicitly with ` +
+        `"auth migrate --credentials-file <path> --select-entry N" and set ${TOKEN_ENV_KEY} before rerunning setup`
+    );
+  }
+
+  await mkdir(root, { recursive: true });
+  await mkdir(join(root, 'config'), { recursive: true });
+  await mkdir(join(root, 'secrets'), { recursive: true, mode: 0o700 });
 
   let vaultInfo;
   try {
@@ -329,24 +354,6 @@ export async function bootstrap(options: BootstrapOptions): Promise<BootstrapRes
   const envDigests = existingEnv === undefined ? [] : parseEnvDigests(existingEnv, envPath);
   if (envDigests.length > 1) {
     throw invalidInput(`${envPath} assigns ${TOKEN_ENV_KEY} more than once`);
-  }
-
-  const legacyIndicators: string[] = [];
-  if ((await readIfExists(legacyCredentialsPath)) !== undefined) {
-    legacyIndicators.push(legacyCredentialsPath);
-  }
-  if ((await readIfExists(ownerTokenPath)) !== undefined) {
-    legacyIndicators.push(ownerTokenPath);
-  }
-  if (existingConfig !== undefined && /credentials_file\s*:/u.test(existingConfig)) {
-    legacyIndicators.push(configPath);
-  }
-  if (legacyIndicators.length > 0 && envDigests.length === 0) {
-    throw invalidInput(
-      `legacy credentials or configuration found at ${legacyIndicators.join(', ')}; ` +
-        `select one digest explicitly with "auth migrate --credentials-file <path> --select-entry N" ` +
-        `and set ${TOKEN_ENV_KEY} before rerunning setup`
-    );
   }
 
   const existingToken = await readIfExists(tokenPath);

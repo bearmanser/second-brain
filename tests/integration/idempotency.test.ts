@@ -415,24 +415,24 @@ test('an unprovable truncated feedback reason requires recovery', () => {
     revision_id: KEY(0xb1),
     verdict: 'useful' as const
   };
-  const truncation = openSeeded((database) => {
+  const incomingLonger = openSeeded((database) => {
     seedLegacyFeedback(database, {
       feedback_id: KEY(0x2a),
       principal_id: principalId,
       idempotency_key: idempotencyKey,
-      reason: 'a'.repeat(240),
+      reason: 'a'.repeat(200),
       payload_hash: null
     });
   });
   try {
     expect(
-      codeOf(() => truncation.journal.replayFeedback({ ...base, reason: `${'a'.repeat(240)}suffix` }))
+      codeOf(() => incomingLonger.journal.replayFeedback({ ...base, reason: `${'a'.repeat(200)}${'b'.repeat(80)}` }))
     ).toBe('RECOVERY_REQUIRED');
   } finally {
-    dispose(truncation);
+    dispose(incomingLonger);
   }
 
-  const conflict = openSeeded((database) => {
+  const storedBoundary = openSeeded((database) => {
     seedLegacyFeedback(database, {
       feedback_id: KEY(0x2b),
       principal_id: principalId,
@@ -443,10 +443,63 @@ test('an unprovable truncated feedback reason requires recovery', () => {
   });
   try {
     expect(
-      codeOf(() => conflict.journal.replayFeedback({ ...base, reason: 'a different reason' }))
+      codeOf(() => storedBoundary.journal.replayFeedback({ ...base, reason: 'a'.repeat(240) }))
+    ).toBe('RECOVERY_REQUIRED');
+  } finally {
+    dispose(storedBoundary);
+  }
+
+  const provable = openSeeded((database) => {
+    seedLegacyFeedback(database, {
+      feedback_id: KEY(0x2c),
+      principal_id: principalId,
+      idempotency_key: idempotencyKey,
+      reason: 'a short legacy reason',
+      payload_hash: null
+    });
+  });
+  try {
+    expect(codeOf(() => provable.journal.replayFeedback({ ...base, reason: 'a short legacy reason' }))).toBe(
+      'NO_ERROR'
+    );
+    expect(
+      codeOf(() => provable.journal.replayFeedback({ ...base, reason: 'a different short reason' }))
     ).toBe('IDEMPOTENCY_CONFLICT');
   } finally {
-    dispose(conflict);
+    dispose(provable);
+  }
+});
+
+test('classifies a valid historical project-ensure key without a mutation outcome', () => {
+  const fixture = openSeeded((database) => {
+    seedLegacyOperation(database, {
+      operation_id: KEY(0x25),
+      idempotency_key: KEY(0x124),
+      tool: 'brain_project_ensure',
+      scope: 'freellmapi',
+      payload_hash: PAYLOAD,
+      state: 'complete',
+      receipt_json: JSON.stringify({
+        operation_id: KEY(0x25),
+        repository_identity: 'github.com/example/legacy',
+        scope: 'freellmapi',
+        created: true,
+        backend_ready: true,
+        materialized: true,
+        warnings: []
+      }),
+      plan_json: null
+    });
+  });
+  try {
+    const replay = fixture.journal.reserve(
+      captureInput(KEY(0x124), { tool: 'brain_project_ensure' })
+    );
+    expect(replay.kind).toBe('replay');
+    expect(replay.record.operation_id).toBe(KEY(0x25));
+    expect(fixture.journal.isKeyBlocked(KEY(0x124))).toBe(false);
+  } finally {
+    dispose(fixture);
   }
 });
 

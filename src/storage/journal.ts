@@ -1250,6 +1250,8 @@ export class Journal {
       tool: string;
       project: string;
       payload: string | null;
+      receipt: string | null;
+      signature: string;
     }[] = [];
     for (const member of members) {
       if (member.record_kind === 'operation') {
@@ -1274,6 +1276,7 @@ export class Journal {
             'recovery_required'
           );
         }
+        let canonical: string | null = null;
         if (receipt !== null) {
           try {
             const parsed = JSON.parse(receipt) as unknown;
@@ -1284,12 +1287,24 @@ export class Journal {
             if (record.operation_id !== row.operation_id) {
               throw new Error('receipt operation does not match');
             }
-            if (
+            if (row.tool === 'brain_project_ensure') {
+              if (
+                typeof record.repository_identity !== 'string' ||
+                record.repository_identity.length === 0
+              ) {
+                throw new Error('project receipt identity is invalid');
+              }
+              const projectId = record.project_id ?? record.scope;
+              if (typeof projectId !== 'string' || projectId.length === 0) {
+                throw new Error('project receipt scope is invalid');
+              }
+            } else if (
               typeof record.outcome !== 'string' ||
               !['stored', 'stored_conflict', 'pending'].includes(record.outcome)
             ) {
               throw new Error('receipt outcome is invalid');
             }
+            canonical = canonicalJson(receipt);
           } catch (cause) {
             throw markResolution(
               recoveryRequired(
@@ -1305,7 +1320,9 @@ export class Journal {
           id: row.operation_id,
           tool: row.tool,
           project: row.scope,
-          payload: row.payload_hash
+          payload: row.payload_hash,
+          receipt: canonical,
+          signature: JSON.stringify(['operation', row.tool, row.scope, row.payload_hash, canonical])
         });
       } else {
         const row = this.selectFeedbackRowById(member.record_id);
@@ -1322,18 +1339,36 @@ export class Journal {
           id: row.feedback_id,
           tool: 'brain_feedback',
           project: row.scope,
-          payload: row.payload_hash
+          payload: row.payload_hash,
+          receipt: null,
+          signature: JSON.stringify([
+            'feedback',
+            row.scope,
+            row.logical_id,
+            row.revision_id,
+            row.verdict,
+            row.reason,
+            row.warning,
+            row.payload_hash
+          ])
         });
       }
     }
     if (targets.length > 1) {
-      throw markResolution(
-        new BrainError({
-          code: 'IDEMPOTENCY_CONFLICT',
-          message: `idempotency key ${key.idempotency_key} was reused with conflicting legacy records`
-        }),
-        'conflict'
-      );
+      const receipts = targets.map((target) => target.receipt);
+      const provablyEquivalent =
+        receipts.every((receipt) => receipt !== null) &&
+        new Set(receipts).size === 1 &&
+        new Set(targets.map((target) => target.signature)).size === 1;
+      if (!provablyEquivalent) {
+        throw markResolution(
+          new BrainError({
+            code: 'IDEMPOTENCY_CONFLICT',
+            message: `idempotency key ${key.idempotency_key} was reused with conflicting legacy records`
+          }),
+          'conflict'
+        );
+      }
     }
     const target = targets[0];
     this.database
@@ -2074,10 +2109,12 @@ export class Journal {
       }
       return { kind: 'replay', entry: toFeedback(row) };
     }
-    if ([...raw.reason].length > FEEDBACK_REASON_MAX_LENGTH && row.reason === normalized.reason) {
+    const storedAtBoundary = [...row.reason].length >= FEEDBACK_REASON_MAX_LENGTH;
+    const incomingLonger = [...raw.reason].length > FEEDBACK_REASON_MAX_LENGTH;
+    if (storedAtBoundary || incomingLonger) {
       throw markResolution(
         recoveryRequired(
-          `idempotency key ${normalized.idempotency_key} cannot prove the full reason matched a truncated historical value`
+          `idempotency key ${normalized.idempotency_key} cannot prove equality against a truncated historical reason`
         ),
         'recovery_required'
       );

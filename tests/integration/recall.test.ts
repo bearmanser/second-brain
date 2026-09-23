@@ -1043,3 +1043,43 @@ test('one best hit per project/note survives multi-page candidates', async () =>
     await h.close();
   }
 });
+
+test('fallback telemetry unions hybrid and text attempts', async () => {
+  const h = await createHarness();
+  try {
+    const ids = ['p0', 'p1', 'p2', 'p3', 'p4', 'p5'];
+    h.deps.scopeRegistry.all = () =>
+      ids.map((id) => ({
+        id,
+        backend_project: id,
+        relative_root: `Projects/${id}`,
+        repository_aliases: []
+      }));
+    const hit = {
+      permalink: '',
+      relative_path: '',
+      revision_id: '',
+      logical_id: '',
+      rank: 1,
+      matched_text: ''
+    };
+    h.backend.search = async (input) => {
+      if (input.mode === 'hybrid') {
+        if (input.project === 'p5') {
+          throw new BrainError({ code: 'EMBEDDINGS_UNAVAILABLE', message: 'unavailable' });
+        }
+        return { hits: [], has_more: false };
+      }
+      return { hits: [hit], has_more: false };
+    };
+    const traced = await recallTraced(
+      reviewerContext,
+      { query: 'anything', mode: 'hybrid', allow_text_fallback: true },
+      h.deps
+    );
+    expect(traced.searched_project_ids).toContain('p5');
+    expect(traced.searched_project_ids).toContain('p0');
+  } finally {
+    await h.close();
+  }
+});

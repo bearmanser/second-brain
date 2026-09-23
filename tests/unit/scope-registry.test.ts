@@ -33,7 +33,8 @@ const sourceFrom = (
   bindings: Record<string, LegacyProjectBackendBinding> = {}
 ): ScopeRegistrySource => ({
   listProjects: () => projects,
-  getProjectBinding: (id) => bindings[id]
+  getProjectBinding: (id) =>
+    bindings[id] ?? { backend_project: id, backend_relative_root: `Projects/${id}` }
 });
 
 test('loads configured static projects and resolves their aliases', () => {
@@ -162,6 +163,18 @@ test('keeps a recovery-required project known but unusable after restart', () =>
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('fails rather than fabricating a backend project when a binding is missing', () => {
+  const project = readyProject({
+    project: { id: 'no-binding', display_name: 'no-binding', relative_root: 'Projects/no-binding' }
+  });
+  const source: ScopeRegistrySource = {
+    listProjects: () => [project],
+    getProjectBinding: () => undefined
+  };
+  const registry = new ScopeRegistry(staticScopes, source);
+  expect(() => registry.get('no-binding')).toThrow(/RECOVERY_REQUIRED/);
 });
 
 test('reopening the journal returns the same stable project id and root without a grant', () => {

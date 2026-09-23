@@ -368,3 +368,70 @@ test('a project filter narrows retrieval without denying access to another proje
     await h.close();
   }
 });
+
+test('status resolves a repository identity before comparing pending work', async () => {
+  const h = await createHarness();
+  try {
+    const ensured = await ensureProject(
+      roleFreeContext(),
+      { idempotency_key: randomUUID(), remote_url: 'https://github.com/example/identity-project.git' },
+      h.deps
+    );
+    h.deps.journal.reserve({
+      principal_id: SYSTEM_ACTOR.id,
+      idempotency_key: randomUUID(),
+      tool: 'brain_capture',
+      scope: ensured.scope,
+      payload_hash: 'c'.repeat(64),
+      payload_json: '{}'
+    });
+    const result = await status(
+      roleFreeContext(),
+      { project: 'github.com/example/identity-project' },
+      h.deps
+    );
+    expect(result.scopes).toEqual([{ id: ensured.scope }]);
+    expect(result.pending_operations).toBe(1);
+  } finally {
+    await h.close();
+  }
+});
+
+test('status rejects a stored project receipt for a different operation', async () => {
+  const h = await createHarness();
+  try {
+    const reserved = h.deps.journal.reserve({
+      principal_id: SYSTEM_ACTOR.id,
+      idempotency_key: randomUUID(),
+      tool: 'brain_project_ensure',
+      scope: 'freellmapi',
+      payload_hash: 'd'.repeat(64),
+      payload_json: '{}'
+    }).record;
+    h.deps.journal.saveProjectPlan(reserved.operation_id, {
+      repository_identity: 'github.com/example/mismatch',
+      project_id: 'freellmapi',
+      display_name: 'freellmapi',
+      relative_root: 'freellmapi',
+      backend_project: 'freellmapi',
+      backend_relative_root: 'freellmapi',
+      created_by_actor_id: SYSTEM_ACTOR.id,
+      creation_operation_id: reserved.operation_id
+    });
+    h.deps.journal.mark(reserved.operation_id, 'submitted');
+    h.deps.journal.mark(reserved.operation_id, 'complete', {
+      operation_id: randomUUID(),
+      repository_identity: 'github.com/example/mismatch',
+      scope: 'freellmapi',
+      created: true,
+      backend_ready: true,
+      materialized: true,
+      warnings: []
+    } as never);
+    await expect(
+      status(roleFreeContext(), { operation_id: reserved.operation_id }, h.deps)
+    ).rejects.toThrow(/RECOVERY_REQUIRED/);
+  } finally {
+    await h.close();
+  }
+});

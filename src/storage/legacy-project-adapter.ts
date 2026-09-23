@@ -144,7 +144,12 @@ export function parseLegacyProvisioningPlan(input: {
     }
     const grantRecord = grant as Record<string, unknown>;
     const grantActor = requiredString(grantRecord.principal_id, 'grant principal', input.operation_id);
-    if (grantRecord.scope !== scope || grantRecord.can_read !== true) {
+    if (
+      grantRecord.scope !== scope ||
+      grantRecord.can_read !== true ||
+      typeof grantRecord.can_write !== 'boolean' ||
+      typeof grantRecord.can_review !== 'boolean'
+    ) {
       throw recoveryRequired(
         `provisioning plan for ${input.operation_id} has an inconsistent legacy grant`
       );
@@ -217,6 +222,12 @@ export function projectEnsureReceipt(
     throw recoveryRequired(`operation ${operationId} has an invalid project receipt`);
   }
   const record = parsed as Record<string, unknown>;
+  const storedOperationId = requiredString(record.operation_id, 'operation_id', operationId);
+  if (storedOperationId !== operationId) {
+    throw recoveryRequired(
+      `operation ${operationId} has a project receipt for a different operation`
+    );
+  }
   const repositoryIdentity = requiredString(
     record.repository_identity,
     'repository_identity',
@@ -227,7 +238,7 @@ export function projectEnsureReceipt(
     ? record.warnings.filter((entry): entry is string => typeof entry === 'string')
     : [];
   return {
-    operation_id: requiredString(record.operation_id, 'operation_id', operationId),
+    operation_id: storedOperationId,
     repository_identity: repositoryIdentity,
     project_id: projectId,
     created: record.created === true,

@@ -296,7 +296,7 @@ class BrainRuntimeImpl implements BrainRuntime {
         ids: this.ids
       });
       this.journal = journal;
-      const scopeRegistry = new ScopeRegistry(this.config.scopes);
+      const scopeRegistry = new ScopeRegistry(this.config.scopes, journal);
       if (knowledgeExists && !journal.hasOperationalHistory()) {
         if (!journal.hasOperationalLossAcknowledgement()) {
           throw recoveryRequired(
@@ -354,6 +354,7 @@ class BrainRuntimeImpl implements BrainRuntime {
               'startup_verification',
               error.code
             );
+            scopeRegistry.quarantineProject(project.project.id);
             continue;
           }
           throw error;

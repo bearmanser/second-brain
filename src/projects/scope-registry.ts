@@ -101,9 +101,15 @@ export class ScopeRegistry {
 
   private scopeFor(project: Project): ScopeConfig {
     const binding = this.bindings.get(project.id);
+    if (binding === undefined) {
+      throw new BrainError({
+        code: 'RECOVERY_REQUIRED',
+        message: `project ${project.id} has no legacy backend binding`
+      });
+    }
     return {
       id: project.id,
-      backend_project: binding?.backend_project ?? project.id,
+      backend_project: binding.backend_project,
       relative_root: project.relative_root,
       repository_aliases: []
     };

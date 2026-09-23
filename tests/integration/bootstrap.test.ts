@@ -85,12 +85,13 @@ test('legacy-only setup stops with explicit conversion instructions', async () =
   }
 });
 
-test('legacy token plus credentials without an explicit digest is refused', async () => {
+test('legacy layout is refused before any file is written', async () => {
   const root = await mkdtemp(join(tmpdir(), 'brain-setup-'));
   try {
     await mkdir(join(root, 'secrets'), { recursive: true });
     await mkdir(join(root, 'config'), { recursive: true });
-    await writeFile(join(root, 'secrets/brain-token'), 'legacy-worker-token\n', { mode: 0o600 });
+    const tokenBefore = 'legacy-worker-token\n';
+    await writeFile(join(root, 'secrets/brain-token'), tokenBefore, { mode: 0o600 });
     await writeFile(
       join(root, 'secrets/credentials.json'),
       JSON.stringify({ credentials: [{ token_sha256: 'a'.repeat(64) }] }),
@@ -101,8 +102,45 @@ test('legacy token plus credentials without an explicit digest is refused', asyn
       'credentials_file: /run/secrets/brain_credentials\n',
       'utf8'
     );
-    await expect(bootstrap({ root })).rejects.toThrow(/auth migrate/);
+    await expect(bootstrap({ root })).rejects.toThrow(/conversion|auth migrate/);
     await expect(readFile(join(root, '.env'))).rejects.toThrow();
+    await expect(stat(join(root, 'secrets/cursor-key'))).rejects.toThrow();
+    await expect(stat(join(root, 'vault'))).rejects.toThrow();
+    expect(await readFile(join(root, 'secrets/brain-token'), 'utf8')).toBe(tokenBefore);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a legacy credentials layout without a config is refused before writing', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'brain-setup-'));
+  try {
+    await mkdir(join(root, 'secrets'), { recursive: true });
+    await writeFile(
+      join(root, 'secrets/credentials.json'),
+      JSON.stringify({ credentials: [{ token_sha256: 'a'.repeat(64) }] }),
+      'utf8'
+    );
+    await expect(bootstrap({ root })).rejects.toThrow(/auth migrate/);
+    await expect(stat(join(root, 'secrets/brain-token'))).rejects.toThrow();
+    await expect(readFile(join(root, '.env'))).rejects.toThrow();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a credentials_file config is refused even when a digest exists', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'brain-setup-'));
+  try {
+    await mkdir(join(root, 'config'), { recursive: true });
+    await mkdir(join(root, 'secrets'), { recursive: true });
+    await writeFile(
+      join(root, 'config/brain.yaml'),
+      'credentials_file: /run/secrets/brain_credentials\n',
+      'utf8'
+    );
+    await writeFile(join(root, '.env'), `BRAIN_TOKEN_SHA256=${'a'.repeat(64)}\n`, { mode: 0o600 });
+    await expect(bootstrap({ root })).rejects.toThrow(/conversion/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -139,3 +139,85 @@ test('projects a historical ensure receipt while dropping obsolete permissions',
   });
   expect(() => projectEnsureReceipt('{not json', OPERATION_ID)).toThrow(/RECOVERY_REQUIRED/);
 });
+
+test('rejects a project receipt that names a different operation', () => {
+  const raw = JSON.stringify({
+    operation_id: '00000000-0000-4000-8000-0000000000e1',
+    repository_identity: 'github.com/example/legacy',
+    scope: 'legacy',
+    created: true,
+    backend_ready: true,
+    materialized: true,
+    warnings: []
+  });
+  expect(() => projectEnsureReceipt(raw, OPERATION_ID)).toThrow(/RECOVERY_REQUIRED/);
+});
+
+test('uses the persisted backend binding when four identifiers all differ', async () => {
+  const journal = Journal.open(':memory:');
+  const ensureCalls: [string, string][] = [];
+  const verifyCalls: [string, string][] = [];
+  const registered: string[] = [];
+  const backend = {
+    connect: async () => undefined,
+    probe: async () => ({ server_version: 'test', tools: [] }),
+    registerScope: () => undefined,
+    verifyProject: async (project: string, path: string) => {
+      verifyCalls.push([project, path]);
+      return true;
+    },
+    ensureProject: async (project: string, path: string) => {
+      ensureCalls.push([project, path]);
+      return { created: true };
+    },
+    create: async () => ({ permalink: '' }),
+    search: async () => ({ hits: [], has_more: false }),
+    isIndexed: async () => true,
+    close: async () => undefined
+  };
+  const vault = {
+    registerScope: (scope: { relative_root: string }) => {
+      registered.push(scope.relative_root);
+    },
+    list: async () => [],
+    read: async () => {
+      throw new Error('unused');
+    },
+    scan: async () => ({ managed: [], unmanaged: [] })
+  };
+  const catalogue = { registerScope: () => undefined };
+  try {
+    journal.reserveProject({
+      repository_identity: 'github.com/example/four-way',
+      project_id: 'four-way-id',
+      display_name: 'Four Way Display',
+      relative_root: 'Knowledge/Four',
+      backend_project: 'legacy-backend',
+      backend_relative_root: 'Backends/four',
+      created_by_actor_id: 'actor-a',
+      creation_operation_id: '00000000-0000-4000-8000-0000000000e2'
+    });
+    journal.markProjectReady('github.com/example/four-way');
+    const persisted = journal.getProjectById('four-way-id');
+    if (persisted === undefined) throw new Error('missing persisted project');
+    const adapter = new LegacyProjectAdapter({
+      source: journal,
+      backend: backend as never,
+      vault: vault as never,
+      catalogue: catalogue as never
+    });
+    expect(adapter.scopeFor(persisted.project)).toEqual({
+      id: 'four-way-id',
+      backend_project: 'legacy-backend',
+      relative_root: 'Knowledge/Four',
+      repository_aliases: []
+    });
+    expect(await adapter.ensure(persisted.project)).toEqual({ created: true });
+    expect(ensureCalls[0]).toEqual(['legacy-backend', '/app/data/Backends/four']);
+    expect(await adapter.verify(persisted.project)).toBe(true);
+    expect(verifyCalls[0]).toEqual(['legacy-backend', '/app/data/Backends/four']);
+    expect(registered).toContain('Knowledge/Four');
+  } finally {
+    journal.close();
+  }
+});

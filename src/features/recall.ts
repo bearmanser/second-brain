@@ -174,10 +174,16 @@ async function collectProjects(
   mode: 'hybrid' | 'text',
   deps: BrainDeps,
   deadline: number,
-  attemptedBefore: number
+  attemptedBefore: number,
+  priorAttempted: readonly string[] = []
 ): Promise<SearchAccumulator> {
   const accumulator: SearchAccumulator = {
-    projectHits: scopes.map((scope) => ({ scope, hits: [], exhausted: false, attempted: false })),
+    projectHits: scopes.map((scope) => ({
+      scope,
+      hits: [],
+      exhausted: false,
+      attempted: priorAttempted.includes(scope.id)
+    })),
     attemptedCalls: attemptedBefore,
     completedCalls: 0,
     hits: 0,
@@ -477,6 +483,15 @@ function toItem(
   };
 }
 
+export function hasDivergentIdentities(
+  identities: ReadonlyMap<string, ReadonlySet<string>>
+): boolean {
+  for (const identity of identities.values()) {
+    if (identity.size > 1) return true;
+  }
+  return false;
+}
+
 async function runRecall(
   ctx: AuthenticatedContext,
   input: RecallRequest,
@@ -514,7 +529,8 @@ async function runRecall(
       'text',
       deps,
       deadline,
-      accumulator.attemptedCalls
+      accumulator.attemptedCalls,
+      accumulator.projectHits.filter((project) => project.attempted).map((project) => project.scope.id)
     );
     const fallbackUsable = fallback.failure === undefined && fallback.hits > 0;
     if (fallbackUsable || (!hybridHasState && fallback.failure === undefined)) {
@@ -573,7 +589,7 @@ async function runRecall(
       const decision = evaluateHit(project.scope, head, request, kinds, now);
       if (!decision.included) continue;
       const identity = identities.get(head.revision.id) ?? new Set<string>();
-      identity.add(`${project.scope.id}|${head.revision.revision_id}|${head.raw_hash}`);
+      identity.add(`${head.revision.revision_id}|${head.raw_hash}`);
       identities.set(head.revision.id, identity);
       const key = `${project.scope.id}:${head.revision.id}`;
       const existing = best.get(key);
@@ -602,10 +618,7 @@ async function runRecall(
   }
 
   let divergentIdentity = false;
-  for (const identity of identities.values()) {
-    const scopes = new Set([...identity].map((entry) => entry.split('|')[0]));
-    if (scopes.size > 1) divergentIdentity = true;
-  }
+  if (hasDivergentIdentities(identities)) divergentIdentity = true;
   if (divergentIdentity && !warnings.includes(RECALL_WARNING_DUPLICATE_IDENTITY)) {
     warnings.push(RECALL_WARNING_DUPLICATE_IDENTITY);
   }
