@@ -1,8 +1,8 @@
 import { fromMarkdown } from 'mdast-util-from-markdown';
 import { parseDocument as parseYamlDocument, stringify, visit } from 'yaml';
 import { BrainError } from '../contracts/errors.js';
-import { EVIDENCE_KINDS, type Evidence, type NoteInput } from '../core/types.js';
-import { NOTE_REGISTRY } from './registry.js';
+import { EVIDENCE_KINDS, type Evidence, type NoteInput, type NoteKind } from '../core/types.js';
+import { NOTE_REGISTRY, RELATED_SECTION_TITLE, normalizeSectionTitle } from './registry.js';
 import {
   BRAIN_SCHEMA_VERSION,
   DEFAULT_TYPE_FOR_KIND,
@@ -27,9 +27,13 @@ const RECOGNIZED_FRONTMATTER_KEYS: ReadonlySet<string> = new Set([
   'created',
   'updated'
 ]);
-const SOURCE_ENTRY_PATTERN =
-  /^- \*\*([a-z_]+)\*\* (?:\[([^\]]*)\]\(<?([^>\s)]+)>?\)|`([^`]+)`)(?: \(observed ([^)]+)\))? \u2014 (.*)$/;
 const FRONTMATTER_DELIMITER_PATTERN = /^---[ \t]*$/;
+const SECTION_BOUNDARY_PATTERN = /^ {0,3}#{1,2}[ \t]/;
+const HEADING_PATTERN = /^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$/;
+const FENCE_OPEN_PATTERN = /^ {0,3}(`{3,}|~{3,})/;
+const LINK_SCHEMES: ReadonlySet<string> = new Set(['http', 'https', 'mailto']);
+const SOURCE_ENTRY_PATTERN =
+  /^- \*\*([a-z_]+)\*\* (?:\[((?:\\.|[^\]])*)\]\(<((?:\\.|[^>])*)>\)|`((?:\\.|[^`])*)`)(?: \(observed ((?:\\.|[^)])*)\))? \u2014 (.*)$/;
 
 export interface DocumentMetadata {
   path: string;
@@ -42,6 +46,23 @@ export interface DocumentMetadata {
   created?: string;
   updated?: string;
   properties?: Record<string, unknown>;
+}
+
+export interface RevisionMetadata {
+  id?: string;
+  type?: string;
+  status?: DocumentStatus;
+  project?: string;
+  aliases?: string[];
+  tags?: string[];
+  created?: string;
+  updated?: string;
+  properties?: Record<string, unknown>;
+}
+
+export interface NoteBodyExtras {
+  human?: string[];
+  sourceHuman?: string[];
 }
 
 export interface ParsedSources {
@@ -59,6 +80,30 @@ function unsupported(message: string): BrainError {
 
 function singleLine(value: string): string {
   return value.replace(/[\r\n]+/g, ' ').trim();
+}
+
+function trimBlock(value: string): string {
+  return value.replace(/^\n+/, '').replace(/\n+$/, '');
+}
+
+function escapeField(value: string, extra = ''): string {
+  let out = value.replace(/\\/g, '\\\\').replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+  for (const character of extra) out = out.split(character).join(`\\${character}`);
+  return out;
+}
+
+function unescapeField(value: string): string {
+  return value.replace(
+    /\\(.)/g,
+    (_match, character: string) =>
+      character === 'n' ? '\n' : character === 'r' ? '\r' : character === 't' ? '\t' : character
+  );
+}
+
+function isSafeLink(ref: string): boolean {
+  const match = /^([a-z][a-z0-9+.-]*):/i.exec(ref);
+  if (match === null) return false;
+  return LINK_SCHEMES.has(match[1].toLowerCase());
 }
 
 interface SplitDocument {
@@ -258,56 +303,96 @@ export function renderDocument(document: CurrentDocument): string {
     aliasDuplicateObjects: false,
     defaultKeyType: 'PLAIN'
   }).replace(/\n$/, '');
-  return `---\n${yaml}\n---\n\n${document.body.replace(/^\n+/, '')}`;
+  return `---\n${yaml}\n---\n${document.body}`;
 }
 
 function renderReference(entry: Evidence): string {
-  const ref = singleLine(entry.ref);
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(ref)) {
-    const target = /[\s)>]/.test(ref) ? `<${ref}>` : ref;
-    return `[${ref}](${target})`;
+  if (isSafeLink(entry.ref)) {
+    const label = escapeField(entry.ref, '[]');
+    const target = escapeField(entry.ref, '<>');
+    return `[${label}](<${target}>)`;
   }
-  return `\`${ref.replace(/`/g, "'")}\``;
+  return `\`${escapeField(entry.ref, '`')}\``;
 }
 
 export function renderSources(evidence: readonly Evidence[]): string {
   const lines = evidence.map((entry) => {
     const observed =
-      entry.observed_at === undefined ? '' : ` (observed ${singleLine(entry.observed_at)})`;
-    return `- **${entry.kind}** ${renderReference(entry)}${observed} \u2014 ${singleLine(entry.description)}`;
+      entry.observed_at === undefined ? '' : ` (observed ${escapeField(entry.observed_at, '()')})`;
+    return `- **${entry.kind}** ${renderReference(entry)}${observed} \u2014 ${escapeField(entry.description)}`;
   });
   return `## ${SOURCE_SECTION_TITLE}\n\n${lines.join('\n')}`;
 }
 
+interface FenceState {
+  marker: string;
+  length: number;
+}
+
+function headingTitle(line: string): string | undefined {
+  const match = HEADING_PATTERN.exec(line);
+  return match === null ? undefined : normalizeSectionTitle(match[2]);
+}
+
+function isSourceHeading(line: string): boolean {
+  return HEADING_PATTERN.test(line) && headingTitle(line) === SOURCE_SECTION_TITLE;
+}
+
+function updateFence(state: FenceState | null, line: string): FenceState | null {
+  const match = FENCE_OPEN_PATTERN.exec(line);
+  if (state === null) {
+    return match === null ? null : { marker: match[1][0], length: match[1].length };
+  }
+  if (match === null) return state;
+  if (match[1][0] === state.marker && match[1].length >= state.length) return null;
+  return state;
+}
+
+function collectSourceLines(
+  lines: string[],
+  start: number,
+  stopAtBoundary: boolean,
+  evidence: Evidence[],
+  human: string[]
+): void {
+  let fence: FenceState | null = null;
+  for (let index = start; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (fence === null && stopAtBoundary && SECTION_BOUNDARY_PATTERN.test(line)) return;
+    if (fence !== null) {
+      human.push(line);
+      fence = updateFence(fence, line);
+      continue;
+    }
+    const match = SOURCE_ENTRY_PATTERN.exec(line);
+    const kind = match?.[1];
+    if (match !== null && kind !== undefined && (EVIDENCE_KINDS as readonly string[]).includes(kind)) {
+      const observed = match[5];
+      evidence.push({
+        kind: kind as Evidence['kind'],
+        ref: unescapeField(match[3] ?? match[4] ?? ''),
+        description: unescapeField(match[6] ?? ''),
+        ...(observed === undefined ? {} : { observed_at: unescapeField(observed) })
+      });
+      continue;
+    }
+    human.push(line);
+    fence = updateFence(fence, line);
+  }
+}
+
 export function parseSources(section: string): ParsedSources {
+  const lines = section.split('\n');
   const evidence: Evidence[] = [];
   const human: string[] = [];
-  for (const line of section.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed.length === 0) {
-      human.push('');
-      continue;
-    }
-    if (trimmed.replace(/^#{1,6}[ \t]*/, '').trim() === SOURCE_SECTION_TITLE && trimmed.startsWith('#')) {
-      continue;
-    }
-    const match = SOURCE_ENTRY_PATTERN.exec(trimmed);
-    const kind = match?.[1];
-    if (match === null || kind === undefined || !(EVIDENCE_KINDS as readonly string[]).includes(kind)) {
-      human.push(line);
-      continue;
-    }
-    const ref = match[3] ?? match[4] ?? '';
-    const observed = match[5];
-    evidence.push({
-      kind: kind as Evidence['kind'],
-      ref,
-      description: match[6] ?? '',
-      ...(observed === undefined ? {} : { observed_at: observed })
-    });
+  const headingIndex = lines.findIndex((line) => isSourceHeading(line));
+  if (headingIndex === -1) {
+    collectSourceLines(lines, 0, false, evidence, human);
+    return { evidence, human };
   }
-  while (human.length > 0 && human[0].trim() === '') human.shift();
-  while (human.length > 0 && human[human.length - 1].trim() === '') human.pop();
+  let start = headingIndex + 1;
+  if (start < lines.length && lines[start].trim() === '') start += 1;
+  collectSourceLines(lines, start, true, evidence, human);
   return { evidence, human };
 }
 
@@ -315,7 +400,7 @@ function renderList(items: readonly string[]): string {
   return items.map((item) => `- ${singleLine(item)}`).join('\n');
 }
 
-export function renderNoteBody(note: NoteInput): string {
+export function renderNoteBody(note: NoteInput, extras: NoteBodyExtras = {}): string {
   const content = note.content as unknown as Record<string, unknown>;
   const blocks: string[] = [`# ${singleLine(note.title)}`];
   for (const spec of NOTE_REGISTRY[note.content.kind].sections) {
@@ -324,11 +409,21 @@ export function renderNoteBody(note: NoteInput): string {
     const text = spec.form === 'yaml_list' ? renderList(value as string[]) : String(value);
     blocks.push(`## ${spec.title}\n\n${text}`);
   }
-  if (note.evidence.length > 0) blocks.push(renderSources(note.evidence));
-  if (note.related_ids.length > 0) {
-    blocks.push(`## Related\n\n${note.related_ids.map((id) => `- [[${id}]]`).join('\n')}`);
+  const sourceHuman = trimBlock((extras.sourceHuman ?? []).join('\n'));
+  if (note.evidence.length > 0 || sourceHuman.length > 0) {
+    const sources = renderSources(note.evidence);
+    blocks.push(sourceHuman.length === 0 ? sources : `${sources}\n\n${sourceHuman}`);
   }
-  return `${blocks.join('\n\n')}\n`;
+  if (note.related_ids.length > 0) {
+    blocks.push(
+      `## ${RELATED_SECTION_TITLE}\n\n${note.related_ids.map((id) => `- [[${id}]]`).join('\n')}`
+    );
+  }
+  const human = (extras.human ?? [])
+    .map((block) => trimBlock(block))
+    .filter((block) => block.length > 0);
+  if (human.length > 0) blocks.push(human.join('\n\n'));
+  return `\n${blocks.join('\n\n')}\n`;
 }
 
 export function documentFromNote(note: NoteInput, meta: DocumentMetadata): CurrentDocument {
@@ -345,5 +440,111 @@ export function documentFromNote(note: NoteInput, meta: DocumentMetadata): Curre
     ...(meta.updated === undefined ? {} : { updated: meta.updated }),
     properties: { ...(meta.properties ?? {}) },
     body: renderNoteBody(note)
+  };
+}
+
+interface HeadingRef {
+  title: string;
+  depth: number;
+  start: number;
+  end: number;
+}
+
+function collectLevelOneAndTwoHeadings(body: string): HeadingRef[] {
+  const tree = fromMarkdown(body);
+  const refs: HeadingRef[] = [];
+  for (const node of tree.children) {
+    if (node.type !== 'heading' || (node.depth !== 1 && node.depth !== 2)) continue;
+    const start = node.position?.start.offset;
+    const end = node.position?.end.offset;
+    if (start === undefined || end === undefined) continue;
+    const title = normalizeSectionTitle(
+      body.slice(start, end).replace(/^#{1,6}[ \t]*/, '').replace(/\s*#+\s*$/, '').trim()
+    );
+    refs.push({ title, depth: node.depth, start, end });
+  }
+  return refs;
+}
+
+function managedSectionTitles(kind: NoteKind): ReadonlySet<string> {
+  const titles = new Set<string>();
+  for (const spec of NOTE_REGISTRY[kind].sections) titles.add(normalizeSectionTitle(spec.title));
+  titles.add(SOURCE_SECTION_TITLE);
+  titles.add(RELATED_SECTION_TITLE);
+  return titles;
+}
+
+interface HumanContent {
+  human: string[];
+  sourceHuman: string[];
+}
+
+function extractHumanContent(body: string, kind: NoteKind): HumanContent {
+  const headings = collectLevelOneAndTwoHeadings(body);
+  const managed = managedSectionTitles(kind);
+  const ranges: [number, number][] = [];
+  const sourceHuman: string[] = [];
+  const relatedHuman: string[] = [];
+  for (let index = 0; index < headings.length; index += 1) {
+    const heading = headings[index];
+    if (heading.depth === 1) {
+      ranges.push([heading.start, heading.end]);
+      continue;
+    }
+    if (!managed.has(heading.title)) continue;
+    const end = index + 1 < headings.length ? headings[index + 1].start : body.length;
+    ranges.push([heading.start, end]);
+    if (heading.title === SOURCE_SECTION_TITLE) {
+      sourceHuman.push(...parseSources(body.slice(heading.start, end)).human);
+    } else if (heading.title === RELATED_SECTION_TITLE) {
+      const sectionLines = body.slice(heading.start, end).split('\n');
+      for (let line = 1; line < sectionLines.length; line += 1) {
+        if (/^\s*- \[\[.*\]\]\s*$/.test(sectionLines[line])) continue;
+        relatedHuman.push(sectionLines[line]);
+      }
+    }
+  }
+  ranges.sort((left, right) => left[0] - right[0]);
+  const human: string[] = [];
+  let cursor = 0;
+  for (const [start, end] of ranges) {
+    if (start > cursor) {
+      const segment = trimBlock(body.slice(cursor, start));
+      if (segment.length > 0) human.push(segment);
+    }
+    cursor = Math.max(cursor, end);
+  }
+  if (cursor < body.length) {
+    const segment = trimBlock(body.slice(cursor));
+    if (segment.length > 0) human.push(segment);
+  }
+  const related = trimBlock(relatedHuman.join('\n'));
+  if (related.length > 0) human.push(related);
+  return { human, sourceHuman };
+}
+
+export function reviseDocument(
+  base: CurrentDocument,
+  note: NoteInput,
+  meta: RevisionMetadata = {}
+): CurrentDocument {
+  const id = meta.id ?? base.id;
+  const project = meta.project ?? base.project;
+  const created = meta.created ?? base.created;
+  const updated = meta.updated ?? base.updated;
+  const extracted = extractHumanContent(base.body, note.content.kind);
+  return {
+    ...(id === undefined ? {} : { id }),
+    path: base.path,
+    title: note.title,
+    type: meta.type ?? base.type,
+    status: meta.status ?? base.status,
+    ...(project === undefined ? {} : { project }),
+    aliases: meta.aliases === undefined ? [...base.aliases] : [...meta.aliases],
+    tags: meta.tags === undefined ? [...base.tags] : [...meta.tags],
+    ...(created === undefined ? {} : { created }),
+    ...(updated === undefined ? {} : { updated }),
+    properties: { ...base.properties, ...(meta.properties ?? {}) },
+    body: renderNoteBody(note, { human: extracted.human, sourceHuman: extracted.sourceHuman })
   };
 }

@@ -5,7 +5,8 @@ import {
   parseDocument,
   parseSources,
   renderDocument,
-  renderSources
+  renderSources,
+  reviseDocument
 } from '../../src/notes/document-codec.js';
 import {
   DEFAULT_TYPE_FOR_KIND,
@@ -363,7 +364,7 @@ test('V2 evidence renders labeled Markdown sources with kind and observed date',
   expect(section).toContain('## Sources');
   expect(section).toContain('**test_run**');
   expect(section).toContain('**reference**');
-  expect(section).toContain('[https://example.com/laya](https://example.com/laya)');
+  expect(section).toContain('[https://example.com/laya](<https://example.com/laya>)');
   expect(section).toContain('(observed 2026-09-15)');
   expect(section).not.toContain('```');
   const parsed = parseSources(section);
@@ -439,4 +440,150 @@ test('the readable decision fixture round-trips with custom properties intact', 
 
 test('explicit V1 decoding remains available beside the V2 codec', () => {
   expect(decodeRevisionV1).toBe(decodeRevision);
+});
+
+test('body bytes including leading blank lines survive an exact round trip', () => {
+  const raw = '---\ntype: note\nstatus: active\n---\n\n\n\n# Spaced\n\ntext\n';
+  const parsed = parseDocument(raw, 'Spaced.md');
+  expect(parsed.body).toBe('\n\n\n# Spaced\n\ntext\n');
+  const rendered = renderDocument(parsed);
+  expect(parseDocument(rendered, parsed.path).body).toBe(parsed.body);
+  expect(renderDocument(parseDocument(rendered, parsed.path))).toBe(rendered);
+});
+
+test('a fenced code example inside Sources is not reclassified as evidence', () => {
+  const section = [
+    '## Sources',
+    '',
+    '- **repository** `src/notes/document.ts` — Real source',
+    '',
+    '```markdown',
+    '- **repository** `not-a-real-source` — Human example',
+    '```'
+  ].join('\n');
+  const parsed = parseSources(section);
+  expect(parsed.evidence).toEqual([
+    { kind: 'repository', ref: 'src/notes/document.ts', description: 'Real source' }
+  ]);
+  expect(parsed.human.join('\n')).toContain('- **repository** `not-a-real-source` — Human example');
+});
+
+test('multi-line human additions and their blank lines are preserved exactly', () => {
+  const section = [
+    '## Sources',
+    '',
+    '- **repository** `a` — A',
+    '',
+    '',
+    'First human line.',
+    '',
+    'Second human line.'
+  ].join('\n');
+  const parsed = parseSources(section);
+  expect(parsed.evidence).toHaveLength(1);
+  expect(parsed.human).toEqual(['', '', 'First human line.', '', 'Second human line.']);
+});
+
+test('a following section is not absorbed into Sources', () => {
+  const section = [
+    '## Sources',
+    '',
+    '- **repository** `a` — A',
+    '',
+    '## Related',
+    '',
+    '- [[Note]]'
+  ].join('\n');
+  const parsed = parseSources(section);
+  expect(parsed.evidence).toHaveLength(1);
+  expect(parsed.human).toEqual(['']);
+  expect(parsed.human.join('\n')).not.toContain('Related');
+  expect(parsed.human.join('\n')).not.toContain('[[Note]]');
+});
+
+test('rendered sources reverse exactly for punctuation and multiline values', () => {
+  const evidence: Evidence[] = [
+    {
+      kind: 'reference',
+      ref: 'https://example.com/wiki/Laya_(model)',
+      description: 'Parenthesised URL'
+    },
+    { kind: 'repository', ref: 'weird`ref', description: 'Backtick reference' },
+    {
+      kind: 'observation',
+      ref: 'line one\nline two',
+      description: 'first line\nsecond line',
+      observed_at: '2026-09-15'
+    },
+    {
+      kind: 'reference',
+      ref: 'https://example.com/a b(c)',
+      description: 'URL with a space and parens'
+    }
+  ];
+  const parsed = parseSources(renderSources(evidence));
+  expect(parsed.evidence).toEqual(evidence);
+  expect(parsed.human).toEqual([]);
+});
+
+test('unsafe link schemes are inert text and labels stay escaped', () => {
+  const section = renderSources([
+    { kind: 'reference', ref: 'javascript:alert(1)', description: 'Unsafe scheme' },
+    { kind: 'reference', ref: 'https://example.com/a]b', description: 'Bracket in a URL' }
+  ]);
+  expect(section).not.toContain('](<javascript:');
+  expect(section).toContain('`javascript:alert(1)`');
+  const parsed = parseSources(section);
+  expect(parsed.evidence).toEqual([
+    { kind: 'reference', ref: 'javascript:alert(1)', description: 'Unsafe scheme' },
+    { kind: 'reference', ref: 'https://example.com/a]b', description: 'Bracket in a URL' }
+  ]);
+});
+
+test('a revision preserves human sections and source additions', () => {
+  const raw = readFileSync(
+    new URL('../fixtures/vault-v2/readable-decision.md', import.meta.url),
+    'utf8'
+  );
+  const base = parseDocument(raw, 'Projects/Second Brain/Decisions/Local retrieval design.md');
+  const revised = reviseDocument(
+    base,
+    {
+      title: 'Local retrieval design',
+      tags: ['retrieval'],
+      related_ids: ['44b093c5-71db-4785-b9a5-bb8118304278'],
+      content: {
+        kind: 'decision',
+        context: 'Updated context.',
+        decision: 'Updated decision.',
+        rationale: 'Updated rationale.'
+      },
+      evidence: [
+        {
+          kind: 'repository',
+          ref: 'src/notes/document-codec.ts',
+          description: 'Readable codec'
+        }
+      ]
+    },
+    { tags: ['retrieval'], updated: '2026-09-24' }
+  );
+  const again = parseDocument(renderDocument(revised), revised.path);
+  expect(again.id).toBe(base.id);
+  expect(again.status).toBe('candidate');
+  expect(again.aliases).toEqual(['Local retrieval design']);
+  expect(again.tags).toEqual(['retrieval']);
+  expect(again.properties.custom_property).toBe('keep me');
+  expect(again.properties.related).toEqual(['[[Projects/Second Brain/Research/Laya]]']);
+  expect(again.body).toContain('Updated context.');
+  expect(again.body).toContain('Updated decision.');
+  expect(again.body).not.toContain('The brain needs a retrieval path that works offline');
+  expect(again.body).toContain('Human addition: this note is maintained by hand.');
+  expect(again.body).toContain('Obsidian callout preserved as written.');
+  expect(again.body).toContain('This code fence is data, not frontmatter.');
+  const sources = parseSources(again.body.slice(again.body.indexOf('## Sources')));
+  expect(sources.evidence).toEqual([
+    { kind: 'repository', ref: 'src/notes/document-codec.ts', description: 'Readable codec' }
+  ]);
+  expect(sources.human.join('\n')).toContain('Human addition: this note is maintained by hand.');
 });
