@@ -276,6 +276,19 @@ export interface Principal {
   review_scopes: string[];
 }
 
+export interface SystemActor {
+  readonly kind: 'system';
+  readonly id: string;
+}
+
+export const SYSTEM_ACTOR: SystemActor = Object.freeze({ kind: 'system', id: 'system' });
+
+export interface AuthenticatedContext {
+  readonly actor: SystemActor;
+  readonly request_id: string;
+  readonly signal: AbortSignal;
+}
+
 export interface RequestContext {
   principal: Principal;
   request_id: string;

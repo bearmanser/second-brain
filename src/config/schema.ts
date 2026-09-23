@@ -22,6 +22,10 @@ export type ResultDelivery = (typeof RESULT_DELIVERY_MODES)[number];
 
 export const TOKEN_SHA256_PATTERN = /^[a-f0-9]{64}$/;
 
+export const tokenDigestSchema = z.string().regex(TOKEN_SHA256_PATTERN, {
+  message: 'token digest must be a lowercase sha256 hex digest'
+});
+
 const TRAVERSAL_PATTERN = /(^|[\\/])\.\.([\\/]|$)|%2e|%2f|%5c|\u0000/i;
 
 const withoutTraversal = (value: string): boolean => !TRAVERSAL_PATTERN.test(value);

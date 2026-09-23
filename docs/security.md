@@ -32,6 +32,39 @@ rejected before method handling; non-`/mcp` paths return `404`.
 - Credentials are reloaded when the file changes and on `SIGHUP`; rotate by
   adding a record, reloading, then removing the old one.
 
+### Single-token path (migration window)
+
+The replacement credential model is one operator-configured token digest, not a
+per-principal record:
+
+- The operator env file supplies `BRAIN_TOKEN_SHA256`, the lowercase SHA-256 hex
+  digest of a cryptographically random token with at least 32 bytes of entropy.
+  There is intentionally no example default; a missing or malformed digest fails
+  closed at startup. Neither the raw token nor its digest is written to notes,
+  normal status output, logs, or committed configuration.
+- Every request is authenticated per request against that single digest. A valid
+  token grants access to every brain operation and every project; the request
+  carries a fixed system actor and a request ID, not a role, principal, or scope
+  grant. No MCP tool argument can set or widen authentication.
+- The `Authorization` header must be a single, correctly formed
+  `Bearer <token>` value. Missing, malformed, duplicated, oversized, or invalid
+  headers get `401` with `WWW-Authenticate: Bearer`. Duplicate headers are
+  detected from the raw HTTP header list before Express combines the values, and
+  the accepted header value is bounded.
+- Token rotation replaces `BRAIN_TOKEN_SHA256` and reloads or restarts the
+  gateway. Because authentication is per request and the endpoint is stateless,
+  the old token stops working on the next request and any existing session or
+  stream must reauthenticate. Session IDs and read cursors are never credentials.
+- Generate a token with `node dist/cli.js auth generate --show-token`. The raw
+  value is printed only because `--show-token` explicitly requests that terminal
+  output; otherwise only the `BRAIN_TOKEN_SHA256=` assignment is emitted. Convert
+  one legacy credential with
+  `node dist/cli.js auth migrate --credentials-file PATH --select-entry N`: the
+  migration selects exactly one numbered entry and never imports every legacy
+  token. This is a local administrative command, not another MCP permission
+  level. A shared token cannot cryptographically distinguish the human from the
+  agent.
+
 ## Authorization
 
 Scope resolution happens **before** any knowledge backend call. A principal
@@ -133,6 +166,14 @@ The security behaviors above are exercised by:
 
 - `tests/unit/security.test.ts` — authentication, scope resolution, redaction,
   configuration validation.
+- `tests/unit/single-token.test.ts` — single-token digest verification, digest
+  fail-closed loading, raw-header duplicate/length rejection, token generation,
+  and the `auth` CLI commands.
+- `tests/integration/token-rotation.test.ts` — the isolated HTTP guard: missing,
+  duplicated, oversized, and wrong credentials, every supported HTTP method,
+  host/origin rejection, role-free authenticated context, resource failures kept
+  distinct from authentication failure, and rotation invalidating an existing
+  session.
 - `tests/integration/http-security.test.ts` — transport, host/origin, size, and
   method handling.
 - `tests/contract/backend.test.ts` — malformed backend responses and

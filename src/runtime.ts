@@ -4,7 +4,7 @@ import { existsSync, readdirSync, unwatchFile, watchFile, type StatWatcher } fro
 import { createServer, type Server as HttpServer } from 'node:http';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
-import { loadCredentials } from './config/load.js';
+import { loadCredentials, assertTokenDigest } from './config/load.js';
 import type { BrainConfig, CredentialRecord } from './config/schema.js';
 import { BrainError, isBrainError } from './contracts/errors.js';
 import type {
@@ -51,6 +51,7 @@ export interface RuntimeOptions {
   ids?: IdSource;
   logger?: (line: string) => void;
   wrapServices?: (services: BrainServices, deps: BrainDeps) => BrainServices;
+  token_digest?: string;
 }
 
 export interface BrainRuntime {
@@ -58,6 +59,7 @@ export interface BrainRuntime {
   readonly deps: BrainDeps;
   readonly services: BrainServices;
   readonly credentials: CredentialRecord[];
+  readonly tokenDigest: string | undefined;
   readonly port: number;
   readonly url: string;
   readonly ready: boolean;
@@ -67,6 +69,7 @@ export interface BrainRuntime {
   readonly shutdownSignal: AbortSignal;
   trackOperation<T>(work: Promise<T>): Promise<T>;
   reloadCredentials(): void;
+  rotateTokenDigest(digest: string): void;
   close(): Promise<void>;
 }
 
@@ -231,6 +234,7 @@ class BrainRuntimeImpl implements BrainRuntime {
   deps!: BrainDeps;
   services!: BrainServices;
   credentials: CredentialRecord[] = [];
+  tokenDigest: string | undefined = undefined;
   port = 0;
   url = '';
   ready = false;
@@ -272,6 +276,9 @@ class BrainRuntimeImpl implements BrainRuntime {
   }
 
   async start(): Promise<void> {
+    if (this.options.token_digest !== undefined) {
+      this.tokenDigest = assertTokenDigest(this.options.token_digest);
+    }
     await mkdir(this.config.mounts.state, { recursive: true });
     const lock = InstanceLock.acquire(this.config.mounts.state);
     this.lock = lock;
@@ -506,6 +513,10 @@ class BrainRuntimeImpl implements BrainRuntime {
 
   reloadCredentials(): void {
     this.credentials = loadCredentials(this.config.credentials_file);
+  }
+
+  rotateTokenDigest(digest: string): void {
+    this.tokenDigest = assertTokenDigest(digest);
   }
 
   private startCredentialWatch(): void {

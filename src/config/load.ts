@@ -1,8 +1,10 @@
 import { readFileSync } from 'node:fs';
 import { parse } from 'yaml';
 import { BrainError } from '../contracts/errors.js';
-import { brainConfigSchema, credentialsFileSchema } from './schema.js';
+import { brainConfigSchema, credentialsFileSchema, tokenDigestSchema } from './schema.js';
 import type { BrainConfig, CredentialRecord } from './schema.js';
+
+export const BRAIN_TOKEN_ENV = 'BRAIN_TOKEN_SHA256';
 
 const invalidConfig = (message: string, cause?: unknown): BrainError =>
   new BrainError({ code: 'INVALID_INPUT', message, cause });
@@ -51,4 +53,20 @@ export function loadCredentials(path: string): CredentialRecord[] {
     throw invalidConfig('credentials file is invalid');
   }
   return parsed.data.credentials;
+}
+
+export function assertTokenDigest(value: unknown): string {
+  const parsed = tokenDigestSchema.safeParse(value);
+  if (!parsed.success) {
+    throw invalidConfig(`${BRAIN_TOKEN_ENV} must be a lowercase sha256 hex digest`);
+  }
+  return parsed.data;
+}
+
+export function loadTokenDigest(env: NodeJS.ProcessEnv = process.env): string {
+  const value = env[BRAIN_TOKEN_ENV];
+  if (typeof value !== 'string' || value.length === 0) {
+    throw invalidConfig(`${BRAIN_TOKEN_ENV} is required`);
+  }
+  return assertTokenDigest(value);
 }

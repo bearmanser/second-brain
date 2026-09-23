@@ -3,16 +3,23 @@ import type { IncomingMessage } from 'node:http';
 import express from 'express';
 import type { Express, Request, Response } from 'express';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { assertTokenDigest } from '../config/load.js';
 import { isBrainError } from '../contracts/errors.js';
 import { INPUT_BODY_MAX_BYTES } from '../core/limits.js';
-import type { Principal, RequestContext } from '../core/types.js';
-import { authenticate } from '../security/authenticate.js';
+import {
+  SYSTEM_ACTOR,
+  type AuthenticatedContext,
+  type Principal,
+  type RequestContext
+} from '../core/types.js';
+import { authenticate, verifyBearer } from '../security/authenticate.js';
 import type { BrainRuntime } from '../runtime.js';
 import { createMcpServer } from './server.js';
 import { internalDiagnostic } from './tools.js';
 
 export const MCP_PATH = '/mcp';
 export const OVERFLOW_DRAIN_MS = 1000;
+export const MAX_AUTHORIZATION_HEADER_CHARS = 1024;
 
 const HOST_NAME = /^[A-Za-z0-9.-]+$/;
 const HOST_PORT = /^[1-9]\d{0,4}$/;
@@ -255,6 +262,123 @@ async function handleMcpRequest(
     }
     await cleanup();
   }
+}
+
+export function readAuthorizationHeader(rawHeaders: readonly string[]): string | undefined {
+  let count = 0;
+  let value: string | undefined;
+  for (let index = 0; index + 1 < rawHeaders.length; index += 2) {
+    if (rawHeaders[index]?.toLowerCase() !== 'authorization') continue;
+    count += 1;
+    value = rawHeaders[index + 1];
+  }
+  if (count > 1) return undefined;
+  if (value !== undefined && value.length > MAX_AUTHORIZATION_HEADER_CHARS) return undefined;
+  return value;
+}
+
+export interface AuthenticatedHttpOptions {
+  token_digest: string | (() => string);
+  allowed_hosts: readonly string[];
+  allowed_origins: readonly string[];
+  input_body_max_bytes?: number;
+  signal: AbortSignal;
+  isClosing?: () => boolean;
+  reportDiagnostic?: (message: string) => void;
+  dispatch: (
+    ctx: AuthenticatedContext,
+    req: Request,
+    res: Response,
+    parsedBody: unknown
+  ) => Promise<void>;
+}
+
+function resolveTokenDigest(source: string | (() => string)): string {
+  return typeof source === 'function' ? source() : source;
+}
+
+async function handleAuthenticatedRequest(
+  options: AuthenticatedHttpOptions,
+  req: Request,
+  res: Response
+): Promise<void> {
+  if (!hostAllowed(req.headers.host, options.allowed_hosts)) {
+    sendJsonRpcError(res, 403, -32000, 'the request host is not allowed');
+    return;
+  }
+  if (!originAllowed(req.headers.origin, options.allowed_origins)) {
+    sendJsonRpcError(res, 403, -32000, 'the request origin is not allowed');
+    return;
+  }
+
+  const authorization = readAuthorizationHeader(req.rawHeaders);
+  if (authorization === undefined || !verifyBearer(authorization, resolveTokenDigest(options.token_digest))) {
+    res.setHeader('WWW-Authenticate', 'Bearer');
+    sendJsonRpcError(res, 401, -32000, 'a valid bearer credential is required');
+    return;
+  }
+
+  if (options.isClosing?.() === true) {
+    sendJsonRpcError(res, 503, -32000, 'the gateway is shutting down');
+    return;
+  }
+
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
+    sendJsonRpcError(res, 405, -32000, 'this stateless endpoint accepts only POST');
+    return;
+  }
+  if (!isJsonContentType(req.headers['content-type'])) {
+    sendJsonRpcError(res, 415, -32000, 'Content-Type must be application/json');
+    return;
+  }
+
+  const limit = options.input_body_max_bytes ?? INPUT_BODY_MAX_BYTES;
+  const raw = await readBody(req, limit);
+  if (!raw.ok) {
+    if (raw.tooLarge) {
+      res.setHeader('Connection', 'close');
+      sendJsonRpcError(res, 413, -32000, 'the request body exceeds the input limit');
+      discardRemainingBody(req);
+    } else {
+      sendJsonRpcError(res, 400, -32700, 'the request body could not be read');
+    }
+    return;
+  }
+  let parsedBody: unknown;
+  try {
+    parsedBody = JSON.parse(raw.body.toString('utf8'));
+  } catch {
+    sendJsonRpcError(res, 400, -32700, 'Parse error: Invalid JSON');
+    return;
+  }
+
+  const ctx: AuthenticatedContext = {
+    actor: SYSTEM_ACTOR,
+    request_id: randomUUID(),
+    signal: options.signal
+  };
+  await options.dispatch(ctx, req, res, parsedBody);
+}
+
+export function createAuthenticatedHttpApp(options: AuthenticatedHttpOptions): Express {
+  assertTokenDigest(resolveTokenDigest(options.token_digest));
+  const app = express();
+  app.disable('x-powered-by');
+  app.set('etag', false);
+
+  app.all(MCP_PATH, (req: Request, res: Response): void => {
+    void handleAuthenticatedRequest(options, req, res).catch((error: unknown) => {
+      options.reportDiagnostic?.(internalDiagnostic(error));
+      sendJsonRpcError(res, 500, -32603, 'the gateway could not complete the request');
+    });
+  });
+
+  app.use((_req: Request, res: Response): void => {
+    res.status(404).type('application/json').send(JSON.stringify({ error: 'not found' }));
+  });
+
+  return app;
 }
 
 export function createHttpApp(runtime: BrainRuntime): Express {

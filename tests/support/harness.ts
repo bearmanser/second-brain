@@ -439,6 +439,7 @@ export interface HttpHarnessOptions {
   reconcile_interval_ms?: number;
   concurrent_reads?: number;
   vault?: VaultPort;
+  token_digest?: string;
 }
 
 export interface HttpHarness {
@@ -570,6 +571,7 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
     runtime = await createRuntime(config, {
       backend,
       ...(options.vault === undefined ? {} : { vault: options.vault }),
+      ...(options.token_digest === undefined ? {} : { token_digest: options.token_digest }),
       logger: (line) => {
         diagnostics.push(line);
       },

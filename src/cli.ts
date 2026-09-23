@@ -23,6 +23,7 @@ import { bootstrap } from './operations/bootstrap.js';
 import { health } from './operations/health.js';
 import { assertRecoveryMode, authenticateOwner, recoverPending, summariseRecovery } from './operations/recovery.js';
 import { ScopeRegistry } from './projects/scope-registry.js';
+import { generateBearerToken } from './security/authenticate.js';
 import { BasicMemoryBackend } from './storage/basic-memory.js';
 import { Journal } from './storage/journal.js';
 import { FileVault } from './storage/vault.js';
@@ -37,7 +38,8 @@ export type CliCommand =
   | 'backup-manifest'
   | 'validate-archive'
   | 'validate-store-links'
-  | 'verify-backup';
+  | 'verify-backup'
+  | 'auth';
 
 export const CLI_COMMANDS: readonly CliCommand[] = [
   'serve',
@@ -49,7 +51,8 @@ export const CLI_COMMANDS: readonly CliCommand[] = [
   'backup-manifest',
   'validate-archive',
   'validate-store-links',
-  'verify-backup'
+  'verify-backup',
+  'auth'
 ];
 
 export interface ParsedArguments {
@@ -63,7 +66,7 @@ const systemIds: IdSource = { next: () => randomUUID() };
 
 const USAGE = [
   'usage: node dist/cli.js <command> [options]',
-  'commands: serve | setup | health | recover | recover-state | rebuild-catalogue | backup-manifest | validate-archive | validate-store-links | verify-backup'
+  'commands: serve | setup | health | recover | recover-state | rebuild-catalogue | backup-manifest | validate-archive | validate-store-links | verify-backup | auth'
 ].join('\n');
 
 function invalidInput(message: string): BrainError {
@@ -417,6 +420,35 @@ async function runValidateStoreLinks(parsed: ParsedArguments): Promise<number> {
   return 0;
 }
 
+async function runAuth(parsed: ParsedArguments): Promise<number> {
+  const subcommand = parsed.positionals[0];
+  if (subcommand === 'generate') {
+    const generated = generateBearerToken();
+    process.stdout.write(`BRAIN_TOKEN_SHA256=${generated.token_sha256}\n`);
+    if (flagBoolean(parsed.flags, 'show-token')) {
+      process.stdout.write(`${generated.token}\n`);
+    }
+    return 0;
+  }
+  if (subcommand === 'migrate') {
+    const credentialsFile = flagString(parsed.flags, 'credentials-file');
+    if (credentialsFile === undefined) {
+      throw invalidInput('auth migrate requires --credentials-file');
+    }
+    const selection = flagNumber(parsed.flags, 'select-entry');
+    if (selection === undefined) {
+      throw invalidInput('auth migrate requires --select-entry');
+    }
+    const credentials = loadCredentials(credentialsFile);
+    if (selection < 1 || selection > credentials.length) {
+      throw invalidInput(`--select-entry must select exactly one of ${credentials.length} entries`);
+    }
+    process.stdout.write(`BRAIN_TOKEN_SHA256=${credentials[selection - 1].token_sha256}\n`);
+    return 0;
+  }
+  throw invalidInput(`auth requires a subcommand\n${USAGE}`);
+}
+
 export async function runCli(
   argv: readonly string[],
   env: NodeJS.ProcessEnv = process.env
@@ -447,6 +479,8 @@ export async function runCli(
       return runValidateStoreLinks(parsed);
     case 'verify-backup':
       return runVerifyBackup(parsed);
+    case 'auth':
+      return runAuth(parsed);
   }
 }
 
