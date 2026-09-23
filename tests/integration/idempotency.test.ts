@@ -304,7 +304,7 @@ test('an aborted new reservation keeps a released fingerprint for identical retr
   }
 });
 
-test('aborting an imported legacy reservation marks it terminal and preserves the row', () => {
+test('aborting an imported legacy reservation refuses the original key', () => {
   const fixture = openSeeded((database) => {
     seedCapture(database, {
       operation_id: KEY(0x08),
@@ -316,13 +316,137 @@ test('aborting an imported legacy reservation marks it terminal and preserves th
   });
   try {
     fixture.journal.abort(KEY(0x08));
-    const row = fixture.journal.get(KEY(0x08));
-    expect(row?.state).toBe('failed');
-    const replay = fixture.journal.reserve(captureInput(KEY(0x105)));
-    expect(replay.kind).toBe('replay');
-    expect(replay.record.state).toBe('failed');
+    expect(fixture.journal.get(KEY(0x08))?.state).toBe('failed');
+    expect(codeOf(() => fixture.journal.reserve(captureInput(KEY(0x105))))).toBe(
+      'IDEMPOTENCY_CONFLICT'
+    );
+    const fresh = fixture.journal.reserve(captureInput(KEY(0x10f)));
+    expect(fresh.kind).toBe('new');
   } finally {
     dispose(fixture);
+  }
+});
+
+test('a mismatching retry preserves the original binding across restart', () => {
+  const fixture = openSeeded((database) => {
+    seedCapture(database, { operation_id: KEY(0x20), idempotency_key: KEY(0x120) });
+  });
+  try {
+    expect(fixture.journal.reserve(captureInput(KEY(0x120))).kind).toBe('replay');
+    expect(
+      codeOf(() => fixture.journal.reserve(captureInput(KEY(0x120), { payload_hash: OTHER_PAYLOAD })))
+    ).toBe('IDEMPOTENCY_CONFLICT');
+    const again = fixture.journal.reserve(captureInput(KEY(0x120)));
+    expect(again.kind).toBe('replay');
+    expect(again.record.operation_id).toBe(KEY(0x20));
+
+    fixture.journal.close();
+    const reopened = Journal.open(fixture.path, { requireExisting: true });
+    try {
+      expect(reopened.reserve(captureInput(KEY(0x120))).kind).toBe('replay');
+      expect(
+        codeOf(() => reopened.reserve(captureInput(KEY(0x120), { payload_hash: OTHER_PAYLOAD })))
+      ).toBe('IDEMPOTENCY_CONFLICT');
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    dispose(fixture);
+  }
+});
+
+test('an ambiguous legacy group with a corrupt member requires recovery', () => {
+  const fixture = openSeeded((database) => {
+    seedCapture(database, { operation_id: KEY(0x21), idempotency_key: KEY(0x121) });
+    seedCapture(database, {
+      operation_id: KEY(0x22),
+      idempotency_key: KEY(0x121),
+      principal_id: KEY(0x31),
+      payload_hash: OTHER_PAYLOAD,
+      receipt_json: '{not json'
+    });
+  });
+  try {
+    expect(codeOf(() => fixture.journal.reserve(captureInput(KEY(0x121))))).toBe(
+      'RECOVERY_REQUIRED'
+    );
+    expect(fixture.journal.isKeyBlocked(KEY(0x121))).toBe(true);
+  } finally {
+    dispose(fixture);
+  }
+});
+
+test('an ambiguous legacy pending group is blocked before any recovery submission', () => {
+  const fixture = openSeeded((database) => {
+    seedCapture(database, {
+      operation_id: KEY(0x23),
+      idempotency_key: KEY(0x122),
+      state: 'submitted',
+      receipt_json: null,
+      plan_json: '{}'
+    });
+    seedCapture(database, {
+      operation_id: KEY(0x24),
+      idempotency_key: KEY(0x122),
+      principal_id: KEY(0x32),
+      state: 'submitted',
+      receipt_json: null,
+      plan_json: '{}'
+    });
+  });
+  try {
+    expect(fixture.journal.isKeyBlocked(KEY(0x122))).toBe(true);
+    expect(codeOf(() => fixture.journal.reserve(captureInput(KEY(0x122))))).toBe(
+      'IDEMPOTENCY_CONFLICT'
+    );
+  } finally {
+    dispose(fixture);
+  }
+});
+
+test('an unprovable truncated feedback reason requires recovery', () => {
+  const principalId = KEY(0x1a);
+  const idempotencyKey = KEY(0x123);
+  const base = {
+    principal_id: 'system',
+    idempotency_key: idempotencyKey,
+    scope: 'freellmapi',
+    logical_id: KEY(0xa1),
+    revision_id: KEY(0xb1),
+    verdict: 'useful' as const
+  };
+  const truncation = openSeeded((database) => {
+    seedLegacyFeedback(database, {
+      feedback_id: KEY(0x2a),
+      principal_id: principalId,
+      idempotency_key: idempotencyKey,
+      reason: 'a'.repeat(240),
+      payload_hash: null
+    });
+  });
+  try {
+    expect(
+      codeOf(() => truncation.journal.replayFeedback({ ...base, reason: `${'a'.repeat(240)}suffix` }))
+    ).toBe('RECOVERY_REQUIRED');
+  } finally {
+    dispose(truncation);
+  }
+
+  const conflict = openSeeded((database) => {
+    seedLegacyFeedback(database, {
+      feedback_id: KEY(0x2b),
+      principal_id: principalId,
+      idempotency_key: idempotencyKey,
+      reason: 'a'.repeat(240),
+      payload_hash: null
+    });
+  });
+  try {
+    expect(
+      codeOf(() => conflict.journal.replayFeedback({ ...base, reason: 'a different reason' }))
+    ).toBe('IDEMPOTENCY_CONFLICT');
+  } finally {
+    dispose(conflict);
   }
 });
 

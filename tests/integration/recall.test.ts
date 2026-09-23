@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { expect, test, vi } from 'vitest';
 import { BrainError } from '../../src/contracts/errors.js';
 import type {
+  BackendHit,
   BackendSearch,
   Head,
   MutationReceipt,
@@ -19,7 +20,8 @@ import {
   RECALL_WARNING_SEARCH_TRUNCATED,
   RECALL_WARNING_SHARED_PROJECT,
   RECALL_WARNING_STALE_HITS_EXCLUDED,
-  recall
+  recall,
+  recallTraced
 } from '../../src/features/recall.js';
 import { review } from '../../src/features/review.js';
 import { hashRaw, relativePathFor } from '../../src/notes/identity.js';
@@ -988,4 +990,56 @@ test('exposes the archive head through the catalogue used by recall', async () =
   const head: Head = await h.deps.catalogue.get('freellmapi', root.revision.id);
   expect(head.state).toBe('ready');
   await h.close();
+});
+
+test('telemetry reports only the projects actually attempted under the call budget', async () => {
+  const h = await createHarness();
+  try {
+    const scopes = Array.from({ length: 10 }, (_, index) => ({
+      id: `p${index}`,
+      backend_project: `p${index}`,
+      relative_root: `Projects/p${index}`,
+      repository_aliases: []
+    }));
+    h.deps.scopeRegistry.all = () => scopes;
+    h.backend.search = async () => ({ hits: [], has_more: true });
+    const traced = await recallTraced(reviewerContext, { query: 'anything' }, h.deps);
+    expect(traced.searched_project_ids).toEqual([
+      'p0', 'p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7'
+    ]);
+    expect(traced.searched_project_ids).not.toContain('p8');
+    expect(traced.result.partial).toBe(true);
+    expect(traced.result.warnings).toContain(RECALL_WARNING_SEARCH_TRUNCATED);
+  } finally {
+    await h.close();
+  }
+});
+
+test('one best hit per project/note survives multi-page candidates', async () => {
+  const h = await createHarness();
+  await h.seed(lessonFixture, { status: 'active' });
+  const original = h.backend.search.bind(h.backend);
+  const pages: number[] = [];
+  let firstHit: BackendHit | undefined;
+  h.backend.search = async (input) => {
+    pages.push(input.page);
+    if (input.page === 1) {
+      const base = await original(input);
+      firstHit = base.hits[0];
+      return firstHit === undefined
+        ? { hits: [], has_more: false }
+        : { hits: [{ ...firstHit, rank: 1 }], has_more: true };
+    }
+    return firstHit === undefined
+      ? { hits: [], has_more: false }
+      : { hits: [{ ...firstHit, rank: 5 }], has_more: false };
+  };
+  try {
+    const result = await recall(reviewerContext, { scope: 'freellmapi', query: lessonFixture.title }, h.deps);
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0].reasons).toContain('backend_rank:5');
+    expect(pages).toContain(2);
+  } finally {
+    await h.close();
+  }
 });

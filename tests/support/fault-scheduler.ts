@@ -88,6 +88,12 @@ export function wrapJournal(journal: Journal, scheduler: FaultScheduler): Journa
     markProjectRecoveryRequired: journal.markProjectRecoveryRequired.bind(journal),
     listReadyProjects: journal.listReadyProjects.bind(journal),
     listProjects: journal.listProjects.bind(journal),
+    resolveLegacyKeys(): void {
+      journal.resolveLegacyKeys();
+    },
+    isKeyBlocked(idempotency_key: string): boolean {
+      return journal.isKeyBlocked(idempotency_key);
+    },
     get(id: string): OperationRecord | undefined {
       return journal.get(id);
     },

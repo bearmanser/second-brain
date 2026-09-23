@@ -9,7 +9,7 @@ import type {
 import { ProjectRegistry } from './registry.js';
 
 export interface ScopeRegistrySource {
-  listReadyProjects(): PersistedProject[];
+  listProjects(): PersistedProject[];
   getProjectBinding(projectId: string): LegacyProjectBackendBinding | undefined;
 }
 
@@ -32,8 +32,12 @@ export class ScopeRegistry {
   constructor(staticScopes: readonly ScopeConfig[], source?: ScopeRegistrySource) {
     for (const scope of staticScopes) this.registerStatic(scope);
     if (source !== undefined) {
-      for (const project of source.listReadyProjects()) {
-        this.registerDynamicProject(project.project, source.getProjectBinding(project.project.id));
+      for (const project of source.listProjects()) {
+        this.registerDynamicProject(
+          project.project,
+          source.getProjectBinding(project.project.id),
+          project.state !== 'ready'
+        );
       }
     }
     this.registry = this.buildRegistry();
@@ -125,7 +129,11 @@ export class ScopeRegistry {
     });
   }
 
-  private registerDynamicProject(project: Project, binding?: LegacyProjectBackendBinding): void {
+  private registerDynamicProject(
+    project: Project,
+    binding?: LegacyProjectBackendBinding,
+    unusable = false
+  ): void {
     if (RESERVED.has(project.id)) {
       throw invalidInput(`dynamic project ${project.id} is reserved`);
     }
@@ -142,6 +150,7 @@ export class ScopeRegistry {
         throw conflict(`dynamic project ${project.id} was registered with a different mapping`);
       }
       if (binding !== undefined) this.bindings.set(project.id, binding);
+      if (unusable) this.quarantined.add(project.id);
       this.registry = this.buildRegistry();
       return;
     }
@@ -149,6 +158,7 @@ export class ScopeRegistry {
     this.order.push(project.id);
     this.dynamic.add(project.id);
     if (binding !== undefined) this.bindings.set(project.id, binding);
+    if (unusable) this.quarantined.add(project.id);
     this.registry = this.buildRegistry();
   }
 }

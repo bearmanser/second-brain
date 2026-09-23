@@ -40,6 +40,7 @@ export const RECALL_WARNING_EMBEDDINGS_FALLBACK = 'embeddings_unavailable_text_f
 export const RECALL_WARNING_CANDIDATE = 'candidate';
 export const RECALL_WARNING_SHARED_PROJECT = 'shared_project';
 export const RECALL_WARNING_INCLUDE_SHARED_DEPRECATED = 'include_shared_deprecated';
+export const RECALL_WARNING_DUPLICATE_IDENTITY = 'duplicate_identity';
 
 const SHARED_PROJECT_ID = 'shared';
 const MAX_SEARCH_TERMS = 64;
@@ -54,6 +55,7 @@ interface ProjectHits {
   scope: ScopeConfig;
   hits: BackendHit[];
   exhausted: boolean;
+  attempted: boolean;
 }
 
 interface SearchAccumulator {
@@ -175,7 +177,7 @@ async function collectProjects(
   attemptedBefore: number
 ): Promise<SearchAccumulator> {
   const accumulator: SearchAccumulator = {
-    projectHits: scopes.map((scope) => ({ scope, hits: [], exhausted: false })),
+    projectHits: scopes.map((scope) => ({ scope, hits: [], exhausted: false, attempted: false })),
     attemptedCalls: attemptedBefore,
     completedCalls: 0,
     hits: 0,
@@ -197,6 +199,7 @@ async function collectProjects(
         return accumulator;
       }
       accumulator.attemptedCalls += 1;
+      project.attempted = true;
       let pageResult: { hits: BackendHit[]; has_more: boolean };
       try {
         pageResult = await deps.backend.search({
@@ -474,26 +477,17 @@ function toItem(
   };
 }
 
-export interface RecallSelection {
-  filter: ProjectFilter;
-  scopes: ScopeConfig[];
-}
-
-export function recallSelection(request: RecallRequest, deps: BrainDeps): RecallSelection {
-  const filter = projectFilter(request);
-  return { filter, scopes: selectProjects(request, filter, deps, []) };
-}
-
-export async function recall(
+async function runRecall(
   ctx: AuthenticatedContext,
   input: RecallRequest,
   deps: BrainDeps
-): Promise<RecallResult> {
+): Promise<RecallTrace> {
   if (ctx.signal.aborted) throw cancelled();
   const request = parseRequest(input);
   const filter = projectFilter(request);
   const warnings: string[] = [];
   const scopes = selectProjects(request, filter, deps, warnings);
+  const primaryProjectId = filter.mode === 'project' ? scopes[0]?.id ?? null : null;
   const kinds = requestedKinds(request);
   const searchText = buildSearchText(request.query, request.topics);
   const terms = searchTerms(searchText);
@@ -535,8 +529,6 @@ export async function recall(
     }
   }
 
-  const searchedProjects = accumulator.projectHits.map((project) => project.scope.id);
-
   if (accumulator.failure !== undefined) {
     if (accumulator.completedCalls === 0 && accumulator.hits === 0) {
       throw normalizeBackendFailure(accumulator.failure);
@@ -560,8 +552,8 @@ export async function recall(
   }
 
   const now = deps.clock.now();
-  const eligible: EligibleHit[] = [];
-  const seen = new Set<string>();
+  const best = new Map<string, EligibleHit>();
+  const identities = new Map<string, Set<string>>();
   const headCache = new Map<string, HeadLookup>();
   let unresolved = false;
   let staleExcluded = false;
@@ -578,11 +570,21 @@ export async function recall(
         continue;
       }
       const head = resolution.head;
-      const key = `${project.scope.id}:${head.revision.id}`;
-      if (seen.has(key)) continue;
       const decision = evaluateHit(project.scope, head, request, kinds, now);
       if (!decision.included) continue;
-      seen.add(key);
+      const identity = identities.get(head.revision.id) ?? new Set<string>();
+      identity.add(`${project.scope.id}|${head.revision.revision_id}|${head.raw_hash}`);
+      identities.set(head.revision.id, identity);
+      const key = `${project.scope.id}:${head.revision.id}`;
+      const existing = best.get(key);
+      if (
+        existing !== undefined &&
+        (existing.rank > hit.rank ||
+          (existing.rank === hit.rank &&
+            existing.head.revision.revision_id <= head.revision.revision_id))
+      ) {
+        continue;
+      }
       const extracted = buildExcerpt(head.revision, terms);
       const reasons = [
         ...decision.reasons,
@@ -590,13 +592,22 @@ export async function recall(
         `backend_rank:${hit.rank}`
       ];
       if (extracted.section.length > 0) reasons.push(`section:${extracted.section}`);
-      eligible.push({
+      best.set(key, {
         head,
         rank: hit.rank,
         matched_section: extracted.excerpt,
         reasons
       });
     }
+  }
+
+  let divergentIdentity = false;
+  for (const identity of identities.values()) {
+    const scopes = new Set([...identity].map((entry) => entry.split('|')[0]));
+    if (scopes.size > 1) divergentIdentity = true;
+  }
+  if (divergentIdentity && !warnings.includes(RECALL_WARNING_DUPLICATE_IDENTITY)) {
+    warnings.push(RECALL_WARNING_DUPLICATE_IDENTITY);
   }
 
   if (unresolved) {
@@ -609,20 +620,51 @@ export async function recall(
     warnings.push(RECALL_WARNING_STALE_HITS_EXCLUDED);
   }
 
-  const ranked = rankEligible(eligible, request.phase ?? 'general');
+  const ranked = rankEligible([...best.values()], request.phase ?? 'general');
   const limit = resolveLimit(request.limit);
   const items = ranked.slice(0, limit).map((hit) => toItem(hit, mode, deps));
   const budget = clampRecallBudget(request.budget_tokens);
 
-  return packRecall(
+  const result = packRecall(
     items,
     {
       retrieval_id: deps.ids.next(),
       mode,
-      partial,
+      partial: partial || divergentIdentity,
       warnings
     },
     budget,
     deps.config.result_delivery
   );
+  return {
+    result,
+    filter,
+    searched_project_ids: accumulator.projectHits
+      .filter((project) => project.attempted)
+      .map((project) => project.scope.id),
+    primary_project_id: primaryProjectId
+  };
+}
+
+export interface RecallTrace {
+  result: RecallResult;
+  filter: ProjectFilter;
+  searched_project_ids: string[];
+  primary_project_id: string | null;
+}
+
+export async function recall(
+  ctx: AuthenticatedContext,
+  input: RecallRequest,
+  deps: BrainDeps
+): Promise<RecallResult> {
+  return (await runRecall(ctx, input, deps)).result;
+}
+
+export async function recallTraced(
+  ctx: AuthenticatedContext,
+  input: RecallRequest,
+  deps: BrainDeps
+): Promise<RecallTrace> {
+  return runRecall(ctx, input, deps);
 }

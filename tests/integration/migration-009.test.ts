@@ -145,26 +145,28 @@ test('migration 009 is idempotent across reopen and preserves foreign keys', () 
   }
 });
 
-test('a new project may use an independent root and legacy backend mapping', () => {
+test('a new project may use an independent root and backend mapping', () => {
   const journal = Journal.open(':memory:');
   try {
     const reserved = journal.reserveProject({
       repository_identity: 'github.com/example/readable',
-      project_id: 'readable',
+      project_id: 'readable-id',
       display_name: 'Readable project',
       relative_root: 'Knowledge/Readable',
+      backend_project: 'legacy-backend-name',
+      backend_relative_root: 'Backends/legacy-root',
       created_by_actor_id: 'actor-a',
       creation_operation_id: '00000000-0000-4000-8000-0000000000d2'
     });
     expect(reserved.project.project).toMatchObject({
-      id: 'readable',
+      id: 'readable-id',
       display_name: 'Readable project',
       relative_root: 'Knowledge/Readable',
       repository_identity: 'github.com/example/readable'
     });
-    expect(journal.getProjectBinding('readable')).toEqual({
-      backend_project: 'readable',
-      backend_relative_root: 'Knowledge/Readable'
+    expect(journal.getProjectBinding('readable-id')).toEqual({
+      backend_project: 'legacy-backend-name',
+      backend_relative_root: 'Backends/legacy-root'
     });
   } finally {
     journal.close();

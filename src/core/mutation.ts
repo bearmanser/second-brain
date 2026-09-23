@@ -91,6 +91,8 @@ export interface MutationJournal {
   countProjects(): number;
   markProjectReady(identifier: string): PersistedProject;
   markProjectRecoveryRequired(identifier: string, stage: string, code: string): PersistedProject;
+  resolveLegacyKeys(): void;
+  isKeyBlocked(idempotency_key: string): boolean;
 }
 
 export interface BrainDeps {
@@ -516,8 +518,20 @@ export class MutationCoordinator {
 
   async recoverDetailed(): Promise<RecoveryReport> {
     return this.withLock(async () => {
+      this.deps.journal.resolveLegacyKeys();
       const operations: RecoveryOperationReport[] = [];
       for (const record of this.deps.journal.pending()) {
+        if (this.deps.journal.isKeyBlocked(record.idempotency_key)) {
+          operations.push(
+            this.operationReport(record, {
+              outcome: 'conflicted',
+              reason: 'idempotency_key_ambiguous',
+              blocking: true,
+              warnings: ['idempotency_key_ambiguous']
+            })
+          );
+          continue;
+        }
         let operation: RecoveryOperationReport;
         try {
           operation =

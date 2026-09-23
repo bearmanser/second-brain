@@ -102,6 +102,8 @@ export interface ProjectProvisioningPlan {
   project_id: string;
   display_name: string;
   relative_root: string;
+  backend_project: string;
+  backend_relative_root: string;
   created_by_actor_id: string;
   creation_operation_id: string;
 }

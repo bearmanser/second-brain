@@ -83,6 +83,38 @@ test('reads an old provisioning plan without applying its grant', () => {
   expect(() => parseLegacyProvisioningPlan({ operation_id: OPERATION_ID })).toThrow(
     /RECOVERY_REQUIRED/
   );
+
+  const missingGrant = JSON.stringify({
+    repository_identity: 'github.com/example/legacy',
+    scope: 'legacy',
+    backend_project: 'legacy',
+    relative_root: 'Projects/legacy'
+  });
+  expect(() => parseLegacyProvisioningPlan({ plan_json: missingGrant, operation_id: OPERATION_ID })).toThrow(
+    /RECOVERY_REQUIRED/
+  );
+
+  const mismatchedGrant = JSON.stringify({
+    repository_identity: 'github.com/example/legacy',
+    scope: 'legacy',
+    backend_project: 'legacy',
+    relative_root: 'Projects/legacy',
+    grant: { principal_id: 'legacy-worker', scope: 'other', can_read: true }
+  });
+  expect(() =>
+    parseLegacyProvisioningPlan({ plan_json: mismatchedGrant, operation_id: OPERATION_ID })
+  ).toThrow(/RECOVERY_REQUIRED/);
+
+  const inconsistentRoot = JSON.stringify({
+    repository_identity: 'github.com/example/legacy',
+    scope: 'legacy',
+    backend_project: 'other-backend',
+    relative_root: 'Projects/legacy',
+    grant: { principal_id: 'legacy-worker', scope: 'legacy', can_read: true }
+  });
+  expect(() =>
+    parseLegacyProvisioningPlan({ plan_json: inconsistentRoot, operation_id: OPERATION_ID })
+  ).toThrow(/RECOVERY_REQUIRED/);
 });
 
 test('projects a historical ensure receipt while dropping obsolete permissions', () => {

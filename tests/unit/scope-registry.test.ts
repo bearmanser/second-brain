@@ -32,7 +32,7 @@ const sourceFrom = (
   projects: PersistedProject[],
   bindings: Record<string, LegacyProjectBackendBinding> = {}
 ): ScopeRegistrySource => ({
-  listReadyProjects: () => projects,
+  listProjects: () => projects,
   getProjectBinding: (id) => bindings[id]
 });
 
@@ -136,6 +136,32 @@ test('does not expose a permission surface', () => {
   expect(members).not.toContain('visibleTo');
   expect(members).not.toContain('registerGrant');
   expect(members).not.toContain('grantProject');
+});
+
+test('keeps a recovery-required project known but unusable after restart', () => {
+  const root = mkdtempSync(join('/tmp/opencode', 'scope-registry-recovery-'));
+  const path = join(root, 'journal.db');
+  try {
+    const first = Journal.open(path);
+    first.reserveProject({
+      repository_identity: 'github.com/bearmanser/recovering',
+      project_id: 'recovering',
+      created_by_actor_id: 'actor-a',
+      creation_operation_id: '00000000-0000-4000-8000-0000000000c2'
+    });
+    first.markProjectReady('github.com/bearmanser/recovering');
+    first.markProjectRecoveryRequired('github.com/bearmanser/recovering', 'ready_verification', 'CONFLICT');
+    first.close();
+
+    const reopened = Journal.open(path, { requireExisting: true });
+    const registry = new ScopeRegistry(staticScopes, reopened);
+    expect(registry.get('recovering')).toMatchObject({ id: 'recovering' });
+    expect(() => registry.require('recovering')).toThrow(/RECOVERY_REQUIRED/);
+    expect(registry.all().map((scope) => scope.id)).not.toContain('recovering');
+    reopened.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('reopening the journal returns the same stable project id and root without a grant', () => {

@@ -17,6 +17,7 @@ import { ensureProject } from '../../src/features/project-ensure.js';
 import { read } from '../../src/features/read.js';
 import { recall } from '../../src/features/recall.js';
 import { review } from '../../src/features/review.js';
+import { status } from '../../src/features/status.js';
 import { createHarness, type MemoryHarness } from '../support/harness.js';
 
 function roleFreeContext(): AuthenticatedContext {
@@ -273,6 +274,70 @@ test('project creation adds organization without a permission grant', async () =
       h.deps
     );
     expect(captured.outcome).toBe('stored');
+  } finally {
+    await h.close();
+  }
+});
+
+test('status resolves a project alias before comparing pending work', async () => {
+  const h = await createHarness();
+  try {
+    h.deps.journal.reserve({
+      principal_id: SYSTEM_ACTOR.id,
+      idempotency_key: randomUUID(),
+      tool: 'brain_capture',
+      scope: 'freellmapi',
+      payload_hash: 'a'.repeat(64),
+      payload_json: '{}'
+    });
+    const result = await status(roleFreeContext(), { project: 'free-llm-api' }, h.deps);
+    expect(result.scopes).toEqual([{ id: 'freellmapi' }]);
+    expect(result.pending_operations).toBe(1);
+  } finally {
+    await h.close();
+  }
+});
+
+test('status projects a historical permission-bearing project receipt', async () => {
+  const h = await createHarness();
+  try {
+    const ctx = roleFreeContext();
+    const reserved = h.deps.journal.reserve({
+      principal_id: SYSTEM_ACTOR.id,
+      idempotency_key: randomUUID(),
+      tool: 'brain_project_ensure',
+      scope: 'freellmapi',
+      payload_hash: 'b'.repeat(64),
+      payload_json: '{}'
+    }).record;
+    h.deps.journal.saveProjectPlan(reserved.operation_id, {
+      repository_identity: 'github.com/example/runtime',
+      project_id: 'freellmapi',
+      display_name: 'freellmapi',
+      relative_root: 'freellmapi',
+      backend_project: 'freellmapi',
+      backend_relative_root: 'freellmapi',
+      created_by_actor_id: SYSTEM_ACTOR.id,
+      creation_operation_id: reserved.operation_id
+    });
+    h.deps.journal.mark(reserved.operation_id, 'submitted');
+    h.deps.journal.mark(reserved.operation_id, 'complete', {
+      operation_id: reserved.operation_id,
+      repository_identity: 'github.com/example/runtime',
+      scope: 'freellmapi',
+      created: true,
+      permissions: { can_read: true, can_write: true, can_review: true },
+      backend_ready: true,
+      materialized: true,
+      warnings: []
+    } as never);
+    const result = await status(ctx, { operation_id: reserved.operation_id }, h.deps);
+    expect(result.operation).toMatchObject({
+      operation_id: reserved.operation_id,
+      scope: 'freellmapi',
+      created: true
+    });
+    expect(result.operation).not.toHaveProperty('permissions');
   } finally {
     await h.close();
   }

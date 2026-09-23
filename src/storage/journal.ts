@@ -106,6 +106,8 @@ export interface ProjectReservation {
   project_id: string;
   display_name?: string;
   relative_root?: string;
+  backend_project?: string;
+  backend_relative_root?: string;
   created_by_actor_id: string;
   creation_operation_id: string;
 }
@@ -313,6 +315,21 @@ interface LegacyMemberRow {
 
 function recoveryRequired(message: string, cause?: unknown): BrainError {
   return new BrainError({ code: 'RECOVERY_REQUIRED', message, cause });
+}
+
+interface KeyResolutionError {
+  key_resolution?: 'conflict' | 'recovery_required';
+}
+
+function markResolution(error: BrainError, resolution: 'conflict' | 'recovery_required'): BrainError {
+  (error as KeyResolutionError).key_resolution = resolution;
+  return error;
+}
+
+function keyResolutionOf(error: unknown): 'conflict' | 'recovery_required' | undefined {
+  if (!isBrainError(error)) return undefined;
+  const value = (error as KeyResolutionError).key_resolution;
+  return value === 'conflict' || value === 'recovery_required' ? value : undefined;
 }
 
 function invalidInput(message: string): BrainError {
@@ -1041,7 +1058,38 @@ export class Journal {
       if (isBrainError(error)) throw error;
       throw recoveryRequired(`operation journal at ${path} cannot be initialized`, error);
     }
-    return new Journal(database, clock, ids);
+    const journal = new Journal(database, clock, ids);
+    journal.resolveLegacyKeys();
+    return journal;
+  }
+
+  resolveLegacyKeys(): void {
+    this.assertOpen();
+    const rows = this.database
+      .prepare(
+        "SELECT * FROM brain_idempotency_keys WHERE origin = 'legacy' AND resolution = 'unresolved'"
+      )
+      .all() as IdempotencyKeyRow[];
+    for (const row of rows) {
+      try {
+        const run = this.database.transaction((): void => {
+          this.classifyLegacyKey(row);
+        });
+        run.immediate();
+      } catch (error) {
+        const resolution = keyResolutionOf(error);
+        if (resolution !== undefined) this.markKeyOutcome(row.idempotency_key, resolution);
+      }
+    }
+  }
+
+  isKeyBlocked(idempotency_key: string): boolean {
+    this.assertOpen();
+    const key = this.getIdempotencyKey(idempotency_key);
+    return (
+      key !== undefined &&
+      (key.resolution === 'conflict' || key.resolution === 'recovery_required')
+    );
   }
 
   reserve(input: OperationReservation): ReservationResult {
@@ -1049,15 +1097,8 @@ export class Journal {
     try {
       return this.reserveTransaction(input);
     } catch (error) {
-      if (
-        isBrainError(error) &&
-        (error.code === 'IDEMPOTENCY_CONFLICT' || error.code === 'RECOVERY_REQUIRED')
-      ) {
-        this.markKeyOutcome(
-          input.idempotency_key,
-          error.code === 'IDEMPOTENCY_CONFLICT' ? 'conflict' : 'recovery_required'
-        );
-      }
+      const resolution = keyResolutionOf(error);
+      if (resolution !== undefined) this.markKeyOutcome(input.idempotency_key, resolution);
       throw error;
     }
   }
@@ -1127,7 +1168,6 @@ export class Journal {
     }
     if (key.resolution === 'released') {
       if (!this.matchesKeyFingerprint(key, input.tool, input.scope, input.payload_hash)) {
-        this.setKeyResolution(input.idempotency_key, 'conflict');
         throw new BrainError({
           code: 'IDEMPOTENCY_CONFLICT',
           message: `idempotency key ${input.idempotency_key} was released for a different request`
@@ -1167,14 +1207,12 @@ export class Journal {
       return { kind: 'new', record: stored };
     }
     if (key.target_kind !== 'operation') {
-      this.setKeyResolution(input.idempotency_key, 'conflict');
       throw new BrainError({
         code: 'IDEMPOTENCY_CONFLICT',
         message: `idempotency key ${input.idempotency_key} was used for a different tool`
       });
     }
     if (!this.matchesKeyFingerprint(key, input.tool, input.scope, input.payload_hash)) {
-      this.setKeyResolution(input.idempotency_key, 'conflict');
       throw new BrainError({
         code: 'IDEMPOTENCY_CONFLICT',
         message: `idempotency key ${input.idempotency_key} was used for a different request`,
@@ -1183,16 +1221,16 @@ export class Journal {
     }
     const targetId = key.target_id;
     if (targetId === null) {
-      this.setKeyResolution(input.idempotency_key, 'recovery_required');
-      throw recoveryRequired(
-        `idempotency key ${input.idempotency_key} has no operation target`
+      throw markResolution(
+        recoveryRequired(`idempotency key ${input.idempotency_key} has no operation target`),
+        'recovery_required'
       );
     }
     const record = this.get(targetId);
     if (record === undefined) {
-      this.setKeyResolution(input.idempotency_key, 'recovery_required');
-      throw recoveryRequired(
-        `idempotency key ${input.idempotency_key} points at a missing operation`
+      throw markResolution(
+        recoveryRequired(`idempotency key ${input.idempotency_key} points at a missing operation`),
+        'recovery_required'
       );
     }
     return { kind: 'replay', record };
@@ -1201,71 +1239,118 @@ export class Journal {
   private classifyLegacyKey(key: IdempotencyKeyRow): IdempotencyKeyRow {
     const members = this.listLegacyMembers(key.idempotency_key);
     if (members.length === 0) {
-      this.setKeyResolution(key.idempotency_key, 'recovery_required');
-      throw recoveryRequired(
-        `idempotency key ${key.idempotency_key} has no historical members`
+      throw markResolution(
+        recoveryRequired(`idempotency key ${key.idempotency_key} has no historical members`),
+        'recovery_required'
       );
     }
-    if (members.length > 1) {
-      this.setKeyResolution(key.idempotency_key, 'conflict');
-      throw new BrainError({
-        code: 'IDEMPOTENCY_CONFLICT',
-        message: `idempotency key ${key.idempotency_key} was reused with conflicting legacy records`
-      });
-    }
-    const member = members[0];
-    if (member.record_kind === 'operation') {
-      const row = this.get(member.record_id);
-      if (row === undefined) {
-        this.setKeyResolution(key.idempotency_key, 'recovery_required');
-        throw recoveryRequired(
-          `idempotency key ${key.idempotency_key} references a missing operation`
-        );
-      }
-      const receipt =
-        row.receipt_json === undefined || row.receipt_json === null ? null : row.receipt_json;
-      if (TERMINAL_STATES.includes(row.state) && (receipt === null || receipt === '')) {
-        this.setKeyResolution(key.idempotency_key, 'recovery_required');
-        throw recoveryRequired(
-          `idempotency key ${key.idempotency_key} has a terminal operation without a receipt`
-        );
-      }
-      if (receipt !== null && receipt !== '') {
-        try {
-          JSON.parse(receipt);
-        } catch (cause) {
-          this.setKeyResolution(key.idempotency_key, 'recovery_required');
-          throw recoveryRequired(
-            `idempotency key ${key.idempotency_key} has an unreadable receipt`,
-            cause
+    const targets: {
+      kind: 'operation' | 'feedback';
+      id: string;
+      tool: string;
+      project: string;
+      payload: string | null;
+    }[] = [];
+    for (const member of members) {
+      if (member.record_kind === 'operation') {
+        const row = this.get(member.record_id);
+        if (row === undefined) {
+          throw markResolution(
+            recoveryRequired(
+              `idempotency key ${key.idempotency_key} references a missing operation`
+            ),
+            'recovery_required'
           );
         }
+        const receipt =
+          row.receipt_json === undefined || row.receipt_json === null || row.receipt_json === ''
+            ? null
+            : row.receipt_json;
+        if (TERMINAL_STATES.includes(row.state) && receipt === null) {
+          throw markResolution(
+            recoveryRequired(
+              `idempotency key ${key.idempotency_key} has a terminal operation without a receipt`
+            ),
+            'recovery_required'
+          );
+        }
+        if (receipt !== null) {
+          try {
+            const parsed = JSON.parse(receipt) as unknown;
+            if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              throw new Error('receipt is not an object');
+            }
+            const record = parsed as Record<string, unknown>;
+            if (record.operation_id !== row.operation_id) {
+              throw new Error('receipt operation does not match');
+            }
+            if (
+              typeof record.outcome !== 'string' ||
+              !['stored', 'stored_conflict', 'pending'].includes(record.outcome)
+            ) {
+              throw new Error('receipt outcome is invalid');
+            }
+          } catch (cause) {
+            throw markResolution(
+              recoveryRequired(
+                `idempotency key ${key.idempotency_key} has an invalid receipt`,
+                cause
+              ),
+              'recovery_required'
+            );
+          }
+        }
+        targets.push({
+          kind: 'operation',
+          id: row.operation_id,
+          tool: row.tool,
+          project: row.scope,
+          payload: row.payload_hash
+        });
+      } else {
+        const row = this.selectFeedbackRowById(member.record_id);
+        if (row === undefined) {
+          throw markResolution(
+            recoveryRequired(
+              `idempotency key ${key.idempotency_key} references a missing feedback record`
+            ),
+            'recovery_required'
+          );
+        }
+        targets.push({
+          kind: 'feedback',
+          id: row.feedback_id,
+          tool: 'brain_feedback',
+          project: row.scope,
+          payload: row.payload_hash
+        });
       }
-      this.database
-        .prepare(
-          `UPDATE brain_idempotency_keys
-           SET resolution = 'bound', tool = ?, project_id = ?, payload_hash = ?,
-               target_kind = 'operation', target_id = ?
-           WHERE idempotency_key = ?`
-        )
-        .run(row.tool, row.scope, row.payload_hash, row.operation_id, key.idempotency_key);
-    } else {
-      const row = this.selectFeedbackRowById(member.record_id);
-      if (row === undefined) {
-        this.setKeyResolution(key.idempotency_key, 'recovery_required');
-        throw recoveryRequired(
-          `idempotency key ${key.idempotency_key} references a missing feedback record`
-        );
-      }
-      this.database
-        .prepare(
-          `UPDATE brain_idempotency_keys
-           SET resolution = 'bound', tool = ?, project_id = ?, payload_hash = ?,
-               target_kind = 'feedback', target_id = ?
-           WHERE idempotency_key = ?`
-        )
-        .run('brain_feedback', row.scope, row.payload_hash, row.feedback_id, key.idempotency_key);
     }
+    if (targets.length > 1) {
+      throw markResolution(
+        new BrainError({
+          code: 'IDEMPOTENCY_CONFLICT',
+          message: `idempotency key ${key.idempotency_key} was reused with conflicting legacy records`
+        }),
+        'conflict'
+      );
+    }
+    const target = targets[0];
+    this.database
+      .prepare(
+        `UPDATE brain_idempotency_keys
+         SET resolution = 'bound', tool = ?, project_id = ?, payload_hash = ?,
+             target_kind = ?, target_id = ?
+         WHERE idempotency_key = ?`
+      )
+      .run(
+        target.tool,
+        target.project,
+        target.payload,
+        target.kind,
+        target.id,
+        key.idempotency_key
+      );
     const updated = this.getIdempotencyKey(key.idempotency_key);
     if (updated === undefined) {
       throw recoveryRequired(`idempotency key ${key.idempotency_key} disappeared while binding`);
@@ -1369,6 +1454,14 @@ export class Journal {
       input.relative_root ?? `Projects/${projectId}`,
       'relative root'
     );
+    const backendProject = requireProjectText(
+      input.backend_project ?? projectId,
+      'backend project'
+    );
+    const backendRelativeRoot = requireProjectText(
+      input.backend_relative_root ?? relativeRoot,
+      'backend relative root'
+    );
     if (
       repositoryIdentity.includes('://') ||
       (repositoryIdentity.split('/', 1)[0]?.includes('@') ?? true) ||
@@ -1382,6 +1475,8 @@ export class Journal {
       project_id: projectId,
       display_name: displayName,
       relative_root: relativeRoot,
+      backend_project: backendProject,
+      backend_relative_root: backendRelativeRoot,
       created_by_actor_id: actorId,
       creation_operation_id: operationId
     };
@@ -1415,9 +1510,8 @@ export class Journal {
             project_id, backend_project, backend_relative_root
           ) VALUES (?, ?, ?)`
         )
-        .run(projectId, projectId, relativeRoot);
-      const project = this.getProjectById(projectId);
-      if (project === undefined) throw recoveryRequired('project was not persisted');
+        .run(projectId, backendProject, backendRelativeRoot);
+      const project = this.getProjectById(projectId);      if (project === undefined) throw recoveryRequired('project was not persisted');
       this.clearOperationalLossAcknowledgement();
       return { kind: 'new', project };
     });
@@ -1729,11 +1823,10 @@ export class Journal {
         this.database
           .prepare(
             `UPDATE brain_idempotency_keys
-             SET resolution = 'bound', tool = ?, project_id = ?, payload_hash = ?,
-                 target_kind = 'operation', target_id = ?
+             SET resolution = 'conflict'
              WHERE idempotency_key = ?`
           )
-          .run(row.tool, row.scope, row.payload_hash, id, row.idempotency_key);
+          .run(row.idempotency_key);
         return;
       }
       if (key !== undefined) {
@@ -1925,11 +2018,8 @@ export class Journal {
   }
 
   private markFeedbackFailure(idempotencyKey: string, error: unknown): void {
-    if (!isBrainError(error)) return;
-    if (error.code === 'IDEMPOTENCY_CONFLICT') this.markKeyOutcome(idempotencyKey, 'conflict');
-    else if (error.code === 'RECOVERY_REQUIRED') {
-      this.markKeyOutcome(idempotencyKey, 'recovery_required');
-    }
+    const resolution = keyResolutionOf(error);
+    if (resolution !== undefined) this.markKeyOutcome(idempotencyKey, resolution);
   }
 
   private resolveFeedbackKey(
@@ -1951,14 +2041,12 @@ export class Journal {
       );
     }
     if (key.resolution === 'released' || key.target_kind !== 'feedback') {
-      this.setKeyResolution(normalized.idempotency_key, 'conflict');
       throw new BrainError({
         code: 'IDEMPOTENCY_CONFLICT',
         message: `idempotency key ${normalized.idempotency_key} was used for a different tool`
       });
     }
     if (key.project_id !== normalized.scope) {
-      this.setKeyResolution(normalized.idempotency_key, 'conflict');
       throw new BrainError({
         code: 'IDEMPOTENCY_CONFLICT',
         message: `idempotency key ${normalized.idempotency_key} was used in a different project`
@@ -1966,9 +2054,11 @@ export class Journal {
     }
     const row = key.target_id === null ? undefined : this.selectFeedbackRowById(key.target_id);
     if (row === undefined) {
-      this.setKeyResolution(normalized.idempotency_key, 'recovery_required');
-      throw recoveryRequired(
-        `idempotency key ${normalized.idempotency_key} points at a missing feedback record`
+      throw markResolution(
+        recoveryRequired(
+          `idempotency key ${normalized.idempotency_key} points at a missing feedback record`
+        ),
+        'recovery_required'
       );
     }
     if (key.payload_hash !== null) {
@@ -1977,7 +2067,6 @@ export class Journal {
           ? legacyFeedbackHash(raw, row.principal_id)
           : feedbackSemanticHash(raw);
       if (expected !== key.payload_hash) {
-        this.setKeyResolution(normalized.idempotency_key, 'conflict');
         throw new BrainError({
           code: 'IDEMPOTENCY_CONFLICT',
           message: `idempotency key ${normalized.idempotency_key} was used for different feedback`
@@ -1985,8 +2074,15 @@ export class Journal {
       }
       return { kind: 'replay', entry: toFeedback(row) };
     }
+    if ([...raw.reason].length > FEEDBACK_REASON_MAX_LENGTH && row.reason === normalized.reason) {
+      throw markResolution(
+        recoveryRequired(
+          `idempotency key ${normalized.idempotency_key} cannot prove the full reason matched a truncated historical value`
+        ),
+        'recovery_required'
+      );
+    }
     if (!feedbackMatches(row, normalized)) {
-      this.setKeyResolution(normalized.idempotency_key, 'conflict');
       throw new BrainError({
         code: 'IDEMPOTENCY_CONFLICT',
         message: `idempotency key ${normalized.idempotency_key} was used for different feedback`

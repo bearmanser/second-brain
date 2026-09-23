@@ -1,4 +1,5 @@
 import { BrainError } from '../contracts/errors.js';
+import { SCOPE_ID_PATTERN } from '../core/limits.js';
 import type {
   BackendPort,
   CataloguePort,
@@ -52,11 +53,15 @@ export class LegacyProjectAdapter implements LegacyProjectAdapterPort {
 
   async ensure(project: Project): Promise<{ created: boolean }> {
     const scope = this.scopeFor(project);
-    if (scope === undefined) {
+    const binding = this.binding(project.id);
+    if (scope === undefined || binding === undefined) {
       throw recoveryRequired(`project ${project.id} has no legacy backend binding`);
     }
     const created = (
-      await this.deps.backend.ensureProject(scope.backend_project, `/app/data/${scope.relative_root}`)
+      await this.deps.backend.ensureProject(
+        binding.backend_project,
+        `/app/data/${binding.backend_relative_root}`
+      )
     ).created;
     this.deps.vault.registerScope(scope);
     this.deps.backend.registerScope(scope);
@@ -66,11 +71,12 @@ export class LegacyProjectAdapter implements LegacyProjectAdapterPort {
 
   async verify(project: Project): Promise<boolean> {
     const scope = this.scopeFor(project);
-    if (scope === undefined) return false;
+    const binding = this.binding(project.id);
+    if (scope === undefined || binding === undefined) return false;
     this.deps.vault.registerScope(scope);
     return this.deps.backend.verifyProject(
-      scope.backend_project,
-      `/app/data/${scope.relative_root}`
+      binding.backend_project,
+      `/app/data/${binding.backend_relative_root}`
     );
   }
 }
@@ -116,16 +122,47 @@ export function parseLegacyProvisioningPlan(input: {
     input.operation_id
   );
   const legacyScope = record.scope;
-  const projectId = requiredString(
-    record.project_id ?? legacyScope,
-    'project_id',
-    input.operation_id
-  );
-  const relativeRoot = requiredString(
-    record.relative_root,
-    'relative_root',
-    input.operation_id
-  );
+  if (legacyScope !== undefined) {
+    const scope = requiredString(legacyScope, 'scope', input.operation_id);
+    if (!SCOPE_ID_PATTERN.test(scope)) {
+      throw recoveryRequired(`provisioning plan for ${input.operation_id} has an invalid scope`);
+    }
+    const backendProject = requiredString(
+      record.backend_project,
+      'backend_project',
+      input.operation_id
+    );
+    const relativeRoot = requiredString(record.relative_root, 'relative_root', input.operation_id);
+    if (backendProject !== scope || relativeRoot !== `Projects/${scope}`) {
+      throw recoveryRequired(
+        `provisioning plan for ${input.operation_id} has inconsistent legacy storage mappings`
+      );
+    }
+    const grant = record.grant;
+    if (grant === null || typeof grant !== 'object' || Array.isArray(grant)) {
+      throw recoveryRequired(`provisioning plan for ${input.operation_id} has no legacy grant`);
+    }
+    const grantRecord = grant as Record<string, unknown>;
+    const grantActor = requiredString(grantRecord.principal_id, 'grant principal', input.operation_id);
+    if (grantRecord.scope !== scope || grantRecord.can_read !== true) {
+      throw recoveryRequired(
+        `provisioning plan for ${input.operation_id} has an inconsistent legacy grant`
+      );
+    }
+    return {
+      repository_identity: repositoryIdentity,
+      project_id: scope,
+      display_name: scope,
+      relative_root: relativeRoot,
+      backend_project: backendProject,
+      backend_relative_root: relativeRoot,
+      created_by_actor_id: grantActor,
+      creation_operation_id: input.operation_id
+    };
+  }
+  const projectId = requiredString(record.project_id, 'project_id', input.operation_id);
+  const displayName = requiredString(record.display_name, 'display_name', input.operation_id);
+  const relativeRoot = requiredString(record.relative_root, 'relative_root', input.operation_id);
   const backendProject = requiredString(
     record.backend_project ?? projectId,
     'backend_project',
@@ -136,21 +173,10 @@ export function parseLegacyProvisioningPlan(input: {
     'backend_relative_root',
     input.operation_id
   );
-  const displayName =
-    typeof record.display_name === 'string' && record.display_name.length > 0
-      ? record.display_name
-      : projectId;
-  const grant = record.grant;
-  const grantActor =
-    grant !== null && typeof grant === 'object' && !Array.isArray(grant)
-      ? (grant as { principal_id?: unknown }).principal_id
-      : undefined;
   const createdBy =
     typeof record.created_by_actor_id === 'string' && record.created_by_actor_id.length > 0
       ? record.created_by_actor_id
-      : typeof grantActor === 'string' && grantActor.length > 0
-        ? grantActor
-        : SYSTEM_ACTOR.id;
+      : SYSTEM_ACTOR.id;
   const creationOperationId =
     typeof record.creation_operation_id === 'string' && record.creation_operation_id.length > 0
       ? record.creation_operation_id

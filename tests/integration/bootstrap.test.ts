@@ -85,6 +85,29 @@ test('legacy-only setup stops with explicit conversion instructions', async () =
   }
 });
 
+test('legacy token plus credentials without an explicit digest is refused', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'brain-setup-'));
+  try {
+    await mkdir(join(root, 'secrets'), { recursive: true });
+    await mkdir(join(root, 'config'), { recursive: true });
+    await writeFile(join(root, 'secrets/brain-token'), 'legacy-worker-token\n', { mode: 0o600 });
+    await writeFile(
+      join(root, 'secrets/credentials.json'),
+      JSON.stringify({ credentials: [{ token_sha256: 'a'.repeat(64) }] }),
+      'utf8'
+    );
+    await writeFile(
+      join(root, 'config/brain.yaml'),
+      'credentials_file: /run/secrets/brain_credentials\n',
+      'utf8'
+    );
+    await expect(bootstrap({ root })).rejects.toThrow(/auth migrate/);
+    await expect(readFile(join(root, '.env'))).rejects.toThrow();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('bootstrap rejects secrets placed inside the vault', async () => {
   const root = await mkdtemp(join(tmpdir(), 'brain-setup-'));
   try {

@@ -81,6 +81,8 @@ function planFor(
     project_id: projectId,
     display_name: projectId,
     relative_root: `Projects/${projectId}`,
+    backend_project: projectId,
+    backend_relative_root: `Projects/${projectId}`,
     created_by_actor_id: actorId,
     creation_operation_id: operationId
   };
@@ -103,6 +105,8 @@ function parsePlan(record: OperationRecord): ProjectProvisioningPlan {
     project_id: parsed.project_id,
     display_name: parsed.display_name,
     relative_root: parsed.relative_root,
+    backend_project: parsed.backend_project,
+    backend_relative_root: parsed.backend_relative_root,
     created_by_actor_id: parsed.created_by_actor_id,
     creation_operation_id: parsed.creation_operation_id
   };
@@ -152,6 +156,8 @@ async function finalizePlan(
       project_id: plan.project_id,
       display_name: plan.display_name,
       relative_root: plan.relative_root,
+      backend_project: plan.backend_project,
+      backend_relative_root: plan.backend_relative_root,
       created_by_actor_id: plan.created_by_actor_id,
       creation_operation_id: record.operation_id
     }).project;

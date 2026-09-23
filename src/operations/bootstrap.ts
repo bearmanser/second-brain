@@ -48,6 +48,7 @@ const CONFIG_RELATIVE = 'config/brain.yaml';
 const TOKEN_RELATIVE = 'secrets/brain-token';
 const CURSOR_KEY_RELATIVE = 'secrets/cursor-key';
 const LEGACY_CREDENTIALS_RELATIVE = 'secrets/credentials.json';
+const OWNER_TOKEN_RELATIVE = 'secrets/owner-token';
 const ENV_RELATIVE = '.env';
 
 const SCOPE_RELATIVE_ROOTS: Record<string, string> = {
@@ -251,6 +252,7 @@ export async function bootstrap(options: BootstrapOptions): Promise<BootstrapRes
   const cursorPath = join(root, CURSOR_KEY_RELATIVE);
   const envPath = join(root, ENV_RELATIVE);
   const legacyCredentialsPath = join(root, LEGACY_CREDENTIALS_RELATIVE);
+  const ownerTokenPath = join(root, OWNER_TOKEN_RELATIVE);
 
   const scopes = buildScopes(scope);
   const created: string[] = [];
@@ -328,6 +330,25 @@ export async function bootstrap(options: BootstrapOptions): Promise<BootstrapRes
   if (envDigests.length > 1) {
     throw invalidInput(`${envPath} assigns ${TOKEN_ENV_KEY} more than once`);
   }
+
+  const legacyIndicators: string[] = [];
+  if ((await readIfExists(legacyCredentialsPath)) !== undefined) {
+    legacyIndicators.push(legacyCredentialsPath);
+  }
+  if ((await readIfExists(ownerTokenPath)) !== undefined) {
+    legacyIndicators.push(ownerTokenPath);
+  }
+  if (existingConfig !== undefined && /credentials_file\s*:/u.test(existingConfig)) {
+    legacyIndicators.push(configPath);
+  }
+  if (legacyIndicators.length > 0 && envDigests.length === 0) {
+    throw invalidInput(
+      `legacy credentials or configuration found at ${legacyIndicators.join(', ')}; ` +
+        `select one digest explicitly with "auth migrate --credentials-file <path> --select-entry N" ` +
+        `and set ${TOKEN_ENV_KEY} before rerunning setup`
+    );
+  }
+
   const existingToken = await readIfExists(tokenPath);
   let digest = envDigests[0];
   if (existingToken !== undefined) {
@@ -341,12 +362,6 @@ export async function bootstrap(options: BootstrapOptions): Promise<BootstrapRes
     preserved.push(TOKEN_RELATIVE);
   }
   if (digest === undefined) {
-    if ((await readIfExists(legacyCredentialsPath)) !== undefined) {
-      throw invalidInput(
-        `legacy credentials found at ${legacyCredentialsPath}; select one digest explicitly with ` +
-          `"auth migrate --credentials-file ${legacyCredentialsPath} --select-entry N" and set ${TOKEN_ENV_KEY}`
-      );
-    }
     const token = newToken();
     digest = tokenDigest(token);
     await writeFile(tokenPath, `${token}\n`, { mode: SECRET_MODE });

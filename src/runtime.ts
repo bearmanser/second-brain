@@ -26,7 +26,7 @@ import { capture } from './features/capture.js';
 import { feedback, retrievalEventFromRecall } from './features/feedback.js';
 import { ensureProject } from './features/project-ensure.js';
 import { read } from './features/read.js';
-import { recall, recallSelection } from './features/recall.js';
+import { recallTraced } from './features/recall.js';
 import { review } from './features/review.js';
 import { status } from './features/status.js';
 import { createHttpApp } from './mcp/http.js';
@@ -125,15 +125,14 @@ function buildServices(
     projectEnsure: (ctx, request): Promise<ProjectEnsureResult> => ensureProject(ctx, request, deps),
     recall: async (ctx, request): Promise<RecallResult> => {
       const started = Date.now();
-      const result = await recall(ctx, request, deps);
+      const traced = await recallTraced(ctx, request, deps);
+      const result = traced.result;
       try {
-        const selection = recallSelection(request, deps);
         deps.journal.recordRetrievalV2(
           retrievalEventFromRecall(ctx, result, {
-            filter: selection.filter,
-            searched_project_ids: selection.scopes.map((scope) => scope.id),
-            primary_project_id:
-              selection.filter.mode === 'project' ? selection.filter.identifier : null,
+            filter: traced.filter,
+            searched_project_ids: traced.searched_project_ids,
+            primary_project_id: traced.primary_project_id,
             duration_ms: Math.max(0, Date.now() - started)
           })
         );
@@ -317,17 +316,25 @@ class BrainRuntimeImpl implements BrainRuntime {
       for (const scope of scopeRegistry.all()) backend.registerScope(scope);
       for (const project of journal.listReadyProjects()) {
         const binding = journal.getProjectBinding(project.project.id);
+        if (binding === undefined) {
+          journal.markProjectRecoveryRequired(
+            project.project.id,
+            'startup_verification',
+            'MISSING_BINDING'
+          );
+          continue;
+        }
         const scope = {
           id: project.project.id,
-          backend_project: binding?.backend_project ?? project.project.id,
+          backend_project: binding.backend_project,
           relative_root: project.project.relative_root,
           repository_aliases: []
         };
         try {
           vault.registerScope(scope);
           const verified = await backend.verifyProject(
-            scope.backend_project,
-            `/app/data/${scope.relative_root}`
+            binding.backend_project,
+            `/app/data/${binding.backend_relative_root}`
           );
           if (!verified) {
             throw new BrainError({

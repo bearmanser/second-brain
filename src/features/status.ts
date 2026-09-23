@@ -19,6 +19,7 @@ import {
   type StatusResult
 } from '../core/types.js';
 import { projectFilter } from '../projects/registry.js';
+import { projectEnsureReceipt } from '../storage/legacy-project-adapter.js';
 import {
   APPLICATION_VERSION,
   PROTOCOL_VERSION,
@@ -61,7 +62,6 @@ const projectEnsureResultSchema = z.strictObject({
   materialized: z.boolean(),
   warnings: z.array(z.string())
 });
-
 const storedRevisionSchema = z.looseObject({
   id: uuidSchema,
   revision_id: uuidSchema,
@@ -158,17 +158,19 @@ function plannedIdentity(record: OperationRecord): PlannedIdentity | undefined {
 function receiptFromRecord(record: OperationRecord): MutationReceipt | ProjectEnsureResult | undefined {
   if (record.tool === 'brain_project_ensure') {
     if (record.receipt_json === undefined) return undefined;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(record.receipt_json);
-    } catch (cause) {
-      throw recoveryRequired(record.operation_id, cause);
-    }
-    const result = projectEnsureResultSchema.safeParse(parsed);
-    if (!result.success || result.data.operation_id !== record.operation_id || result.data.scope !== record.scope) {
+    const projected = projectEnsureReceipt(record.receipt_json, record.operation_id);
+    if (projected.project_id !== record.scope) {
       throw recoveryRequired(record.operation_id);
     }
-    return result.data;
+    return {
+      operation_id: projected.operation_id,
+      repository_identity: projected.repository_identity,
+      scope: projected.project_id,
+      created: projected.created,
+      backend_ready: projected.backend_ready,
+      materialized: projected.materialized,
+      warnings: projected.warnings
+    };
   }
   const plan = plannedIdentity(record);
   if (record.receipt_json !== undefined) {
@@ -244,9 +246,10 @@ export async function status(
       : [deps.scopeRegistry.require(filter.identifier)];
 
   const scopes = selectedScopes.map((scope) => ({ id: scope.id }));
+  const selectedIds = new Set(selectedScopes.map((scope) => scope.id));
   const pending = deps.journal
     .pending()
-    .filter((record) => filter.mode === 'all' || record.scope === filter.identifier);
+    .filter((record) => filter.mode === 'all' || selectedIds.has(record.scope));
 
   const backend = await backendHealth(deps);
   const gateway = backend === 'unavailable' ? 'degraded' : pending.length > 0 ? 'recovering' : 'ready';
@@ -260,7 +263,7 @@ export async function status(
     pending_operations: pending.length
   };
   const projects = projectRecords.filter(
-    (project) => filter.mode === 'all' || project.project.id === filter.identifier
+    (project) => filter.mode === 'all' || selectedIds.has(project.project.id)
   );
   if (projects.length > 0) {
     result.projects = projects.map((project) => ({
