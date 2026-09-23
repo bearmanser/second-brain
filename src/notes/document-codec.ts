@@ -1,7 +1,7 @@
 import { fromMarkdown } from 'mdast-util-from-markdown';
 import { parseDocument as parseYamlDocument, stringify, visit } from 'yaml';
 import { BrainError } from '../contracts/errors.js';
-import { EVIDENCE_KINDS, type Evidence, type NoteInput, type NoteKind } from '../core/types.js';
+import { EVIDENCE_KINDS, type Evidence, type NoteInput } from '../core/types.js';
 import { NOTE_REGISTRY, RELATED_SECTION_TITLE, normalizeSectionTitle } from './registry.js';
 import {
   BRAIN_SCHEMA_VERSION,
@@ -33,7 +33,7 @@ const HEADING_PATTERN = /^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$/;
 const FENCE_OPEN_PATTERN = /^ {0,3}(`{3,}|~{3,})/;
 const LINK_SCHEMES: ReadonlySet<string> = new Set(['http', 'https', 'mailto']);
 const SOURCE_ENTRY_PATTERN =
-  /^- \*\*([a-z_]+)\*\* (?:\[((?:\\.|[^\]])*)\]\(<((?:\\.|[^>])*)>\)|`((?:\\.|[^`])*)`)(?: \(observed ((?:\\.|[^)])*)\))? \u2014 (.*)$/;
+  /^- \*\*([a-z_]+)\*\* (?:\[((?:\\.|[^\]])*)\]\(<((?:\\.|[^>])*)>\)|\[((?:\\.|[^\]])*)\]\(((?:\\.|[^)\s])+)\)|`((?:\\.|[^`])*)`)(?: \(observed ((?:\\.|[^)])*)\))? \u2014 (.*)$/;
 
 export interface DocumentMetadata {
   path: string;
@@ -62,7 +62,7 @@ export interface RevisionMetadata {
 
 export interface NoteBodyExtras {
   human?: string[];
-  sourceHuman?: string[];
+  sectionHuman?: Record<string, string[]>;
 }
 
 export interface ParsedSources {
@@ -308,7 +308,7 @@ export function renderDocument(document: CurrentDocument): string {
 
 function renderReference(entry: Evidence): string {
   if (isSafeLink(entry.ref)) {
-    const label = escapeField(entry.ref, '[]');
+    const label = escapeField(entry.ref, '[]*_');
     const target = escapeField(entry.ref, '<>');
     return `[${label}](<${target}>)`;
   }
@@ -348,6 +348,16 @@ function updateFence(state: FenceState | null, line: string): FenceState | null 
   return state;
 }
 
+function findSourceHeadingIndex(lines: string[]): number {
+  let fence: FenceState | null = null;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (fence === null && isSourceHeading(line)) return index;
+    fence = updateFence(fence, line);
+  }
+  return -1;
+}
+
 function collectSourceLines(
   lines: string[],
   start: number,
@@ -367,11 +377,11 @@ function collectSourceLines(
     const match = SOURCE_ENTRY_PATTERN.exec(line);
     const kind = match?.[1];
     if (match !== null && kind !== undefined && (EVIDENCE_KINDS as readonly string[]).includes(kind)) {
-      const observed = match[5];
+      const observed = match[7];
       evidence.push({
         kind: kind as Evidence['kind'],
-        ref: unescapeField(match[3] ?? match[4] ?? ''),
-        description: unescapeField(match[6] ?? ''),
+        ref: unescapeField(match[3] ?? match[5] ?? match[6] ?? ''),
+        description: unescapeField(match[8] ?? ''),
         ...(observed === undefined ? {} : { observed_at: unescapeField(observed) })
       });
       continue;
@@ -385,11 +395,8 @@ export function parseSources(section: string): ParsedSources {
   const lines = section.split('\n');
   const evidence: Evidence[] = [];
   const human: string[] = [];
-  const headingIndex = lines.findIndex((line) => isSourceHeading(line));
-  if (headingIndex === -1) {
-    collectSourceLines(lines, 0, false, evidence, human);
-    return { evidence, human };
-  }
+  const headingIndex = findSourceHeadingIndex(lines);
+  if (headingIndex === -1) return { evidence, human: [...lines] };
   let start = headingIndex + 1;
   if (start < lines.length && lines[start].trim() === '') start += 1;
   collectSourceLines(lines, start, true, evidence, human);
@@ -402,24 +409,34 @@ function renderList(items: readonly string[]): string {
 
 export function renderNoteBody(note: NoteInput, extras: NoteBodyExtras = {}): string {
   const content = note.content as unknown as Record<string, unknown>;
+  const sectionHuman: Record<string, string[]> = { ...(extras.sectionHuman ?? {}) };
+  const takeSection = (title: string): string[] => {
+    const value = sectionHuman[title];
+    delete sectionHuman[title];
+    return value ?? [];
+  };
+  const withHuman = (base: string, blocks: string[]): string => {
+    const extra = trimBlock(blocks.join('\n\n'));
+    return extra.length === 0 ? base : `${base}\n\n${extra}`;
+  };
   const blocks: string[] = [`# ${singleLine(note.title)}`];
   for (const spec of NOTE_REGISTRY[note.content.kind].sections) {
     const value = content[spec.field];
     if (value === undefined) continue;
     const text = spec.form === 'yaml_list' ? renderList(value as string[]) : String(value);
-    blocks.push(`## ${spec.title}\n\n${text}`);
+    blocks.push(withHuman(`## ${spec.title}\n\n${text}`, takeSection(spec.title)));
   }
-  const sourceHuman = trimBlock((extras.sourceHuman ?? []).join('\n'));
-  if (note.evidence.length > 0 || sourceHuman.length > 0) {
-    const sources = renderSources(note.evidence);
-    blocks.push(sourceHuman.length === 0 ? sources : `${sources}\n\n${sourceHuman}`);
+  const sourceExtra = takeSection(SOURCE_SECTION_TITLE);
+  if (note.evidence.length > 0 || sourceExtra.length > 0) {
+    blocks.push(withHuman(renderSources(note.evidence), sourceExtra));
   }
-  if (note.related_ids.length > 0) {
-    blocks.push(
-      `## ${RELATED_SECTION_TITLE}\n\n${note.related_ids.map((id) => `- [[${id}]]`).join('\n')}`
-    );
+  const relatedExtra = takeSection(RELATED_SECTION_TITLE);
+  if (note.related_ids.length > 0 || relatedExtra.length > 0) {
+    const generated = note.related_ids.map((id) => `- [[${id}]]`).join('\n');
+    blocks.push(withHuman(`## ${RELATED_SECTION_TITLE}\n\n${generated}`, relatedExtra));
   }
-  const human = (extras.human ?? [])
+  const leftovers = Object.values(sectionHuman).flat();
+  const human = [...(extras.human ?? []), ...leftovers]
     .map((block) => trimBlock(block))
     .filter((block) => block.length > 0);
   if (human.length > 0) blocks.push(human.join('\n\n'));
@@ -466,73 +483,72 @@ function collectLevelOneAndTwoHeadings(body: string): HeadingRef[] {
   return refs;
 }
 
-function managedSectionTitles(kind: NoteKind): ReadonlySet<string> {
-  const titles = new Set<string>();
-  for (const spec of NOTE_REGISTRY[kind].sections) titles.add(normalizeSectionTitle(spec.title));
-  titles.add(SOURCE_SECTION_TITLE);
-  titles.add(RELATED_SECTION_TITLE);
-  return titles;
+interface GeneratedRemoval {
+  start: number;
+  end: number;
+  title: string;
+  depth: number;
 }
 
-interface HumanContent {
-  human: string[];
-  sourceHuman: string[];
-}
-
-function extractHumanContent(body: string, kind: NoteKind): HumanContent {
-  const headings = collectLevelOneAndTwoHeadings(body);
-  const managed = managedSectionTitles(kind);
-  const ranges: [number, number][] = [];
-  const sourceHuman: string[] = [];
-  const relatedHuman: string[] = [];
+function subtractGenerated(
+  body: string,
+  generated: string
+): { general: string[]; sections: Record<string, string[]> } {
+  const headings = collectLevelOneAndTwoHeadings(generated);
+  const removals: GeneratedRemoval[] = [];
+  let cursor = 0;
   for (let index = 0; index < headings.length; index += 1) {
     const heading = headings[index];
-    if (heading.depth === 1) {
-      ranges.push([heading.start, heading.end]);
+    const end = index + 1 < headings.length ? headings[index + 1].start : generated.length;
+    const block = generated.slice(heading.start, end);
+    const found = body.indexOf(block, cursor);
+    if (found === -1) continue;
+    removals.push({
+      start: found,
+      end: found + block.length,
+      title: heading.title,
+      depth: heading.depth
+    });
+    cursor = found + block.length;
+  }
+  const general: string[] = [];
+  const sections: Record<string, string[]> = {};
+  const prefix = removals.length > 0 ? body.slice(0, removals[0].start) : body;
+  const prefixText = trimBlock(prefix);
+  if (prefixText.length > 0) general.push(prefixText);
+  for (let index = 0; index < removals.length; index += 1) {
+    const removal = removals[index];
+    const nextStart = index + 1 < removals.length ? removals[index + 1].start : body.length;
+    const segment = trimBlock(body.slice(removal.end, nextStart));
+    if (segment.length === 0) continue;
+    if (removal.depth === 1) {
+      general.push(segment);
       continue;
     }
-    if (!managed.has(heading.title)) continue;
-    const end = index + 1 < headings.length ? headings[index + 1].start : body.length;
-    ranges.push([heading.start, end]);
-    if (heading.title === SOURCE_SECTION_TITLE) {
-      sourceHuman.push(...parseSources(body.slice(heading.start, end)).human);
-    } else if (heading.title === RELATED_SECTION_TITLE) {
-      const sectionLines = body.slice(heading.start, end).split('\n');
-      for (let line = 1; line < sectionLines.length; line += 1) {
-        if (/^\s*- \[\[.*\]\]\s*$/.test(sectionLines[line])) continue;
-        relatedHuman.push(sectionLines[line]);
-      }
-    }
+    const existing = sections[removal.title];
+    if (existing === undefined) sections[removal.title] = [segment];
+    else existing.push(segment);
   }
-  ranges.sort((left, right) => left[0] - right[0]);
-  const human: string[] = [];
-  let cursor = 0;
-  for (const [start, end] of ranges) {
-    if (start > cursor) {
-      const segment = trimBlock(body.slice(cursor, start));
-      if (segment.length > 0) human.push(segment);
-    }
-    cursor = Math.max(cursor, end);
-  }
-  if (cursor < body.length) {
-    const segment = trimBlock(body.slice(cursor));
-    if (segment.length > 0) human.push(segment);
-  }
-  const related = trimBlock(relatedHuman.join('\n'));
-  if (related.length > 0) human.push(related);
-  return { human, sourceHuman };
+  return { general, sections };
+}
+
+export interface RevisionOptions {
+  previous: NoteInput;
+  meta?: RevisionMetadata;
 }
 
 export function reviseDocument(
   base: CurrentDocument,
   note: NoteInput,
-  meta: RevisionMetadata = {}
+  options: RevisionOptions
 ): CurrentDocument {
+  const meta = options.meta ?? {};
+  const generated = renderNoteBody(options.previous);
+  const { general, sections } = subtractGenerated(base.body, generated);
   const id = meta.id ?? base.id;
   const project = meta.project ?? base.project;
   const created = meta.created ?? base.created;
   const updated = meta.updated ?? base.updated;
-  const extracted = extractHumanContent(base.body, note.content.kind);
   return {
     ...(id === undefined ? {} : { id }),
     path: base.path,
@@ -545,6 +561,6 @@ export function reviseDocument(
     ...(created === undefined ? {} : { created }),
     ...(updated === undefined ? {} : { updated }),
     properties: { ...base.properties, ...(meta.properties ?? {}) },
-    body: renderNoteBody(note, { human: extracted.human, sourceHuman: extracted.sourceHuman })
+    body: renderNoteBody(note, { human: general, sectionHuman: sections })
   };
 }

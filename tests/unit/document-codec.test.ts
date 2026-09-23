@@ -540,14 +540,35 @@ test('unsafe link schemes are inert text and labels stay escaped', () => {
   ]);
 });
 
+const referenceId = '11111111-1111-4111-8111-111111111111';
+
 test('a revision preserves human sections and source additions', () => {
-  const raw = readFileSync(
-    new URL('../fixtures/vault-v2/readable-decision.md', import.meta.url),
-    'utf8'
-  );
-  const base = parseDocument(raw, 'Projects/Second Brain/Decisions/Local retrieval design.md');
+  const previous: NoteInput = {
+    title: 'Local retrieval design',
+    tags: ['retrieval'],
+    related_ids: [referenceId],
+    content: {
+      kind: 'decision',
+      context: 'Original context.',
+      decision: 'Original decision.',
+      rationale: 'Original rationale.'
+    },
+    evidence: [{ kind: 'user_statement', ref: 'conversation-1', description: 'Original source' }]
+  };
+  const base = documentFromNote(previous, {
+    path: 'Projects/Second Brain/Decisions/Local retrieval design.md',
+    id: '7f0b5c2a-9d1e-4a3b-8c4d-5e6f7a8b9c0d',
+    aliases: ['Local retrieval design'],
+    created: '2026-09-23',
+    properties: { custom_property: 'keep me' }
+  });
+  const editedBody = base.body
+    .replace('Original context.\n\n', 'Original context.\n\nHuman context note.\n\n')
+    .replace('Original source\n\n## Related', 'Original source\n\nHuman source note.\n\n## Related')
+    .replace(`- [[${referenceId}]]`, `- [[${referenceId}]]\n- [[Knowledge/Laya]]`);
+  const edited = parseDocument(renderDocument({ ...base, body: editedBody }), base.path);
   const revised = reviseDocument(
-    base,
+    edited,
     {
       title: 'Local retrieval design',
       tags: ['retrieval'],
@@ -559,14 +580,10 @@ test('a revision preserves human sections and source additions', () => {
         rationale: 'Updated rationale.'
       },
       evidence: [
-        {
-          kind: 'repository',
-          ref: 'src/notes/document-codec.ts',
-          description: 'Readable codec'
-        }
+        { kind: 'repository', ref: 'src/notes/document-codec.ts', description: 'Readable codec' }
       ]
     },
-    { tags: ['retrieval'], updated: '2026-09-24' }
+    { previous, meta: { tags: ['retrieval'], updated: '2026-09-24' } }
   );
   const again = parseDocument(renderDocument(revised), revised.path);
   expect(again.id).toBe(base.id);
@@ -574,16 +591,147 @@ test('a revision preserves human sections and source additions', () => {
   expect(again.aliases).toEqual(['Local retrieval design']);
   expect(again.tags).toEqual(['retrieval']);
   expect(again.properties.custom_property).toBe('keep me');
-  expect(again.properties.related).toEqual(['[[Projects/Second Brain/Research/Laya]]']);
   expect(again.body).toContain('Updated context.');
-  expect(again.body).toContain('Updated decision.');
-  expect(again.body).not.toContain('The brain needs a retrieval path that works offline');
-  expect(again.body).toContain('Human addition: this note is maintained by hand.');
-  expect(again.body).toContain('Obsidian callout preserved as written.');
-  expect(again.body).toContain('This code fence is data, not frontmatter.');
+  expect(again.body).not.toContain('Original context.');
+  expect(again.body).toContain('Human context note.');
+  expect(again.body).toContain('Human source note.');
+  expect(again.body).toContain('[[Knowledge/Laya]]');
   const sources = parseSources(again.body.slice(again.body.indexOf('## Sources')));
   expect(sources.evidence).toEqual([
     { kind: 'repository', ref: 'src/notes/document-codec.ts', description: 'Readable codec' }
   ]);
-  expect(sources.human.join('\n')).toContain('Human addition: this note is maintained by hand.');
+  expect(sources.human.join('\n')).toContain('Human source note.');
+});
+
+test('a revision preserves a human-added related link', () => {
+  const previous: NoteInput = {
+    title: 'Related note',
+    tags: [],
+    related_ids: [referenceId],
+    content: { kind: 'note', summary: 'A summary.', body_markdown: 'Body.' },
+    evidence: []
+  };
+  const base = documentFromNote(previous, { path: 'Related note.md' });
+  const edited = parseDocument(
+    renderDocument({
+      ...base,
+      body: base.body.replace(`- [[${referenceId}]]`, `- [[${referenceId}]]\n- [[Knowledge/Laya]]`)
+    }),
+    base.path
+  );
+  const revised = reviseDocument(edited, previous, { previous });
+  const again = parseDocument(renderDocument(revised), revised.path);
+  expect(again.body).toContain(`[[${referenceId}]]`);
+  expect(again.body).toContain('[[Knowledge/Laya]]');
+});
+
+test('a revision preserves human content added inside a managed heading', () => {
+  const previous: NoteInput = {
+    title: 'Managed decision',
+    tags: [],
+    related_ids: [],
+    content: { kind: 'decision', context: 'Generated context.', decision: 'D.', rationale: 'R.' },
+    evidence: []
+  };
+  const base = documentFromNote(previous, { path: 'Managed decision.md' });
+  const edited = parseDocument(
+    renderDocument({
+      ...base,
+      body: base.body.replace(
+        'Generated context.\n\n',
+        'Generated context.\n\n> [!note]\n> Human note inside Context.\n\n'
+      )
+    }),
+    base.path
+  );
+  const revised = reviseDocument(
+    edited,
+    {
+      ...previous,
+      content: { kind: 'decision', context: 'Updated context.', decision: 'D2.', rationale: 'R2.' }
+    },
+    { previous }
+  );
+  const again = parseDocument(renderDocument(revised), revised.path);
+  expect(again.body).toContain('Updated context.');
+  expect(again.body).not.toContain('Generated context.');
+  expect(again.body).toContain('> [!note]\n> Human note inside Context.');
+});
+
+test('a pre-fix ordinary-link source still parses after the format change', () => {
+  const legacy =
+    '## Sources\n\n- **reference** [https://example.com/laya](https://example.com/laya) — Laya model card\n';
+  const parsed = parseSources(legacy);
+  expect(parsed.evidence).toEqual([
+    { kind: 'reference', ref: 'https://example.com/laya', description: 'Laya model card' }
+  ]);
+  expect(parsed.human.join('\n').trim()).toBe('');
+});
+
+test('a pre-fix ordinary-link source with an observed date still parses', () => {
+  const legacy =
+    '## Sources\n\n- **test_run** [https://example.com/run](https://example.com/run) (observed 2026-09-15) — Run\n';
+  const parsed = parseSources(legacy);
+  expect(parsed.evidence).toEqual([
+    {
+      kind: 'test_run',
+      ref: 'https://example.com/run',
+      description: 'Run',
+      observed_at: '2026-09-15'
+    }
+  ]);
+});
+
+test('source-shaped lines outside a genuine Sources section stay body text', () => {
+  const document = [
+    '# Doc',
+    '',
+    '```markdown',
+    '## Sources',
+    '',
+    '- **repository** `fenced` — Fenced example',
+    '```',
+    '',
+    '## Sources',
+    '',
+    '- **repository** `real` — Real entry'
+  ].join('\n');
+  const parsed = parseSources(document);
+  expect(parsed.evidence).toEqual([{ kind: 'repository', ref: 'real', description: 'Real entry' }]);
+  expect(parsed.evidence.some((entry) => entry.ref === 'fenced')).toBe(false);
+});
+
+test('without a Sources heading no body line is reclassified as evidence', () => {
+  const body = '# Doc\n\n- **repository** `not-a-source` — Body text\n';
+  const parsed = parseSources(body);
+  expect(parsed.evidence).toEqual([]);
+  expect(parsed.human.join('\n')).toContain('- **repository** `not-a-source` — Body text');
+});
+
+test('a source-shaped line after the Sources section is not evidence', () => {
+  const document = [
+    '## Sources',
+    '',
+    '- **repository** `real` — Real entry',
+    '',
+    '## Related',
+    '',
+    '- **repository** `after` — Body text'
+  ].join('\n');
+  const parsed = parseSources(document);
+  expect(parsed.evidence).toEqual([{ kind: 'repository', ref: 'real', description: 'Real entry' }]);
+});
+
+test('link label metacharacters are escaped and survive a round trip', () => {
+  const evidence: Evidence[] = [
+    {
+      kind: 'reference',
+      ref: 'https://example.com/*star*_under_',
+      description: 'Metacharacters'
+    }
+  ];
+  const section = renderSources(evidence);
+  expect(section).toContain('\\*star\\*');
+  const parsed = parseSources(section);
+  expect(parsed.evidence).toEqual(evidence);
 });
