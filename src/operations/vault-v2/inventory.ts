@@ -41,7 +41,7 @@ function assertDescriptorSupport(): void {
 }
 
 function childPath(parent: FileHandle, name: string): string {
-  if (name.length === 0 || name === '.' || name === '..' || name.includes('/') || name.includes('\\')) {
+  if (name.length === 0 || name === '.' || name === '..' || name.includes('/') || name.includes('\0')) {
     throw new Error(`inventory rejects unsafe entry name: ${JSON.stringify(name)}`);
   }
   return `${descriptorPath(parent)}/${name}`;

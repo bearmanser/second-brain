@@ -129,6 +129,20 @@ test('inventory does not rewrite source bytes', async () => {
   }
 });
 
+test('inventory accounts for a backslash filename on Linux', async () => {
+  const s = await vaultSandbox();
+  try {
+    const raw = Buffer.from('backslash name\r\n');
+    await writeFile(join(s.vault, 'notes\\legacy.md'), raw);
+    expect(await inventoryTree(s.vault)).toEqual([
+      { path: 'notes\\legacy.md', bytes: raw.length, sha256: digest(raw) }
+    ]);
+    expect(await readFile(join(s.vault, 'notes\\legacy.md'))).toEqual(raw);
+  } finally {
+    await s.dispose();
+  }
+});
+
 test('inventory orders paths deterministically and includes non-retrieval files', async () => {
   const s = await vaultSandbox();
   try {
