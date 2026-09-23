@@ -18,14 +18,13 @@ import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import type { BrainConfig, CredentialRecord, ResultDelivery } from '../../src/config/schema.js';
+import type { BrainConfig, ResultDelivery } from '../../src/config/schema.js';
 import {
   BACKEND_TIMEOUT_MS,
   CONCURRENT_READS,
   DYNAMIC_PROJECTS_MAX,
   INPUT_BODY_MAX_BYTES,
   PROJECT_PROVISION_GLOBAL_PER_MINUTE,
-  PROJECT_PROVISION_PER_PRINCIPAL_PER_MINUTE,
   RECONCILE_INTERVAL_MS,
   RENDERED_NOTE_MAX_BYTES,
   TOOL_RESULT_MAX_BYTES
@@ -38,16 +37,16 @@ import {
   type MutationIntent,
   type RevisionBuilder
 } from '../../src/core/mutation.js';
-import type {
-  Clock,
-  Head,
-  IdSource,
-  Lifecycle,
-  NoteInput,
-  Principal,
-  RequestContext,
-  StoredRevision,
-  VaultPort
+import {
+  SYSTEM_ACTOR,
+  type AuthenticatedContext,
+  type Clock,
+  type Head,
+  type IdSource,
+  type Lifecycle,
+  type NoteInput,
+  type StoredRevision,
+  type VaultPort
 } from '../../src/core/types.js';
 import type { BrainServices } from '../../src/mcp/server.js';
 import { ScopeRegistry } from '../../src/projects/scope-registry.js';
@@ -65,12 +64,7 @@ import { createRuntime, type BrainRuntime } from '../../src/runtime.js';
 import { Journal, type AuditEventRecord } from '../../src/storage/journal.js';
 import { FileVault } from '../../src/storage/vault.js';
 import { fixtureIds } from '../fixtures/content.js';
-import {
-  ownerPrincipal,
-  reviewerPrincipal,
-  scopeFixtures,
-  workerPrincipal
-} from '../fixtures/principals.js';
+import { scopeFixtures } from '../fixtures/principals.js';
 import { FakeBackend } from './fake-backend.js';
 import { FaultScheduler, wrapJournal, type FaultOptions, type FaultPoint } from './fault-scheduler.js';
 
@@ -131,7 +125,7 @@ export function createCandidateIntent(note: NoteInput, options: CandidateOptions
     return {
       ...base,
       approval: {
-        principal_id: options.approved_by ?? reviewerPrincipal.id,
+        principal_id: options.approved_by ?? SYSTEM_ACTOR.id,
         rationale: options.rationale ?? 'seeded approval for tests',
         payload_hash: payloadHash(base)
       }
@@ -166,7 +160,6 @@ class MemoryHarnessImpl implements MemoryHarness {
       backend_endpoint: 'http://memory:8000/mcp',
       port: 7331,
       mounts: { vault: this.vaultRoot, state: this.stateDir },
-      credentials_file: join(root, 'credentials.json'),
       scopes,
       limits: {
         input_body_max_bytes: INPUT_BODY_MAX_BYTES,
@@ -176,7 +169,6 @@ class MemoryHarnessImpl implements MemoryHarness {
         materialization_timeout_ms: MATERIALIZATION_TIMEOUT_MS,
         reconcile_interval_ms: RECONCILE_INTERVAL_MS,
         concurrent_reads: CONCURRENT_READS,
-        project_provision_per_principal_per_minute: PROJECT_PROVISION_PER_PRINCIPAL_PER_MINUTE,
         project_provision_global_per_minute: PROJECT_PROVISION_GLOBAL_PER_MINUTE,
         dynamic_projects_max: DYNAMIC_PROJECTS_MAX
       },
@@ -262,7 +254,7 @@ class MemoryHarnessImpl implements MemoryHarness {
       status === 'candidate'
         ? this.ids.next()
         : this.journal.reserve({
-            principal_id: reviewerPrincipal.id,
+            principal_id: SYSTEM_ACTOR.id,
             idempotency_key: randomUUID(),
             tool: 'brain_review',
             scope: scopeId,
@@ -288,7 +280,7 @@ class MemoryHarnessImpl implements MemoryHarness {
         : {
             ...base,
             approval: {
-              principal_id: reviewerPrincipal.id,
+              principal_id: SYSTEM_ACTOR.id,
               rationale: 'seeded approval for tests',
               payload_hash: payloadHash(base)
             }
@@ -428,7 +420,7 @@ export function armFault(harness: MemoryHarness, point: FaultPoint, options?: Fa
 
 export interface RecordedToolCall {
   tool: string;
-  principal_id: string;
+  actor_id: string;
   request_id: string;
 }
 
@@ -474,11 +466,11 @@ function recordingServices(
   calls: RecordedToolCall[]
 ): BrainServices {
   const track =
-    <A, R>(tool: string, invoke: (ctx: RequestContext, argument: A) => Promise<R>) =>
-    (ctx: RequestContext, argument: A): Promise<R> => {
+    <A, R>(tool: string, invoke: (ctx: AuthenticatedContext, argument: A) => Promise<R>) =>
+    (ctx: AuthenticatedContext, argument: A): Promise<R> => {
       calls.push({
         tool,
-        principal_id: ctx.principal.id,
+        actor_id: ctx.actor.id,
         request_id: ctx.request_id
       });
       return invoke(ctx, argument);
@@ -493,20 +485,6 @@ function recordingServices(
     projectEnsure: track('brain_project_ensure', services.projectEnsure),
     status: track('brain_status', services.status)
   };
-}
-
-async function seedHttpCredentials(
-  path: string,
-  tokens: { worker: string; rotated: string; reviewer: string; owner: string },
-  principals: { worker: Principal; reviewer: Principal; owner: Principal }
-): Promise<void> {
-  const records: CredentialRecord[] = [
-    { token_sha256: tokenDigest(tokens.worker), principal: principals.worker },
-    { token_sha256: tokenDigest(tokens.rotated), principal: principals.worker },
-    { token_sha256: tokenDigest(tokens.reviewer), principal: principals.reviewer },
-    { token_sha256: tokenDigest(tokens.owner), principal: principals.owner }
-  ];
-  await writeFile(path, `${JSON.stringify({ credentials: records }, null, 2)}\n`, 'utf8');
 }
 
 export async function startHttpHarness(options: HttpHarnessOptions = {}): Promise<HttpHarness> {
@@ -526,11 +504,6 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
     owner: newToken()
   };
   const credentialsFile = join(root, 'credentials.json');
-  await seedHttpCredentials(
-    credentialsFile,
-    tokens,
-    { worker: workerPrincipal, reviewer: reviewerPrincipal, owner: ownerPrincipal }
-  );
   const cursorSecretFile = join(root, 'cursor.key');
   await writeFile(cursorSecretFile, randomBytes(48));
 
@@ -539,7 +512,6 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
     backend_endpoint: 'http://127.0.0.1:1/mcp',
     port: 0,
     mounts: { vault: vaultRoot, state: stateDir },
-    credentials_file: credentialsFile,
     cursor_secret_file: cursorSecretFile,
     scopes: scopeFixtures.map((scope) => ({ ...scope })),
     limits: {
@@ -550,7 +522,6 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
       materialization_timeout_ms: MATERIALIZATION_TIMEOUT_MS,
       reconcile_interval_ms: options.reconcile_interval_ms ?? RECONCILE_INTERVAL_MS,
       concurrent_reads: options.concurrent_reads ?? CONCURRENT_READS,
-      project_provision_per_principal_per_minute: PROJECT_PROVISION_PER_PRINCIPAL_PER_MINUTE,
       project_provision_global_per_minute: PROJECT_PROVISION_GLOBAL_PER_MINUTE,
       dynamic_projects_max: DYNAMIC_PROJECTS_MAX
     },
@@ -571,7 +542,7 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
     runtime = await createRuntime(config, {
       backend,
       ...(options.vault === undefined ? {} : { vault: options.vault }),
-      ...(options.token_digest === undefined ? {} : { token_digest: options.token_digest }),
+      token_digest: options.token_digest ?? tokenDigest(tokens.worker),
       logger: (line) => {
         diagnostics.push(line);
       },
@@ -588,8 +559,8 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
     port: runtime.port,
     token: tokens.worker,
     rotatedToken: tokens.rotated,
-    reviewerToken: tokens.reviewer,
-    ownerToken: tokens.owner,
+    reviewerToken: tokens.worker,
+    ownerToken: tokens.worker,
     credentialsFile,
     config,
     runtime,

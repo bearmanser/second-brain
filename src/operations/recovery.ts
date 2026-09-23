@@ -1,8 +1,6 @@
-import type { CredentialRecord } from '../config/schema.js';
 import { BrainError } from '../contracts/errors.js';
 import type { BrainDeps, RecoveryReport } from '../core/mutation.js';
-import type { Principal } from '../core/types.js';
-import { authenticate } from '../security/authenticate.js';
+import { verifyBearer } from '../security/authenticate.js';
 
 export type { RecoveryOperationReport, RecoveryOutcome, RecoveryReport } from '../core/mutation.js';
 
@@ -23,18 +21,16 @@ export function assertRecoveryMode(mode: string | undefined): void {
   }
 }
 
-export function authenticateOwner(
+export function requireRecoveryAuthorization(
   authorization: string | undefined,
-  credentials: CredentialRecord[]
-): Principal {
-  const principal = authenticate(authorization, credentials);
-  if (principal.role !== 'owner') {
+  expectedDigest: string
+): void {
+  if (!verifyBearer(authorization, expectedDigest)) {
     throw new BrainError({
-      code: 'FORBIDDEN',
-      message: 'recover-state requires an owner credential'
+      code: 'UNAUTHENTICATED',
+      message: 'recover-state requires the configured bearer token'
     });
   }
-  return principal;
 }
 
 export function summariseRecovery(report: RecoveryReport): string {

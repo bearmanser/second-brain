@@ -1,11 +1,12 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import { expect, test } from 'vitest';
 import type {
-  DynamicProjectGrant,
-  Principal,
-  RepositoryProjectRecord,
+  LegacyProjectBackendBinding,
+  PersistedProject,
   ScopeConfig
 } from '../../src/core/types.js';
-import { ScopeRegistry } from '../../src/projects/scope-registry.js';
+import { ScopeRegistry, type ScopeRegistrySource } from '../../src/projects/scope-registry.js';
 import { Journal } from '../../src/storage/journal.js';
 
 const staticScopes: ScopeConfig[] = [
@@ -14,146 +15,153 @@ const staticScopes: ScopeConfig[] = [
   { id: 'profile', backend_project: 'profile', relative_root: 'Profile', repository_aliases: [] }
 ];
 
-const principal = (overrides: Partial<Principal> = {}): Principal => ({
-  id: 'reviewer-a',
-  role: 'reviewer',
-  read_scopes: ['freellmapi', 'shared'],
-  write_scopes: ['freellmapi'],
-  review_scopes: ['freellmapi'],
-  ...overrides
-});
-
-const readyProject = (overrides: Partial<RepositoryProjectRecord> = {}): RepositoryProjectRecord => ({
-  repository_identity: 'github.com/bearmanser/second-brain',
-  scope: 'second-brain',
-  backend_project: 'second-brain',
-  relative_root: 'Projects/second-brain',
+const readyProject = (overrides: Partial<PersistedProject> = {}): PersistedProject => ({
+  project: {
+    id: 'second-brain',
+    display_name: 'second-brain',
+    relative_root: 'Projects/second-brain',
+    repository_identity: 'github.com/bearmanser/second-brain'
+  },
   state: 'ready',
-  created_by_principal_id: 'reviewer-a',
-  creation_operation_id: 'operation-a',
-  created_at: '2026-09-21T09:00:00.000Z',
+  provisioning: { created_by_actor_id: 'actor-a', creation_operation_id: 'operation-a' },
   updated_at: '2026-09-21T09:00:00.000Z',
   ...overrides
 });
 
-const reviewGrant: DynamicProjectGrant = {
-  principal_id: 'reviewer-a',
-  scope: 'second-brain',
-  can_read: true,
-  can_write: true,
-  can_review: true
-};
+const sourceFrom = (
+  projects: PersistedProject[],
+  bindings: Record<string, LegacyProjectBackendBinding> = {}
+): ScopeRegistrySource => ({
+  listReadyProjects: () => projects,
+  getProjectBinding: (id) => bindings[id]
+});
 
-test('loads ready projects and grants without mutating the authenticated principal', () => {
-  const journal = Journal.open(':memory:');
-  journal.reserveProject({
-    repository_identity: 'github.com/bearmanser/second-brain',
-    scope: 'second-brain',
-    created_by_principal_id: 'reviewer-a',
-    creation_operation_id: 'operation-a'
+test('loads configured static projects and resolves their aliases', () => {
+  const registry = new ScopeRegistry(staticScopes);
+  expect(registry.all().map((scope) => scope.id)).toEqual(['freellmapi', 'shared', 'profile']);
+  expect(registry.get('free-api')?.id).toBe('freellmapi');
+  expect(registry.get('freellmapi')).toEqual({
+    id: 'freellmapi',
+    backend_project: 'freellmapi',
+    relative_root: 'Projects/freellmapi',
+    repository_aliases: []
   });
-  journal.grantProject(reviewGrant);
-  journal.markProjectReady('github.com/bearmanser/second-brain');
-  const reviewer = principal();
-  const before = structuredClone(reviewer);
-  const registry = new ScopeRegistry(staticScopes, journal);
+  expect(registry.get('unknown-project')).toBeUndefined();
+});
 
+test('merges persisted ready projects into one collision-checked namespace', () => {
+  const registry = new ScopeRegistry(
+    staticScopes,
+    sourceFrom([readyProject()], {
+      'second-brain': { backend_project: 'second-brain', backend_relative_root: 'Projects/second-brain' }
+    })
+  );
   expect(registry.all().map((scope) => scope.id)).toEqual([
     'freellmapi',
     'shared',
     'profile',
     'second-brain'
   ]);
-  expect(registry.visibleTo(reviewer).map((scope) => scope.id)).toEqual([
-    'freellmapi',
-    'shared',
-    'second-brain'
-  ]);
-  expect(registry.permissions(reviewer, 'second-brain')).toEqual({
-    can_read: true,
-    can_write: true,
-    can_review: true
+  expect(registry.get('second-brain')).toMatchObject({
+    id: 'second-brain',
+    backend_project: 'second-brain',
+    relative_root: 'Projects/second-brain'
   });
-  expect(reviewer).toEqual(before);
-  journal.close();
+  expect(registry.get('github.com/bearmanser/second-brain')?.id).toBe('second-brain');
 });
 
-test('isolates dynamic grants while owners can see every ready project', () => {
-  const source = {
-    listReadyProjects: () => [readyProject()],
-    listProjectGrants: () => [reviewGrant]
-  };
-  const registry = new ScopeRegistry(staticScopes, source);
-  const other = principal({ id: 'reviewer-b', read_scopes: [], write_scopes: [], review_scopes: [] });
-  const owner = principal({ id: 'owner-a', role: 'owner', read_scopes: [], write_scopes: [], review_scopes: [] });
-  expect(registry.visibleTo(other)).toEqual([]);
-  expect(registry.permissions(other, 'second-brain')).toEqual({
-    can_read: false,
-    can_write: false,
-    can_review: false
-  });
-  expect(registry.visibleTo(owner).map((scope) => scope.id)).toEqual(['second-brain']);
-  expect(registry.permissions(owner, 'second-brain')).toEqual({
-    can_read: true,
-    can_write: true,
-    can_review: true
-  });
+test('keeps static identifiers authoritative and rejects colliding aliases', () => {
+  expect(
+    () =>
+      new ScopeRegistry([
+        ...staticScopes,
+        { id: 'other', backend_project: 'other', relative_root: 'Projects/other', repository_aliases: ['free-api'] }
+      ])
+  ).toThrow(/CONFLICT/);
+
+  const registry = new ScopeRegistry(staticScopes);
+  expect(() =>
+    registry.registerReadyProject(
+      readyProject({
+        project: { id: 'shared', display_name: 'shared', relative_root: 'Projects/shared' }
+      })
+    )
+  ).toThrow(/INVALID_INPUT/);
+  expect(() =>
+    registry.registerReadyProject(
+      readyProject({
+        project: { id: 'free-api', display_name: 'free-api', relative_root: 'Projects/free-api' }
+      })
+    )
+  ).toThrow(/CONFLICT/);
 });
 
-test('does not load projects that are provisioning or require recovery', () => {
-  const source = {
-    listReadyProjects: () => [],
-    listProjectGrants: () => [reviewGrant]
-  };
-  const registry = new ScopeRegistry(staticScopes, source);
-  expect(registry.get('second-brain')).toBeUndefined();
-  expect(() => registry.registerReadyProject(readyProject({ state: 'provisioning' }), reviewGrant)).toThrow(
+test('registers only ready projects and rejects duplicates with different mappings', () => {
+  const registry = new ScopeRegistry(staticScopes);
+  expect(() => registry.registerReadyProject(readyProject({ state: 'provisioning' }))).toThrow(
     /INVALID_INPUT/
   );
+  expect(() => registry.registerReadyProject(readyProject({ state: 'recovery_required' }))).toThrow(
+    /INVALID_INPUT/
+  );
+  registry.registerReadyProject(readyProject());
+  registry.registerReadyProject(readyProject());
   expect(() =>
-    registry.registerReadyProject(readyProject({ state: 'recovery_required' }), reviewGrant)
-  ).toThrow(/INVALID_INPUT/);
-});
-
-test('keeps static identifiers authoritative and rejects aliases or reserved dynamic scopes', () => {
-  expect(() =>
-    new ScopeRegistry([
-      ...staticScopes,
-      { id: 'other', backend_project: 'other', relative_root: 'Projects/other', repository_aliases: ['free-api'] }
-    ])
-  ).toThrow(/INVALID_INPUT/);
-
-  const registry = new ScopeRegistry(staticScopes);
-  expect(registry.get('free-api')?.id).toBe('freellmapi');
-  expect(() =>
-    registry.registerReadyProject(readyProject({ scope: 'shared', backend_project: 'shared', relative_root: 'Projects/shared' }), {
-      ...reviewGrant,
-      scope: 'shared'
-    })
-  ).toThrow(/INVALID_INPUT/);
-  expect(() =>
-    registry.registerReadyProject(readyProject({ scope: 'free-api', backend_project: 'free-api', relative_root: 'Projects/free-api' }), {
-      ...reviewGrant,
-      scope: 'free-api'
-    })
-  ).toThrow(/INVALID_INPUT/);
-});
-
-test('registers repeated identical projects and additional grants safely', () => {
-  const registry = new ScopeRegistry(staticScopes);
-  registry.registerReadyProject(readyProject(), reviewGrant);
-  registry.registerReadyProject(readyProject(), reviewGrant);
-  registry.registerReadyProject(readyProject(), {
-    ...reviewGrant,
-    principal_id: 'worker-b',
-    can_review: false
-  });
-  expect(registry.permissions(principal({ id: 'worker-b', role: 'worker' }), 'second-brain')).toEqual({
-    can_read: true,
-    can_write: true,
-    can_review: false
-  });
-  expect(() =>
-    registry.registerReadyProject(readyProject({ backend_project: 'wrong' }), reviewGrant)
+    registry.registerReadyProject(
+      readyProject({
+        project: {
+          id: 'second-brain',
+          display_name: 'second-brain',
+          relative_root: 'Projects/other-root'
+        }
+      })
+    )
   ).toThrow(/CONFLICT/);
+});
+
+test('quarantined projects stay known but leave the usable universe', () => {
+  const registry = new ScopeRegistry(staticScopes, sourceFrom([readyProject()]));
+  registry.quarantineProject('second-brain');
+  expect(registry.all().map((scope) => scope.id)).toEqual(['freellmapi', 'shared', 'profile']);
+  expect(registry.get('second-brain')?.id).toBe('second-brain');
+  expect(registry.isUsable('second-brain')).toBe(false);
+  expect(registry.isUsable('freellmapi')).toBe(true);
+  expect(registry.unusable().map((scope) => scope.id)).toEqual(['second-brain']);
+});
+
+test('does not expose a permission surface', () => {
+  const registry = new ScopeRegistry(staticScopes);
+  const members = Object.getOwnPropertyNames(Object.getPrototypeOf(registry));
+  expect(members).not.toContain('permissions');
+  expect(members).not.toContain('visibleTo');
+  expect(members).not.toContain('registerGrant');
+  expect(members).not.toContain('grantProject');
+});
+
+test('reopening the journal returns the same stable project id and root without a grant', () => {
+  const root = mkdtempSync(join('/tmp/opencode', 'scope-registry-'));
+  const path = join(root, 'journal.db');
+  try {
+    const first = Journal.open(path);
+    first.reserveProject({
+      repository_identity: 'github.com/bearmanser/second-brain',
+      project_id: 'second-brain',
+      created_by_actor_id: 'actor-a',
+      creation_operation_id: '00000000-0000-4000-8000-0000000000c1'
+    });
+    first.markProjectReady('github.com/bearmanser/second-brain');
+    first.close();
+
+    const reopened = Journal.open(path, { requireExisting: true });
+    const registry = new ScopeRegistry(staticScopes, reopened);
+    expect(registry.get('github.com/bearmanser/second-brain')).toMatchObject({
+      id: 'second-brain',
+      backend_project: 'second-brain',
+      relative_root: 'Projects/second-brain'
+    });
+    expect(registry.all().map((scope) => scope.id)).toContain('second-brain');
+    reopened.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

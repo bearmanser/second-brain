@@ -9,7 +9,7 @@ import { countReferenceTokens } from '../../src/retrieval/budget.js';
 import { BrainError } from '../../src/contracts/errors.js';
 import { TOOL_RESULT_MAX_BYTES } from '../../src/core/limits.js';
 import { lessonFixture } from '../fixtures/content.js';
-import { workerPrincipal } from '../fixtures/principals.js';
+import { SYSTEM_ACTOR } from '../../src/core/types.js';
 import { FakeBackend } from '../support/fake-backend.js';
 import { startHttpHarness } from '../support/harness.js';
 
@@ -113,79 +113,65 @@ test('lists the seven tools and completes a status call with structured content'
     const calls = h.recordedToolCalls();
     expect(calls).toHaveLength(1);
     expect(calls[0].tool).toBe('brain_status');
-    expect(calls[0].principal_id).toBe(workerPrincipal.id);
+    expect(calls[0].actor_id).toBe(SYSTEM_ACTOR.id);
   } finally {
     await client.close();
     await h.close();
   }
 });
 
-test('ensures a repository scope and uses it immediately across principals and reconnects', async () => {
+test('ensures a repository scope and uses it immediately with the single token', async () => {
   const h = await startHttpHarness();
-  const worker = await h.connect(h.token, 'project-worker');
-  const reviewer = await h.connect(h.reviewerToken, 'project-reviewer');
+  const client = await h.connect(h.token, 'runtime-client');
   try {
     const remote = 'https://github.com/example/runtime-project.git';
-    const ensured = await call(worker, 'brain_project_ensure', {
+    const ensured = await call(client, 'brain_project_ensure', {
       idempotency_key: randomUUID(),
       remote_url: remote
     });
     expect(ensured.isError).toBeFalsy();
-    const scope = record(ensured.structuredContent).scope as string;
+    const structured = record(ensured.structuredContent);
+    const scope = structured.scope as string;
     expect(scope).toBe('runtime-project');
-    const ensuredStatus = await call(worker, 'brain_status', {
-      operation_id: record(ensured.structuredContent).operation_id
+    expect(structured).not.toHaveProperty('permissions');
+    const ensuredStatus = await call(client, 'brain_status', {
+      operation_id: structured.operation_id
     });
     expect(record(record(ensuredStatus.structuredContent).operation)).toMatchObject({
       repository_identity: 'github.com/example/runtime-project',
       scope
     });
 
-    const captured = await call(worker, 'brain_capture', {
+    const captured = await call(client, 'brain_capture', {
       idempotency_key: randomUUID(),
       scope,
       note: lessonFixture
     });
     expect(captured.isError).toBeFalsy();
-    const recalled = await call(worker, 'brain_recall', {
+    const recalled = await call(client, 'brain_recall', {
       scope,
       query: 'proxied request',
       include_candidates: true
     });
     expect(record(recalled.structuredContent).items).toHaveLength(1);
 
-    const isolated = await call(reviewer, 'brain_recall', {
-      scope,
-      query: 'proxied request',
-      include_candidates: true
-    });
-    expect(isolated.isError).toBe(true);
-    const reviewerEnsure = await call(reviewer, 'brain_project_ensure', {
+    const ensureAgain = await call(client, 'brain_project_ensure', {
       idempotency_key: randomUUID(),
       remote_url: 'git@github.com:example/runtime-project.git'
     });
-    expect(record(reviewerEnsure.structuredContent).permissions).toEqual({
-      can_read: true,
-      can_write: true,
-      can_review: true
-    });
+    expect(record(ensureAgain.structuredContent).created).toBe(false);
     expect(h.auditedEvents().some((event) => event.tool === 'brain_project_ensure')).toBe(true);
 
-    await worker.close();
-    const reconnected = await h.connect(h.rotatedToken, 'project-worker-reconnected');
+    await client.close();
+    const reconnected = await h.connect(h.token, 'runtime-reconnected');
     try {
       const status = await call(reconnected, 'brain_status', {});
-      expect(record(status.structuredContent).scopes).toContainEqual({
-        id: scope,
-        can_write: true,
-        can_review: false
-      });
+      expect(record(status.structuredContent).scopes).toContainEqual({ id: scope });
     } finally {
       await reconnected.close();
     }
   } finally {
-    await reviewer.close();
-    await worker.close().catch(() => undefined);
+    await client.close().catch(() => undefined);
     await h.close();
   }
 });
@@ -208,31 +194,25 @@ test('sanitizes secret-bearing repository remotes in MCP errors and diagnostics'
   }
 });
 
-test('status reveals a failed provisioning only to its caller and owners', async () => {
+test('status reports provisioning state to every authenticated caller', async () => {
   const h = await startHttpHarness();
-  const worker = await h.connect(h.token);
-  const reviewer = await h.connect(h.reviewerToken);
-  const owner = await h.connect(h.ownerToken);
+  const first = await h.connect(h.token);
+  const second = await h.connect(h.token);
   try {
     h.backend.ensure_project_fail_once = true;
-    const failed = await call(worker, 'brain_project_ensure', {
+    const failed = await call(first, 'brain_project_ensure', {
       idempotency_key: randomUUID(),
       remote_url: 'https://github.com/example/pending-project.git'
     });
     expect(failed.isError).toBe(true);
 
-    const workerStatus = record((await call(worker, 'brain_status', {})).structuredContent);
-    expect(workerStatus.projects).toEqual([{ scope: 'pending-project', state: 'provisioning' }]);
-    expect(workerStatus.pending_operations).toBe(1);
-
-    const reviewerStatus = record((await call(reviewer, 'brain_status', {})).structuredContent);
-    expect(reviewerStatus.projects).toBeUndefined();
-    expect(reviewerStatus.pending_operations).toBe(0);
-
-    const ownerStatus = record((await call(owner, 'brain_status', {})).structuredContent);
-    expect(ownerStatus.projects).toEqual([{ scope: 'pending-project', state: 'provisioning' }]);
+    for (const client of [first, second]) {
+      const status = record((await call(client, 'brain_status', {})).structuredContent);
+      expect(status.projects).toEqual([{ scope: 'pending-project', state: 'provisioning' }]);
+      expect(status.pending_operations).toBe(1);
+    }
   } finally {
-    await Promise.all([worker.close(), reviewer.close(), owner.close()]);
+    await Promise.all([first.close(), second.close()]);
     await h.close();
   }
 });
@@ -328,7 +308,7 @@ test.each(['structured', 'text-json'] as const)(
   async (delivery) => {
     const h = await startHttpHarness({ result_delivery: delivery });
     const worker = await h.connect(h.token, `recall-budget-worker-${delivery}`);
-    const reviewer = await h.connect(h.reviewerToken, `recall-budget-reviewer-${delivery}`);
+    const reviewer = await h.connect(h.token, `recall-budget-reviewer-${delivery}`);
     try {
       const captured = await call(worker, 'brain_capture', captureArgs(randomUUID()));
       const receipt = record(captured.structuredContent);
@@ -359,17 +339,17 @@ test.each(['structured', 'text-json'] as const)(
   }
 );
 
-test('an unauthorized scope returns a structured, retryability-tagged tool error', async () => {
+test('an unknown project returns a structured, retryability-tagged tool error', async () => {
   const h = await startHttpHarness();
   const client = await h.connect(h.token);
   try {
-    const result = await call(client, 'brain_status', { scope: 'profile' });
+    const result = await call(client, 'brain_status', { project: 'unknown-project' });
     expect(result.isError).toBe(true);
     const error = record(record(result.structuredContent).error);
-    expect(error.code).toBe('FORBIDDEN');
+    expect(error.code).toBe('NOT_FOUND');
     expect(error.retryable).toBe(false);
     const parsed = record(JSON.parse(textOf(result)));
-    expect(record(parsed.error).code).toBe('FORBIDDEN');
+    expect(record(parsed.error).code).toBe('NOT_FOUND');
   } finally {
     await client.close();
     await h.close();
@@ -394,7 +374,7 @@ test('schema-invalid arguments are rejected before any service call', async () =
 test('read and both review result branches survive output validation', async () => {
   const h = await startHttpHarness();
   const worker = await h.connect(h.token, 'read-worker');
-  const reviewer = await h.connect(h.reviewerToken, 'review-approver');
+  const reviewer = await h.connect(h.token, 'review-approver');
   try {
     const capture = await call(worker, 'brain_capture', captureArgs(randomUUID()));
     const receipt = record(capture.structuredContent);
@@ -434,7 +414,7 @@ test('read and both review result branches survive output validation', async () 
 
 test('the published review schema encodes the result union', async () => {
   const h = await startHttpHarness();
-  const client = await h.connect(h.reviewerToken);
+  const client = await h.connect(h.token);
   try {
     const review = (await client.listTools()).tools.find((tool) => tool.name === 'brain_review');
     const schema = review?.outputSchema as { type?: string; oneOf?: unknown[] } | undefined;
@@ -465,85 +445,48 @@ test('the published review schema encodes the result union', async () => {
   }
 });
 
-test('two simultaneous principals keep separate identities and tool closures', async () => {
+test('concurrent clients share one identity and key namespace', async () => {
   const h = await startHttpHarness();
-  const worker = await h.connect(h.token, 'worker-client');
-  const reviewer = await h.connect(h.reviewerToken, 'reviewer-client');
+  const first = await h.connect(h.token, 'client-one');
+  const second = await h.connect(h.token, 'client-two');
   try {
-    const workerStatus = record((await call(worker, 'brain_status', {})).structuredContent);
-    const reviewerStatus = record((await call(reviewer, 'brain_status', {})).structuredContent);
-    const workerScope = (workerStatus.scopes as { id: string; can_review: boolean }[]).find(
-      (scope) => scope.id === 'freellmapi'
-    );
-    const reviewerScope = (reviewerStatus.scopes as { id: string; can_review: boolean }[]).find(
-      (scope) => scope.id === 'freellmapi'
-    );
-    expect(workerScope?.can_review).toBe(false);
-    expect(reviewerScope?.can_review).toBe(true);
+    for (const client of [first, second]) {
+      const status = record((await call(client, 'brain_status', {})).structuredContent);
+      const scope = (status.scopes as { id: string }[]).find((entry) => entry.id === 'freellmapi');
+      expect(scope).toEqual({ id: 'freellmapi' });
+    }
 
     const key = randomUUID();
-    const workerCapture = await call(worker, 'brain_capture', captureArgs(key));
-    expect(workerCapture.isError).toBeFalsy();
-    const workerOperation = record(workerCapture.structuredContent).operation_id as string;
+    const firstCapture = await call(first, 'brain_capture', captureArgs(key));
+    expect(firstCapture.isError).toBeFalsy();
+    const operationId = record(firstCapture.structuredContent).operation_id as string;
 
-    const reviewerCapture = await call(reviewer, 'brain_capture', captureArgs(key));
-    expect(reviewerCapture.isError).toBeFalsy();
-    const reviewerOperation = record(reviewerCapture.structuredContent).operation_id as string;
-    expect(reviewerOperation).not.toBe(workerOperation);
+    const secondCapture = await call(second, 'brain_capture', captureArgs(key));
+    expect(record(secondCapture.structuredContent).operation_id).toBe(operationId);
 
-    const foreignLookup = await call(reviewer, 'brain_status', { operation_id: workerOperation });
-    expect(foreignLookup.isError).toBe(true);
-    expect(record(record(foreignLookup.structuredContent).error).code).toBe('NOT_FOUND');
+    const lookup = await call(second, 'brain_status', { operation_id: operationId });
+    expect(lookup.isError).toBeFalsy();
+    expect(record(record(lookup.structuredContent).operation).operation_id).toBe(operationId);
 
-    const ownLookup = await call(worker, 'brain_status', { operation_id: workerOperation });
-    expect(ownLookup.isError).toBeFalsy();
-    expect(record(record(ownLookup.structuredContent).operation).operation_id).toBe(workerOperation);
-
-    const principals = new Set(h.recordedToolCalls().map((entry) => entry.principal_id));
-    expect(principals.has(workerPrincipal.id)).toBe(true);
-    expect(principals.size).toBe(2);
+    const actors = new Set(h.recordedToolCalls().map((entry) => entry.actor_id));
+    expect(actors.has(SYSTEM_ACTOR.id)).toBe(true);
+    expect(actors.size).toBe(1);
   } finally {
-    await worker.close();
-    await reviewer.close();
-    await h.close();
-  }
-});
-
-test('rotated tokens authenticate as one principal identity', async () => {
-  const h = await startHttpHarness();
-  const first = await h.connect(h.token, 'before-rotation');
-  try {
-    const capture = await call(first, 'brain_capture', captureArgs(randomUUID()));
-    expect(capture.isError).toBeFalsy();
-    const operationId = record(capture.structuredContent).operation_id as string;
     await first.close();
-
-    const second = await h.connect(h.rotatedToken, 'after-rotation');
-    const status = await call(second, 'brain_status', { operation_id: operationId });
-    expect(status.isError).toBeFalsy();
-    expect(record(record(status.structuredContent).operation).operation_id).toBe(operationId);
     await second.close();
-  } finally {
     await h.close();
   }
 });
 
-test('a rotated-out credential stops authenticating after a credential reload', async () => {
+test('runtime token rotation invalidates the previous token', async () => {
   const h = await startHttpHarness();
   const before = await h.connect(h.token, 'before-rotation');
   expect((await before.listTools()).tools).toHaveLength(7);
   await before.close();
 
-  const digest = (token: string): string =>
-    createHash('sha256').update(token, 'utf8').digest('hex');
-  await writeFile(
-    h.credentialsFile,
-    `${JSON.stringify({
-      credentials: [{ token_sha256: digest(h.rotatedToken), principal: workerPrincipal }]
-    })}\n`,
-    'utf8'
-  );
-  h.runtime.reloadCredentials();
+  const next = `rotated-${randomUUID()}`;
+  const digestValue = createHash('sha256').update(next, 'utf8').digest('hex');
+  h.runtime.rotateTokenDigest(digestValue);
 
   const rejected = await fetch(h.url, {
     method: 'POST',
@@ -556,56 +499,17 @@ test('a rotated-out credential stops authenticating after a credential reload', 
   });
   expect(rejected.status).toBe(401);
 
-  const after = await h.connect(h.rotatedToken, 'after-rotation');
-  try {
-    expect((await after.listTools()).tools).toHaveLength(7);
-  } finally {
-    await after.close();
-    await h.close();
-  }
-});
-
-test('a running runtime reloads rotated credentials written to disk', async () => {
-  const h = await startHttpHarness();
-  const before = await h.connect(h.token, 'before-rotation');
-  expect((await before.listTools()).tools).toHaveLength(7);
-  await before.close();
-
-  const digest = (token: string): string =>
-    createHash('sha256').update(token, 'utf8').digest('hex');
-  await writeFile(
-    h.credentialsFile,
-    `${JSON.stringify({
-      credentials: [{ token_sha256: digest(h.rotatedToken), principal: workerPrincipal }]
-    })}\n`,
-    'utf8'
-  );
-
-  const deadline = Date.now() + 5000;
-  let status = 0;
-  while (Date.now() < deadline) {
-    const response = await fetch(h.url, {
-      method: 'POST',
-      headers: {
-        authorization: `Bearer ${h.token}`,
-        'content-type': 'application/json',
-        accept: 'application/json, text/event-stream'
-      },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })
-    });
-    status = response.status;
-    if (status === 401) break;
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  expect(status).toBe(401);
-
-  const after = await h.connect(h.rotatedToken, 'after-rotation');
-  try {
-    expect((await after.listTools()).tools).toHaveLength(7);
-  } finally {
-    await after.close();
-    await h.close();
-  }
+  const accepted = await fetch(h.url, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${next}`,
+      'content-type': 'application/json',
+      accept: 'application/json, text/event-stream'
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })
+  });
+  expect(accepted.status).toBe(200);
+  await h.close();
 });
 
 test('recall records a content-free retrieval event', async () => {
@@ -621,7 +525,7 @@ test('recall records a content-free retrieval event', async () => {
     const retrievalId = record(recalled.structuredContent).retrieval_id as string;
     const event = h.runtime.deps.journal.getRetrieval(retrievalId);
     expect(event).toBeDefined();
-    expect(event?.principal_id).toBe(workerPrincipal.id);
+    expect(event?.principal_id).toBe(SYSTEM_ACTOR.id);
     expect(event?.scope_ids).toContain('freellmapi');
     expect(JSON.stringify(event)).not.toContain(lessonFixture.title);
   } finally {
@@ -698,7 +602,7 @@ test('a write blocked past the drain deadline keeps the lock until it completes'
     root: h.config.mounts.vault,
     projects: h.config.scopes.map((scope) => scope.backend_project)
   });
-  await expect(createRuntime(h.config, { backend: replacementBackend })).rejects.toMatchObject({
+  await expect(createRuntime(h.config, { backend: replacementBackend, token_digest: h.runtime.tokenDigest })).rejects.toMatchObject({
     code: 'CONFLICT'
   });
 
@@ -709,7 +613,7 @@ test('a write blocked past the drain deadline keeps the lock until it completes'
   expect(h.runtime.shutdownPending).toBe(false);
   expect(h.runtime.closed).toBe(true);
 
-  const reopened = await createRuntime(h.config, { backend: replacementBackend });
+  const reopened = await createRuntime(h.config, { backend: replacementBackend, token_digest: h.runtime.tokenDigest });
   try {
     expect(reopened.ready).toBe(true);
     const candidates = await reopened.deps.catalogue.list('freellmapi', 'candidate');
@@ -738,7 +642,7 @@ test('normal runtime startup refuses an existing vault after its journal is lost
     root: h.config.mounts.vault,
     projects: h.config.scopes.map((scope) => scope.backend_project)
   });
-  await expect(createRuntime(h.config, { backend })).rejects.toMatchObject({
+  await expect(createRuntime(h.config, { backend, token_digest: h.runtime.tokenDigest })).rejects.toMatchObject({
     code: 'RECOVERY_REQUIRED'
   });
   await expect(rm(`${h.config.mounts.state}/journal.db`)).rejects.toMatchObject({ code: 'ENOENT' });
@@ -771,7 +675,7 @@ test('normal runtime startup detects lost state when only a dynamic project rema
     root: h.config.mounts.vault,
     projects: h.config.scopes.map((scope) => scope.backend_project)
   });
-  await expect(createRuntime(h.config, { backend })).rejects.toMatchObject({
+  await expect(createRuntime(h.config, { backend, token_digest: h.runtime.tokenDigest })).rejects.toMatchObject({
     code: 'RECOVERY_REQUIRED'
   });
   await backend.close().catch(() => undefined);
@@ -797,14 +701,14 @@ test('startup quarantines one broken dynamic scope while unrelated scopes remain
     root: h.config.mounts.vault,
     projects: h.config.scopes.map((candidate) => candidate.backend_project)
   });
-  const reopened = await createRuntime(h.config, { backend });
+  const reopened = await createRuntime(h.config, { backend, token_digest: h.runtime.tokenDigest });
   try {
     expect(reopened.ready).toBe(true);
-    expect(reopened.deps.scopeRegistry.get(scope)).toBeUndefined();
-    expect(reopened.deps.scopeRegistry.get('shared')).toBeDefined();
-    expect(reopened.deps.journal.getProjectByScope(scope)).toMatchObject({
+    expect(reopened.deps.scopeRegistry.isUsable(scope)).toBe(false);
+    expect(reopened.deps.scopeRegistry.isUsable('shared')).toBe(true);
+    expect(reopened.deps.journal.getProjectById(scope)).toMatchObject({
       state: 'recovery_required',
-      failure_stage: 'startup_verification'
+      provisioning: { failure_stage: 'startup_verification' }
     });
   } finally {
     await reopened.close();

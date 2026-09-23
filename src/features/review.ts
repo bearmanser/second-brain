@@ -2,10 +2,11 @@ import { BrainError, isBrainError } from '../contracts/errors.js';
 import { reviewRequestSchema } from '../contracts/protocol.js';
 import type { BrainDeps, MutationIntent, RevisionBuilder } from '../core/mutation.js';
 import type {
+  AuthenticatedContext,
   Head,
   MutationReceipt,
   NoteInput,
-  RequestContext,
+  ProjectSelector,
   ReviewListResult,
   ReviewRequest,
   ScopeConfig,
@@ -13,13 +14,12 @@ import type {
 } from '../core/types.js';
 import { decodeRevision, makeEtag, normalizeLineEndings, payloadHash } from '../notes/codec.js';
 import { resolveHead, type ParsedRevision } from '../notes/catalogue.js';
-import { resolveScopes } from '../security/authorise.js';
+import { requiredProject } from '../projects/registry.js';
 import { assertNoCredentials } from '../security/redact.js';
-import { authorizeRelatedIds } from './related.js';
+import { validateRelatedIds } from './related.js';
 
 const REVIEW_TOOL = 'brain_review';
 const FACTUAL_KINDS: readonly string[] = ['lesson', 'fact', 'decision', 'playbook'];
-const PROTECTED_SCOPES: readonly string[] = ['shared', 'profile'];
 const STRUCTURAL_REASONS: readonly string[] = [
   'duplicate_revision_id',
   'multiple_logical_ids',
@@ -32,10 +32,6 @@ const MAX_SUPERSESSION_DEPTH = 64;
 
 function invalidInput(message: string, cause?: unknown): BrainError {
   return new BrainError({ code: 'INVALID_INPUT', message, cause });
-}
-
-function forbidden(message: string): BrainError {
-  return new BrainError({ code: 'FORBIDDEN', message });
 }
 
 function conflict(message: string): BrainError {
@@ -118,73 +114,12 @@ function rejectCredentialText(note: NoteInput): void {
   for (const entry of strings) assertNoCredentials(entry.value, entry.field);
 }
 
-function readScope(ctx: RequestContext, requested: string, deps: BrainDeps): ScopeConfig {
-  const [scope] = resolveScopes(ctx.principal, requested, false, 'read', deps.scopeRegistry);
-  return scope;
-}
-
-function writeScope(ctx: RequestContext, requested: string, deps: BrainDeps): ScopeConfig {
-  const [scope] = resolveScopes(ctx.principal, requested, false, 'write', deps.scopeRegistry);
-  return scope;
-}
-
-function reviewScope(ctx: RequestContext, requested: string, deps: BrainDeps): ScopeConfig {
-  const [scope] = resolveScopes(ctx.principal, requested, false, 'review', deps.scopeRegistry);
-  return scope;
-}
-
-function mayReview(
-  ctx: RequestContext,
-  scope: string,
-  protectedNote: boolean,
-  deps: BrainDeps
-): boolean {
-  if (!deps.scopeRegistry.permissions(ctx.principal, scope).can_review) return false;
-  return !protectedNote || ctx.principal.role === 'owner';
+function resolveProject(request: ProjectSelector, deps: BrainDeps): ScopeConfig {
+  return deps.scopeRegistry.require(requiredProject(request));
 }
 
 function hasValidApproval(revision: StoredRevision, deps: BrainDeps): boolean {
   return deps.catalogue.approvalIsValid(revision);
-}
-
-async function hasApprovedAncestor(
-  scope: string,
-  revision: StoredRevision,
-  deps: BrainDeps
-): Promise<boolean> {
-  const visited = new Set<string>();
-  const queue: StoredRevision[] = [revision];
-  while (queue.length > 0) {
-    const current = queue.shift() as StoredRevision;
-    if (visited.has(current.revision_id)) continue;
-    visited.add(current.revision_id);
-    if (hasValidApproval(current, deps)) return true;
-    for (const parent of current.parents) {
-      if (visited.has(parent.revision_id)) return true;
-      let head: Head;
-      try {
-        head = await deps.catalogue.getRevision(scope, revision.id, parent.revision_id);
-      } catch {
-        return true;
-      }
-      if (head.state !== 'ready' && head.state !== 'manual_unreviewed') return true;
-      if (head.raw_hash !== parent.raw_hash) return true;
-      queue.push(head.revision);
-    }
-  }
-  return false;
-}
-
-async function isProtectedNote(
-  scope: string,
-  revision: StoredRevision,
-  deps: BrainDeps
-): Promise<boolean> {
-  const kind = revision.note.content.kind;
-  if (kind === 'preference') return true;
-  if (PROTECTED_SCOPES.includes(scope)) return true;
-  if (kind !== 'decision') return false;
-  return hasApprovedAncestor(scope, revision, deps);
 }
 
 function requireSingleHead(heads: Head[], id: string): Head {
@@ -281,7 +216,6 @@ function parsedRevisionToHead(scope: string, parsed: ParsedRevision): Head {
 }
 
 async function analyseFork(
-  ctx: RequestContext,
   scope: ScopeConfig,
   operation: { id: string; expected_heads: { revision_id: string; etag: string }[] },
   deps: BrainDeps
@@ -331,11 +265,6 @@ async function analyseFork(
     throw recoveryRequired(`note ${operation.id} has corrupt ancestry: ${structural.join(', ')}`);
   }
   const heads = resolution.heads;
-  for (const head of heads) {
-    if ((await isProtectedNote(scope.id, head.revision, deps)) && !mayReview(ctx, scope.id, true, deps)) {
-      throw forbidden('a protected note can only be resolved by an owner');
-    }
-  }
   const expected = new Map(
     heads.map((head) => [head.revision.revision_id, makeEtag(head.revision.revision_id, head.raw_hash)])
   );
@@ -384,16 +313,12 @@ async function requireChainHead(scope: string, id: string, deps: BrainDeps): Pro
 }
 
 async function assertReplacement(
-  ctx: RequestContext,
   scope: ScopeConfig,
   operation: { id: string; replacement_id: string },
   deps: BrainDeps
 ): Promise<void> {
   if (operation.replacement_id === operation.id) {
     throw invalidInput('a note cannot supersede itself');
-  }
-  if (!deps.scopeRegistry.permissions(ctx.principal, scope.id).can_read) {
-    throw forbidden('the replacement note is not readable by this principal');
   }
   const replacement = await requireChainHead(scope.id, operation.replacement_id, deps);
   if (replacement.revision.status !== 'active') {
@@ -418,22 +343,17 @@ async function assertReplacement(
 }
 
 async function listAction(
-  ctx: RequestContext,
-  requested: string,
+  request: ProjectSelector,
   operation: { filter: 'candidate' | 'conflict'; cursor?: string },
   deps: BrainDeps
 ): Promise<ReviewListResult> {
-  const scope = readScope(ctx, requested, deps);
+  const scope = resolveProject(request, deps);
   await deps.catalogue.reconcile(scope.id);
-  const page = await deps.catalogue.list(scope.id, operation.filter, operation.cursor);
-  const items = page.items.filter(
-    (item) => deps.scopeRegistry.permissions(ctx.principal, item.scope).can_read
-  );
-  return page.next_cursor === undefined ? { items } : { items, next_cursor: page.next_cursor };
+  return deps.catalogue.list(scope.id, operation.filter, operation.cursor);
 }
 
 async function approveAction(
-  ctx: RequestContext,
+  ctx: AuthenticatedContext,
   scope: ScopeConfig,
   operation: { idempotency_key: string; id: string; expected_etag: string; rationale: string },
   deps: BrainDeps
@@ -443,15 +363,10 @@ async function approveAction(
     scope: scope.id,
     idempotency_key: operation.idempotency_key,
     payload: decisionPayload('approve', operation),
-    expected_heads: [{ id: operation.id, etag: operation.expected_etag }],
-    authorization: 'review'
+    expected_heads: [{ id: operation.id, etag: operation.expected_etag }]
   };
   const build: RevisionBuilder = async (identities, heads) => {
     const head = requireSingleHead(heads, operation.id);
-    const protectedNote = await isProtectedNote(scope.id, head.revision, deps);
-    if (!mayReview(ctx, scope.id, protectedNote, deps)) {
-      throw forbidden(`principal ${ctx.principal.id} may not approve note ${operation.id}`);
-    }
     assertApprovable(head);
     assertApprovalEvidence(head.revision.note);
     const base: StoredRevision = {
@@ -470,7 +385,7 @@ async function approveAction(
     return {
       ...base,
       approval: {
-        principal_id: ctx.principal.id,
+        principal_id: ctx.actor.id,
         rationale: operation.rationale,
         payload_hash: payloadHash(base)
       }
@@ -480,7 +395,7 @@ async function approveAction(
 }
 
 async function archiveAction(
-  ctx: RequestContext,
+  ctx: AuthenticatedContext,
   scope: ScopeConfig,
   operation: { idempotency_key: string; id: string; expected_etag: string; rationale: string },
   deps: BrainDeps
@@ -490,14 +405,10 @@ async function archiveAction(
     scope: scope.id,
     idempotency_key: operation.idempotency_key,
     payload: decisionPayload('archive', operation),
-    expected_heads: [{ id: operation.id, etag: operation.expected_etag }],
-    authorization: 'review'
+    expected_heads: [{ id: operation.id, etag: operation.expected_etag }]
   };
   const build: RevisionBuilder = (identities, heads) => {
     const head = requireSingleHead(heads, operation.id);
-    if (!mayReview(ctx, scope.id, false, deps)) {
-      throw forbidden(`principal ${ctx.principal.id} may not archive note ${operation.id}`);
-    }
     return {
       id: identities.note_id,
       revision_id: identities.revision_id,
@@ -517,7 +428,7 @@ async function archiveAction(
 }
 
 async function reviseAction(
-  ctx: RequestContext,
+  ctx: AuthenticatedContext,
   scope: ScopeConfig,
   operation: {
     idempotency_key: string;
@@ -529,21 +440,17 @@ async function reviseAction(
   deps: BrainDeps
 ): Promise<MutationReceipt> {
   const note = normalizeNote(operation.note);
-  await authorizeRelatedIds(ctx, note.related_ids, deps);
+  await validateRelatedIds(note.related_ids, deps);
   rejectCredentialText(note);
   const intent: MutationIntent = {
     tool: REVIEW_TOOL,
     scope: scope.id,
     idempotency_key: operation.idempotency_key,
     payload: { ...decisionPayload('revise', operation), note },
-    expected_heads: [{ id: operation.id, etag: operation.expected_etag }],
-    authorization: 'write'
+    expected_heads: [{ id: operation.id, etag: operation.expected_etag }]
   };
   const build: RevisionBuilder = async (identities, heads) => {
     const head = requireSingleHead(heads, operation.id);
-    if ((await isProtectedNote(scope.id, head.revision, deps)) && !mayReview(ctx, scope.id, true, deps)) {
-      throw forbidden(`only an owner may revise the protected note ${operation.id}`);
-    }
     return {
       id: identities.note_id,
       revision_id: identities.revision_id,
@@ -562,7 +469,7 @@ async function reviseAction(
 }
 
 async function supersedeAction(
-  ctx: RequestContext,
+  ctx: AuthenticatedContext,
   scope: ScopeConfig,
   operation: {
     idempotency_key: string;
@@ -578,15 +485,11 @@ async function supersedeAction(
     scope: scope.id,
     idempotency_key: operation.idempotency_key,
     payload: { ...decisionPayload('supersede', operation), replacement_id: operation.replacement_id },
-    expected_heads: [{ id: operation.id, etag: operation.expected_etag }],
-    authorization: 'review'
+    expected_heads: [{ id: operation.id, etag: operation.expected_etag }]
   };
   const build: RevisionBuilder = async (identities, heads) => {
     const head = requireSingleHead(heads, operation.id);
-    if (!mayReview(ctx, scope.id, false, deps)) {
-      throw forbidden(`principal ${ctx.principal.id} may not supersede note ${operation.id}`);
-    }
-    await assertReplacement(ctx, scope, operation, deps);
+    await assertReplacement(scope, operation, deps);
     return {
       id: identities.note_id,
       revision_id: identities.revision_id,
@@ -607,7 +510,7 @@ async function supersedeAction(
 }
 
 async function resolveAction(
-  ctx: RequestContext,
+  ctx: AuthenticatedContext,
   scope: ScopeConfig,
   operation: {
     idempotency_key: string;
@@ -619,7 +522,7 @@ async function resolveAction(
   deps: BrainDeps
 ): Promise<MutationReceipt> {
   const note = normalizeNote(operation.note);
-  await authorizeRelatedIds(ctx, note.related_ids, deps);
+  await validateRelatedIds(note.related_ids, deps);
   rejectCredentialText(note);
   const intent: MutationIntent = {
     tool: REVIEW_TOOL,
@@ -633,8 +536,7 @@ async function resolveAction(
       note
     },
     expected_heads: [],
-    authorization: 'review',
-    resolve_heads: (lockedScope) => analyseFork(ctx, lockedScope, operation, deps)
+    resolve_heads: (lockedScope) => analyseFork(lockedScope, operation, deps)
   };
   const build: RevisionBuilder = (identities, heads) => {
     if (heads.length !== operation.expected_heads.length || heads.length === 0) {
@@ -661,21 +563,19 @@ async function resolveAction(
 }
 
 export async function review(
-  ctx: RequestContext,
+  ctx: AuthenticatedContext,
   input: ReviewRequest,
   deps: BrainDeps
 ): Promise<MutationReceipt | ReviewListResult> {
   const request = parseRequest(input);
   const operation = request.operation;
   if (operation.action === 'list') {
-    return listAction(ctx, request.scope, operation, deps);
+    return listAction(request, operation, deps);
   }
-  if (operation.action === 'revise') {
-    const scope = writeScope(ctx, request.scope, deps);
-    return reviseAction(ctx, scope, operation, deps);
-  }
-  const scope = reviewScope(ctx, request.scope, deps);
+  const scope = resolveProject(request, deps);
   switch (operation.action) {
+    case 'revise':
+      return reviseAction(ctx, scope, operation, deps);
     case 'approve':
       return approveAction(ctx, scope, operation, deps);
     case 'archive':

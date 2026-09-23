@@ -11,25 +11,21 @@ import type { BrainDeps } from '../core/mutation.js';
 import {
   LIFECYCLES,
   NOTE_KINDS,
+  type AuthenticatedContext,
   type MutationReceipt,
-  type Principal,
   type ProjectEnsureResult,
-  type RequestContext,
   type ScopeConfig,
   type StatusRequest,
   type StatusResult
 } from '../core/types.js';
-import { DUPLICATE_DETAILS_WITHHELD } from './capture.js';
+import { projectFilter } from '../projects/registry.js';
 import {
   APPLICATION_VERSION,
   PROTOCOL_VERSION,
   SCHEMA_VERSION,
   toolDefinitions
 } from '../mcp/tools.js';
-import { resolveScopes } from '../security/authorise.js';
-import type { ScopeRegistry } from '../projects/scope-registry.js';
 import type { OperationRecord } from '../storage/journal.js';
-
 const MATERIALIZATION_UNCONFIRMED = 'materialization_unconfirmed';
 
 const sourceRefSchema = z.strictObject({
@@ -61,11 +57,6 @@ const projectEnsureResultSchema = z.strictObject({
   repository_identity: z.string(),
   scope: scopeIdSchema,
   created: z.boolean(),
-  permissions: z.strictObject({
-    can_read: z.literal(true),
-    can_write: z.boolean(),
-    can_review: z.boolean()
-  }),
   backend_ready: z.boolean(),
   materialized: z.boolean(),
   warnings: z.array(z.string())
@@ -106,7 +97,7 @@ function invalidInput(message: string, cause?: unknown): BrainError {
 function notFound(): BrainError {
   return new BrainError({
     code: 'NOT_FOUND',
-    message: 'the requested operation is not available to this principal'
+    message: 'the requested operation is not available'
   });
 }
 
@@ -132,26 +123,6 @@ function parseRequest(input: StatusRequest): StatusRequest {
     throw invalidInput(`status request is invalid: ${detail}`);
   }
   return parsed.data as StatusRequest;
-}
-
-function scopeEntry(
-  principal: Principal,
-  scope: ScopeConfig,
-  registry: ScopeRegistry
-): { id: string; can_write: boolean; can_review: boolean } {
-  const permissions = registry.permissions(principal, scope.id);
-  return {
-    id: scope.id,
-    can_write: permissions.can_write,
-    can_review: permissions.can_review
-  };
-}
-
-function canInspect(principal: Principal, record: OperationRecord, registry: ScopeRegistry): boolean {
-  if (record.principal_id === principal.id) return true;
-  if (principal.role !== 'owner') return false;
-  const permissions = registry.permissions(principal, record.scope);
-  return permissions.can_read || permissions.can_write || permissions.can_review;
 }
 
 interface PlannedIdentity {
@@ -236,22 +207,6 @@ function receiptFromRecord(record: OperationRecord): MutationReceipt | ProjectEn
   return undefined;
 }
 
-function filterReadableDuplicates(
-  principal: Principal,
-  receipt: MutationReceipt | ProjectEnsureResult,
-  registry: ScopeRegistry
-): MutationReceipt | ProjectEnsureResult {
-  if (!('possible_duplicates' in receipt)) return receipt;
-  if (receipt.possible_duplicates.length === 0) return receipt;
-  const visible = receipt.possible_duplicates.filter(
-    (entry) => registry.permissions(principal, entry.scope).can_read
-  );
-  if (visible.length === receipt.possible_duplicates.length) return receipt;
-  const warnings = [...receipt.warnings];
-  if (!warnings.includes(DUPLICATE_DETAILS_WITHHELD)) warnings.push(DUPLICATE_DETAILS_WITHHELD);
-  return { ...receipt, possible_duplicates: visible, warnings };
-}
-
 function toolSchemas(): Record<string, unknown> {
   const schemas: Record<string, unknown> = {};
   for (const definition of toolDefinitions) {
@@ -274,44 +229,24 @@ async function backendHealth(deps: BrainDeps): Promise<'ready' | 'unavailable'> 
 }
 
 export async function status(
-  ctx: RequestContext,
+  ctx: AuthenticatedContext,
   input: StatusRequest,
   deps: BrainDeps
 ): Promise<StatusResult> {
   if (ctx.signal.aborted) throw cancelled();
   const request = parseRequest(input);
+  const filter = projectFilter(request);
 
-  const authorized = deps.scopeRegistry.visibleTo(ctx.principal);
-  const projectRecords =
-    typeof deps.journal.listProjects === 'function' ? deps.journal.listProjects() : [];
-  const visibleProjects = projectRecords
-    .filter(
-      (project) =>
-        project.state !== 'ready' &&
-        (ctx.principal.role === 'owner' || project.created_by_principal_id === ctx.principal.id)
-    );
-  const requestedProject =
-    request.scope === undefined
-      ? undefined
-      : visibleProjects.find((project) => project.scope === request.scope);
-  const scopes =
-    request.scope === undefined
-      ? authorized.map((scope) => scopeEntry(ctx.principal, scope, deps.scopeRegistry))
-      : requestedProject !== undefined
-        ? []
-      : [
-          scopeEntry(
-            ctx.principal,
-            resolveScopes(ctx.principal, request.scope, false, 'read', deps.scopeRegistry)[0],
-            deps.scopeRegistry
-          )
-        ];
+  const projectRecords = deps.journal.listProjects();
+  const selectedScopes =
+    filter.mode === 'all'
+      ? deps.scopeRegistry.all()
+      : [deps.scopeRegistry.require(filter.identifier)];
 
-  const scopeIds = new Set(scopes.map((entry) => entry.id));
-  const visibleProjectScopes = new Set(visibleProjects.map((project) => project.scope));
+  const scopes = selectedScopes.map((scope) => ({ id: scope.id }));
   const pending = deps.journal
     .pending()
-    .filter((record) => scopeIds.has(record.scope) || visibleProjectScopes.has(record.scope));
+    .filter((record) => filter.mode === 'all' || record.scope === filter.identifier);
 
   const backend = await backendHealth(deps);
   const gateway = backend === 'unavailable' ? 'degraded' : pending.length > 0 ? 'recovering' : 'ready';
@@ -324,20 +259,21 @@ export async function status(
     health: { gateway, backend, embeddings: 'unknown' },
     pending_operations: pending.length
   };
-  if (visibleProjects.length > 0) {
-    result.projects = visibleProjects.map((project) => ({
-      scope: project.scope,
+  const projects = projectRecords.filter(
+    (project) => filter.mode === 'all' || project.project.id === filter.identifier
+  );
+  if (projects.length > 0) {
+    result.projects = projects.map((project) => ({
+      scope: project.project.id,
       state: project.state
     }));
   }
 
   if (request.operation_id !== undefined) {
     const record = deps.journal.get(request.operation_id);
-    if (record === undefined || !canInspect(ctx.principal, record, deps.scopeRegistry)) throw notFound();
+    if (record === undefined) throw notFound();
     const receipt = receiptFromRecord(record);
-    if (receipt !== undefined) {
-      result.operation = filterReadableDuplicates(ctx.principal, receipt, deps.scopeRegistry);
-    }
+    if (receipt !== undefined) result.operation = receipt;
   }
 
   if (request.include_schemas === true) result.schemas = toolSchemas();

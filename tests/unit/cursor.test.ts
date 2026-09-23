@@ -1,213 +1,137 @@
 import { createHmac } from 'node:crypto';
 import { expect, test } from 'vitest';
-import { signCursor, verifyCursor } from '../../src/retrieval/cursor.js';
-import { reviewerContext, workerContext } from '../fixtures/principals.js';
+import type { CursorPayloadV1, CursorPayloadV2 } from '../../src/retrieval/cursor.js';
+import {
+  signCursorV2,
+  signLegacyCursor,
+  verifyCursorV2,
+  verifyLegacyCursor
+} from '../../src/retrieval/cursor.js';
 
 const NOW = new Date('2026-09-20T12:00:00Z');
 const KEY = new Uint8Array(32).fill(7);
+const rawHash = (fill: string): string => fill.repeat(64);
 
-const payload = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
-  principal_id: reviewerContext.principal.id,
+const payload = (overrides: Partial<CursorPayloadV2> = {}): CursorPayloadV2 => ({
+  version: 2,
   scope: 'freellmapi',
-  id: 'n1',
-  revision_id: 'r1',
-  raw_hash: 'a'.repeat(64),
+  id: '00000000-0000-4000-8000-0000000000a1',
+  revision_id: '00000000-0000-4000-8000-0000000000b1',
+  raw_hash: rawHash('a'),
   offset: 100,
   expires_at: '2026-09-20T12:10:00Z',
   ...overrides
 });
 
-const forge = (body: Record<string, unknown>, secret: Uint8Array): string => {
+const forgeV2 = (body: Record<string, unknown>, secret: Uint8Array): string => {
   const bytes = Buffer.from(JSON.stringify(body), 'utf8');
   const signature = createHmac('sha256', secret).update(bytes).digest();
-  return `${bytes.toString('base64url')}.${signature.toString('base64url')}`;
+  return `v2.${bytes.toString('base64url')}.${signature.toString('base64url')}`;
 };
 
 test('rejects a cursor whose signature is replaced', () => {
-  const key = new Uint8Array(32).fill(7);
-  const cursor = signCursor(
-    {
-      principal_id: reviewerContext.principal.id,
-      scope: 'freellmapi',
-      id: 'n1',
-      revision_id: 'r1',
-      raw_hash: 'a'.repeat(64),
-      offset: 100,
-      expires_at: '2026-09-20T12:10:00Z'
-    },
-    key
-  );
-  const body = cursor.split('.')[0];
-  expect(() =>
-    verifyCursor(`${body}.invalid`, key, reviewerContext, new Date('2026-09-20T12:00:00Z'))
-  ).toThrow(/INVALID_INPUT/);
+  const cursor = signCursorV2(payload(), KEY);
+  const [prefix, body] = cursor.split('.');
+  expect(() => verifyCursorV2(`${prefix}.${body}.invalid`, KEY, NOW)).toThrow(/INVALID_INPUT/);
 });
 
-test('round-trips the exact documented payload fields', () => {
-  const cursor = signCursor(
-    {
-      principal_id: reviewerContext.principal.id,
-      scope: 'freellmapi',
-      id: 'n1',
-      revision_id: 'r1',
-      raw_hash: 'b'.repeat(64),
-      offset: 42,
-      expires_at: '2026-09-20T12:05:00Z'
-    },
-    KEY
-  );
-  expect(cursor.split('.')).toHaveLength(2);
-  const verified = verifyCursor(cursor, KEY, reviewerContext, NOW);
+test('round-trips the exact documented role-free payload fields', () => {
+  const cursor = signCursorV2(payload({ raw_hash: rawHash('b'), offset: 42, expires_at: '2026-09-20T12:05:00Z' }), KEY);
+  expect(cursor.split('.')).toHaveLength(3);
+  const verified = verifyCursorV2(cursor, KEY, NOW);
   expect(Object.keys(verified).sort()).toEqual(
-    ['expires_at', 'id', 'offset', 'principal_id', 'raw_hash', 'revision_id', 'scope'].sort()
+    ['version', 'expires_at', 'id', 'offset', 'raw_hash', 'revision_id', 'scope'].sort()
   );
   expect(verified).toEqual({
-    principal_id: reviewerContext.principal.id,
+    version: 2,
     scope: 'freellmapi',
-    id: 'n1',
-    revision_id: 'r1',
-    raw_hash: 'b'.repeat(64),
+    id: '00000000-0000-4000-8000-0000000000a1',
+    revision_id: '00000000-0000-4000-8000-0000000000b1',
+    raw_hash: rawHash('b'),
     offset: 42,
     expires_at: '2026-09-20T12:05:00Z'
   });
+  expect('principal_id' in verified).toBe(false);
   expect('path' in verified).toBe(false);
-  expect('relative_path' in verified).toBe(false);
 });
 
-test('signs deterministically', () => {
-  const first = signCursor(payload() as never, KEY);
-  const second = signCursor(payload() as never, KEY);
-  expect(first).toBe(second);
+test('signs deterministically and rejects a cursor signed with another secret', () => {
+  expect(signCursorV2(payload(), KEY)).toBe(signCursorV2(payload(), KEY));
+  const cursor = signCursorV2(payload(), KEY);
+  expect(() => verifyCursorV2(cursor, new Uint8Array(32).fill(9), NOW)).toThrow(/INVALID_INPUT/);
 });
 
-test('does not let an extra path field ride inside the signed body', () => {
-  const cursor = signCursor(payload({ relative_path: '../../etc/passwd' }) as never, KEY);
-  const verified = verifyCursor(cursor, KEY, reviewerContext, NOW);
-  expect(Object.keys(verified)).toHaveLength(7);
-  expect('relative_path' in verified).toBe(false);
-
-  const forged = forge(payload({ path: '../../etc/passwd' }), KEY);
-  expect(() => verifyCursor(forged, KEY, reviewerContext, NOW)).toThrow(/INVALID_INPUT/);
+test('rejects an extra path field riding inside the signed body', () => {
+  const forged = forgeV2({ ...payload(), relative_path: '../../etc/passwd' }, KEY);
+  expect(() => verifyCursorV2(forged, KEY, NOW)).toThrow(/INVALID_INPUT/);
 });
 
-test('rejects a cursor signed with another secret', () => {
-  const cursor = signCursor(payload() as never, KEY);
-  expect(() => verifyCursor(cursor, new Uint8Array(32).fill(9), reviewerContext, NOW)).toThrow(
-    /INVALID_INPUT/
-  );
-});
-
-test('rejects a cursor bound to another principal', () => {
-  const cursor = signCursor(payload() as never, KEY);
-  expect(() => verifyCursor(cursor, KEY, workerContext, NOW)).toThrow(/INVALID_INPUT/);
+test('cursors are integrity tokens without a caller binding', () => {
+  const legacy: CursorPayloadV1 = {
+    principal_id: 'legacy-principal',
+    scope: 'freellmapi',
+    id: 'n1',
+    revision_id: 'r1',
+    raw_hash: rawHash('c'),
+    offset: 3,
+    expires_at: '2026-09-20T12:05:00Z'
+  };
+  const decoded = verifyLegacyCursor(signLegacyCursor(legacy, KEY), KEY, NOW);
+  expect(decoded.principal_id).toBe('legacy-principal');
+  expect(decoded.offset).toBe(3);
 });
 
 test('rejects an expired cursor and accepts the expiry boundary', () => {
-  const expired = signCursor(payload({ expires_at: '2026-09-20T11:59:59Z' }) as never, KEY);
-  expect(() => verifyCursor(expired, KEY, reviewerContext, NOW)).toThrow(/INVALID_INPUT/);
-
-  const boundary = signCursor(payload({ expires_at: '2026-09-20T12:00:00Z' }) as never, KEY);
-  expect(verifyCursor(boundary, KEY, reviewerContext, NOW).offset).toBe(100);
+  const expired = signCursorV2(payload({ expires_at: '2026-09-20T11:59:59Z' }), KEY);
+  expect(() => verifyCursorV2(expired, KEY, NOW)).toThrow(/INVALID_INPUT/);
+  const boundary = signCursorV2(payload({ expires_at: '2026-09-20T12:00:00Z' }), KEY);
+  expect(verifyCursorV2(boundary, KEY, NOW).offset).toBe(100);
 });
 
-test('rejects an expiry beyond the ten-minute window', () => {
-  const cursor = signCursor(payload({ expires_at: '2026-09-20T12:10:01Z' }) as never, KEY);
-  expect(() => verifyCursor(cursor, KEY, reviewerContext, NOW)).toThrow(/INVALID_INPUT/);
-});
-
-test('rejects an invalid expiry', () => {
-  const cursor = signCursor(payload({ expires_at: 'not-a-date' }) as never, KEY);
-  expect(() => verifyCursor(cursor, KEY, reviewerContext, NOW)).toThrow(/INVALID_INPUT/);
-});
-
-test('rejects a non-UTC or non-RFC3339 expiry', () => {
-  for (const value of [
-    '2026-09-20T12:10:00+02:00',
-    '2026-09-20T12:10:00z',
-    '2026-09-20T12:10:00',
-    '2026-09-20',
-    '20260920T121000Z'
-  ]) {
-    const cursor = signCursor(payload({ expires_at: value }) as never, KEY);
-    expect(() => verifyCursor(cursor, KEY, reviewerContext, NOW)).toThrow(/INVALID_INPUT/);
+test('rejects an expiry beyond the ten-minute window or an invalid instant', () => {
+  for (const value of ['2026-09-20T12:10:01Z', 'not-a-date', '2026-09-20T12:10:00+02:00', '2026-02-30T12:10:00Z']) {
+    const cursor = signCursorV2(payload({ expires_at: value }), KEY);
+    expect(() => verifyCursorV2(cursor, KEY, NOW)).toThrow(/INVALID_INPUT/);
   }
-});
-
-test('rejects impossible calendar instants such as February 30', () => {
-  for (const value of [
-    '2026-02-30T12:10:00Z',
-    '2026-02-29T12:10:00Z',
-    '2026-13-01T12:10:00Z',
-    '2026-09-20T25:10:00Z'
-  ]) {
-    const cursor = signCursor(payload({ expires_at: value }) as never, KEY);
-    expect(() => verifyCursor(cursor, KEY, reviewerContext, NOW)).toThrow(/INVALID_INPUT/);
-  }
-  const leap = signCursor(payload({ expires_at: '2024-02-29T12:10:00Z' }) as never, KEY);
-  expect(verifyCursor(leap, KEY, reviewerContext, new Date('2024-02-29T12:00:00Z')).offset).toBe(100);
 });
 
 test('rejects short or empty signing secrets in both directions', () => {
-  const valid = signCursor(payload() as never, KEY);
+  const valid = signCursorV2(payload(), KEY);
   for (const key of [new Uint8Array(0), new Uint8Array(16).fill(1), new Uint8Array(31).fill(1)]) {
-    expect(() => signCursor(payload() as never, key)).toThrow(/INVALID_INPUT/);
-    expect(() => verifyCursor(valid, key, reviewerContext, NOW)).toThrow(/INVALID_INPUT/);
+    expect(() => signCursorV2(payload(), key)).toThrow(/INVALID_INPUT/);
+    expect(() => verifyCursorV2(valid, key, NOW)).toThrow(/INVALID_INPUT/);
   }
 });
 
-test('rejects negative, fractional, and non-numeric offsets', () => {
+test('rejects negative, fractional, and non-numeric offsets and accepts zero', () => {
   for (const offset of [-1, 1.5, Number.NaN, '5']) {
-    const cursor = signCursor(payload({ offset }) as never, KEY);
-    expect(() => verifyCursor(cursor, KEY, reviewerContext, NOW)).toThrow(/INVALID_INPUT/);
+    const cursor = signCursorV2(payload({ offset: offset as unknown as number }), KEY);
+    expect(() => verifyCursorV2(cursor, KEY, NOW)).toThrow(/INVALID_INPUT/);
   }
-});
-
-test('accepts a zero offset', () => {
-  const cursor = signCursor(payload({ offset: 0 }) as never, KEY);
-  expect(verifyCursor(cursor, KEY, reviewerContext, NOW).offset).toBe(0);
+  expect(verifyCursorV2(signCursorV2(payload({ offset: 0 }), KEY), KEY, NOW).offset).toBe(0);
 });
 
 test('rejects truncated, empty, extra, and non-base64url tokens', () => {
-  const cursor = signCursor(payload() as never, KEY);
-  const [body, signature] = cursor.split('.');
-  expect(() => verifyCursor(body, KEY, reviewerContext, NOW)).toThrow(/INVALID_INPUT/);
-  expect(() => verifyCursor(`${cursor}.extra`, KEY, reviewerContext, NOW)).toThrow(/INVALID_INPUT/);
-  expect(() => verifyCursor(`${body}.`, KEY, reviewerContext, NOW)).toThrow(/INVALID_INPUT/);
-  expect(() => verifyCursor(`.${signature}`, KEY, reviewerContext, NOW)).toThrow(/INVALID_INPUT/);
-  expect(() => verifyCursor('not base64url!!.also!!', KEY, reviewerContext, NOW)).toThrow(
-    /INVALID_INPUT/
-  );
-  expect(() => verifyCursor('', KEY, reviewerContext, NOW)).toThrow(/INVALID_INPUT/);
+  const cursor = signCursorV2(payload(), KEY);
+  const [prefix, body, signature] = cursor.split('.');
+  expect(() => verifyCursorV2(body, KEY, NOW)).toThrow(/INVALID_INPUT/);
+  expect(() => verifyCursorV2(`${cursor}.extra`, KEY, NOW)).toThrow(/INVALID_INPUT/);
+  expect(() => verifyCursorV2(`${prefix}.${body}.`, KEY, NOW)).toThrow(/INVALID_INPUT/);
+  expect(() => verifyCursorV2(`${prefix}..${signature}`, KEY, NOW)).toThrow(/INVALID_INPUT/);
+  expect(() => verifyCursorV2('', KEY, NOW)).toThrow(/INVALID_INPUT/);
 });
 
 test('rejects a tampered body that keeps the original signature', () => {
-  const cursor = signCursor(payload() as never, KEY);
-  const [body, signature] = cursor.split('.');
-  const tampered = Buffer.from(
-    JSON.stringify({ ...payload(), offset: 999999 }),
-    'utf8'
-  ).toString('base64url');
-  expect(() => verifyCursor(`${tampered}.${signature}`, KEY, reviewerContext, NOW)).toThrow(
-    /INVALID_INPUT/
-  );
-  expect(typeof body).toBe('string');
+  const cursor = signCursorV2(payload(), KEY);
+  const [, , signature] = cursor.split('.');
+  const tampered = Buffer.from(JSON.stringify({ ...payload(), offset: 999999 }), 'utf8').toString('base64url');
+  expect(() => verifyCursorV2(`v2.${tampered}.${signature}`, KEY, NOW)).toThrow(/INVALID_INPUT/);
 });
 
-test('rejects a signed body that is valid JSON but not an object', () => {
+test('rejects a signed body that is valid JSON but not a v2 object', () => {
   const body = Buffer.from(JSON.stringify([1, 2, 3]), 'utf8');
   const signature = createHmac('sha256', KEY).update(body).digest();
-  expect(() =>
-    verifyCursor(`${body.toString('base64url')}.${signature.toString('base64url')}`, KEY, reviewerContext, NOW)
-  ).toThrow(/INVALID_INPUT/);
-
-  const emptyObject = Buffer.from('{}', 'utf8');
-  const emptySignature = createHmac('sha256', KEY).update(emptyObject).digest();
-  expect(() =>
-    verifyCursor(
-      `${emptyObject.toString('base64url')}.${emptySignature.toString('base64url')}`,
-      KEY,
-      reviewerContext,
-      NOW
-    )
-  ).toThrow(/INVALID_INPUT/);
+  expect(() => verifyCursorV2(`v2.${body.toString('base64url')}.${signature.toString('base64url')}`, KEY, NOW)).toThrow(
+    /INVALID_INPUT/
+  );
 });

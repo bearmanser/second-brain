@@ -15,7 +15,6 @@ import {
 } from '../../src/mcp/http.js';
 import { generateBearerToken, verifyBearer } from '../../src/security/authenticate.js';
 import { runCli } from '../../src/cli.js';
-import { workerPrincipal } from '../fixtures/principals.js';
 
 const digest = (value: string): string =>
   createHash('sha256').update(value, 'utf8').digest('hex');
@@ -174,8 +173,8 @@ test('auth migrate selects exactly one legacy entry and never emits raw tokens',
     path,
     `${JSON.stringify({
       credentials: [
-        { token_sha256: digest(first), principal: workerPrincipal },
-        { token_sha256: digest(second), principal: workerPrincipal }
+        { token_sha256: digest(first), principal: { id: '00000000-0000-4000-8000-000000000001' } },
+        { token_sha256: digest(second), principal: { id: '00000000-0000-4000-8000-000000000001' } }
       ]
     })}\n`,
     'utf8'

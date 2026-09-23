@@ -11,6 +11,7 @@ import {
   cursorSchema,
   etagSchema,
   noteInputSchema,
+  projectIdentifierSchema,
   remoteUrlSchema,
   scopeIdSchema,
   uuidSchema,
@@ -67,7 +68,8 @@ const reviewResolveOperation = z.strictObject({
 export const captureRequestSchema = z
   .strictObject({
     idempotency_key: uuidSchema,
-    scope: scopeIdSchema,
+    project: projectIdentifierSchema.optional(),
+    scope: scopeIdSchema.optional(),
     note: noteInputSchema
   })
   .refine(withinInputBodyLimit, { message: 'input body exceeds the 256 KiB limit' });
@@ -81,7 +83,8 @@ export const projectEnsureRequestSchema = z
 
 export const recallRequestSchema = z
   .strictObject({
-    scope: scopeIdSchema,
+    project: projectIdentifierSchema.optional(),
+    scope: scopeIdSchema.optional(),
     query: text,
     topics: z.array(text).max(32).optional(),
     phase: z.enum(PHASES).optional(),
@@ -98,7 +101,8 @@ export const recallRequestSchema = z
 
 export const readRequestSchema = z
   .strictObject({
-    scope: scopeIdSchema,
+    project: projectIdentifierSchema.optional(),
+    scope: scopeIdSchema.optional(),
     id: uuidSchema,
     revision_id: uuidSchema.optional(),
     cursor: cursorSchema.optional(),
@@ -108,7 +112,8 @@ export const readRequestSchema = z
 
 export const reviewRequestSchema = z
   .strictObject({
-    scope: scopeIdSchema,
+    project: projectIdentifierSchema.optional(),
+    scope: scopeIdSchema.optional(),
     operation: z.discriminatedUnion('action', [
       reviewListOperation,
       reviewDecisionOperation,
@@ -122,7 +127,8 @@ export const reviewRequestSchema = z
 export const feedbackRequestSchema = z
   .strictObject({
     idempotency_key: uuidSchema,
-    scope: scopeIdSchema,
+    project: projectIdentifierSchema.optional(),
+    scope: scopeIdSchema.optional(),
     id: uuidSchema,
     revision_id: uuidSchema,
     retrieval_id: uuidSchema.optional(),
@@ -134,6 +140,7 @@ export const feedbackRequestSchema = z
 
 export const statusRequestSchema = z
   .strictObject({
+    project: projectIdentifierSchema.optional(),
     scope: scopeIdSchema.optional(),
     operation_id: uuidSchema.optional(),
     include_schemas: z.boolean().optional()

@@ -1,7 +1,6 @@
 import { BrainError } from '../contracts/errors.js';
 import type { BrainDeps } from '../core/mutation.js';
 import type {
-  Principal,
   ReconcileFinding,
   ReconcileReport,
   ScopeConfig
@@ -16,7 +15,6 @@ import type { ApprovalProvenance, ApprovalProvenanceInput } from './catalogue.js
 
 export interface ReconcileOptions {
   detailed?: boolean;
-  principal?: Principal;
 }
 
 export type { ReconcileFinding, ReconcileReport, ReconcileScopeReport } from '../core/types.js';
@@ -93,20 +91,11 @@ function selectScopes(deps: BrainDeps, scope: string | undefined): ScopeConfig[]
   const match = deps.scopeRegistry.get(scope);
   if (match === undefined) {
     throw new BrainError({
-      code: 'FORBIDDEN',
+      code: 'INVALID_INPUT',
       message: `scope ${scope} is not configured for reconciliation`
     });
   }
   return [match];
-}
-
-function authorized(
-  deps: BrainDeps,
-  findings: ReconcileFinding[],
-  principal: Principal | undefined
-): ReconcileFinding[] {
-  if (principal === undefined) return findings;
-  return findings.filter((finding) => deps.scopeRegistry.permissions(principal, finding.scope).can_read);
 }
 
 function idsFor(
@@ -151,13 +140,12 @@ export async function reconcileVault(
     findings.push(...scoped.findings);
   }
   if (options.detailed === true) {
-    const visible = authorized(deps, findings, options.principal);
-    report.findings = visible;
+    report.findings = findings;
     report.ids = {
-      malformed: idsFor(visible, 'malformed'),
-      conflicted: idsFor(visible, 'conflict'),
-      manual_unreviewed: idsFor(visible, 'manual_unreviewed'),
-      unsupported_schema: idsFor(visible, 'unsupported_schema')
+      malformed: idsFor(findings, 'malformed'),
+      conflicted: idsFor(findings, 'conflict'),
+      manual_unreviewed: idsFor(findings, 'manual_unreviewed'),
+      unsupported_schema: idsFor(findings, 'unsupported_schema')
     };
   }
   return report;

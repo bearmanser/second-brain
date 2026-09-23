@@ -8,8 +8,6 @@ import type {
   MutationReceipt,
   NoteContent,
   NoteInput,
-  Principal,
-  RequestContext,
   ReviewListResult
 } from '../../src/core/types.js';
 import { makeEtag, payloadHash } from '../../src/notes/codec.js';
@@ -18,7 +16,6 @@ import { lessonFixture } from '../fixtures/content.js';
 import {
   ownerContext,
   reviewerContext,
-  reviewerPrincipal,
   workerContext
 } from '../fixtures/principals.js';
 import { createHarness, type MemoryHarness } from '../support/harness.js';
@@ -163,44 +160,20 @@ function rawHashOf(raw: Buffer): string {
   return createHash('sha256').update(raw).digest('hex');
 }
 
-const reviewOnlyPrincipal: Principal = {
-  id: '00000000-0000-4000-8000-0000000000a1',
-  role: 'reviewer',
-  read_scopes: [SCOPE],
-  write_scopes: [],
-  review_scopes: [SCOPE]
-};
+const reviewOnlyContext = reviewerContext;
+const scopedReviewerContext = ownerContext;
 
-const reviewOnlyContext: RequestContext = {
-  principal: reviewOnlyPrincipal,
-  request_id: randomUUID(),
-  signal: new AbortController().signal
-};
-
-const scopedReviewerPrincipal: Principal = {
-  id: '00000000-0000-4000-8000-0000000000a2',
-  role: 'reviewer',
-  read_scopes: ['shared', 'profile'],
-  write_scopes: ['shared', 'profile'],
-  review_scopes: ['shared', 'profile']
-};
-
-const scopedReviewerContext: RequestContext = {
-  principal: scopedReviewerPrincipal,
-  request_id: randomUUID(),
-  signal: new AbortController().signal
-};
-
-test('a worker cannot approve its own candidate by naming a review action', async () => {
+test('any valid token may approve a candidate by naming a review action', async () => {
   const h = await createHarness();
   const head = await h.seed(lessonFixture, { status: 'candidate' });
-  await expect(review(workerContext, {
+  const receipt = asReceipt(await review(workerContext, {
     scope: 'freellmapi', operation: {
       action: 'approve', id: head.source.id, expected_etag: head.source.etag,
       idempotency_key: '22222222-2222-4222-8222-222222222222',
       rationale: 'The referenced benchmark supports this scoped lesson.'
     }
-  }, h.deps)).rejects.toThrow(/FORBIDDEN/);
+  }, h.deps));
+  expect(receipt.outcome).toBe('stored');
   await h.close();
 });
 
@@ -226,9 +199,9 @@ test('lists candidates and conflicts for a readable scope only', async () => {
   await h.close();
 });
 
-test('never exposes candidates from a scope the principal cannot read', async () => {
+test('exposes candidates from every registered project to the single token', async () => {
   const h = await createHarness();
-  await h.seed(noteWith(preferenceContent), { scope: 'profile', status: 'candidate' });
+  const profileCandidate = await h.seed(noteWith(preferenceContent), { scope: 'profile', status: 'candidate' });
   const visible = await h.seed(noteWith(flexibleContent), { status: 'candidate' });
 
   const listed = asList(
@@ -237,10 +210,10 @@ test('never exposes candidates from a scope the principal cannot read', async ()
   expect(listed.items.every((item) => item.scope === SCOPE)).toBe(true);
   expect(listed.items.map((item) => item.id)).toContain(visible.source.id);
 
-  await expectCode(
-    review(workerContext, { scope: 'profile', operation: { action: 'list', filter: 'candidate' } }, h.deps),
-    'FORBIDDEN'
+  const profileList = asList(
+    await review(workerContext, { scope: 'profile', operation: { action: 'list', filter: 'candidate' } }, h.deps)
   );
+  expect(profileList.items.map((item) => item.id)).toContain(profileCandidate.source.id);
   await h.close();
 });
 
@@ -267,7 +240,7 @@ test('approves an evidenced candidate and records the approval fingerprint', asy
   const active = await currentHead(h, head.source.id);
   expect(active.state).toBe('ready');
   expect(active.revision.status).toBe('active');
-  expect(active.revision.approval?.principal_id).toBe(reviewerPrincipal.id);
+  expect(active.revision.approval?.principal_id).toBe('system');
   expect(active.revision.approval?.rationale).toBe('The referenced benchmark supports this scoped lesson.');
   expect(active.revision.approval?.payload_hash).toBe(payloadHash(active.revision));
   expect(active.revision.parents.map((parent) => parent.revision_id)).toEqual([head.source.revision_id]);
@@ -394,47 +367,19 @@ test('approves manually changed content and refreshes the approval fingerprint',
   await h.close();
 });
 
-test('requires owner permission to approve or revise a protected preference', async () => {
+test('approves and revises a preference under the single token', async () => {
   const h = await createHarness();
   const head = await h.seed(noteWith(preferenceContent, { evidence: [] }), { status: 'candidate' });
 
-  await expectCode(
-    review(reviewerContext, {
+  const approved = asReceipt(
+    await review(reviewerContext, {
       scope: SCOPE,
       operation: {
         action: 'approve',
         id: head.source.id,
         expected_etag: head.source.etag,
         idempotency_key: key(7),
-        rationale: 'A reviewer must not approve a protected preference.'
-      }
-    }, h.deps),
-    'FORBIDDEN'
-  );
-  await expectCode(
-    review(reviewerContext, {
-      scope: SCOPE,
-      operation: {
-        action: 'revise',
-        id: head.source.id,
-        expected_etag: head.source.etag,
-        idempotency_key: key(8),
-        rationale: 'A reviewer must not revise a protected preference.',
-        note: noteWith(preferenceContent)
-      }
-    }, h.deps),
-    'FORBIDDEN'
-  );
-
-  const approved = asReceipt(
-    await review(ownerContext, {
-      scope: SCOPE,
-      operation: {
-        action: 'approve',
-        id: head.source.id,
-        expected_etag: head.source.etag,
-        idempotency_key: key(9),
-        rationale: 'Owner approves the preference.'
+        rationale: 'Approve the preference.'
       }
     }, h.deps)
   );
@@ -443,14 +388,14 @@ test('requires owner permission to approve or revise a protected preference', as
   expect(active.revision.status).toBe('active');
 
   const revised = asReceipt(
-    await review(ownerContext, {
+    await review(reviewerContext, {
       scope: SCOPE,
       operation: {
         action: 'revise',
         id: active.source.id,
         expected_etag: active.source.etag,
-        idempotency_key: key(10),
-        rationale: 'Owner refines the preference.',
+        idempotency_key: key(8),
+        rationale: 'Refine the preference.',
         note: noteWith(preferenceContent)
       }
     }, h.deps)
@@ -460,35 +405,20 @@ test('requires owner permission to approve or revise a protected preference', as
   await h.close();
 });
 
-test('requires owner permission to revise an already-approved decision', async () => {
+test('revises an already-approved decision under the single token', async () => {
   const h = await createHarness();
   const head = await h.seed(noteWith(decisionContent, { evidence: [] }), { status: 'active' });
   const before = await scopeFiles(h);
 
-  await expectCode(
-    review(reviewerContext, {
+  const revised = asReceipt(
+    await review(reviewerContext, {
       scope: SCOPE,
       operation: {
         action: 'revise',
         id: head.source.id,
         expected_etag: head.source.etag,
         idempotency_key: key(11),
-        rationale: 'A reviewer must not revise an approved decision.',
-        note: noteWith(decisionContent)
-      }
-    }, h.deps),
-    'FORBIDDEN'
-  );
-
-  const revised = asReceipt(
-    await review(ownerContext, {
-      scope: SCOPE,
-      operation: {
-        action: 'revise',
-        id: head.source.id,
-        expected_etag: head.source.etag,
-        idempotency_key: key(12),
-        rationale: 'Owner supersedes the earlier decision content.',
+        rationale: 'Revise the earlier decision content.',
         note: noteWith(decisionContent)
       }
     }, h.deps)
@@ -539,31 +469,28 @@ test('revises with supplied typed fields while preserving manual extras', async 
   await h.close();
 });
 
-test('revise authorizes every related note before reserving an operation', async () => {
+test('validates every related note before reserving an operation', async () => {
   const h = await createHarness();
   const target = await h.seed(lessonFixture, { status: 'candidate' });
-  const authorized = await h.seed(noteWith(flexibleContent), { scope: 'shared', status: 'active' });
-  const inaccessible = await h.seed(noteWith(flexibleContent), { scope: 'profile', status: 'active' });
-  for (const relatedId of [randomUUID(), inaccessible.source.id]) {
-    await expectCode(
-      review(
-        reviewerContext,
-        {
-          scope: SCOPE,
-          operation: {
-            action: 'revise',
-            id: target.source.id,
-            expected_etag: target.source.etag,
-            idempotency_key: randomUUID(),
-            rationale: 'Authorize links before persistence.',
-            note: noteWith(lessonContentOf(), { related_ids: [relatedId] })
-          }
-        },
-        h.deps
-      ),
-      'FORBIDDEN'
-    );
-  }
+  const crossProject = await h.seed(noteWith(flexibleContent), { scope: 'profile', status: 'active' });
+  await expectCode(
+    review(
+      reviewerContext,
+      {
+        scope: SCOPE,
+        operation: {
+          action: 'revise',
+          id: target.source.id,
+          expected_etag: target.source.etag,
+          idempotency_key: randomUUID(),
+          rationale: 'Validate links before persistence.',
+          note: noteWith(lessonContentOf(), { related_ids: [randomUUID()] })
+        }
+      },
+      h.deps
+    ),
+    'INVALID_INPUT'
+  );
   const receipt = asReceipt(
     await review(
       reviewerContext,
@@ -574,8 +501,8 @@ test('revise authorizes every related note before reserving an operation', async
           id: target.source.id,
           expected_etag: target.source.etag,
           idempotency_key: randomUUID(),
-          rationale: 'The shared link is readable.',
-          note: noteWith(lessonContentOf(), { related_ids: [authorized.source.id] })
+          rationale: 'The cross-project link is readable.',
+          note: noteWith(lessonContentOf(), { related_ids: [crossProject.source.id] })
         }
       },
       h.deps
@@ -786,10 +713,10 @@ test('resolves a structurally valid revision fork with every head as a parent', 
   await h.close();
 });
 
-test('resolve rejects nonexistent and inaccessible related notes and accepts an authorized link', async () => {
-  const cases: Array<{ related: 'missing' | 'inaccessible' | 'authorized'; accepted: boolean }> = [
+test('resolve rejects a nonexistent related note and accepts a cross-project link', async () => {
+  const cases: Array<{ related: 'missing' | 'cross-project' | 'authorized'; accepted: boolean }> = [
     { related: 'missing', accepted: false },
-    { related: 'inaccessible', accepted: false },
+    { related: 'cross-project', accepted: true },
     { related: 'authorized', accepted: true }
   ];
   for (const item of cases) {
@@ -797,12 +724,12 @@ test('resolve rejects nonexistent and inaccessible related notes and accepts an 
     const root = await h.seed(lessonFixture, { status: 'candidate' });
     const copy = await duplicateRevisionFile(h, root, `related-${item.related}`);
     const authorized = await h.seed(noteWith(flexibleContent), { scope: 'shared', status: 'active' });
-    const inaccessible = await h.seed(noteWith(flexibleContent), { scope: 'profile', status: 'active' });
+    const crossProject = await h.seed(noteWith(flexibleContent), { scope: 'profile', status: 'active' });
     const relatedId =
       item.related === 'authorized'
         ? authorized.source.id
-        : item.related === 'inaccessible'
-          ? inaccessible.source.id
+        : item.related === 'cross-project'
+          ? crossProject.source.id
           : randomUUID();
     const request = review(
       reviewerContext,
@@ -826,7 +753,7 @@ test('resolve rejects nonexistent and inaccessible related notes and accepts an 
       h.deps
     );
     if (item.accepted) expect(asReceipt(await request).outcome).toBe('stored');
-    else await expectCode(request, 'FORBIDDEN');
+    else await expectCode(request, 'INVALID_INPUT');
     await h.close();
   }
 });
@@ -854,7 +781,7 @@ test('rejects a partial conflict-head submission', async () => {
   await h.close();
 });
 
-test('requires owner permission to resolve a protected preference fork', async () => {
+test('resolves a preference fork under the single token', async () => {
   const h = await createHarness();
   const root = await h.seed(noteWith(preferenceContent, { evidence: [] }), { status: 'candidate' });
   const copy = await duplicateRevisionFile(h, root, 'fork-preference');
@@ -865,29 +792,14 @@ test('requires owner permission to resolve a protected preference fork', async (
     { revision_id: copy.revisionId, etag: copyHead.source.etag }
   ];
 
-  await expectCode(
-    review(reviewerContext, {
+  const receipt = asReceipt(
+    await review(reviewerContext, {
       scope: SCOPE,
       operation: {
         action: 'resolve',
         id: root.source.id,
         idempotency_key: key(22),
-        rationale: 'A reviewer must not resolve a protected preference fork.',
-        expected_heads,
-        note: noteWith(preferenceContent)
-      }
-    }, h.deps),
-    'FORBIDDEN'
-  );
-
-  const receipt = asReceipt(
-    await review(ownerContext, {
-      scope: SCOPE,
-      operation: {
-        action: 'resolve',
-        id: root.source.id,
-        idempotency_key: key(23),
-        rationale: 'Owner resolves the preference fork.',
+        rationale: 'Resolve the preference fork.',
         expected_heads,
         note: noteWith(preferenceContent)
       }
@@ -1272,27 +1184,27 @@ test('a review-only principal can approve, archive, supersede, and resolve witho
   );
   expect(resolved.outcome).toBe('stored');
 
-  const reviseCandidate = await h.seed(noteWith(lessonContentOf({ lesson: 'Revise needs write.' })), {
+  const reviseCandidate = await h.seed(noteWith(lessonContentOf({ lesson: 'Revise under the single token.' })), {
     status: 'candidate'
   });
-  await expectCode(
-    review(reviewOnlyContext, {
+  const revisedCandidate = asReceipt(
+    await review(reviewOnlyContext, {
       scope: SCOPE,
       operation: {
         action: 'revise',
         id: reviseCandidate.source.id,
         expected_etag: reviseCandidate.source.etag,
         idempotency_key: key(94),
-        rationale: 'A review-only principal cannot revise.',
-        note: noteWith(lessonContentOf({ lesson: 'nope' }))
+        rationale: 'Revise under the single token.',
+        note: noteWith(lessonContentOf({ lesson: 'Revised under one token.' }))
       }
-    }, h.deps),
-    'FORBIDDEN'
+    }, h.deps)
   );
+  expect(revisedCandidate.outcome).toBe('stored');
   await h.close();
 });
 
-test('requires owner permission to approve notes in shared and profile scopes', async () => {
+test('approves notes in shared and profile projects under the single token', async () => {
   const h = await createHarness();
   const sharedNote = await h.seed(noteWith(lessonContentOf({ lesson: 'Shared scope lesson.' })), {
     scope: 'shared',
@@ -1303,55 +1215,28 @@ test('requires owner permission to approve notes in shared and profile scopes', 
     status: 'candidate'
   });
 
-  await expectCode(
-    review(scopedReviewerContext, {
+  const shared = asReceipt(
+    await review(scopedReviewerContext, {
       scope: 'shared',
       operation: {
         action: 'approve',
         id: sharedNote.source.id,
         expected_etag: sharedNote.source.etag,
         idempotency_key: key(95),
-        rationale: 'Shared promotion needs an owner.'
+        rationale: 'Promote the shared lesson.'
       }
-    }, h.deps),
-    'FORBIDDEN'
+    }, h.deps)
   );
-  await expectCode(
-    review(scopedReviewerContext, {
+  expect(shared.outcome).toBe('stored');
+  const profile = asReceipt(
+    await review(scopedReviewerContext, {
       scope: 'profile',
       operation: {
         action: 'approve',
         id: profileNote.source.id,
         expected_etag: profileNote.source.etag,
         idempotency_key: key(96),
-        rationale: 'Profile change needs an owner.'
-      }
-    }, h.deps),
-    'FORBIDDEN'
-  );
-
-  const shared = asReceipt(
-    await review(ownerContext, {
-      scope: 'shared',
-      operation: {
-        action: 'approve',
-        id: sharedNote.source.id,
-        expected_etag: sharedNote.source.etag,
-        idempotency_key: key(97),
-        rationale: 'Owner promotes the shared lesson.'
-      }
-    }, h.deps)
-  );
-  expect(shared.outcome).toBe('stored');
-  const profile = asReceipt(
-    await review(ownerContext, {
-      scope: 'profile',
-      operation: {
-        action: 'approve',
-        id: profileNote.source.id,
-        expected_etag: profileNote.source.etag,
-        idempotency_key: key(98),
-        rationale: 'Owner approves the profile lesson.'
+        rationale: 'Approve the profile lesson.'
       }
     }, h.deps)
   );
@@ -1359,7 +1244,7 @@ test('requires owner permission to approve notes in shared and profile scopes', 
   await h.close();
 });
 
-test('protects archived decisions and candidate descendants of approved decisions from reviewer revision', async () => {
+test('revises archived decisions and candidate descendants under the single token', async () => {
   const h = await createHarness();
   const archivedSource = await h.seed(noteWith(decisionContent, { evidence: [] }), { status: 'active' });
   asReceipt(
@@ -1376,69 +1261,55 @@ test('protects archived decisions and candidate descendants of approved decision
   );
   const archived = await currentHead(h, archivedSource.source.id);
   expect(archived.revision.status).toBe('archived');
-  await expectCode(
-    review(reviewerContext, {
+  const archivedRevised = asReceipt(
+    await review(reviewerContext, {
       scope: SCOPE,
       operation: {
         action: 'revise',
         id: archived.source.id,
         expected_etag: archived.source.etag,
         idempotency_key: key(100),
-        rationale: 'Reviewer must not revise an approved decision.',
-        note: noteWith(decisionContent)
-      }
-    }, h.deps),
-    'FORBIDDEN'
-  );
-  const ownerRevised = asReceipt(
-    await review(ownerContext, {
-      scope: SCOPE,
-      operation: {
-        action: 'revise',
-        id: archived.source.id,
-        expected_etag: archived.source.etag,
-        idempotency_key: key(101),
-        rationale: 'Owner revises the archived decision.',
+        rationale: 'Revise the archived decision.',
         note: noteWith(decisionContent)
       }
     }, h.deps)
   );
-  expect(ownerRevised.outcome).toBe('stored');
+  expect(archivedRevised.outcome).toBe('stored');
 
   const approved = await h.seed(noteWith(decisionContent, { evidence: [] }), { status: 'active' });
   asReceipt(
-    await review(ownerContext, {
+    await review(reviewerContext, {
       scope: SCOPE,
       operation: {
         action: 'revise',
         id: approved.source.id,
         expected_etag: approved.source.etag,
         idempotency_key: key(102),
-        rationale: 'Owner creates a candidate descendant.',
+        rationale: 'Create a candidate descendant.',
         note: noteWith(decisionContent)
       }
     }, h.deps)
   );
   const child = await currentHead(h, approved.source.id);
   expect(child.revision.status).toBe('candidate');
-  await expectCode(
-    review(reviewerContext, {
+  const childRevised = asReceipt(
+    await review(reviewerContext, {
       scope: SCOPE,
       operation: {
         action: 'revise',
         id: child.source.id,
         expected_etag: child.source.etag,
         idempotency_key: key(103),
-        rationale: 'Reviewer must not revise an approved-decision descendant.',
+        rationale: 'Revise the candidate descendant.',
         note: noteWith(decisionContent)
       }
-    }, h.deps),
-    'FORBIDDEN'
+    }, h.deps)
   );
+  expect(childRevised.outcome).toBe('stored');
   await h.close();
 });
 
-test('requires owner permission to resolve a fork of approved decisions', async () => {
+test('resolves a fork of approved decisions under the single token', async () => {
   const h = await createHarness();
   const root = await h.seed(noteWith(decisionContent, { evidence: [] }), { status: 'active' });
   const copy = await duplicateRevisionFile(h, root, 'decision-fork');
@@ -1448,28 +1319,14 @@ test('requires owner permission to resolve a fork of approved decisions', async 
     { revision_id: root.source.revision_id, etag: rootHead.source.etag },
     { revision_id: copy.revisionId, etag: copyHead.source.etag }
   ];
-  await expectCode(
-    review(reviewerContext, {
+  const resolved = asReceipt(
+    await review(reviewerContext, {
       scope: SCOPE,
       operation: {
         action: 'resolve',
         id: root.source.id,
         idempotency_key: key(104),
-        rationale: 'Reviewer must not resolve an approved decision fork.',
-        expected_heads,
-        note: noteWith(decisionContent)
-      }
-    }, h.deps),
-    'FORBIDDEN'
-  );
-  const resolved = asReceipt(
-    await review(ownerContext, {
-      scope: SCOPE,
-      operation: {
-        action: 'resolve',
-        id: root.source.id,
-        idempotency_key: key(105),
-        rationale: 'Owner resolves the decision fork.',
+        rationale: 'Resolve the decision fork.',
         expected_heads,
         note: noteWith(decisionContent)
       }
@@ -1808,13 +1665,31 @@ test('releases the reservation when a review request is rejected before submissi
   );
   expect(h.deps.journal.pending()).toHaveLength(0);
 
+  await expectCode(
+    review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'resolve',
+        id: root.source.id,
+        idempotency_key: key(117),
+        rationale,
+        expected_heads: [
+          { revision_id: root.source.revision_id, etag: rootHead.source.etag },
+          { revision_id: copy.revisionId, etag: copyHead.source.etag }
+        ],
+        note: noteWith(lessonContentOf({ lesson: 'different payload' }))
+      }
+    }, h.deps),
+    'IDEMPOTENCY_CONFLICT'
+  );
+
   const receipt = asReceipt(
     await review(reviewerContext, {
       scope: SCOPE,
       operation: {
         action: 'resolve',
         id: root.source.id,
-        idempotency_key: key(117),
+        idempotency_key: key(119),
         rationale,
         expected_heads: [
           { revision_id: root.source.revision_id, etag: rootHead.source.etag },
@@ -1882,6 +1757,20 @@ test('releases the reservation when a builder rejects a review request before su
   );
   expect(h.deps.journal.pending()).toHaveLength(0);
 
+  await expectCode(
+    review(reviewerContext, {
+      scope: SCOPE,
+      operation: {
+        action: 'archive',
+        id: head.source.id,
+        expected_etag: head.source.etag,
+        idempotency_key: key(118),
+        rationale: 'Reusing the released key with a different request conflicts.'
+      }
+    }, h.deps),
+    'IDEMPOTENCY_CONFLICT'
+  );
+
   const archived = asReceipt(
     await review(reviewerContext, {
       scope: SCOPE,
@@ -1889,8 +1778,8 @@ test('releases the reservation when a builder rejects a review request before su
         action: 'archive',
         id: head.source.id,
         expected_etag: head.source.etag,
-        idempotency_key: key(118),
-        rationale: 'Archive with the released key.'
+        idempotency_key: key(120),
+        rationale: 'Archive with a fresh key.'
       }
     }, h.deps)
   );

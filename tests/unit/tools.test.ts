@@ -17,15 +17,14 @@ import { TOOL_RESULT_MAX_BYTES } from '../../src/core/limits.js';
 import type {
   FeedbackResult,
   MutationReceipt,
-  Principal,
   RecallResult,
   ReadResult,
-  RequestContext,
   ReviewListResult,
   SourceRef,
   StatusResult,
   ProjectEnsureResult
 } from '../../src/core/types.js';
+import { SYSTEM_ACTOR } from '../../src/core/types.js';
 import { capture } from '../../src/features/capture.js';
 import { status } from '../../src/features/status.js';
 import { buildInstructions } from '../../src/mcp/instructions.js';
@@ -44,7 +43,6 @@ import type { ResultDelivery } from '../../src/config/schema.js';
 import { fixtureIds, lessonFixture } from '../fixtures/content.js';
 import {
   ownerContext,
-  ownerPrincipal,
   reviewerContext,
   workerContext
 } from '../fixtures/principals.js';
@@ -123,7 +121,7 @@ const statusSample: StatusResult = {
   version: APPLICATION_VERSION,
   protocol_version: PROTOCOL_VERSION,
   schema_version: 1,
-  scopes: [{ id: 'freellmapi', can_write: true, can_review: false }],
+  scopes: [{ id: 'freellmapi' }],
   health: { gateway: 'ready', backend: 'ready', embeddings: 'unknown' },
   pending_operations: 0
 };
@@ -133,7 +131,6 @@ const projectEnsureSample: ProjectEnsureResult = {
   repository_identity: 'github.com/bearmanser/second-brain',
   scope: 'second-brain',
   created: true,
-  permissions: { can_read: true, can_write: true, can_review: false },
   backend_ready: true,
   materialized: true,
   warnings: []
@@ -247,39 +244,39 @@ test('the published tool contract is pinned', () => {
   expect(contract).toMatchInlineSnapshot(`
     [
       {
-        "input": "ce62bc381c1f6a8fb292f2dc07ff1d546e3d25e6883cc32025e37793dd4f74bb",
+        "input": "8cf96af973581c3f8fd6c954a45694b1ccf66b9de148d07299d0fef2aa1acc98",
         "name": "brain_capture",
         "output": "dc958acd644403bdc22f902b313d6d16640e38f6a8d4f0a5bf57eef1d2a15043",
       },
       {
-        "input": "344e4a1cfa3091868abfbcebf5c57603a3977498e94f509eb26ef170cefd0eab",
+        "input": "2e5e0114744f0da9c5c9b683d8400d42b07a79894b90f8721fb4cd491ee4bcb5",
         "name": "brain_feedback",
         "output": "0db1da61ddcc5a1c8600781e90507114dbc22afc41437edea448d32dbe1924d5",
       },
       {
         "input": "cc6a684a8e3ef79221529b2b197a0d67cdcb20ac2eb795036a3164b80ab2c5a0",
         "name": "brain_project_ensure",
-        "output": "7c38e23d28b6861ab8bc2b69304c282510536afcdcab3c385b73da1231c56082",
+        "output": "40731a03c5b473df298d1b772af2e3e25338b72086c13d09d0f270e23b54b1d8",
       },
       {
-        "input": "847f7e5740dc8c25781651c7469f6c73029266518cba02da3ccb15223b232026",
+        "input": "05e8e79e12cca928634f3e2adbf42fe15ac3a27360008921eda09412367c89f6",
         "name": "brain_read",
         "output": "9be233d055cc7a4b8911f780188c2a06e24178929005730793ca1ad19ecfa7f1",
       },
       {
-        "input": "e35afbd078a9f87b92e159b9c820400a3484a18d5e90148b6c816ffce03283af",
+        "input": "0bfa6cab591812643e43585e87249f467ee19aa3b307391e88840d502aa9b776",
         "name": "brain_recall",
         "output": "011604281ab18429687866c85b1572b1d6a562eeaae3ce20ac24355664cebccc",
       },
       {
-        "input": "30c3da0ec30313b994130f06eab4be0d2cbefb07fa30bd4a61088b672b568bc8",
+        "input": "0f634814942ffd8e42673cd140f080abf1d86cc172eccca2ee28289b8a5a8ddc",
         "name": "brain_review",
         "output": "60d762fba468702212a631676552e6f935ac16a8388d451433778457c53d1b73",
       },
       {
-        "input": "30dee43261cae830a7ada8821f20d78e4dfb002fc0df30205749ed54295b0e4f",
+        "input": "b08c7c6e06ed73a354cdcd37ef9fc28a5d454f4e7a7394270bc295db8a285579",
         "name": "brain_status",
-        "output": "e1902e65bfb87367bef3eab6b347ed98f1985f6124c986a93c17e66edd56c730",
+        "output": "f538313f968f049f2d0def1645642d21b371bce555da1d3ee2b30f6bd1f16f52",
       },
     ]
   `);
@@ -346,6 +343,11 @@ test('representative tool schemas are pinned in full', () => {
           ],
           "type": "string",
         },
+        "project": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string",
+        },
         "query": {
           "maxLength": 8000,
           "minLength": 1,
@@ -371,7 +373,6 @@ test('representative tool schemas are pinned in full', () => {
         },
       },
       "required": [
-        "scope",
         "query",
       ],
       "type": "object",
@@ -554,27 +555,6 @@ test('representative tool schemas are pinned in full', () => {
                   "format": "uuid",
                   "type": "string",
                 },
-                "permissions": {
-                  "additionalProperties": false,
-                  "properties": {
-                    "can_read": {
-                      "const": true,
-                      "type": "boolean",
-                    },
-                    "can_review": {
-                      "type": "boolean",
-                    },
-                    "can_write": {
-                      "type": "boolean",
-                    },
-                  },
-                  "required": [
-                    "can_read",
-                    "can_write",
-                    "can_review",
-                  ],
-                  "type": "object",
-                },
                 "repository_identity": {
                   "type": "string",
                 },
@@ -594,7 +574,6 @@ test('representative tool schemas are pinned in full', () => {
                 "repository_identity",
                 "scope",
                 "created",
-                "permissions",
                 "backend_ready",
                 "materialized",
                 "warnings",
@@ -646,12 +625,6 @@ test('representative tool schemas are pinned in full', () => {
           "items": {
             "additionalProperties": false,
             "properties": {
-              "can_review": {
-                "type": "boolean",
-              },
-              "can_write": {
-                "type": "boolean",
-              },
               "id": {
                 "pattern": "^[a-z][a-z0-9-]{0,63}$",
                 "type": "string",
@@ -659,8 +632,6 @@ test('representative tool schemas are pinned in full', () => {
             },
             "required": [
               "id",
-              "can_write",
-              "can_review",
             ],
             "type": "object",
           },
@@ -689,8 +660,7 @@ test('result_delivery defaults to structured and rejects unknown modes', () => {
     backend_endpoint: 'http://memory:8000/mcp',
     port: 7331,
     mounts: { vault: '/vault', state: '/var/lib/second-brain' },
-    credentials_file: '/run/secrets/brain_credentials',
-    allowed_hosts: ['127.0.0.1:7331'],
+      allowed_hosts: ['127.0.0.1:7331'],
     scopes: [
       {
         id: 'freellmapi',
@@ -858,22 +828,16 @@ test('INTERNAL_ERROR is a published BrainError code producing a fixed safe resul
   });
 });
 
-test('status reports authorization-filtered scopes for each principal', async () => {
+test('status lists every registered project for the single token', async () => {
   const harness = await createHarness();
   try {
-    const worker = await status(workerContext, {}, harness.deps);
-    expect(worker.scopes).toEqual([
-      { id: 'freellmapi', can_write: true, can_review: false },
-      { id: 'shared', can_write: false, can_review: false }
+    const result = await status(workerContext, {}, harness.deps);
+    expect(result.scopes).toEqual([
+      { id: 'freellmapi' },
+      { id: 'shared' },
+      { id: 'profile' }
     ]);
-    const owner = await status(ownerContext, {}, harness.deps);
-    expect(owner.scopes).toEqual([
-      { id: 'freellmapi', can_write: true, can_review: true },
-      { id: 'shared', can_write: true, can_review: true },
-      { id: 'profile', can_write: true, can_review: true }
-    ]);
-    const reviewer = await status(reviewerContext, {}, harness.deps);
-    expect(reviewer.scopes).toContainEqual({ id: 'freellmapi', can_write: true, can_review: true });
+    expect(Object.keys(result.scopes[0])).toEqual(['id']);
   } finally {
     await harness.close();
   }
@@ -899,29 +863,32 @@ test('status publishes version metadata and exposes schemas only on request', as
       TOOL_RESULT_MAX_BYTES
     );
     expect(JSON.stringify(explicit.schemas)).not.toContain('credentials');
+    expect(JSON.stringify(explicit.schemas)).not.toContain('can_review');
   } finally {
     await harness.close();
   }
 });
 
-test('status narrows to an authorized requested scope and rejects an unauthorized one', async () => {
+test('status narrows to a requested project and rejects an unknown one', async () => {
   const harness = await createHarness();
   try {
     const narrowed = await status(workerContext, { scope: 'freellmapi' }, harness.deps);
     expect(narrowed.scopes.map((scope) => scope.id)).toEqual(['freellmapi']);
-    await expect(status(workerContext, { scope: 'profile' }, harness.deps)).rejects.toMatchObject({
-      code: 'FORBIDDEN'
+    const profile = await status(workerContext, { scope: 'profile' }, harness.deps);
+    expect(profile.scopes.map((scope) => scope.id)).toEqual(['profile']);
+    await expect(status(workerContext, { project: 'unknown-project' }, harness.deps)).rejects.toMatchObject({
+      code: 'NOT_FOUND'
     });
   } finally {
     await harness.close();
   }
 });
 
-test('status counts only pending operations inside readable scopes', async () => {
+test('status counts every pending operation in the brain', async () => {
   const harness = await createHarness();
   try {
     harness.deps.journal.reserve({
-      principal_id: ownerPrincipal.id,
+      principal_id: SYSTEM_ACTOR.id,
       idempotency_key: key(1),
       tool: 'brain_capture',
       scope: 'profile',
@@ -929,13 +896,13 @@ test('status counts only pending operations inside readable scopes', async () =>
       payload_json: '{}'
     });
     expect((await status(ownerContext, {}, harness.deps)).pending_operations).toBe(1);
-    expect((await status(workerContext, {}, harness.deps)).pending_operations).toBe(0);
+    expect((await status(workerContext, {}, harness.deps)).pending_operations).toBe(1);
   } finally {
     await harness.close();
   }
 });
 
-test('status returns an operation only to its submitter or an allowed owner', async () => {
+test('status returns an operation to any authenticated caller', async () => {
   const harness = await createHarness();
   try {
     const receipt = await capture(
@@ -950,16 +917,8 @@ test('status returns an operation only to its submitter or an allowed owner', as
       revision_id: receipt.revision_id,
       outcome: 'stored'
     });
-    const owner = await status(ownerContext, { operation_id: receipt.operation_id }, harness.deps);
-    expect((owner.operation as MutationReceipt | undefined)?.revision_id).toBe(receipt.revision_id);
-
-    const denied = await status(
-      reviewerContext,
-      { operation_id: receipt.operation_id },
-      harness.deps
-    ).catch((error: unknown) => error as BrainError);
-    expect(denied).toMatchObject({ code: 'NOT_FOUND' });
-    expect(JSON.stringify(denied)).not.toContain(receipt.revision_id);
+    const other = await status(reviewerContext, { operation_id: receipt.operation_id }, harness.deps);
+    expect((other.operation as MutationReceipt | undefined)?.revision_id).toBe(receipt.revision_id);
     await expect(
       status(reviewerContext, { operation_id: fixtureIds.revision }, harness.deps)
     ).rejects.toMatchObject({ code: 'NOT_FOUND' });
@@ -968,7 +927,7 @@ test('status returns an operation only to its submitter or an allowed owner', as
   }
 });
 
-test('status reports a pending owned operation and a recovering gateway', async () => {
+test('status reports a pending operation and a recovering gateway', async () => {
   const harness = await createHarness();
   try {
     harness.backend.fail_once = 'before_write';
@@ -1015,37 +974,10 @@ test('status rejects malformed input with a stable code', async () => {
   }
 });
 
-test('an owner with review permission can inspect an operation in that scope', async () => {
-  const harness = await createHarness();
-  try {
-    const receipt = await capture(
-      ownerContext,
-      { idempotency_key: key(4), scope: 'profile', note: lessonFixture },
-      harness.deps
-    );
-    const reviewOnlyOwner: Principal = {
-      id: '00000000-0000-4000-8000-0000000000f1',
-      role: 'owner',
-      read_scopes: ['freellmapi'],
-      write_scopes: [],
-      review_scopes: ['profile']
-    };
-    const context: RequestContext = {
-      principal: reviewOnlyOwner,
-      request_id: key(5),
-      signal: new AbortController().signal
-    };
-    const view = await status(context, { operation_id: receipt.operation_id }, harness.deps);
-    expect((view.operation as MutationReceipt | undefined)?.revision_id).toBe(receipt.revision_id);
-  } finally {
-    await harness.close();
-  }
-});
-
 function recordWith(overrides: Partial<OperationRecord>): OperationRecord {
   return {
     operation_id: fixtureIds.idempotencyKey,
-    principal_id: workerContext.principal.id,
+    principal_id: SYSTEM_ACTOR.id,
     idempotency_key: key(6),
     tool: 'brain_capture',
     scope: 'freellmapi',
@@ -1099,7 +1031,7 @@ test('status validates plan identity and returns the receipt when it is consiste
     });
     const deps = {
       ...harness.deps,
-      journal: { get: () => consistent, pending: () => [] } as unknown as Journal
+      journal: { get: () => consistent, pending: () => [], listProjects: () => [] } as unknown as Journal
     };
     const view = await status(workerContext, { operation_id: consistent.operation_id }, deps);
     expect(view.operation?.operation_id).toBe(consistent.operation_id);
@@ -1141,7 +1073,7 @@ test('status rejects corrupt or inconsistent persisted records with RECOVERY_REQ
     for (const record of cases) {
       const deps = {
         ...harness.deps,
-        journal: { get: () => record, pending: () => [] } as unknown as Journal
+        journal: { get: () => record, pending: () => [], listProjects: () => [] } as unknown as Journal
       };
       await expect(
         status(workerContext, { operation_id: record.operation_id }, deps)
@@ -1155,7 +1087,7 @@ test('status rejects corrupt or inconsistent persisted records with RECOVERY_REQ
     });
     const deps = {
       ...harness.deps,
-      journal: { get: () => pendingPlan, pending: () => [] } as unknown as Journal
+      journal: { get: () => pendingPlan, pending: () => [], listProjects: () => [] } as unknown as Journal
     };
     const view = await status(workerContext, { operation_id: pendingPlan.operation_id }, deps);
     expect(view.operation).toMatchObject({

@@ -1,36 +1,34 @@
 import { BrainError, isBrainError } from '../contracts/errors.js';
 import type { BrainDeps } from '../core/mutation.js';
-import type { RequestContext } from '../core/types.js';
 
-function forbidden(message: string): BrainError {
-  return new BrainError({ code: 'FORBIDDEN', message });
+function invalidInput(message: string): BrainError {
+  return new BrainError({ code: 'INVALID_INPUT', message });
 }
 
-export async function authorizeRelatedIds(
-  ctx: RequestContext,
+export async function validateRelatedIds(
   relatedIds: readonly string[],
   deps: BrainDeps
 ): Promise<void> {
   const targets = [...new Set(relatedIds)];
   if (targets.length === 0) return;
-  const scopes = deps.scopeRegistry.visibleTo(ctx.principal);
+  const scopes = deps.scopeRegistry.all();
   for (const target of targets) {
-    let visible = false;
+    let found = false;
     for (const scope of scopes) {
       try {
         await deps.catalogue.get(scope.id, target);
-        visible = true;
+        found = true;
         break;
       } catch (error) {
         if (!isBrainError(error)) throw error;
         if (error.code === 'NOT_FOUND') continue;
         if (error.code === 'CONFLICT') {
-          visible = true;
+          found = true;
           break;
         }
         throw error;
       }
     }
-    if (!visible) throw forbidden(`related note ${target} is not an authorized reference`);
+    if (!found) throw invalidInput(`related note ${target} does not exist`);
   }
 }

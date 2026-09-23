@@ -2,9 +2,9 @@
 #
 # Copy this file to config/brain.yaml and adjust it for your deployment before
 # running `docker compose up`. Configuration is validated on load; an invalid
-# file fails closed with INVALID_INPUT. Bearer token digests are kept in the
-# separate credentials file referenced by `credentials_file` and are never
-# inlined here or committed to the repository.
+# file fails closed with INVALID_INPUT. The single bearer-token digest is read
+# from the BRAIN_TOKEN_SHA256 environment value and is never inlined here or
+# committed to the repository.
 #
 # Redaction in logs is best-effort. It removes known credential patterns but
 # cannot guarantee that captured note content contains no private data.
@@ -24,10 +24,6 @@ port: 7331
 mounts:
   vault: /vault
   state: /var/lib/second-brain
-
-# Location of the credentials file (JSON). Each record holds a SHA-256 digest of
-# a high-entropy bearer token plus the exact permissions for that identity.
-credentials_file: /run/secrets/brain_credentials
 
 # Persistent, independent HMAC-SHA256 key used to sign paginated brain_read
 # cursors. `setup` generates a random 32-byte key at secrets/cursor-key and
@@ -74,7 +70,6 @@ limits:
   materialization_timeout_ms: 10000
   reconcile_interval_ms: 30000
   concurrent_reads: 8
-  project_provision_per_principal_per_minute: 10
   project_provision_global_per_minute: 50
   dynamic_projects_max: 1000
 

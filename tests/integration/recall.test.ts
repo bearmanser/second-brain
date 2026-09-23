@@ -17,7 +17,7 @@ import {
   RECALL_WARNING_EMBEDDINGS_FALLBACK,
   RECALL_WARNING_HIT_UNRESOLVED,
   RECALL_WARNING_SEARCH_TRUNCATED,
-  RECALL_WARNING_SHARED_SCOPE,
+  RECALL_WARNING_SHARED_PROJECT,
   RECALL_WARNING_STALE_HITS_EXCLUDED,
   recall
 } from '../../src/features/recall.js';
@@ -25,12 +25,7 @@ import { review } from '../../src/features/review.js';
 import { hashRaw, relativePathFor } from '../../src/notes/identity.js';
 import { payloadHash, encodeRevision, renderRevision } from '../../src/notes/codec.js';
 import { lessonFixture } from '../fixtures/content.js';
-import {
-  ownerContext,
-  reviewerContext,
-  reviewerPrincipal,
-  workerContext
-} from '../fixtures/principals.js';
+import { ownerContext, reviewerContext, workerContext } from '../fixtures/principals.js';
 import { createHarness, type MemoryHarness } from '../support/harness.js';
 
 const FORBIDDEN_MARKER = 'FORBIDDEN-FIXTURE-MARKER';
@@ -119,7 +114,7 @@ function buildChain(harness: MemoryHarness, noteId: string, count: number): Chai
   for (let index = 0; index < count; index += 1) {
     const revisionId = `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
     const reserved = harness.deps.journal.reserve({
-      principal_id: reviewerPrincipal.id,
+      principal_id: 'system',
       idempotency_key: randomUUID(),
       tool: 'brain_review',
       scope: scope.id,
@@ -142,7 +137,7 @@ function buildChain(harness: MemoryHarness, noteId: string, count: number): Chai
     const revision: StoredRevision = {
       ...base,
       approval: {
-        principal_id: reviewerPrincipal.id,
+        principal_id: 'system',
         rationale: 'seeded chain revision',
         payload_hash: payloadHash(base)
       }
@@ -539,7 +534,7 @@ test('separates embedding failure from a degraded text fallback', async () => {
   await h.close();
 });
 
-test('never consults an unauthorized profile scope even from the shared flag', async () => {
+test('an explicit project narrows results while the whole brain includes every project', async () => {
   const h = await createHarness();
   await h.seed(
     lessonNote(`sharedquery ${FORBIDDEN_MARKER} private profile note`),
@@ -562,10 +557,8 @@ test('never consults an unauthorized profile scope even from the shared flag', a
     include_shared: true
   }, h.deps);
   expect(projects).not.toContain('profile');
-  expect(withShared.items).toHaveLength(1);
-  expect(withShared.items[0].scope).toBe('shared');
-  expect(withShared.items[0].revision_id).toBe(shared.revision.revision_id);
-  expect(withShared.items[0].warnings).toContain(RECALL_WARNING_SHARED_SCOPE);
+  expect(withShared.warnings).toContain('include_shared_deprecated');
+  expect(withShared.items.map((item) => item.revision_id)).toContain(shared.revision.revision_id);
   expect(JSON.stringify(withShared)).not.toContain(FORBIDDEN_MARKER);
 
   projects.length = 0;
@@ -575,15 +568,22 @@ test('never consults an unauthorized profile scope even from the shared flag', a
   }, h.deps);
   expect(projects).toEqual(['freellmapi']);
   expect(projectOnly.items).toHaveLength(0);
-  expect(JSON.stringify(projectOnly)).not.toContain(FORBIDDEN_MARKER);
+
+  projects.length = 0;
+  const wholeBrain = await recall(reviewerContext, { query: 'sharedquery' }, h.deps);
+  expect(projects).toContain('profile');
+  expect(JSON.stringify(wholeBrain)).toContain(FORBIDDEN_MARKER);
   await h.close();
 });
 
-test('keeps recall bounded to the requester and rejects an unreadable scope', async () => {
+test('omitting the project searches the whole brain and an unknown project is NOT_FOUND', async () => {
   const h = await createHarness();
+  await h.seed(lessonNote('anything profile note'), { scope: 'profile', status: 'active' });
+  const wholeBrain = await recall(workerContext, { query: 'anything' }, h.deps);
+  expect(wholeBrain.items.some((item) => item.scope === 'profile')).toBe(true);
   await expect(
-    recall(workerContext, { scope: 'profile', query: 'anything' }, h.deps)
-  ).rejects.toThrow(/FORBIDDEN/);
+    recall(workerContext, { project: 'unknown-project', query: 'anything' }, h.deps)
+  ).rejects.toThrow(/NOT_FOUND/);
   await h.close();
 });
 

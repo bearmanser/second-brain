@@ -1,6 +1,13 @@
 import type { NoteContent } from '../contracts/content.js';
+import type { Project, ProjectFilter } from '../projects/registry.js';
 
 export type { NoteContent } from '../contracts/content.js';
+export type {
+  Project,
+  ProjectAlias,
+  ProjectFilter,
+  ProjectRegistryPort
+} from '../projects/registry.js';
 
 export const NOTE_KINDS = [
   'lesson',
@@ -65,9 +72,13 @@ export interface NoteInput {
   related_ids: string[];
 }
 
-export interface CaptureRequest {
+export interface ProjectSelector {
+  project?: string;
+  scope?: string;
+}
+
+export interface CaptureRequest extends ProjectSelector {
   idempotency_key: string;
-  scope: string;
   note: NoteInput;
 }
 
@@ -81,7 +92,6 @@ export interface ProjectEnsureResult {
   repository_identity: string;
   scope: string;
   created: boolean;
-  permissions: { can_read: true; can_write: boolean; can_review: boolean };
   backend_ready: boolean;
   materialized: boolean;
   warnings: string[];
@@ -89,38 +99,16 @@ export interface ProjectEnsureResult {
 
 export interface ProjectProvisioningPlan {
   repository_identity: string;
-  scope: string;
-  backend_project: string;
+  project_id: string;
+  display_name: string;
   relative_root: string;
-  grant: DynamicProjectGrant;
+  created_by_actor_id: string;
+  creation_operation_id: string;
 }
 
 export type RepositoryProjectState = 'provisioning' | 'ready' | 'recovery_required';
 
-export interface RepositoryProjectRecord {
-  repository_identity: string;
-  scope: string;
-  backend_project: string;
-  relative_root: string;
-  state: RepositoryProjectState;
-  created_by_principal_id: string;
-  creation_operation_id: string;
-  failure_stage?: string;
-  failure_code?: string;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface DynamicProjectGrant {
-  principal_id: string;
-  scope: string;
-  can_read: true;
-  can_write: boolean;
-  can_review: boolean;
-}
-
-export interface RecallRequest {
-  scope: string;
+export interface RecallRequest extends ProjectSelector {
   query: string;
   topics?: string[];
   phase?: Phase;
@@ -134,16 +122,14 @@ export interface RecallRequest {
   limit?: number;
 }
 
-export interface ReadRequest {
-  scope: string;
+export interface ReadRequest extends ProjectSelector {
   id: string;
   revision_id?: string;
   cursor?: string;
   budget_tokens?: number;
 }
 
-export interface ReviewRequest {
-  scope: string;
+export interface ReviewRequest extends ProjectSelector {
   operation:
     | { action: 'list'; filter: 'candidate' | 'conflict'; cursor?: string }
     | {
@@ -179,9 +165,8 @@ export interface ReviewRequest {
       };
 }
 
-export interface FeedbackRequest {
+export interface FeedbackRequest extends ProjectSelector {
   idempotency_key: string;
-  scope: string;
   id: string;
   revision_id: string;
   retrieval_id?: string;
@@ -190,8 +175,7 @@ export interface FeedbackRequest {
   related_id?: string;
 }
 
-export interface StatusRequest {
-  scope?: string;
+export interface StatusRequest extends ProjectSelector {
   operation_id?: string;
   include_schemas?: boolean;
 }
@@ -249,7 +233,7 @@ export interface StatusResult {
   version: string;
   protocol_version: string;
   schema_version: 1;
-  scopes: { id: string; can_write: boolean; can_review: boolean }[];
+  scopes: { id: string }[];
   health: {
     gateway: 'ready' | 'recovering' | 'degraded';
     backend: 'ready' | 'unavailable';
@@ -268,14 +252,6 @@ export interface ScopeConfig {
   repository_aliases: string[];
 }
 
-export interface Principal {
-  id: string;
-  role: 'worker' | 'reviewer' | 'owner';
-  read_scopes: string[];
-  write_scopes: string[];
-  review_scopes: string[];
-}
-
 export interface SystemActor {
   readonly kind: 'system';
   readonly id: string;
@@ -287,12 +263,6 @@ export interface AuthenticatedContext {
   readonly actor: SystemActor;
   readonly request_id: string;
   readonly signal: AbortSignal;
-}
-
-export interface RequestContext {
-  principal: Principal;
-  request_id: string;
-  signal: AbortSignal;
 }
 
 export interface Clock {
@@ -441,4 +411,80 @@ export interface CataloguePort {
     filter: 'candidate' | 'conflict',
     cursor?: string
   ): Promise<{ items: SourceRef[]; next_cursor?: string }>;
+}
+
+export interface ProjectProvisioning {
+  created_by_actor_id: string;
+  creation_operation_id: string;
+  failure_stage?: string;
+  failure_code?: string;
+}
+
+export interface LegacyProjectBackendBinding {
+  backend_project: string;
+  backend_relative_root: string;
+}
+
+export interface PersistedProject {
+  project: Project;
+  state: RepositoryProjectState;
+  provisioning: ProjectProvisioning;
+  updated_at: string;
+}
+
+export interface LegacyProjectAdapterPort {
+  binding(project_id: string): LegacyProjectBackendBinding | undefined;
+  scopeFor(project: Project): ScopeConfig | undefined;
+}
+
+export const IDEMPOTENCY_ORIGINS = ['legacy', 'new'] as const;
+export type IdempotencyOrigin = (typeof IDEMPOTENCY_ORIGINS)[number];
+
+export const IDEMPOTENCY_RESOLUTIONS = [
+  'unresolved',
+  'bound',
+  'conflict',
+  'recovery_required',
+  'released'
+] as const;
+export type IdempotencyResolution = (typeof IDEMPOTENCY_RESOLUTIONS)[number];
+
+export const IDEMPOTENCY_TARGET_KINDS = ['operation', 'feedback'] as const;
+export type IdempotencyTargetKind = (typeof IDEMPOTENCY_TARGET_KINDS)[number];
+
+export interface IdempotencyKeyRecord {
+  idempotency_key: string;
+  origin: IdempotencyOrigin;
+  resolution: IdempotencyResolution;
+  tool?: string;
+  project_id?: string;
+  payload_hash?: string;
+  target_kind?: IdempotencyTargetKind;
+  target_id?: string;
+}
+
+export const RETRIEVAL_OUTCOMES_V2 = ['ok', 'partial', 'error'] as const;
+export type RetrievalOutcomeV2 = (typeof RETRIEVAL_OUTCOMES_V2)[number];
+
+export interface RetrievalSourceRef {
+  scope: string;
+  id: string;
+  revision_id: string;
+}
+
+export interface RetrievalEventInputV2 {
+  retrieval_id: string;
+  actor_id: string;
+  filter: ProjectFilter;
+  searched_project_ids: string[];
+  primary_project_id: string | null;
+  returned_ids: RetrievalSourceRef[];
+  item_count: number;
+  token_used: number;
+  token_limit: number;
+  mode: RecallMode;
+  outcome: RetrievalOutcomeV2;
+  partial: boolean;
+  duration_ms: number;
+  created_at?: string;
 }

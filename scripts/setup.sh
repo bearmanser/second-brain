@@ -169,15 +169,12 @@ main() {
   fi
 
   write_env_file "$vault_raw" "$brain_port"
+  chmod 600 "$ROOT_DIR/.env"
 
   printf 'setup: building second-brain:local from %s\n' "$NODE_IMAGE"
   docker build --build-arg "NODE_IMAGE=$NODE_IMAGE" -t second-brain:local "$ROOT_DIR"
 
   printf 'setup: generating configuration and secrets in %s\n' "$ROOT_DIR"
-  local owner_args=()
-  if [ "${BRAIN_OWNER_CREDENTIAL:-0}" = "1" ]; then
-    owner_args+=(-e BRAIN_SETUP_OWNER_CREDENTIAL=1)
-  fi
   local scope_args=()
   if [ -n "$BRAIN_SCOPE" ]; then
     scope_args+=(-e "BRAIN_SETUP_SCOPE=$BRAIN_SCOPE")
@@ -187,7 +184,6 @@ main() {
     -e "BRAIN_SETUP_VAULT=$vault_abs" \
     -e "BRAIN_SETUP_UID=$BRAIN_UID" \
     -e "BRAIN_SETUP_GID=$BRAIN_GID" \
-    ${owner_args[@]+"${owner_args[@]}"} \
     ${scope_args[@]+"${scope_args[@]}"} \
     -v "$ROOT_DIR":/bootstrap \
     -v "$vault_abs":"$vault_abs" \

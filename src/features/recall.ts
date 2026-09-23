@@ -1,6 +1,7 @@
 import { BrainError, isBrainError } from '../contracts/errors.js';
 import { recallRequestSchema } from '../contracts/protocol.js';
 import {
+  BACKEND_SEARCH_CALL_BUDGET,
   BACKEND_SEARCH_PAGES,
   BACKEND_SEARCH_PAGE_SIZE,
   BACKEND_TIMEOUT_MS,
@@ -12,20 +13,21 @@ import {
 import type { BrainDeps } from '../core/mutation.js';
 import { LIFECYCLES, NOTE_KINDS } from '../core/types.js';
 import type {
+  AuthenticatedContext,
   BackendHit,
   Head,
   NoteInput,
   NoteKind,
+  ProjectFilter,
   RecallRequest,
   RecallResult,
-  RequestContext,
   ScopeConfig,
   SourceRef,
   StoredRevision
 } from '../core/types.js';
 import { decodeRevision } from '../notes/codec.js';
 import { NOTE_REGISTRY } from '../notes/registry.js';
-import { SHARED_SCOPE_ID, resolveScopes } from '../security/authorise.js';
+import { projectFilter } from '../projects/registry.js';
 import { clampRecallBudget, packRecall } from '../retrieval/budget.js';
 import { phaseKinds, rankEligible, type EligibleHit } from '../retrieval/rank.js';
 
@@ -36,8 +38,10 @@ export const RECALL_WARNING_DEADLINE_EXCEEDED = 'retrieval_deadline_exceeded';
 export const RECALL_WARNING_BACKEND_PARTIAL = 'backend_unavailable_partial';
 export const RECALL_WARNING_EMBEDDINGS_FALLBACK = 'embeddings_unavailable_text_fallback';
 export const RECALL_WARNING_CANDIDATE = 'candidate';
-export const RECALL_WARNING_SHARED_SCOPE = 'shared_scope';
+export const RECALL_WARNING_SHARED_PROJECT = 'shared_project';
+export const RECALL_WARNING_INCLUDE_SHARED_DEPRECATED = 'include_shared_deprecated';
 
+const SHARED_PROJECT_ID = 'shared';
 const MAX_SEARCH_TERMS = 64;
 const MATCHED_SECTION_MAX_CODE_POINTS = 600;
 const CONTEXT_SECTION_MAX_CODE_POINTS = 200;
@@ -46,16 +50,21 @@ const SESSION_FRESHNESS_MS = SESSION_FRESHNESS_DAYS * 24 * 60 * 60 * 1000;
 type SessionContent = Extract<NoteInput['content'], { kind: 'session' }>;
 type FactContent = Extract<NoteInput['content'], { kind: 'fact' }>;
 
-interface ScopeHits {
+interface ProjectHits {
   scope: ScopeConfig;
   hits: BackendHit[];
-  truncated: boolean;
-  deadlineExceeded: boolean;
+  exhausted: boolean;
 }
 
-interface HitDecision {
-  included: boolean;
-  reasons: string[];
+interface SearchAccumulator {
+  projectHits: ProjectHits[];
+  attemptedCalls: number;
+  completedCalls: number;
+  hits: number;
+  truncated: boolean;
+  deadlineExceeded: boolean;
+  budgetExhausted: boolean;
+  failure?: unknown;
 }
 
 function invalidInput(message: string, cause?: unknown): BrainError {
@@ -101,6 +110,33 @@ function parseRequest(input: RecallRequest): RecallRequest {
   return parsed.data as RecallRequest;
 }
 
+function selectProjects(
+  request: RecallRequest,
+  filter: ProjectFilter,
+  deps: BrainDeps,
+  warnings: string[]
+): ScopeConfig[] {
+  if (request.include_shared !== undefined) {
+    if (!warnings.includes(RECALL_WARNING_INCLUDE_SHARED_DEPRECATED)) {
+      warnings.push(RECALL_WARNING_INCLUDE_SHARED_DEPRECATED);
+    }
+  }
+  if (filter.mode === 'all') {
+    return deps.scopeRegistry
+      .all()
+      .sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+  }
+  const primary = deps.scopeRegistry.require(filter.identifier);
+  const selected: ScopeConfig[] = [primary];
+  if (request.include_shared === true && primary.id !== SHARED_PROJECT_ID) {
+    const shared = deps.scopeRegistry.get(SHARED_PROJECT_ID);
+    if (shared !== undefined && deps.scopeRegistry.isUsable(shared.id)) {
+      selected.push(shared);
+    }
+  }
+  return selected;
+}
+
 function buildSearchText(query: string, topics: string[] | undefined): string {
   const parts = [query, ...(topics ?? [])]
     .map((part) => part.replace(/\s+/gu, ' ').trim())
@@ -128,51 +164,43 @@ function vaultRelativePath(scope: ScopeConfig, relativePath: string): string {
   return relativePath.startsWith(prefix) ? relativePath : `${prefix}${relativePath}`;
 }
 
-interface SearchAccumulator {
-  scopeHits: ScopeHits[];
-  processedPages: number;
-  hits: number;
-  truncated: boolean;
-  deadlineExceeded: boolean;
-  failure?: unknown;
-}
-
-async function collectScopes(
-  ctx: RequestContext,
+async function collectProjects(
+  ctx: AuthenticatedContext,
   scopes: ScopeConfig[],
   searchText: string,
   kinds: NoteKind[],
   mode: 'hybrid' | 'text',
   deps: BrainDeps,
-  deadline: number
+  deadline: number,
+  attemptedBefore: number
 ): Promise<SearchAccumulator> {
   const accumulator: SearchAccumulator = {
-    scopeHits: [],
-    processedPages: 0,
+    projectHits: scopes.map((scope) => ({ scope, hits: [], exhausted: false })),
+    attemptedCalls: attemptedBefore,
+    completedCalls: 0,
     hits: 0,
     truncated: false,
-    deadlineExceeded: false
+    deadlineExceeded: false,
+    budgetExhausted: false
   };
 
-  for (const scope of scopes) {
-    const result: ScopeHits = {
-      scope,
-      hits: [],
-      truncated: false,
-      deadlineExceeded: false
-    };
-    let page = 1;
-    for (; page <= BACKEND_SEARCH_PAGES; page += 1) {
+  for (let page = 1; page <= BACKEND_SEARCH_PAGES; page += 1) {
+    for (const project of accumulator.projectHits) {
+      if (project.exhausted) continue;
       if (ctx.signal.aborted) throw cancelled();
-      if (Date.now() >= deadline) {
-        result.deadlineExceeded = true;
-        accumulator.deadlineExceeded = true;
-        break;
+      if (accumulator.attemptedCalls >= BACKEND_SEARCH_CALL_BUDGET) {
+        accumulator.budgetExhausted = true;
+        return accumulator;
       }
+      if (Date.now() >= deadline) {
+        accumulator.deadlineExceeded = true;
+        return accumulator;
+      }
+      accumulator.attemptedCalls += 1;
       let pageResult: { hits: BackendHit[]; has_more: boolean };
       try {
         pageResult = await deps.backend.search({
-          project: scope.backend_project,
+          project: project.scope.backend_project,
           query: searchText,
           mode,
           kinds,
@@ -183,27 +211,26 @@ async function collectScopes(
       } catch (error) {
         if (ctx.signal.aborted) throw cancelled();
         accumulator.failure = error;
-        accumulator.scopeHits.push(result);
         return accumulator;
       }
       if (ctx.signal.aborted) throw cancelled();
-      accumulator.processedPages += 1;
-      result.hits.push(...pageResult.hits);
+      accumulator.completedCalls += 1;
+      project.hits.push(...pageResult.hits);
       accumulator.hits += pageResult.hits.length;
+      if (!pageResult.has_more) project.exhausted = true;
       if (Date.now() >= deadline) {
-        result.deadlineExceeded = true;
         accumulator.deadlineExceeded = true;
-        break;
+        return accumulator;
       }
-      if (!pageResult.has_more) break;
     }
-    if (!result.deadlineExceeded && page > BACKEND_SEARCH_PAGES) {
-      result.truncated = true;
-      accumulator.truncated = true;
+    if (accumulator.attemptedCalls >= BACKEND_SEARCH_CALL_BUDGET) {
+      accumulator.budgetExhausted = accumulator.projectHits.some((project) => !project.exhausted);
+      return accumulator;
     }
-    accumulator.scopeHits.push(result);
   }
-
+  if (accumulator.projectHits.some((project) => !project.exhausted)) {
+    accumulator.truncated = true;
+  }
   return accumulator;
 }
 
@@ -321,7 +348,7 @@ function evaluateHit(
   request: RecallRequest,
   kinds: NoteKind[],
   now: Date
-): HitDecision {
+): { included: boolean; reasons: string[] } {
   const reasons: string[] = [];
   const kind = head.source.kind;
   const status = head.source.status;
@@ -346,7 +373,7 @@ function evaluateHit(
     }
   }
   if (status === 'candidate') reasons.push('candidate');
-  if (scope.id === SHARED_SCOPE_ID) reasons.push(RECALL_WARNING_SHARED_SCOPE);
+  if (scope.id === SHARED_PROJECT_ID) reasons.push(RECALL_WARNING_SHARED_PROJECT);
   if (request.phase !== undefined && phaseKinds(request.phase).includes(kind)) {
     reasons.push(`phase_relevant:${request.phase}`);
   }
@@ -433,8 +460,11 @@ function toItem(
   if (hit.head.source.status === 'candidate' && !warnings.includes(RECALL_WARNING_CANDIDATE)) {
     warnings.push(RECALL_WARNING_CANDIDATE);
   }
-  if (hit.head.source.scope === SHARED_SCOPE_ID && !warnings.includes(RECALL_WARNING_SHARED_SCOPE)) {
-    warnings.push(RECALL_WARNING_SHARED_SCOPE);
+  if (
+    hit.head.source.scope === SHARED_PROJECT_ID &&
+    !warnings.includes(RECALL_WARNING_SHARED_PROJECT)
+  ) {
+    warnings.push(RECALL_WARNING_SHARED_PROJECT);
   }
   const source: SourceRef = { ...hit.head.source, warnings };
   return {
@@ -444,31 +474,35 @@ function toItem(
   };
 }
 
+export interface RecallSelection {
+  filter: ProjectFilter;
+  scopes: ScopeConfig[];
+}
+
+export function recallSelection(request: RecallRequest, deps: BrainDeps): RecallSelection {
+  const filter = projectFilter(request);
+  return { filter, scopes: selectProjects(request, filter, deps, []) };
+}
+
 export async function recall(
-  ctx: RequestContext,
+  ctx: AuthenticatedContext,
   input: RecallRequest,
   deps: BrainDeps
 ): Promise<RecallResult> {
   if (ctx.signal.aborted) throw cancelled();
   const request = parseRequest(input);
-  const scopes = resolveScopes(
-    ctx.principal,
-    request.scope,
-    request.include_shared === true,
-    'read',
-    deps.scopeRegistry
-  );
+  const filter = projectFilter(request);
+  const warnings: string[] = [];
+  const scopes = selectProjects(request, filter, deps, warnings);
   const kinds = requestedKinds(request);
   const searchText = buildSearchText(request.query, request.topics);
   const terms = searchTerms(searchText);
 
-  const warnings: string[] = [];
   let partial = false;
   let mode: 'hybrid' | 'text' = request.mode ?? 'hybrid';
-  const deadline =
-    Date.now() + (deps.config.limits.backend_timeout_ms ?? BACKEND_TIMEOUT_MS);
+  const deadline = Date.now() + (deps.config.limits.backend_timeout_ms ?? BACKEND_TIMEOUT_MS);
 
-  let accumulator = await collectScopes(ctx, scopes, searchText, kinds, mode, deps, deadline);
+  let accumulator = await collectProjects(ctx, scopes, searchText, kinds, mode, deps, deadline, 0);
 
   if (
     accumulator.failure !== undefined &&
@@ -477,8 +511,17 @@ export async function recall(
     mode === 'hybrid' &&
     request.allow_text_fallback === true
   ) {
-    const hybridHasState = accumulator.processedPages > 0 || accumulator.hits > 0;
-    const fallback = await collectScopes(ctx, scopes, searchText, kinds, 'text', deps, deadline);
+    const hybridHasState = accumulator.attemptedCalls > 0 || accumulator.hits > 0;
+    const fallback = await collectProjects(
+      ctx,
+      scopes,
+      searchText,
+      kinds,
+      'text',
+      deps,
+      deadline,
+      accumulator.attemptedCalls
+    );
     const fallbackUsable = fallback.failure === undefined && fallback.hits > 0;
     if (fallbackUsable || (!hybridHasState && fallback.failure === undefined)) {
       accumulator = fallback;
@@ -492,8 +535,10 @@ export async function recall(
     }
   }
 
+  const searchedProjects = accumulator.projectHits.map((project) => project.scope.id);
+
   if (accumulator.failure !== undefined) {
-    if (accumulator.processedPages === 0 && accumulator.hits === 0) {
+    if (accumulator.completedCalls === 0 && accumulator.hits === 0) {
       throw normalizeBackendFailure(accumulator.failure);
     }
     partial = true;
@@ -507,7 +552,7 @@ export async function recall(
       warnings.push(RECALL_WARNING_DEADLINE_EXCEEDED);
     }
   }
-  if (accumulator.truncated) {
+  if (accumulator.truncated || accumulator.budgetExhausted) {
     partial = true;
     if (!warnings.includes(RECALL_WARNING_SEARCH_TRUNCATED)) {
       warnings.push(RECALL_WARNING_SEARCH_TRUNCATED);
@@ -521,9 +566,9 @@ export async function recall(
   let unresolved = false;
   let staleExcluded = false;
 
-  for (const hits of accumulator.scopeHits) {
-    for (const hit of hits.hits) {
-      const resolution = await resolveHit(hits.scope, hit, deps, headCache);
+  for (const project of accumulator.projectHits) {
+    for (const hit of project.hits) {
+      const resolution = await resolveHit(project.scope, hit, deps, headCache);
       if (resolution.kind === 'unresolved') {
         unresolved = true;
         continue;
@@ -533,13 +578,17 @@ export async function recall(
         continue;
       }
       const head = resolution.head;
-      const key = `${hits.scope.id}:${head.revision.id}`;
+      const key = `${project.scope.id}:${head.revision.id}`;
       if (seen.has(key)) continue;
-      const decision = evaluateHit(hits.scope, head, request, kinds, now);
+      const decision = evaluateHit(project.scope, head, request, kinds, now);
       if (!decision.included) continue;
       seen.add(key);
       const extracted = buildExcerpt(head.revision, terms);
-      const reasons = [...decision.reasons, `scope:${hits.scope.id}`, `backend_rank:${hit.rank}`];
+      const reasons = [
+        ...decision.reasons,
+        `project:${project.scope.id}`,
+        `backend_rank:${hit.rank}`
+      ];
       if (extracted.section.length > 0) reasons.push(`section:${extracted.section}`);
       eligible.push({
         head,

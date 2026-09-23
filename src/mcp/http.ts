@@ -4,17 +4,13 @@ import express from 'express';
 import type { Express, Request, Response } from 'express';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { assertTokenDigest } from '../config/load.js';
-import { isBrainError } from '../contracts/errors.js';
 import { INPUT_BODY_MAX_BYTES } from '../core/limits.js';
 import {
   SYSTEM_ACTOR,
-  type AuthenticatedContext,
-  type Principal,
-  type RequestContext
+  type AuthenticatedContext
 } from '../core/types.js';
-import { authenticate, verifyBearer } from '../security/authenticate.js';
+import { verifyBearer } from '../security/authenticate.js';
 import type { BrainRuntime } from '../runtime.js';
-import { createMcpServer } from './server.js';
 import { internalDiagnostic } from './tools.js';
 
 export const MCP_PATH = '/mcp';
@@ -157,115 +153,6 @@ function discardRemainingBody(req: IncomingMessage): void {
   req.once('end', stop);
   req.once('error', stop);
   req.resume();
-}
-
-function resolvePrincipal(runtime: BrainRuntime, req: Request): Principal | undefined {
-  try {
-    return authenticate(req.headers.authorization, runtime.credentials);
-  } catch (error) {
-    if (isBrainError(error) && error.code === 'UNAUTHENTICATED') return undefined;
-    throw error;
-  }
-}
-
-async function handleMcpRequest(
-  runtime: BrainRuntime,
-  req: Request,
-  res: Response
-): Promise<void> {
-  if (!hostAllowed(req.headers.host, runtime.config.allowed_hosts)) {
-    sendJsonRpcError(res, 403, -32000, 'the request host is not allowed');
-    return;
-  }
-  if (!originAllowed(req.headers.origin, runtime.config.allowed_origins)) {
-    sendJsonRpcError(res, 403, -32000, 'the request origin is not allowed');
-    return;
-  }
-
-  let principal: Principal | undefined;
-  try {
-    principal = resolvePrincipal(runtime, req);
-  } catch (error) {
-    runtime.services.reportDiagnostic?.(internalDiagnostic(error));
-    sendJsonRpcError(res, 500, -32603, 'the gateway could not authenticate the request');
-    return;
-  }
-  if (principal === undefined) {
-    res.setHeader('WWW-Authenticate', 'Bearer');
-    sendJsonRpcError(res, 401, -32000, 'a valid bearer credential is required');
-    return;
-  }
-
-  if (runtime.closing) {
-    sendJsonRpcError(res, 503, -32000, 'the gateway is shutting down');
-    return;
-  }
-
-  if (req.method !== 'POST') {
-    res.setHeader('Allow', 'POST');
-    sendJsonRpcError(res, 405, -32000, 'this stateless endpoint accepts only POST');
-    return;
-  }
-  if (!isJsonContentType(req.headers['content-type'])) {
-    sendJsonRpcError(res, 415, -32000, 'Content-Type must be application/json');
-    return;
-  }
-
-  const limit = runtime.config.limits.input_body_max_bytes ?? INPUT_BODY_MAX_BYTES;
-  const raw = await readBody(req, limit);
-  if (!raw.ok) {
-    if (raw.tooLarge) {
-      res.setHeader('Connection', 'close');
-      sendJsonRpcError(res, 413, -32000, 'the request body exceeds the input limit');
-      discardRemainingBody(req);
-    } else {
-      sendJsonRpcError(res, 400, -32700, 'the request body could not be read');
-    }
-    return;
-  }
-  let parsedBody: unknown;
-  try {
-    parsedBody = JSON.parse(raw.body.toString('utf8'));
-  } catch {
-    sendJsonRpcError(res, 400, -32700, 'Parse error: Invalid JSON');
-    return;
-  }
-
-  const ctx: RequestContext = {
-    principal,
-    request_id: randomUUID(),
-    signal: runtime.shutdownSignal
-  };
-  const server = createMcpServer(runtime.services, ctx);
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined,
-    enableJsonResponse: true
-  });
-  let cleaned = false;
-  const cleanup = async (): Promise<void> => {
-    if (cleaned) return;
-    cleaned = true;
-    await transport.close().catch(() => undefined);
-    await server.close().catch(() => undefined);
-  };
-  res.on('close', () => {
-    void cleanup();
-  });
-
-  try {
-    await server.connect(transport);
-    await transport.handleRequest(req, res, parsedBody);
-  } catch (error) {
-    runtime.services.reportDiagnostic?.(internalDiagnostic(error));
-    if (!res.headersSent) {
-      sendJsonRpcError(res, 500, -32603, 'the gateway could not complete the request');
-    } else {
-      try {
-        res.end();
-      } catch {}
-    }
-    await cleanup();
-  }
 }
 
 export function readAuthorizationHeader(rawHeaders: readonly string[]): string | undefined {
@@ -480,20 +367,14 @@ export function createAuthenticatedHttpApp(options: AuthenticatedHttpOptions): E
 }
 
 export function createHttpApp(runtime: BrainRuntime): Express {
-  const app = express();
-  app.disable('x-powered-by');
-  app.set('etag', false);
-
-  app.all(MCP_PATH, (req: Request, res: Response): void => {
-    void handleMcpRequest(runtime, req, res).catch((error: unknown) => {
-      runtime.services.reportDiagnostic?.(internalDiagnostic(error));
-      sendJsonRpcError(res, 500, -32603, 'the gateway could not complete the request');
-    });
+  return createAuthenticatedHttpApp({
+    token_digest: () => runtime.tokenDigest,
+    allowed_hosts: runtime.config.allowed_hosts,
+    allowed_origins: runtime.config.allowed_origins,
+    input_body_max_bytes: runtime.config.limits.input_body_max_bytes,
+    signal: runtime.shutdownSignal,
+    isClosing: () => runtime.closing,
+    reportDiagnostic: (message) => runtime.services.reportDiagnostic?.(message),
+    dispatch: (ctx, req, res, parsedBody) => runtime.dispatch(ctx, req, res, parsedBody)
   });
-
-  app.use((_req: Request, res: Response): void => {
-    res.status(404).type('application/json').send(JSON.stringify({ error: 'not found' }));
-  });
-
-  return app;
 }

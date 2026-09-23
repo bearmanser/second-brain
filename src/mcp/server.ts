@@ -8,6 +8,7 @@ import { ETAG_PATTERN, SCOPE_ID_PATTERN } from '../core/limits.js';
 import {
   LIFECYCLES,
   NOTE_KINDS,
+  type AuthenticatedContext,
   type CaptureRequest,
   type FeedbackRequest,
   type FeedbackResult,
@@ -18,7 +19,6 @@ import {
   type ReadResult,
   type RecallRequest,
   type RecallResult,
-  type RequestContext,
   type ReviewListResult,
   type ReviewRequest,
   type StatusRequest,
@@ -38,13 +38,13 @@ import {
 } from './tools.js';
 
 export interface BrainServices {
-  capture(ctx: RequestContext, request: CaptureRequest): Promise<MutationReceipt>;
-  review(ctx: RequestContext, request: ReviewRequest): Promise<MutationReceipt | ReviewListResult>;
-  recall(ctx: RequestContext, request: RecallRequest): Promise<RecallResult>;
-  read(ctx: RequestContext, request: ReadRequest): Promise<ReadResult>;
-  feedback(ctx: RequestContext, request: FeedbackRequest): Promise<FeedbackResult>;
-  projectEnsure(ctx: RequestContext, request: ProjectEnsureRequest): Promise<ProjectEnsureResult>;
-  status(ctx: RequestContext, request: StatusRequest): Promise<StatusResult>;
+  capture(ctx: AuthenticatedContext, request: CaptureRequest): Promise<MutationReceipt>;
+  review(ctx: AuthenticatedContext, request: ReviewRequest): Promise<MutationReceipt | ReviewListResult>;
+  recall(ctx: AuthenticatedContext, request: RecallRequest): Promise<RecallResult>;
+  read(ctx: AuthenticatedContext, request: ReadRequest): Promise<ReadResult>;
+  feedback(ctx: AuthenticatedContext, request: FeedbackRequest): Promise<FeedbackResult>;
+  projectEnsure(ctx: AuthenticatedContext, request: ProjectEnsureRequest): Promise<ProjectEnsureResult>;
+  status(ctx: AuthenticatedContext, request: StatusRequest): Promise<StatusResult>;
   readonly result_delivery?: ResultDelivery;
   readonly reportDiagnostic?: (message: string) => void;
 }
@@ -121,11 +121,6 @@ const projectEnsureOutputSchema = z.strictObject({
   repository_identity: z.string(),
   scope: scopeIdOutputSchema,
   created: z.boolean(),
-  permissions: z.strictObject({
-    can_read: z.literal(true),
-    can_write: z.boolean(),
-    can_review: z.boolean()
-  }),
   backend_ready: z.boolean(),
   materialized: z.boolean(),
   warnings: stringListOutputSchema
@@ -137,9 +132,7 @@ const statusOutputSchema = z.strictObject({
   schema_version: z.literal(1),
   scopes: z.array(
     z.strictObject({
-      id: scopeIdOutputSchema,
-      can_write: z.boolean(),
-      can_review: z.boolean()
+      id: scopeIdOutputSchema
     })
   ),
   health: z.strictObject({
@@ -191,7 +184,7 @@ export function publishedTools(): Tool[] {
 
 type ToolInvoker = (
   services: BrainServices,
-  ctx: RequestContext,
+  ctx: AuthenticatedContext,
   args: unknown
 ) => Promise<unknown>;
 
@@ -207,7 +200,7 @@ const TOOL_HANDLERS: Record<ToolName, ToolInvoker> = {
   brain_status: (services, ctx, args) => services.status(ctx, args as StatusRequest)
 };
 
-export function createMcpServer(services: BrainServices, ctx: RequestContext): McpServer {
+export function createMcpServer(services: BrainServices, ctx: AuthenticatedContext): McpServer {
   const server = new McpServer(
     { name: APPLICATION_NAME, version: APPLICATION_VERSION },
     { instructions: buildInstructions() }

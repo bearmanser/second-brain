@@ -274,8 +274,8 @@ function parseApproval(
   if (principalId === undefined || rationale === undefined || payloadHash === undefined) {
     throw invalid('frontmatter approval fields must be present together');
   }
-  if (!uuidSchema.safeParse(principalId).success) {
-    throw invalid('frontmatter brain_approved_by must be a UUID');
+  if (!uuidSchema.safeParse(principalId).success && principalId !== 'system') {
+    throw invalid('frontmatter brain_approved_by must be a legacy UUID or the system actor');
   }
   if (!hashSchema.safeParse(payloadHash).success) {
     throw invalid('frontmatter brain_approval_payload_hash must be a sha256 digest');

@@ -1,13 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile } from 'node:fs/promises';
-import { existsSync, readdirSync, unwatchFile, watchFile, type StatWatcher } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { createServer, type Server as HttpServer } from 'node:http';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
-import { loadCredentials, assertTokenDigest } from './config/load.js';
-import type { BrainConfig, CredentialRecord } from './config/schema.js';
+import type { Request, Response } from 'express';
+import { assertTokenDigest } from './config/load.js';
+import type { BrainConfig } from './config/schema.js';
 import { BrainError, isBrainError } from './contracts/errors.js';
 import type {
+  AuthenticatedContext,
   BackendPort,
   CataloguePort,
   Clock,
@@ -24,21 +26,21 @@ import { capture } from './features/capture.js';
 import { feedback, retrievalEventFromRecall } from './features/feedback.js';
 import { ensureProject } from './features/project-ensure.js';
 import { read } from './features/read.js';
-import { recall } from './features/recall.js';
+import { recall, recallSelection } from './features/recall.js';
 import { review } from './features/review.js';
 import { status } from './features/status.js';
 import { createHttpApp } from './mcp/http.js';
-import type { BrainServices } from './mcp/server.js';
+import { createMcpServer, type BrainServices } from './mcp/server.js';
 import { internalDiagnostic } from './mcp/tools.js';
 import { RevisionCatalogue } from './notes/catalogue.js';
 import { JournalApprovalProvenance, reconcileVault } from './notes/reconcile.js';
 import { recoverPending } from './operations/recovery.js';
 import { ScopeRegistry } from './projects/scope-registry.js';
-import { resolveScopes } from './security/authorise.js';
 import { BasicMemoryBackend } from './storage/basic-memory.js';
 import { Journal } from './storage/journal.js';
 import { FileVault } from './storage/vault.js';
 import { InstanceLock, MutationCoordinator, type BrainDeps } from './core/mutation.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
 export const MIN_CURSOR_SECRET_BYTES = 32;
 export const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
@@ -51,15 +53,14 @@ export interface RuntimeOptions {
   ids?: IdSource;
   logger?: (line: string) => void;
   wrapServices?: (services: BrainServices, deps: BrainDeps) => BrainServices;
-  token_digest?: string;
+  token_digest: string;
 }
 
 export interface BrainRuntime {
   readonly config: BrainConfig;
   readonly deps: BrainDeps;
   readonly services: BrainServices;
-  readonly credentials: CredentialRecord[];
-  readonly tokenDigest: string | undefined;
+  readonly tokenDigest: string;
   readonly port: number;
   readonly url: string;
   readonly ready: boolean;
@@ -68,8 +69,13 @@ export interface BrainRuntime {
   readonly shutdownPending: boolean;
   readonly shutdownSignal: AbortSignal;
   trackOperation<T>(work: Promise<T>): Promise<T>;
-  reloadCredentials(): void;
   rotateTokenDigest(digest: string): void;
+  dispatch(
+    ctx: AuthenticatedContext,
+    req: Request,
+    res: Response,
+    parsedBody: unknown
+  ): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -121,16 +127,13 @@ function buildServices(
       const started = Date.now();
       const result = await recall(ctx, request, deps);
       try {
-        const [primary] = resolveScopes(
-          ctx.principal,
-          request.scope,
-          request.include_shared === true,
-          'read',
-          deps.scopeRegistry
-        );
-        deps.journal.recordRetrieval(
+        const selection = recallSelection(request, deps);
+        deps.journal.recordRetrievalV2(
           retrievalEventFromRecall(ctx, result, {
-            scope: primary.id,
+            filter: selection.filter,
+            searched_project_ids: selection.scopes.map((scope) => scope.id),
+            primary_project_id:
+              selection.filter.mode === 'project' ? selection.filter.identifier : null,
             duration_ms: Math.max(0, Date.now() - started)
           })
         );
@@ -233,8 +236,7 @@ class BrainRuntimeImpl implements BrainRuntime {
   readonly config: BrainConfig;
   deps!: BrainDeps;
   services!: BrainServices;
-  credentials: CredentialRecord[] = [];
-  tokenDigest: string | undefined = undefined;
+  tokenDigest = '';
   port = 0;
   url = '';
   ready = false;
@@ -258,8 +260,6 @@ class BrainRuntimeImpl implements BrainRuntime {
   private pruneTimer: NodeJS.Timeout | undefined;
   private reconcileTimer: NodeJS.Timeout | undefined;
   private reconciling = false;
-  private credentialsWatcher: StatWatcher | undefined;
-  private credentialsListener: (() => void) | undefined;
   private readonly readLimiter: ReadLimiter;
 
   constructor(config: BrainConfig, options: RuntimeOptions) {
@@ -276,9 +276,7 @@ class BrainRuntimeImpl implements BrainRuntime {
   }
 
   async start(): Promise<void> {
-    if (this.options.token_digest !== undefined) {
-      this.tokenDigest = assertTokenDigest(this.options.token_digest);
-    }
+    this.tokenDigest = assertTokenDigest(this.options.token_digest);
     await mkdir(this.config.mounts.state, { recursive: true });
     const lock = InstanceLock.acquire(this.config.mounts.state);
     this.lock = lock;
@@ -317,19 +315,19 @@ class BrainRuntimeImpl implements BrainRuntime {
       this.backend = backend;
       await backend.connect();
       for (const scope of scopeRegistry.all()) backend.registerScope(scope);
-      const projectGrants = journal.listProjectGrants();
       for (const project of journal.listReadyProjects()) {
+        const binding = journal.getProjectBinding(project.project.id);
         const scope = {
-          id: project.scope,
-          backend_project: project.backend_project,
-          relative_root: project.relative_root,
+          id: project.project.id,
+          backend_project: binding?.backend_project ?? project.project.id,
+          relative_root: project.project.relative_root,
           repository_aliases: []
         };
         try {
           vault.registerScope(scope);
           const verified = await backend.verifyProject(
-            project.backend_project,
-            `/app/data/${project.relative_root}`
+            scope.backend_project,
+            `/app/data/${scope.relative_root}`
           );
           if (!verified) {
             throw new BrainError({
@@ -338,17 +336,14 @@ class BrainRuntimeImpl implements BrainRuntime {
             });
           }
           backend.registerScope(scope);
-          scopeRegistry.registerReadyProject(project);
-          for (const grant of projectGrants) {
-            if (grant.scope === project.scope) scopeRegistry.registerReadyProject(project, grant);
-          }
+          scopeRegistry.registerReadyProject(project, binding);
         } catch (error) {
           if (
             isBrainError(error) &&
             ['RECOVERY_REQUIRED', 'FORBIDDEN', 'CONFLICT', 'BACKEND_PROTOCOL_ERROR'].includes(error.code)
           ) {
             journal.markProjectRecoveryRequired(
-              project.repository_identity,
+              project.project.id,
               'startup_verification',
               error.code
             );
@@ -391,9 +386,7 @@ class BrainRuntimeImpl implements BrainRuntime {
         this.logRecovery(report);
       });
       await this.startupReconcile();
-      this.credentials = loadCredentials(this.config.credentials_file);
       await loadCursorSecret(this.config);
-      this.startCredentialWatch();
 
       const base = buildServices(deps, this.config.result_delivery, this.log);
       const wrapped = this.options.wrapServices?.(base, deps) ?? base;
@@ -511,30 +504,50 @@ class BrainRuntimeImpl implements BrainRuntime {
     });
   }
 
-  reloadCredentials(): void {
-    this.credentials = loadCredentials(this.config.credentials_file);
-  }
-
   rotateTokenDigest(digest: string): void {
     this.tokenDigest = assertTokenDigest(digest);
   }
 
-  private startCredentialWatch(): void {
-    const path = this.config.credentials_file;
-    const listener = (): void => {
-      try {
-        this.reloadCredentials();
-      } catch (error) {
-        this.log(internalDiagnostic(error));
-      }
+  async dispatch(
+    ctx: AuthenticatedContext,
+    req: Request,
+    res: Response,
+    parsedBody: unknown
+  ): Promise<void> {
+    const server = createMcpServer(this.services, ctx);
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: true
+    });
+    let cleaned = false;
+    const cleanup = async (): Promise<void> => {
+      if (cleaned) return;
+      cleaned = true;
+      await transport.close().catch(() => undefined);
+      await server.close().catch(() => undefined);
     };
+    res.on('close', () => {
+      void cleanup();
+    });
     try {
-      const watcher = watchFile(path, { interval: 200, persistent: false }, listener);
-      watcher.unref?.();
-      this.credentialsWatcher = watcher;
-      this.credentialsListener = listener;
+      await server.connect(transport);
+      await transport.handleRequest(req, res, parsedBody);
     } catch (error) {
-      this.log(internalDiagnostic(error));
+      this.services.reportDiagnostic?.(internalDiagnostic(error));
+      if (!res.headersSent) {
+        res.status(500).type('application/json').send(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'the gateway could not complete the request' },
+            id: null
+          })
+        );
+      } else {
+        try {
+          res.end();
+        } catch {}
+      }
+      await cleanup();
     }
   }
 
@@ -640,11 +653,6 @@ class BrainRuntimeImpl implements BrainRuntime {
       clearInterval(this.reconcileTimer);
       this.reconcileTimer = undefined;
     }
-    if (this.credentialsWatcher !== undefined && this.credentialsListener !== undefined) {
-      unwatchFile(this.config.credentials_file, this.credentialsListener);
-    }
-    this.credentialsWatcher = undefined;
-    this.credentialsListener = undefined;
     this.ready = false;
     await this.backend?.close().catch(() => undefined);
     this.backend = undefined;
@@ -677,7 +685,7 @@ class BrainRuntimeImpl implements BrainRuntime {
 
 export async function createRuntime(
   config: BrainConfig,
-  options: RuntimeOptions = {}
+  options: RuntimeOptions
 ): Promise<BrainRuntime> {
   const runtime = new BrainRuntimeImpl(config, options);
   await runtime.start();

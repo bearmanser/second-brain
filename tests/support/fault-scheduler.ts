@@ -1,4 +1,4 @@
-import type { MutationReceipt, PlannedWrite, ProjectEnsureResult, ProjectProvisioningPlan } from '../../src/core/types.js';
+import type { MutationReceipt, PlannedWrite, ProjectEnsureResult, ProjectProvisioningPlan, RetrievalEventInputV2 } from '../../src/core/types.js';
 import type {
   AuditEvent,
   AuditEventRecord,
@@ -12,7 +12,8 @@ import type {
   ReceiptAvailability,
   ReservationResult,
   RetrievalEvent,
-  RetrievalEventInput
+  RetrievalEventInput,
+  RetrievalEventV2
 } from '../../src/storage/journal.js';
 
 export type FaultPoint = 'reserve' | 'save_plan' | 'mark' | 'refresh_receipt';
@@ -77,13 +78,14 @@ export function wrapJournal(journal: Journal, scheduler: FaultScheduler): Journa
       journal.mark(id, state, receipt);
     },
     reserveProject: journal.reserveProject.bind(journal),
+    getProjectById: journal.getProjectById.bind(journal),
     getProjectByIdentity: journal.getProjectByIdentity.bind(journal),
-    getProjectByScope: journal.getProjectByScope.bind(journal),
+    getProjectByLegacyScope: journal.getProjectByLegacyScope.bind(journal),
+    getProjectBinding: journal.getProjectBinding.bind(journal),
+    listProjectBindings: journal.listProjectBindings.bind(journal),
     countProjects: journal.countProjects.bind(journal),
     markProjectReady: journal.markProjectReady.bind(journal),
     markProjectRecoveryRequired: journal.markProjectRecoveryRequired.bind(journal),
-    grantProject: journal.grantProject.bind(journal),
-    listProjectGrants: journal.listProjectGrants.bind(journal),
     listReadyProjects: journal.listReadyProjects.bind(journal),
     listProjects: journal.listProjects.bind(journal),
     get(id: string): OperationRecord | undefined {
@@ -104,6 +106,12 @@ export function wrapJournal(journal: Journal, scheduler: FaultScheduler): Journa
     },
     recordRetrieval(input: RetrievalEventInput): RetrievalEvent {
       return journal.recordRetrieval(input);
+    },
+    recordRetrievalV2(input: RetrievalEventInputV2): RetrievalEventV2 {
+      return journal.recordRetrievalV2(input);
+    },
+    getRetrievalV2(retrieval_id: string): RetrievalEventV2 | undefined {
+      return journal.getRetrievalV2(retrieval_id);
     },
     getRetrieval(retrieval_id: string): RetrievalEvent | undefined {
       return journal.getRetrieval(retrieval_id);

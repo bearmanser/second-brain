@@ -209,7 +209,6 @@ const projectEnsureResultSchema: Record<string, unknown> = {
     'repository_identity',
     'scope',
     'created',
-    'permissions',
     'backend_ready',
     'materialized',
     'warnings'
@@ -219,16 +218,6 @@ const projectEnsureResultSchema: Record<string, unknown> = {
     repository_identity: STRING,
     scope: SCOPE,
     created: { type: 'boolean' },
-    permissions: {
-      type: 'object',
-      additionalProperties: false,
-      required: ['can_read', 'can_write', 'can_review'],
-      properties: {
-        can_read: { type: 'boolean', const: true },
-        can_write: { type: 'boolean' },
-        can_review: { type: 'boolean' }
-      }
-    },
     backend_ready: { type: 'boolean' },
     materialized: { type: 'boolean' },
     warnings: STRING_ARRAY
@@ -255,11 +244,9 @@ const statusResultSchema: Record<string, unknown> = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['id', 'can_write', 'can_review'],
+        required: ['id'],
         properties: {
-          id: SCOPE,
-          can_write: { type: 'boolean' },
-          can_review: { type: 'boolean' }
+          id: SCOPE
         }
       }
     },
@@ -307,15 +294,15 @@ const DESCRIPTIONS: Record<ToolName, string> = {
   brain_feedback:
     'Record useful, irrelevant, stale, incorrect, or contradictory feedback on one specific note revision.',
   brain_project_ensure:
-    'Idempotently provision and authorize the project scope for one canonical Git repository remote.',
+    'Idempotently provision the project scope for one canonical Git repository remote.',
   brain_read:
-    'Read the current revision or an explicit historical revision of one authorized note with bounded pagination and an etag.',
+    'Read the current revision or an explicit historical revision of one note with bounded pagination and an etag.',
   brain_recall:
-    'Recall bounded, source-linked reference memory for a task in an explicitly authorized scope.',
+    'Recall bounded, source-linked reference memory for a task across the whole brain or within an explicit project.',
   brain_review:
-    'List candidate or conflicted notes for review, or approve, revise, supersede, archive, or resolve one under the configured review permission. Listing is read-only; the mutation actions change lifecycle state.',
+    'List candidate or conflicted notes for review, or approve, revise, supersede, archive, or resolve one. Listing is read-only; the mutation actions change lifecycle state.',
   brain_status:
-    'Report version metadata, authorization-filtered scopes, backend health, pending work, and one authorized operation state.'
+    'Report version metadata, organization scopes, backend health, and pending work.'
 };
 
 const ANNOTATIONS: Record<ToolName, ToolAnnotations> = {

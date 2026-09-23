@@ -1,5 +1,5 @@
 import { pathToFileURL } from 'node:url';
-import { loadConfig } from './config/load.js';
+import { loadConfig, loadTokenDigest } from './config/load.js';
 import type { BrainConfig } from './config/schema.js';
 import { createRuntime, type BrainRuntime } from './runtime.js';
 
@@ -7,9 +7,6 @@ export const DEFAULT_CONFIG_PATH = '/run/brain/brain.yaml';
 
 function applyEnvironment(config: BrainConfig, env: NodeJS.ProcessEnv): BrainConfig {
   const next: BrainConfig = { ...config, mounts: { ...config.mounts } };
-  if (env.BRAIN_CREDENTIALS !== undefined && env.BRAIN_CREDENTIALS.length > 0) {
-    next.credentials_file = env.BRAIN_CREDENTIALS;
-  }
   if (env.BRAIN_CURSOR_SECRET !== undefined && env.BRAIN_CURSOR_SECRET.length > 0) {
     next.cursor_secret_file = env.BRAIN_CURSOR_SECRET;
   }
@@ -35,7 +32,8 @@ export function resolveConfig(env: NodeJS.ProcessEnv = process.env): BrainConfig
 }
 
 export async function main(env: NodeJS.ProcessEnv = process.env): Promise<BrainRuntime> {
-  return createRuntime(resolveConfig(env));
+  const tokenDigest = loadTokenDigest(env);
+  return createRuntime(resolveConfig(env), { token_digest: tokenDigest });
 }
 
 export function installShutdownHandlers(runtime: BrainRuntime): void {
@@ -52,13 +50,6 @@ export function installShutdownHandlers(runtime: BrainRuntime): void {
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
-  process.on('SIGHUP', () => {
-    try {
-      runtime.reloadCredentials();
-    } catch {
-      process.stderr.write('second-brain credential reload failed\n');
-    }
-  });
 }
 
 const entry = process.argv[1];

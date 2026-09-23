@@ -7,16 +7,15 @@ import type {
   BackendPort,
   CataloguePort,
   Clock,
-  DynamicProjectGrant,
   Head,
   IdSource,
+  LegacyProjectBackendBinding,
   MutationReceipt,
+  PersistedProject,
   ProjectEnsureResult,
   ProjectProvisioningPlan,
-  RepositoryProjectRecord,
   PlannedWrite,
-  Principal,
-  RequestContext,
+  AuthenticatedContext,
   ScopeConfig,
   SourceRef,
   StoredRevision,
@@ -25,13 +24,14 @@ import type {
 import type { BrainConfig } from '../config/schema.js';
 import { decodeRevision, encodeRevision, makeEtag, payloadHash } from '../notes/codec.js';
 import { slugify } from '../notes/identity.js';
-import { resolveScopes } from '../security/authorise.js';
 import type { ScopeRegistry } from '../projects/scope-registry.js';
 import type {
   Journal,
   OperationRecord,
   OperationReservation,
   OperationState,
+  ProjectReservation,
+  ProjectReservationResult,
   ReceiptAvailability,
   ReservationResult
 } from '../storage/journal.js';
@@ -51,8 +51,6 @@ export interface MutationAdvisory {
   possible_duplicates?: SourceRef[];
 }
 
-export type MutationAuthorization = 'write' | 'review';
-
 export interface MutationIntent {
   tool: string;
   scope: string;
@@ -60,7 +58,6 @@ export interface MutationIntent {
   payload: unknown;
   expected_heads: ExpectedHead[];
   advisory?: MutationAdvisory;
-  authorization?: MutationAuthorization;
   resolve_heads?: (scope: ScopeConfig) => Promise<Head[]>;
 }
 
@@ -85,18 +82,15 @@ export interface MutationJournal {
   pending(): OperationRecord[];
   abort(id: string): void;
   refreshReceiptAvailability(id: string, availability: ReceiptAvailability): OperationRecord;
-  reserveProject(input: {
-    repository_identity: string;
-    scope: string;
-    created_by_principal_id: string;
-    creation_operation_id: string;
-  }): { kind: 'new' | 'replay'; project: RepositoryProjectRecord };
-  getProjectByIdentity(identity: string): RepositoryProjectRecord | undefined;
-  getProjectByScope(scope: string): RepositoryProjectRecord | undefined;
+  reserveProject(input: ProjectReservation): ProjectReservationResult;
+  getProjectById(id: string): PersistedProject | undefined;
+  getProjectByIdentity(repositoryIdentity: string): PersistedProject | undefined;
+  getProjectByLegacyScope(legacyScope: string): PersistedProject | undefined;
+  getProjectBinding(projectId: string): LegacyProjectBackendBinding | undefined;
+  listProjectBindings(): { project_id: string; binding: LegacyProjectBackendBinding }[];
   countProjects(): number;
-  markProjectReady(identity: string): RepositoryProjectRecord;
-  markProjectRecoveryRequired(identity: string, stage: string, code: string): RepositoryProjectRecord;
-  grantProject(grant: DynamicProjectGrant): DynamicProjectGrant;
+  markProjectReady(identifier: string): PersistedProject;
+  markProjectRecoveryRequired(identifier: string, stage: string, code: string): PersistedProject;
 }
 
 export interface BrainDeps {
@@ -491,7 +485,7 @@ export class MutationCoordinator {
   }
 
   async commit(
-    ctx: RequestContext,
+    ctx: AuthenticatedContext,
     intent: MutationIntent,
     build: RevisionBuilder
   ): Promise<MutationReceipt> {
@@ -569,16 +563,16 @@ export class MutationCoordinator {
   }
 
   private async commitSerialized(
-    ctx: RequestContext,
+    ctx: AuthenticatedContext,
     intent: MutationIntent,
     build: RevisionBuilder
   ): Promise<MutationReceipt> {
-    const scope = this.authorize(ctx.principal, intent.scope, intent.authorization ?? 'write');
+    const scope = this.resolveProject(intent.scope);
     if (ctx.signal.aborted) throw cancelled();
     const digest = payloadDigest(intent.payload);
     const advisory = normalizeAdvisory(intent.advisory);
     const reservation: OperationReservation = {
-      principal_id: ctx.principal.id,
+      principal_id: ctx.actor.id,
       idempotency_key: intent.idempotency_key,
       tool: intent.tool,
       scope: scope.id,
@@ -600,17 +594,22 @@ export class MutationCoordinator {
     return this.drive(ctx, scope, reserved, intent, build);
   }
 
-  private authorize(
-    principal: Principal,
-    requested: string,
-    authorization: MutationAuthorization
-  ): ScopeConfig {
-    const [scope] = resolveScopes(principal, requested, false, authorization, this.deps.scopeRegistry);
+  private resolveProject(identifier: string): ScopeConfig {
+    const scope = this.deps.scopeRegistry.get(identifier);
+    if (scope === undefined) {
+      throw new BrainError({
+        code: 'NOT_FOUND',
+        message: `project ${identifier} is not configured`
+      });
+    }
+    if (!this.deps.scopeRegistry.isUsable(scope.id)) {
+      throw recoveryRequired(`project ${scope.id} requires recovery before it can be used`);
+    }
     return scope;
   }
 
   private async drive(
-    ctx: RequestContext,
+    ctx: AuthenticatedContext,
     scope: ScopeConfig,
     reserved: ReservationResult,
     intent: MutationIntent,
@@ -783,7 +782,7 @@ export class MutationCoordinator {
   }
 
   private async submit(
-    ctx: RequestContext,
+    ctx: AuthenticatedContext,
     scope: ScopeConfig,
     plan: PlannedWrite,
     operation_id: string,

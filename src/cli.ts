@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { loadCredentials } from './config/load.js';
+import { loadTokenDigest } from './config/load.js';
 import { BrainError, isBrainError } from './contracts/errors.js';
 import type { Clock, IdSource } from './core/types.js';
 import { MutationCoordinator, InstanceLock, type BrainDeps } from './core/mutation.js';
@@ -21,7 +21,13 @@ import {
 } from './operations/backup.js';
 import { bootstrap } from './operations/bootstrap.js';
 import { health } from './operations/health.js';
-import { assertRecoveryMode, authenticateOwner, recoverPending, summariseRecovery } from './operations/recovery.js';
+import { selectLegacyCredentialDigest } from './operations/legacy-credentials.js';
+import {
+  assertRecoveryMode,
+  recoverPending,
+  requireRecoveryAuthorization,
+  summariseRecovery
+} from './operations/recovery.js';
 import { ScopeRegistry } from './projects/scope-registry.js';
 import { generateBearerToken } from './security/authenticate.js';
 import { BasicMemoryBackend } from './storage/basic-memory.js';
@@ -153,15 +159,12 @@ async function runSetup(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promis
   const vault = flagString(parsed.flags, 'vault') ?? env.BRAIN_SETUP_VAULT;
   const uid = flagNumber(parsed.flags, 'uid') ?? (env.BRAIN_SETUP_UID === undefined ? undefined : Number(env.BRAIN_SETUP_UID));
   const gid = flagNumber(parsed.flags, 'gid') ?? (env.BRAIN_SETUP_GID === undefined ? undefined : Number(env.BRAIN_SETUP_GID));
-  const ownerCredential =
-    flagBoolean(parsed.flags, 'owner-credential') || env.BRAIN_SETUP_OWNER_CREDENTIAL === '1';
   const result = await bootstrap({
     root,
     ...(scope === undefined ? {} : { scope }),
     ...(vault === undefined ? {} : { vault_path: vault }),
     ...(uid === undefined ? {} : { uid }),
-    ...(gid === undefined ? {} : { gid }),
-    ...(ownerCredential ? { owner_credential: true } : {})
+    ...(gid === undefined ? {} : { gid })
   });
   process.stdout.write(`bootstrap root: ${root}\n`);
   process.stdout.write(`bootstrap created: ${result.created.join(', ') || '(none)'}\n`);
@@ -289,8 +292,7 @@ function resolveAuthorization(
 async function runRecoverState(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promise<number> {
   assertRecoveryMode(flagString(parsed.flags, 'mode'));
   const config = resolveConfig(env);
-  const credentials = loadCredentials(config.credentials_file);
-  authenticateOwner(resolveAuthorization(parsed, env), credentials);
+  requireRecoveryAuthorization(resolveAuthorization(parsed, env), loadTokenDigest(env));
   const lock = InstanceLock.acquire(config.mounts.state);
   let journal: Journal | undefined;
   let catalogue: RevisionCatalogue | undefined;
@@ -439,11 +441,7 @@ async function runAuth(parsed: ParsedArguments): Promise<number> {
     if (selection === undefined) {
       throw invalidInput('auth migrate requires --select-entry');
     }
-    const credentials = loadCredentials(credentialsFile);
-    if (selection < 1 || selection > credentials.length) {
-      throw invalidInput(`--select-entry must select exactly one of ${credentials.length} entries`);
-    }
-    process.stdout.write(`BRAIN_TOKEN_SHA256=${credentials[selection - 1].token_sha256}\n`);
+    process.stdout.write(`BRAIN_TOKEN_SHA256=${selectLegacyCredentialDigest(credentialsFile, selection)}\n`);
     return 0;
   }
   throw invalidInput(`auth requires a subcommand\n${USAGE}`);

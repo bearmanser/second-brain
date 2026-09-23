@@ -9,19 +9,25 @@ import { RECALL_MAX_SCOPES, RECALL_LIMIT_MAX, SCOPE_ID_PATTERN } from '../core/l
 import {
   FEEDBACK_VERDICTS,
   RECALL_MODES,
+  RETRIEVAL_OUTCOMES_V2,
+  SYSTEM_ACTOR,
   type Clock,
   type FeedbackVerdict,
   type IdSource,
-  type DynamicProjectGrant,
+  type LegacyProjectBackendBinding,
   type MutationReceipt,
+  type PersistedProject,
+  type ProjectFilter,
   type ProjectEnsureResult,
   type ProjectProvisioningPlan,
   type PlannedWrite,
   type RecallMode,
-  type RepositoryProjectRecord,
-  type RepositoryProjectState
+  type RepositoryProjectState,
+  type RetrievalEventInputV2,
+  type RetrievalOutcomeV2
 } from '../core/types.js';
 import { containsCredentials } from '../security/redact.js';
+import { assertProjectIdentifier } from '../projects/registry.js';
 
 export const OPERATION_STATES = [
   'prepared',
@@ -95,16 +101,18 @@ export interface JournalOptions {
   requireExisting?: boolean;
 }
 
-export interface RepositoryProjectReservation {
+export interface ProjectReservation {
   repository_identity: string;
-  scope: string;
-  created_by_principal_id: string;
+  project_id: string;
+  display_name?: string;
+  relative_root?: string;
+  created_by_actor_id: string;
   creation_operation_id: string;
 }
 
 export type ProjectReservationResult =
-  | { kind: 'new'; project: RepositoryProjectRecord }
-  | { kind: 'replay'; project: RepositoryProjectRecord };
+  | { kind: 'new'; project: PersistedProject }
+  | { kind: 'replay'; project: PersistedProject };
 
 export interface Migration {
   version: number;
@@ -158,6 +166,29 @@ export interface RetrievalEvent extends Omit<RetrievalEventInput, 'created_at'> 
   created_at: string;
 }
 
+export interface StoredRetrievalRef {
+  scope: string | null;
+  id: string;
+  revision_id: string;
+}
+
+export interface RetrievalEventV2 {
+  retrieval_id: string;
+  actor_id: string;
+  filter: ProjectFilter;
+  searched_project_ids: string[];
+  primary_project_id: string | null;
+  returned_ids: StoredRetrievalRef[];
+  item_count: number;
+  token_used: number;
+  token_limit: number;
+  mode: RecallMode;
+  outcome: RetrievalOutcomeV2;
+  partial: boolean;
+  duration_ms: number;
+  created_at: string;
+}
+
 export interface FeedbackWrite {
   principal_id: string;
   idempotency_key: string;
@@ -184,7 +215,7 @@ export interface FeedbackWriteResult {
 interface RetrievalRow {
   retrieval_id: string;
   principal_id: string;
-  scope: string;
+  scope: string | null;
   scope_ids_json: string;
   returned_ids_json: string;
   item_count: number;
@@ -194,6 +225,7 @@ interface RetrievalRow {
   outcome: string;
   partial: number;
   duration_ms: number;
+  filter_json: string | null;
   created_at: string;
 }
 
@@ -237,26 +269,46 @@ interface OperationRow {
   updated_at: string;
 }
 
-interface RepositoryProjectRow {
-  repository_identity: string;
-  scope: string;
-  backend_project: string;
+interface ProjectRow {
+  id: string;
+  repository_identity: string | null;
+  display_name: string;
   relative_root: string;
+  legacy_scope: string | null;
   state: string;
-  created_by_principal_id: string;
-  creation_operation_id: string;
-  failure_stage: string | null;
-  failure_code: string | null;
   created_at: string;
   updated_at: string;
 }
 
-interface DynamicProjectGrantRow {
-  principal_id: string;
-  scope: string;
-  can_read: number;
-  can_write: number;
-  can_review: number;
+interface ProjectProvisioningRow {
+  project_id: string;
+  created_by_actor_id: string;
+  creation_operation_id: string;
+  failure_stage: string | null;
+  failure_code: string | null;
+}
+
+interface ProjectBindingRow {
+  project_id: string;
+  backend_project: string;
+  backend_relative_root: string;
+}
+
+interface IdempotencyKeyRow {
+  idempotency_key: string;
+  origin: string;
+  resolution: string;
+  tool: string | null;
+  project_id: string | null;
+  payload_hash: string | null;
+  target_kind: string | null;
+  target_id: string | null;
+}
+
+interface LegacyMemberRow {
+  idempotency_key: string;
+  record_kind: string;
+  record_id: string;
 }
 
 function recoveryRequired(message: string, cause?: unknown): BrainError {
@@ -312,57 +364,60 @@ function requireProjectText(value: string, field: string): string {
 
 const CONTROL_OR_LINE_BREAK = /[\u0000-\u001f\u007f]/;
 
-function toRepositoryProject(row: RepositoryProjectRow): RepositoryProjectRecord {
-  const scope = requireProjectText(row.scope, 'scope');
-  if (!SCOPE_ID_PATTERN.test(scope)) throw recoveryRequired('repository project has malformed scope');
-  if (row.backend_project !== scope || row.relative_root !== `Projects/${scope}`) {
-    throw recoveryRequired('repository project has an inconsistent storage mapping');
-  }
+function toPersistedProject(
+  row: ProjectRow,
+  provisioning: ProjectProvisioningRow
+): PersistedProject {
+  const id = requireProjectText(row.id, 'id');
+  if (!SCOPE_ID_PATTERN.test(id)) throw recoveryRequired('project has malformed id');
+  const displayName = requireProjectText(row.display_name, 'display name');
+  const relativeRoot = requireProjectText(row.relative_root, 'relative root');
   if (!RFC3339_PATTERN.test(row.created_at) || !RFC3339_PATTERN.test(row.updated_at)) {
-    throw recoveryRequired('repository project has malformed timestamps');
+    throw recoveryRequired('project has malformed timestamps');
+  }
+  if (provisioning.project_id !== id) {
+    throw recoveryRequired('project provisioning does not match its project');
   }
   const failureFieldsMatch =
-    (row.failure_stage === null && row.failure_code === null) ||
-    (row.failure_stage !== null && row.failure_code !== null);
-  if (!failureFieldsMatch) throw recoveryRequired('repository project has incomplete failure data');
+    (provisioning.failure_stage === null && provisioning.failure_code === null) ||
+    (provisioning.failure_stage !== null && provisioning.failure_code !== null);
+  if (!failureFieldsMatch) throw recoveryRequired('project has incomplete failure data');
   if (
-    row.failure_stage !== null &&
-    (!FAILURE_STAGE_PATTERN.test(row.failure_stage) ||
-      row.failure_code === null ||
-      !FAILURE_CODE_PATTERN.test(row.failure_code))
+    provisioning.failure_stage !== null &&
+    (!FAILURE_STAGE_PATTERN.test(provisioning.failure_stage) ||
+      provisioning.failure_code === null ||
+      !FAILURE_CODE_PATTERN.test(provisioning.failure_code))
   ) {
-    throw recoveryRequired('repository project has unsafe failure data');
+    throw recoveryRequired('project has unsafe failure data');
   }
+  const repositoryIdentity =
+    row.repository_identity === null
+      ? undefined
+      : requireProjectText(row.repository_identity, 'identity');
   return {
-    repository_identity: requireProjectText(row.repository_identity, 'identity'),
-    scope,
-    backend_project: row.backend_project,
-    relative_root: row.relative_root,
+    project: {
+      id,
+      display_name: displayName,
+      relative_root: relativeRoot,
+      ...(repositoryIdentity === undefined ? {} : { repository_identity: repositoryIdentity })
+    },
     state: requireProjectState(row.state),
-    created_by_principal_id: requireProjectText(row.created_by_principal_id, 'creator'),
-    creation_operation_id: requireProjectText(row.creation_operation_id, 'operation'),
-    ...(row.failure_stage === null ? {} : { failure_stage: row.failure_stage }),
-    ...(row.failure_code === null ? {} : { failure_code: row.failure_code }),
-    created_at: row.created_at,
+    provisioning: {
+      created_by_actor_id: requireProjectText(provisioning.created_by_actor_id, 'creator'),
+      creation_operation_id: requireProjectText(provisioning.creation_operation_id, 'operation'),
+      ...(provisioning.failure_stage === null
+        ? {}
+        : { failure_stage: provisioning.failure_stage }),
+      ...(provisioning.failure_code === null ? {} : { failure_code: provisioning.failure_code })
+    },
     updated_at: row.updated_at
   };
 }
 
-function storedCapability(value: number, field: string): boolean {
-  if (value !== 0 && value !== 1) {
-    throw recoveryRequired(`dynamic project grant has malformed ${field}`);
-  }
-  return value === 1;
-}
-
-function toDynamicProjectGrant(row: DynamicProjectGrantRow): DynamicProjectGrant {
-  if (row.can_read !== 1) throw recoveryRequired('dynamic project grant must retain read access');
+function toProjectBinding(row: ProjectBindingRow): LegacyProjectBackendBinding {
   return {
-    principal_id: requireProjectText(row.principal_id, 'grant principal'),
-    scope: requireProjectText(row.scope, 'grant scope'),
-    can_read: true,
-    can_write: storedCapability(row.can_write, 'write capability'),
-    can_review: storedCapability(row.can_review, 'review capability')
+    backend_project: requireProjectText(row.backend_project, 'backend project'),
+    backend_relative_root: requireProjectText(row.backend_relative_root, 'backend relative root')
   };
 }
 
@@ -431,6 +486,12 @@ export function applyMigrations(
     if (applied.has(migration.version)) continue;
     const apply = database.transaction(() => {
       database.exec(migration.sql);
+      const violations = database.pragma('foreign_key_check') as unknown[];
+      if (violations.length > 0) {
+        throw recoveryRequired(
+          `migration ${migration.version} left ${violations.length} foreign key violation(s)`
+        );
+      }
       database
         .prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)')
         .run(migration.version, appliedAt);
@@ -459,7 +520,7 @@ function toRetrieval(row: RetrievalRow): RetrievalEvent {
   return {
     retrieval_id: row.retrieval_id,
     principal_id: row.principal_id,
-    scope: row.scope,
+    scope: row.scope ?? '',
     scope_ids: scopeIds,
     returned_ids: returnedIds,
     item_count: row.item_count,
@@ -470,6 +531,153 @@ function toRetrieval(row: RetrievalRow): RetrievalEvent {
     partial: row.partial === 1,
     duration_ms: row.duration_ms,
     created_at: row.created_at
+  };
+}
+
+function normalizeFilter(filter: ProjectFilter): ProjectFilter {
+  if (filter === null || typeof filter !== 'object') {
+    throw invalidInput('a project filter is required');
+  }
+  if (filter.mode === 'all') return { mode: 'all' };
+  if (filter.mode === 'project') {
+    return { mode: 'project', identifier: assertProjectIdentifier(filter.identifier) };
+  }
+  throw invalidInput('unknown project filter');
+}
+
+function parseStoredFilter(row: RetrievalRow): ProjectFilter {
+  if (row.filter_json !== null) {
+    try {
+      const parsed = JSON.parse(row.filter_json) as ProjectFilter;
+      if (parsed.mode === 'all') return { mode: 'all' };
+      if (parsed.mode === 'project' && typeof parsed.identifier === 'string') {
+        return { mode: 'project', identifier: parsed.identifier };
+      }
+    } catch {
+      throw recoveryRequired(`retrieval ${row.retrieval_id} has an unreadable filter`);
+    }
+  }
+  return row.scope === null ? { mode: 'all' } : { mode: 'project', identifier: row.scope };
+}
+
+function toRetrievalV2(row: RetrievalRow): RetrievalEventV2 {
+  let searched: unknown;
+  let returned: unknown;
+  try {
+    searched = JSON.parse(row.scope_ids_json);
+    returned = JSON.parse(row.returned_ids_json);
+  } catch (cause) {
+    throw recoveryRequired(`retrieval ${row.retrieval_id} has unreadable metadata`, cause);
+  }
+  if (!Array.isArray(searched) || !Array.isArray(returned)) {
+    throw recoveryRequired(`retrieval ${row.retrieval_id} has invalid metadata`);
+  }
+  const searched_project_ids = searched.map((value, index) =>
+    requireScopeId(value, `searched_project_ids[${index}]`)
+  );
+  const returned_ids: StoredRetrievalRef[] = returned.map((entry, index) => {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw recoveryRequired(`retrieval ${row.retrieval_id} has an invalid returned reference`);
+    }
+    const record = entry as Record<string, unknown>;
+    const scope =
+      typeof record.scope === 'string' && SCOPE_ID_PATTERN.test(record.scope) ? record.scope : null;
+    return {
+      scope,
+      id: requireUuid(record.id, `returned_ids[${index}].id`),
+      revision_id: requireUuid(record.revision_id, `returned_ids[${index}].revision_id`)
+    };
+  });
+  if (!(RETRIEVAL_OUTCOMES_V2 as readonly string[]).includes(row.outcome)) {
+    throw recoveryRequired(`retrieval ${row.retrieval_id} has an unknown outcome`);
+  }
+  return {
+    retrieval_id: row.retrieval_id,
+    actor_id: row.principal_id,
+    filter: parseStoredFilter(row),
+    searched_project_ids,
+    primary_project_id: row.scope,
+    returned_ids,
+    item_count: row.item_count,
+    token_used: row.token_used,
+    token_limit: row.token_limit,
+    mode: row.mode as RecallMode,
+    outcome: row.outcome as RetrievalOutcomeV2,
+    partial: row.partial === 1,
+    duration_ms: row.duration_ms,
+    created_at: row.created_at
+  };
+}
+
+function normalizeRetrievalV2(
+  input: RetrievalEventInputV2,
+  defaultTimestamp: string
+): RetrievalEventV2 {
+  if (input === null || typeof input !== 'object') {
+    throw invalidInput('retrieval metadata must be an object');
+  }
+  const retrieval_id = requireUuid(input.retrieval_id, 'retrieval_id');
+  const actor_id = requireActorId(input.actor_id, 'actor_id');
+  const filter = normalizeFilter(input.filter);
+  if (!Array.isArray(input.searched_project_ids) || input.searched_project_ids.length > 64) {
+    throw invalidInput('searched_project_ids must be a bounded array');
+  }
+  const searched_project_ids = [
+    ...new Set(input.searched_project_ids.map((value) => requireScopeId(value, 'searched_project_ids')))
+  ];
+  const primary_project_id =
+    input.primary_project_id === null
+      ? null
+      : requireScopeId(input.primary_project_id, 'primary_project_id');
+  if (!Array.isArray(input.returned_ids) || input.returned_ids.length > RECALL_LIMIT_MAX) {
+    throw invalidInput('returned_ids must be a bounded array');
+  }
+  const returned_ids: StoredRetrievalRef[] = input.returned_ids.map((entry, index) => {
+    if (entry === null || typeof entry !== 'object') {
+      throw invalidInput(`returned_ids[${index}] must be an object`);
+    }
+    return {
+      scope: requireScopeId(entry.scope, `returned_ids[${index}].scope`),
+      id: requireUuid(entry.id, `returned_ids[${index}].id`),
+      revision_id: requireUuid(entry.revision_id, `returned_ids[${index}].revision_id`)
+    };
+  });
+  if (!(RECALL_MODES as readonly string[]).includes(input.mode)) {
+    throw invalidInput(`unknown retrieval mode ${String(input.mode)}`);
+  }
+  if (!(RETRIEVAL_OUTCOMES_V2 as readonly string[]).includes(input.outcome)) {
+    throw invalidInput(`unknown retrieval outcome ${String(input.outcome)}`);
+  }
+  if (typeof input.partial !== 'boolean') throw invalidInput('partial must be a boolean');
+  const item_count = requireFiniteCount(input.item_count, 'item_count');
+  if (item_count !== returned_ids.length) {
+    throw invalidInput('item_count must match the number of returned ids');
+  }
+  const token_used = requireFiniteCount(input.token_used, 'token_used');
+  const token_limit = requireFiniteCount(input.token_limit, 'token_limit');
+  if (token_limit <= 0 || token_used > token_limit) {
+    throw invalidInput('token accounting must satisfy 0 <= token_used <= token_limit');
+  }
+  const duration_ms = requireFiniteCount(input.duration_ms, 'duration_ms');
+  const created_at =
+    input.created_at === undefined
+      ? defaultTimestamp
+      : requireTimestamp(input.created_at, 'created_at');
+  return {
+    retrieval_id,
+    actor_id,
+    filter,
+    searched_project_ids,
+    primary_project_id,
+    returned_ids,
+    item_count,
+    token_used,
+    token_limit,
+    mode: input.mode,
+    outcome: input.outcome,
+    partial: input.partial,
+    duration_ms,
+    created_at
   };
 }
 
@@ -534,6 +742,67 @@ function requireUuid(value: unknown, field: string): string {
   return value;
 }
 
+function requireActorId(value: unknown, field: string): string {
+  if (value === SYSTEM_ACTOR.id) return value;
+  if (typeof value !== 'string' || !uuidSchema.safeParse(value).success) {
+    throw invalidInput(`${field} must be a legacy UUID or the system actor`);
+  }
+  return value;
+}
+
+function canonicalJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((entry) => canonicalJsonValue(entry));
+  if (typeof value === 'object' && value !== null) {
+    const source = value as Record<string, unknown>;
+    const ordered: Record<string, unknown> = {};
+    for (const key of Object.keys(source).sort()) ordered[key] = canonicalJsonValue(source[key]);
+    return ordered;
+  }
+  return value;
+}
+
+function canonicalJson(raw: string): string {
+  return JSON.stringify(canonicalJsonValue(JSON.parse(raw)));
+}
+
+function feedbackSemanticHash(input: FeedbackWrite): string {
+  return createHash('sha256')
+    .update(
+      JSON.stringify({
+        scope: input.scope,
+        logical_id: input.logical_id,
+        revision_id: input.revision_id,
+        retrieval_id: input.retrieval_id ?? null,
+        related_id: input.related_id ?? null,
+        verdict: input.verdict,
+        reason: input.reason,
+        warning: input.warning ?? null
+      }),
+      'utf8'
+    )
+    .digest('hex');
+}
+
+function legacyFeedbackHash(input: FeedbackWrite, principalId: string): string {
+  return createHash('sha256')
+    .update(
+      JSON.stringify({
+        principal_id: principalId,
+        idempotency_key: input.idempotency_key,
+        scope: input.scope,
+        logical_id: input.logical_id,
+        revision_id: input.revision_id,
+        retrieval_id: input.retrieval_id ?? null,
+        related_id: input.related_id ?? null,
+        verdict: input.verdict,
+        reason: input.reason,
+        warning: input.warning ?? null
+      }),
+      'utf8'
+    )
+    .digest('hex');
+}
+
 function requireScopeId(value: unknown, field: string): string {
   if (typeof value !== 'string' || !SCOPE_ID_PATTERN.test(value)) {
     throw invalidInput(`${field} must match the scope identifier pattern`);
@@ -553,7 +822,7 @@ function normalizeRetrieval(input: RetrievalEventInput, defaultTimestamp: string
     throw invalidInput('retrieval metadata must be an object');
   }
   const retrieval_id = requireUuid(input.retrieval_id, 'retrieval_id');
-  const principal_id = requireUuid(input.principal_id, 'principal_id');
+  const principal_id = requireActorId(input.principal_id, 'principal_id');
   const scope = requireScopeId(input.scope, 'scope');
   if (!Array.isArray(input.scope_ids) || input.scope_ids.length === 0) {
     throw invalidInput('scope_ids must be a non-empty array');
@@ -639,7 +908,7 @@ function normalizeFeedback(input: FeedbackWrite): NormalizedFeedback {
   if (input === null || typeof input !== 'object') {
     throw invalidInput('feedback metadata must be an object');
   }
-  const principal_id = requireUuid(input.principal_id, 'principal_id');
+  const principal_id = requireActorId(input.principal_id, 'principal_id');
   const idempotency_key = requireUuid(input.idempotency_key, 'idempotency_key');
   const scope = requireScopeId(input.scope, 'scope');
   const logical_id = requireUuid(input.logical_id, 'logical_id');
@@ -668,21 +937,18 @@ function normalizeFeedback(input: FeedbackWrite): NormalizedFeedback {
     }
     warning = input.warning;
   }
-  const payload = {
+  const payload_hash = feedbackSemanticHash({
     principal_id,
     idempotency_key,
     scope,
     logical_id,
     revision_id,
-    retrieval_id,
-    related_id,
+    ...(retrieval_id === null ? {} : { retrieval_id }),
+    ...(related_id === null ? {} : { related_id }),
     verdict: input.verdict,
     reason: input.reason,
-    warning
-  };
-  const payload_hash = createHash('sha256')
-    .update(JSON.stringify(payload), 'utf8')
-    .digest('hex');
+    ...(warning === null ? {} : { warning })
+  });
   return {
     principal_id,
     idempotency_key,
@@ -780,11 +1046,28 @@ export class Journal {
 
   reserve(input: OperationReservation): ReservationResult {
     this.assertOpen();
+    try {
+      return this.reserveTransaction(input);
+    } catch (error) {
+      if (
+        isBrainError(error) &&
+        (error.code === 'IDEMPOTENCY_CONFLICT' || error.code === 'RECOVERY_REQUIRED')
+      ) {
+        this.markKeyOutcome(
+          input.idempotency_key,
+          error.code === 'IDEMPOTENCY_CONFLICT' ? 'conflict' : 'recovery_required'
+        );
+      }
+      throw error;
+    }
+  }
+
+  private reserveTransaction(input: OperationReservation): ReservationResult {
     const run = this.database.transaction((value: OperationReservation): ReservationResult => {
-      const existing = this.selectByKey(value.principal_id, value.idempotency_key);
-      if (existing !== undefined) return this.reconcile(value, existing);
-      const operation_id = this.ids.next();
+      const key = this.getIdempotencyKey(value.idempotency_key);
+      if (key !== undefined) return this.reserveAgainstKey(value, key);
       const timestamp = this.timestamp();
+      const operation_id = this.ids.next();
       this.database
         .prepare(
           `INSERT INTO operations (
@@ -809,31 +1092,297 @@ export class Journal {
       if (stored === undefined) {
         throw recoveryRequired(`operation ${operation_id} was not persisted`);
       }
+      this.writeKeyBinding(value.idempotency_key, 'new', 'bound', {
+        tool: value.tool,
+        project_id: value.scope,
+        payload_hash: value.payload_hash,
+        target_kind: 'operation',
+        target_id: stored.operation_id
+      });
       this.clearOperationalLossAcknowledgement();
       if (stored.operation_id === operation_id) return { kind: 'new', record: stored };
-      return this.reconcile(value, stored);
+      return { kind: 'replay', record: stored };
     });
     return run.immediate(input);
   }
 
-  reserveProject(input: RepositoryProjectReservation): ProjectReservationResult {
+  private reserveAgainstKey(
+    input: OperationReservation,
+    initial: IdempotencyKeyRow
+  ): ReservationResult {
+    let key = initial;
+    if (key.resolution === 'unresolved') {
+      key = this.classifyLegacyKey(key);
+    }
+    if (key.resolution === 'conflict') {
+      throw new BrainError({
+        code: 'IDEMPOTENCY_CONFLICT',
+        message: `idempotency key ${input.idempotency_key} was used for a different request`
+      });
+    }
+    if (key.resolution === 'recovery_required') {
+      throw recoveryRequired(
+        `idempotency key ${input.idempotency_key} has unverifiable historical records`
+      );
+    }
+    if (key.resolution === 'released') {
+      if (!this.matchesKeyFingerprint(key, input.tool, input.scope, input.payload_hash)) {
+        this.setKeyResolution(input.idempotency_key, 'conflict');
+        throw new BrainError({
+          code: 'IDEMPOTENCY_CONFLICT',
+          message: `idempotency key ${input.idempotency_key} was released for a different request`
+        });
+      }
+      const timestamp = this.timestamp();
+      const operation_id = this.ids.next();
+      this.database
+        .prepare(
+          `INSERT INTO operations (
+            operation_id, principal_id, idempotency_key, tool, scope, payload_hash,
+            payload_json, state, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          operation_id,
+          input.principal_id,
+          input.idempotency_key,
+          input.tool,
+          input.scope,
+          input.payload_hash,
+          input.payload_json,
+          'prepared',
+          timestamp,
+          timestamp
+        );
+      const stored = this.selectByKey(input.principal_id, input.idempotency_key);
+      if (stored === undefined) throw recoveryRequired(`operation ${operation_id} was not persisted`);
+      this.database
+        .prepare(
+          `UPDATE brain_idempotency_keys
+           SET resolution = 'bound', target_kind = 'operation', target_id = ?
+           WHERE idempotency_key = ?`
+        )
+        .run(stored.operation_id, input.idempotency_key);
+      this.clearOperationalLossAcknowledgement();
+      return { kind: 'new', record: stored };
+    }
+    if (key.target_kind !== 'operation') {
+      this.setKeyResolution(input.idempotency_key, 'conflict');
+      throw new BrainError({
+        code: 'IDEMPOTENCY_CONFLICT',
+        message: `idempotency key ${input.idempotency_key} was used for a different tool`
+      });
+    }
+    if (!this.matchesKeyFingerprint(key, input.tool, input.scope, input.payload_hash)) {
+      this.setKeyResolution(input.idempotency_key, 'conflict');
+      throw new BrainError({
+        code: 'IDEMPOTENCY_CONFLICT',
+        message: `idempotency key ${input.idempotency_key} was used for a different request`,
+        ...(key.target_id === null ? {} : { operation_id: key.target_id })
+      });
+    }
+    const targetId = key.target_id;
+    if (targetId === null) {
+      this.setKeyResolution(input.idempotency_key, 'recovery_required');
+      throw recoveryRequired(
+        `idempotency key ${input.idempotency_key} has no operation target`
+      );
+    }
+    const record = this.get(targetId);
+    if (record === undefined) {
+      this.setKeyResolution(input.idempotency_key, 'recovery_required');
+      throw recoveryRequired(
+        `idempotency key ${input.idempotency_key} points at a missing operation`
+      );
+    }
+    return { kind: 'replay', record };
+  }
+
+  private classifyLegacyKey(key: IdempotencyKeyRow): IdempotencyKeyRow {
+    const members = this.listLegacyMembers(key.idempotency_key);
+    if (members.length === 0) {
+      this.setKeyResolution(key.idempotency_key, 'recovery_required');
+      throw recoveryRequired(
+        `idempotency key ${key.idempotency_key} has no historical members`
+      );
+    }
+    if (members.length > 1) {
+      this.setKeyResolution(key.idempotency_key, 'conflict');
+      throw new BrainError({
+        code: 'IDEMPOTENCY_CONFLICT',
+        message: `idempotency key ${key.idempotency_key} was reused with conflicting legacy records`
+      });
+    }
+    const member = members[0];
+    if (member.record_kind === 'operation') {
+      const row = this.get(member.record_id);
+      if (row === undefined) {
+        this.setKeyResolution(key.idempotency_key, 'recovery_required');
+        throw recoveryRequired(
+          `idempotency key ${key.idempotency_key} references a missing operation`
+        );
+      }
+      const receipt =
+        row.receipt_json === undefined || row.receipt_json === null ? null : row.receipt_json;
+      if (TERMINAL_STATES.includes(row.state) && (receipt === null || receipt === '')) {
+        this.setKeyResolution(key.idempotency_key, 'recovery_required');
+        throw recoveryRequired(
+          `idempotency key ${key.idempotency_key} has a terminal operation without a receipt`
+        );
+      }
+      if (receipt !== null && receipt !== '') {
+        try {
+          JSON.parse(receipt);
+        } catch (cause) {
+          this.setKeyResolution(key.idempotency_key, 'recovery_required');
+          throw recoveryRequired(
+            `idempotency key ${key.idempotency_key} has an unreadable receipt`,
+            cause
+          );
+        }
+      }
+      this.database
+        .prepare(
+          `UPDATE brain_idempotency_keys
+           SET resolution = 'bound', tool = ?, project_id = ?, payload_hash = ?,
+               target_kind = 'operation', target_id = ?
+           WHERE idempotency_key = ?`
+        )
+        .run(row.tool, row.scope, row.payload_hash, row.operation_id, key.idempotency_key);
+    } else {
+      const row = this.selectFeedbackRowById(member.record_id);
+      if (row === undefined) {
+        this.setKeyResolution(key.idempotency_key, 'recovery_required');
+        throw recoveryRequired(
+          `idempotency key ${key.idempotency_key} references a missing feedback record`
+        );
+      }
+      this.database
+        .prepare(
+          `UPDATE brain_idempotency_keys
+           SET resolution = 'bound', tool = ?, project_id = ?, payload_hash = ?,
+               target_kind = 'feedback', target_id = ?
+           WHERE idempotency_key = ?`
+        )
+        .run('brain_feedback', row.scope, row.payload_hash, row.feedback_id, key.idempotency_key);
+    }
+    const updated = this.getIdempotencyKey(key.idempotency_key);
+    if (updated === undefined) {
+      throw recoveryRequired(`idempotency key ${key.idempotency_key} disappeared while binding`);
+    }
+    return updated;
+  }
+
+  private matchesKeyFingerprint(
+    key: IdempotencyKeyRow,
+    tool: string,
+    projectId: string,
+    payloadHash: string
+  ): boolean {
+    return (
+      key.tool === tool && key.project_id === projectId && key.payload_hash === payloadHash
+    );
+  }
+
+  private writeKeyBinding(
+    idempotencyKey: string,
+    origin: 'legacy' | 'new',
+    resolution: 'unresolved' | 'bound' | 'conflict' | 'recovery_required' | 'released',
+    fields: {
+      tool: string | null;
+      project_id: string | null;
+      payload_hash: string | null;
+      target_kind: string | null;
+      target_id: string | null;
+    }
+  ): void {
+    this.database
+      .prepare(
+        `INSERT INTO brain_idempotency_keys (
+          idempotency_key, origin, resolution, tool, project_id, payload_hash, target_kind, target_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(idempotency_key) DO UPDATE SET
+          origin = excluded.origin,
+          resolution = excluded.resolution,
+          tool = excluded.tool,
+          project_id = excluded.project_id,
+          payload_hash = excluded.payload_hash,
+          target_kind = excluded.target_kind,
+          target_id = excluded.target_id`
+      )
+      .run(
+        idempotencyKey,
+        origin,
+        resolution,
+        fields.tool,
+        fields.project_id,
+        fields.payload_hash,
+        fields.target_kind,
+        fields.target_id
+      );
+  }
+
+  private setKeyResolution(
+    idempotencyKey: string,
+    resolution: 'unresolved' | 'bound' | 'conflict' | 'recovery_required' | 'released'
+  ): void {
+    this.database
+      .prepare('UPDATE brain_idempotency_keys SET resolution = ? WHERE idempotency_key = ?')
+      .run(resolution, idempotencyKey);
+  }
+
+  private markKeyOutcome(
+    idempotencyKey: string,
+    resolution: 'conflict' | 'recovery_required'
+  ): void {
+    try {
+      if (this.getIdempotencyKey(idempotencyKey) !== undefined) {
+        this.setKeyResolution(idempotencyKey, resolution);
+      }
+    } catch {
+      return;
+    }
+  }
+
+  private getIdempotencyKey(idempotency_key: string): IdempotencyKeyRow | undefined {
+    return this.database
+      .prepare('SELECT * FROM brain_idempotency_keys WHERE idempotency_key = ?')
+      .get(idempotency_key) as IdempotencyKeyRow | undefined;
+  }
+
+  private listLegacyMembers(idempotency_key: string): LegacyMemberRow[] {
+    return this.database
+      .prepare(
+        'SELECT * FROM legacy_idempotency_members WHERE idempotency_key = ? ORDER BY record_kind ASC, record_id ASC'
+      )
+      .all(idempotency_key) as LegacyMemberRow[];
+  }
+
+  reserveProject(input: ProjectReservation): ProjectReservationResult {
     this.assertOpen();
     const repositoryIdentity = requireProjectText(input.repository_identity, 'identity');
-    const scope = requireProjectText(input.scope, 'scope');
-    const principalId = requireProjectText(input.created_by_principal_id, 'creator');
+    const projectId = requireProjectText(input.project_id, 'project');
+    const actorId = requireProjectText(input.created_by_actor_id, 'creator');
     const operationId = requireProjectText(input.creation_operation_id, 'operation');
+    const displayName = requireProjectText(input.display_name ?? projectId, 'display name');
+    const relativeRoot = requireProjectText(
+      input.relative_root ?? `Projects/${projectId}`,
+      'relative root'
+    );
     if (
       repositoryIdentity.includes('://') ||
       (repositoryIdentity.split('/', 1)[0]?.includes('@') ?? true) ||
       containsCredentials(repositoryIdentity) ||
-      !SCOPE_ID_PATTERN.test(scope)
+      !SCOPE_ID_PATTERN.test(projectId)
     ) {
-      throw invalidInput('repository project reservation is not normalized');
+      throw invalidInput('project reservation is not normalized');
     }
-    const normalized: RepositoryProjectReservation = {
+    const normalized: ProjectReservation = {
       repository_identity: repositoryIdentity,
-      scope,
-      created_by_principal_id: principalId,
+      project_id: projectId,
+      display_name: displayName,
+      relative_root: relativeRoot,
+      created_by_actor_id: actorId,
       creation_operation_id: operationId
     };
     const run = this.database.transaction((): ProjectReservationResult => {
@@ -841,74 +1390,90 @@ export class Journal {
       if (byIdentity !== undefined) {
         return this.reconcileProjectReservation(normalized, byIdentity);
       }
-      const byScope = this.getProjectByScope(scope);
-      if (byScope !== undefined) {
-        throw conflict(`scope ${scope} is already bound to another repository`, operationId);
+      if (this.getProjectById(projectId) !== undefined) {
+        throw conflict(`project ${projectId} is already bound to another repository`, operationId);
       }
       const timestamp = this.timestamp();
       this.database
         .prepare(
-          `INSERT INTO repository_projects (
-            repository_identity, scope, backend_project, relative_root, state,
-            created_by_principal_id, creation_operation_id, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, 'provisioning', ?, ?, ?, ?)`
+          `INSERT INTO projects_v2 (
+            id, repository_identity, display_name, relative_root, legacy_scope,
+            state, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, NULL, 'provisioning', ?, ?)`
         )
-        .run(
-          repositoryIdentity,
-          scope,
-          scope,
-          `Projects/${scope}`,
-          principalId,
-          operationId,
-          timestamp,
-          timestamp
-        );
-      const project = this.getProjectByIdentity(repositoryIdentity);
-      if (project === undefined) throw recoveryRequired('repository project was not persisted');
+        .run(projectId, repositoryIdentity, displayName, relativeRoot, timestamp, timestamp);
+      this.database
+        .prepare(
+          `INSERT INTO project_provisioning (
+            project_id, created_by_actor_id, creation_operation_id, failure_stage, failure_code
+          ) VALUES (?, ?, ?, NULL, NULL)`
+        )
+        .run(projectId, actorId, operationId);
+      this.database
+        .prepare(
+          `INSERT INTO legacy_project_backend_bindings (
+            project_id, backend_project, backend_relative_root
+          ) VALUES (?, ?, ?)`
+        )
+        .run(projectId, projectId, relativeRoot);
+      const project = this.getProjectById(projectId);
+      if (project === undefined) throw recoveryRequired('project was not persisted');
       this.clearOperationalLossAcknowledgement();
       return { kind: 'new', project };
     });
     return run.immediate();
   }
 
-  getProjectByIdentity(repositoryIdentity: string): RepositoryProjectRecord | undefined {
+  getProjectById(idText: string): PersistedProject | undefined {
+    this.assertOpen();
+    return this.readProject('id', idText);
+  }
+
+  getProjectByIdentity(repositoryIdentity: string): PersistedProject | undefined {
+    this.assertOpen();
+    return this.readProject('repository_identity', repositoryIdentity);
+  }
+
+  getProjectByLegacyScope(legacyScope: string): PersistedProject | undefined {
+    this.assertOpen();
+    return this.readProject('legacy_scope', legacyScope);
+  }
+
+  getProjectBinding(projectId: string): LegacyProjectBackendBinding | undefined {
     this.assertOpen();
     const row = this.database
-      .prepare('SELECT * FROM repository_projects WHERE repository_identity = ?')
-      .get(repositoryIdentity) as RepositoryProjectRow | undefined;
-    return row === undefined ? undefined : toRepositoryProject(row);
+      .prepare('SELECT * FROM legacy_project_backend_bindings WHERE project_id = ?')
+      .get(projectId) as ProjectBindingRow | undefined;
+    return row === undefined ? undefined : toProjectBinding(row);
   }
 
-  getProjectByScope(scope: string): RepositoryProjectRecord | undefined {
-    this.assertOpen();
-    const row = this.database
-      .prepare('SELECT * FROM repository_projects WHERE scope = ?')
-      .get(scope) as RepositoryProjectRow | undefined;
-    return row === undefined ? undefined : toRepositoryProject(row);
-  }
-
-  listReadyProjects(): RepositoryProjectRecord[] {
+  listProjectBindings(): { project_id: string; binding: LegacyProjectBackendBinding }[] {
     this.assertOpen();
     const rows = this.database
-      .prepare(
-        `SELECT * FROM repository_projects
-         WHERE state = 'ready' ORDER BY created_at ASC, repository_identity ASC`
-      )
-      .all() as RepositoryProjectRow[];
-    return rows.map(toRepositoryProject);
+      .prepare('SELECT * FROM legacy_project_backend_bindings ORDER BY project_id ASC')
+      .all() as ProjectBindingRow[];
+    return rows.map((row) => ({ project_id: row.project_id, binding: toProjectBinding(row) }));
   }
 
-  listProjects(): RepositoryProjectRecord[] {
+  listReadyProjects(): PersistedProject[] {
     this.assertOpen();
     const rows = this.database
-      .prepare('SELECT * FROM repository_projects ORDER BY created_at ASC, repository_identity ASC')
-      .all() as RepositoryProjectRow[];
-    return rows.map(toRepositoryProject);
+      .prepare(`SELECT * FROM projects_v2 WHERE state = 'ready' ORDER BY created_at ASC, id ASC`)
+      .all() as ProjectRow[];
+    return rows.map((row) => this.projectFromRow(row));
+  }
+
+  listProjects(): PersistedProject[] {
+    this.assertOpen();
+    const rows = this.database
+      .prepare('SELECT * FROM projects_v2 ORDER BY created_at ASC, id ASC')
+      .all() as ProjectRow[];
+    return rows.map((row) => this.projectFromRow(row));
   }
 
   countProjects(): number {
     this.assertOpen();
-    const row = this.database.prepare('SELECT COUNT(*) AS count FROM repository_projects').get() as {
+    const row = this.database.prepare('SELECT COUNT(*) AS count FROM projects_v2').get() as {
       count: number;
     };
     return row.count;
@@ -918,99 +1483,46 @@ export class Journal {
     this.savePlanJson(id, plan, false);
   }
 
-  markProjectReady(repositoryIdentity: string): RepositoryProjectRecord {
+  markProjectReady(identifier: string): PersistedProject {
     this.assertOpen();
-    const run = this.database.transaction((): RepositoryProjectRecord => {
-      const project = this.requireProject(repositoryIdentity);
+    const run = this.database.transaction((): PersistedProject => {
+      const project = this.requireProject(identifier);
       if (project.state === 'ready') return project;
-      const timestamp = this.timestamp();
+      this.database
+        .prepare(`UPDATE projects_v2 SET state = 'ready', updated_at = ? WHERE id = ?`)
+        .run(this.timestamp(), project.project.id);
       this.database
         .prepare(
-          `UPDATE repository_projects
-           SET state = 'ready', failure_stage = NULL, failure_code = NULL, updated_at = ?
-           WHERE repository_identity = ?`
+          'UPDATE project_provisioning SET failure_stage = NULL, failure_code = NULL WHERE project_id = ?'
         )
-        .run(timestamp, repositoryIdentity);
-      return this.requireProject(repositoryIdentity);
+        .run(project.project.id);
+      return this.requireProject(project.project.id);
     });
     return run.immediate();
   }
 
   markProjectRecoveryRequired(
-    repositoryIdentity: string,
+    identifier: string,
     failureStage: string,
     failureCode: string
-  ): RepositoryProjectRecord {
+  ): PersistedProject {
     this.assertOpen();
     if (!FAILURE_STAGE_PATTERN.test(failureStage) || !FAILURE_CODE_PATTERN.test(failureCode)) {
       throw invalidInput('project recovery diagnostics must use sanitized codes');
     }
-    const run = this.database.transaction((): RepositoryProjectRecord => {
-      const project = this.requireProject(repositoryIdentity);
+    const run = this.database.transaction((): PersistedProject => {
+      const project = this.requireProject(identifier);
+      this.database
+        .prepare(`UPDATE projects_v2 SET state = 'recovery_required', updated_at = ? WHERE id = ?`)
+        .run(this.timestamp(), project.project.id);
       this.database
         .prepare(
-          `UPDATE repository_projects
-           SET state = 'recovery_required', failure_stage = ?, failure_code = ?, updated_at = ?
-           WHERE repository_identity = ?`
+          'UPDATE project_provisioning SET failure_stage = ?, failure_code = ? WHERE project_id = ?'
         )
-        .run(failureStage, failureCode, this.timestamp(), repositoryIdentity);
-      return this.requireProject(repositoryIdentity);
+        .run(failureStage, failureCode, project.project.id);
+      return this.requireProject(project.project.id);
     });
     return run.immediate();
-  }
-
-  grantProject(grant: DynamicProjectGrant): DynamicProjectGrant {
-    this.assertOpen();
-    if (grant.can_read !== true) throw invalidInput('dynamic project grants require read access');
-    const principalId = requireProjectText(grant.principal_id, 'grant principal');
-    const scope = requireProjectText(grant.scope, 'grant scope');
-    const run = this.database.transaction((): DynamicProjectGrant => {
-      if (this.getProjectByScope(scope) === undefined) {
-        throw invalidInput(`dynamic project scope ${scope} does not exist`);
-      }
-      const timestamp = this.timestamp();
-      this.database
-        .prepare(
-          `INSERT INTO dynamic_project_grants (
-            principal_id, scope, can_read, can_write, can_review, created_at, updated_at
-          ) VALUES (?, ?, 1, ?, ?, ?, ?)
-          ON CONFLICT(principal_id, scope) DO UPDATE SET
-            can_read = 1,
-            can_write = excluded.can_write,
-            can_review = excluded.can_review,
-            updated_at = excluded.updated_at`
-        )
-        .run(
-          principalId,
-          scope,
-          grant.can_write ? 1 : 0,
-          grant.can_review ? 1 : 0,
-          timestamp,
-          timestamp
-        );
-      const row = this.database
-        .prepare('SELECT * FROM dynamic_project_grants WHERE principal_id = ? AND scope = ?')
-        .get(principalId, scope) as DynamicProjectGrantRow | undefined;
-      if (row === undefined) throw recoveryRequired('dynamic project grant was not persisted');
-      this.clearOperationalLossAcknowledgement();
-      return toDynamicProjectGrant(row);
-    });
-    return run.immediate();
-  }
-
-  listProjectGrants(principalId?: string): DynamicProjectGrant[] {
-    this.assertOpen();
-    const rows =
-      principalId === undefined
-        ? (this.database
-            .prepare('SELECT * FROM dynamic_project_grants ORDER BY principal_id ASC, scope ASC')
-            .all() as DynamicProjectGrantRow[])
-        : (this.database
-            .prepare(
-              'SELECT * FROM dynamic_project_grants WHERE principal_id = ? ORDER BY scope ASC'
-            )
-            .all(principalId) as DynamicProjectGrantRow[]);
-    return rows.map(toDynamicProjectGrant);
   }
 
   savePlan(id: string, plan: PlannedWrite): void {
@@ -1209,6 +1721,30 @@ export class Journal {
       if (current !== 'prepared' || row.plan_json !== null || row.receipt_json !== null) {
         throw conflict(`operation ${id} is not an abortable prepared reservation`, id);
       }
+      const key = this.getIdempotencyKey(row.idempotency_key);
+      if (key !== undefined && key.origin === 'legacy') {
+        this.database
+          .prepare('UPDATE operations SET state = ?, updated_at = ? WHERE operation_id = ?')
+          .run('failed', this.timestamp(), id);
+        this.database
+          .prepare(
+            `UPDATE brain_idempotency_keys
+             SET resolution = 'bound', tool = ?, project_id = ?, payload_hash = ?,
+                 target_kind = 'operation', target_id = ?
+             WHERE idempotency_key = ?`
+          )
+          .run(row.tool, row.scope, row.payload_hash, id, row.idempotency_key);
+        return;
+      }
+      if (key !== undefined) {
+        this.database
+          .prepare(
+            `UPDATE brain_idempotency_keys
+             SET resolution = 'released', target_kind = NULL, target_id = NULL
+             WHERE idempotency_key = ?`
+          )
+          .run(row.idempotency_key);
+      }
       this.database.prepare('DELETE FROM operations WHERE operation_id = ?').run(id);
     });
     run.immediate();
@@ -1238,8 +1774,9 @@ export class Journal {
         .prepare(
           `INSERT INTO retrieval_events (
             retrieval_id, principal_id, scope, scope_ids_json, returned_ids_json,
-            item_count, token_used, token_limit, mode, outcome, partial, duration_ms, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            item_count, token_used, token_limit, mode, outcome, partial, duration_ms,
+            filter_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           record.retrieval_id,
@@ -1254,6 +1791,7 @@ export class Journal {
           record.outcome,
           record.partial ? 1 : 0,
           record.duration_ms,
+          JSON.stringify({ mode: 'project', identifier: record.scope }),
           record.created_at
         );
       return record;
@@ -1264,6 +1802,49 @@ export class Journal {
   getRetrieval(retrieval_id: string): RetrievalEvent | undefined {
     this.assertOpen();
     return this.selectRetrieval(retrieval_id);
+  }
+
+  recordRetrievalV2(input: RetrievalEventInputV2): RetrievalEventV2 {
+    this.assertOpen();
+    const record = normalizeRetrievalV2(input, this.timestamp());
+    const run = this.database.transaction((): RetrievalEventV2 => {
+      const existing = this.getRetrievalV2(record.retrieval_id);
+      if (existing !== undefined) return existing;
+      this.database
+        .prepare(
+          `INSERT INTO retrieval_events (
+            retrieval_id, principal_id, scope, scope_ids_json, returned_ids_json,
+            item_count, token_used, token_limit, mode, outcome, partial, duration_ms,
+            filter_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          record.retrieval_id,
+          record.actor_id,
+          record.primary_project_id,
+          JSON.stringify(record.searched_project_ids),
+          JSON.stringify(record.returned_ids),
+          record.item_count,
+          record.token_used,
+          record.token_limit,
+          record.mode,
+          record.outcome,
+          record.partial ? 1 : 0,
+          record.duration_ms,
+          JSON.stringify(record.filter),
+          record.created_at
+        );
+      return record;
+    });
+    return run.immediate();
+  }
+
+  getRetrievalV2(retrieval_id: string): RetrievalEventV2 | undefined {
+    this.assertOpen();
+    const row = this.database
+      .prepare('SELECT * FROM retrieval_events WHERE retrieval_id = ?')
+      .get(retrieval_id) as RetrievalRow | undefined;
+    return row === undefined ? undefined : toRetrievalV2(row);
   }
 
   pruneRetrievalEvents(now: Date): number {
@@ -1278,66 +1859,140 @@ export class Journal {
   replayFeedback(input: FeedbackWrite): FeedbackWriteResult | undefined {
     this.assertOpen();
     const normalized = normalizeFeedback(input);
-    const existing = this.selectFeedbackRowByKey(normalized.principal_id, normalized.idempotency_key);
-    if (existing === undefined) return undefined;
-    if (!feedbackMatches(existing, normalized)) {
-      throw new BrainError({
-        code: 'IDEMPOTENCY_CONFLICT',
-        message: `idempotency key ${normalized.idempotency_key} was used for different feedback`
+    try {
+      const run = this.database.transaction((): FeedbackWriteResult | undefined => {
+        const key = this.getIdempotencyKey(normalized.idempotency_key);
+        if (key === undefined) return undefined;
+        return this.resolveFeedbackKey(input, normalized, key);
       });
+      return run.immediate();
+    } catch (error) {
+      this.markFeedbackFailure(normalized.idempotency_key, error);
+      throw error;
     }
-    return { kind: 'replay', entry: toFeedback(existing) };
   }
 
   recordFeedback(input: FeedbackWrite): FeedbackWriteResult {
     this.assertOpen();
     const normalized = normalizeFeedback(input);
-    const run = this.database.transaction((): FeedbackWriteResult => {
-      const existing = this.selectFeedbackRowByKey(
-        normalized.principal_id,
-        normalized.idempotency_key
-      );
-      if (existing !== undefined) {
-        if (!feedbackMatches(existing, normalized)) {
-          throw new BrainError({
-            code: 'IDEMPOTENCY_CONFLICT',
-            message: `idempotency key ${normalized.idempotency_key} was used for different feedback`
-          });
+    try {
+      const run = this.database.transaction((): FeedbackWriteResult => {
+        const key = this.getIdempotencyKey(normalized.idempotency_key);
+        if (key !== undefined) return this.resolveFeedbackKey(input, normalized, key);
+        const feedback_id = this.ids.next();
+        const created_at = this.timestamp();
+        this.database
+          .prepare(
+            `INSERT INTO feedback_records (
+              feedback_id, principal_id, idempotency_key, scope, logical_id, revision_id,
+              retrieval_id, related_id, verdict, reason, warning, payload_hash, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            feedback_id,
+            normalized.principal_id,
+            normalized.idempotency_key,
+            normalized.scope,
+            normalized.logical_id,
+            normalized.revision_id,
+            normalized.retrieval_id,
+            normalized.related_id,
+            normalized.verdict,
+            normalized.reason,
+            normalized.warning,
+            normalized.payload_hash,
+            created_at
+          );
+        const stored = this.selectFeedbackById(feedback_id);
+        if (stored === undefined) {
+          throw recoveryRequired(`feedback ${feedback_id} was not persisted`);
         }
-        return { kind: 'replay', entry: toFeedback(existing) };
+        this.writeKeyBinding(normalized.idempotency_key, 'new', 'bound', {
+          tool: 'brain_feedback',
+          project_id: normalized.scope,
+          payload_hash: normalized.payload_hash,
+          target_kind: 'feedback',
+          target_id: feedback_id
+        });
+        this.clearOperationalLossAcknowledgement();
+        return { kind: 'new', entry: stored };
+      });
+      return run.immediate();
+    } catch (error) {
+      this.markFeedbackFailure(normalized.idempotency_key, error);
+      throw error;
+    }
+  }
+
+  private markFeedbackFailure(idempotencyKey: string, error: unknown): void {
+    if (!isBrainError(error)) return;
+    if (error.code === 'IDEMPOTENCY_CONFLICT') this.markKeyOutcome(idempotencyKey, 'conflict');
+    else if (error.code === 'RECOVERY_REQUIRED') {
+      this.markKeyOutcome(idempotencyKey, 'recovery_required');
+    }
+  }
+
+  private resolveFeedbackKey(
+    raw: FeedbackWrite,
+    normalized: NormalizedFeedback,
+    initial: IdempotencyKeyRow
+  ): FeedbackWriteResult {
+    let key = initial;
+    if (key.resolution === 'unresolved') key = this.classifyLegacyKey(key);
+    if (key.resolution === 'conflict') {
+      throw new BrainError({
+        code: 'IDEMPOTENCY_CONFLICT',
+        message: `idempotency key ${normalized.idempotency_key} was used for different feedback`
+      });
+    }
+    if (key.resolution === 'recovery_required') {
+      throw recoveryRequired(
+        `idempotency key ${normalized.idempotency_key} has unverifiable historical records`
+      );
+    }
+    if (key.resolution === 'released' || key.target_kind !== 'feedback') {
+      this.setKeyResolution(normalized.idempotency_key, 'conflict');
+      throw new BrainError({
+        code: 'IDEMPOTENCY_CONFLICT',
+        message: `idempotency key ${normalized.idempotency_key} was used for a different tool`
+      });
+    }
+    if (key.project_id !== normalized.scope) {
+      this.setKeyResolution(normalized.idempotency_key, 'conflict');
+      throw new BrainError({
+        code: 'IDEMPOTENCY_CONFLICT',
+        message: `idempotency key ${normalized.idempotency_key} was used in a different project`
+      });
+    }
+    const row = key.target_id === null ? undefined : this.selectFeedbackRowById(key.target_id);
+    if (row === undefined) {
+      this.setKeyResolution(normalized.idempotency_key, 'recovery_required');
+      throw recoveryRequired(
+        `idempotency key ${normalized.idempotency_key} points at a missing feedback record`
+      );
+    }
+    if (key.payload_hash !== null) {
+      const expected =
+        key.origin === 'legacy'
+          ? legacyFeedbackHash(raw, row.principal_id)
+          : feedbackSemanticHash(raw);
+      if (expected !== key.payload_hash) {
+        this.setKeyResolution(normalized.idempotency_key, 'conflict');
+        throw new BrainError({
+          code: 'IDEMPOTENCY_CONFLICT',
+          message: `idempotency key ${normalized.idempotency_key} was used for different feedback`
+        });
       }
-      const feedback_id = this.ids.next();
-      const created_at = this.timestamp();
-      this.database
-        .prepare(
-          `INSERT INTO feedback_records (
-            feedback_id, principal_id, idempotency_key, scope, logical_id, revision_id,
-            retrieval_id, related_id, verdict, reason, warning, payload_hash, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        )
-        .run(
-          feedback_id,
-          normalized.principal_id,
-          normalized.idempotency_key,
-          normalized.scope,
-          normalized.logical_id,
-          normalized.revision_id,
-          normalized.retrieval_id,
-          normalized.related_id,
-          normalized.verdict,
-          normalized.reason,
-          normalized.warning,
-          normalized.payload_hash,
-          created_at
-        );
-      const stored = this.selectFeedbackById(feedback_id);
-      if (stored === undefined) {
-        throw recoveryRequired(`feedback ${feedback_id} was not persisted`);
-      }
-      this.clearOperationalLossAcknowledgement();
-      return { kind: 'new', entry: stored };
-    });
-    return run.immediate();
+      return { kind: 'replay', entry: toFeedback(row) };
+    }
+    if (!feedbackMatches(row, normalized)) {
+      this.setKeyResolution(normalized.idempotency_key, 'conflict');
+      throw new BrainError({
+        code: 'IDEMPOTENCY_CONFLICT',
+        message: `idempotency key ${normalized.idempotency_key} was used for different feedback`
+      });
+    }
+    return { kind: 'replay', entry: toFeedback(row) };
   }
 
   getFeedback(feedback_id: string): FeedbackEntry | undefined {
@@ -1425,41 +2080,50 @@ export class Journal {
     this.database.close();
   }
 
-  private reconcile(value: OperationReservation, existing: OperationRecord): ReservationResult {
-    if (
-      existing.payload_hash !== value.payload_hash ||
-      existing.scope !== value.scope
-    ) {
-      throw new BrainError({
-        code: 'IDEMPOTENCY_CONFLICT',
-        message: `idempotency key ${value.idempotency_key} was used for a different request`,
-        operation_id: existing.operation_id
-      });
-    }
-    return { kind: 'replay', record: existing };
-  }
-
   private reconcileProjectReservation(
-    value: RepositoryProjectReservation,
-    existing: RepositoryProjectRecord
+    value: ProjectReservation,
+    existing: PersistedProject
   ): ProjectReservationResult {
     if (
-      existing.scope !== value.scope ||
-      existing.created_by_principal_id !== value.created_by_principal_id ||
-      existing.creation_operation_id !== value.creation_operation_id
+      existing.project.id !== value.project_id ||
+      existing.project.repository_identity !== value.repository_identity ||
+      existing.provisioning.creation_operation_id !== value.creation_operation_id
     ) {
       throw conflict(
         'repository identity is already bound to a different project reservation',
-        existing.creation_operation_id
+        existing.provisioning.creation_operation_id
       );
     }
     return { kind: 'replay', project: existing };
   }
 
-  private requireProject(repositoryIdentity: string): RepositoryProjectRecord {
-    const project = this.getProjectByIdentity(repositoryIdentity);
+  private readProject(
+    column: 'id' | 'repository_identity' | 'legacy_scope',
+    value: string
+  ): PersistedProject | undefined {
+    const row = this.database
+      .prepare(`SELECT * FROM projects_v2 WHERE ${column} = ?`)
+      .get(value) as ProjectRow | undefined;
+    return row === undefined ? undefined : this.projectFromRow(row);
+  }
+
+  private projectFromRow(row: ProjectRow): PersistedProject {
+    const provisioning = this.database
+      .prepare('SELECT * FROM project_provisioning WHERE project_id = ?')
+      .get(row.id) as ProjectProvisioningRow | undefined;
+    if (provisioning === undefined) {
+      throw recoveryRequired(`project ${row.id} has no provisioning record`);
+    }
+    return toPersistedProject(row, provisioning);
+  }
+
+  private requireProject(identifier: string): PersistedProject {
+    const project =
+      this.getProjectById(identifier) ??
+      this.getProjectByIdentity(identifier) ??
+      this.getProjectByLegacyScope(identifier);
     if (project === undefined) {
-      throw invalidInput('repository project does not exist');
+      throw invalidInput('project does not exist');
     }
     return project;
   }

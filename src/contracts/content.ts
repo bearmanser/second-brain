@@ -9,6 +9,7 @@ import {
   TITLE_MAX_CODE_POINTS
 } from '../core/limits.js';
 import { EVIDENCE_KINDS } from '../core/types.js';
+import { isProjectIdentifier } from '../projects/registry.js';
 
 const text = z.string().trim().min(1).max(8000);
 const texts = z.array(text).max(32);
@@ -39,6 +40,14 @@ export const uuidSchema = z.uuid();
 export const scopeIdSchema = z.string().regex(SCOPE_ID_PATTERN, {
   message: 'scope id must match ^[a-z][a-z0-9-]{0,63}$'
 });
+
+export const projectIdentifierSchema = z
+  .string()
+  .min(1)
+  .max(256)
+  .refine((value) => isProjectIdentifier(value), {
+    message: 'project identifier is malformed'
+  });
 
 export const etagSchema = z.string().regex(ETAG_PATTERN, {
   message: 'etag must be a lowercase hexadecimal sha256 digest'

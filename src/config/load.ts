@@ -1,8 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { parse } from 'yaml';
 import { BrainError } from '../contracts/errors.js';
-import { brainConfigSchema, credentialsFileSchema, tokenDigestSchema } from './schema.js';
-import type { BrainConfig, CredentialRecord } from './schema.js';
+import { brainConfigSchema, tokenDigestSchema } from './schema.js';
+import type { BrainConfig } from './schema.js';
 
 export const BRAIN_TOKEN_ENV = 'BRAIN_TOKEN_SHA256';
 
@@ -38,21 +38,6 @@ export function loadConfig(path: string): BrainConfig {
     throw invalidConfig(`configuration is invalid${detail}`);
   }
   return parsed.data;
-}
-
-export function loadCredentials(path: string): CredentialRecord[] {
-  const text = readText(path, 'credentials file');
-  let document: unknown;
-  try {
-    document = JSON.parse(text);
-  } catch (error) {
-    throw invalidConfig('credentials file is not valid JSON', error);
-  }
-  const parsed = credentialsFileSchema.safeParse(document);
-  if (!parsed.success) {
-    throw invalidConfig('credentials file is invalid');
-  }
-  return parsed.data.credentials;
 }
 
 export function assertTokenDigest(value: unknown): string {

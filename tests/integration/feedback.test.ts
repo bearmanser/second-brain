@@ -2,7 +2,6 @@ import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { expect, test, vi } from 'vitest';
-import type { CredentialRecord } from '../../src/config/schema.js';
 import { BrainError } from '../../src/contracts/errors.js';
 import {
   feedback,
@@ -13,11 +12,10 @@ import {
 import { recall } from '../../src/features/recall.js';
 import { read } from '../../src/features/read.js';
 import { review } from '../../src/features/review.js';
-import { authenticate } from '../../src/security/authenticate.js';
 import { redactError } from '../../src/security/redact.js';
-import type { FeedbackRequest, RecallResult } from '../../src/core/types.js';
+import type { FeedbackRequest, RecallResult, RetrievalEventInputV2 } from '../../src/core/types.js';
 import { lessonFixture } from '../fixtures/content.js';
-import { reviewerContext, reviewerPrincipal, workerContext, workerPrincipal } from '../fixtures/principals.js';
+import { reviewerContext, workerContext } from '../fixtures/principals.js';
 import { createHarness, type MemoryHarness } from '../support/harness.js';
 
 const QUERY_MARKER = 'First-token latency looked worse';
@@ -53,13 +51,14 @@ function journalRows(h: MemoryHarness, table: string): Record<string, unknown>[]
 
 function recordRetrieval(
   h: MemoryHarness,
-  overrides: Partial<Parameters<MemoryHarness['deps']['journal']['recordRetrieval']>[0]> = {}
+  overrides: Partial<RetrievalEventInputV2> = {}
 ) {
-  return h.deps.journal.recordRetrieval({
+  return h.deps.journal.recordRetrievalV2({
     retrieval_id: uuid(),
-    principal_id: reviewerContext.principal.id,
-    scope: 'freellmapi',
-    scope_ids: ['freellmapi'],
+    actor_id: 'system',
+    filter: { mode: 'project', identifier: 'freellmapi' },
+    searched_project_ids: ['freellmapi'],
+    primary_project_id: 'freellmapi',
     returned_ids: [],
     item_count: 0,
     token_used: 0,
@@ -172,7 +171,7 @@ test('replays a pre-004 feedback row that has no payload digest', async () => {
       )
       .run(
         feedbackId,
-        reviewerContext.principal.id,
+        reviewerContext.actor.id,
         key,
         'freellmapi',
         head.source.id,
@@ -181,6 +180,18 @@ test('replays a pre-004 feedback row that has no payload digest', async () => {
         reason,
         '2026-09-01T00:00:00.000Z'
       );
+    database
+      .prepare(
+        `INSERT INTO brain_idempotency_keys (idempotency_key, origin, resolution)
+         VALUES (?, 'legacy', 'unresolved')`
+      )
+      .run(key);
+    database
+      .prepare(
+        `INSERT INTO legacy_idempotency_members (idempotency_key, record_kind, record_id)
+         VALUES (?, 'feedback', ?)`
+      )
+      .run(key, feedbackId);
   } finally {
     database.close();
   }
@@ -220,7 +231,7 @@ test('accepts a retrieval reference that belongs to the caller and returned the 
   const h = await createHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const retrieval = recordRetrieval(h, {
-    returned_ids: [{ id: head.source.id, revision_id: head.source.revision_id }],
+    returned_ids: [{ scope: 'freellmapi', id: head.source.id, revision_id: head.source.revision_id }],
     item_count: 1
   });
   const result = await feedback(
@@ -234,17 +245,19 @@ test('accepts a retrieval reference that belongs to the caller and returned the 
   await h.close();
 });
 
-test('rejects a retrieval reference that belongs to another caller', async () => {
+test('accepts a retrieval reference regardless of the recorded actor', async () => {
   const h = await createHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const retrieval = recordRetrieval(h, {
-    principal_id: workerPrincipal.id,
-    returned_ids: [{ id: head.source.id, revision_id: head.source.revision_id }],
+    returned_ids: [{ scope: 'freellmapi', id: head.source.id, revision_id: head.source.revision_id }],
     item_count: 1
   });
-  await expect(
-    feedback(reviewerContext, requestFor(head, { retrieval_id: retrieval.retrieval_id }), h.deps)
-  ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+  const result = await feedback(
+    reviewerContext,
+    requestFor(head, { retrieval_id: retrieval.retrieval_id }),
+    h.deps
+  );
+  expect(result.recorded).toBe(true);
   await h.close();
 });
 
@@ -252,7 +265,7 @@ test('rejects a retrieval reference that did not return the target revision', as
   const h = await createHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const retrieval = recordRetrieval(h, {
-    returned_ids: [{ id: head.source.id, revision_id: uuid() }],
+    returned_ids: [{ scope: 'freellmapi', id: head.source.id, revision_id: uuid() }],
     item_count: 1
   });
   await expect(
@@ -261,13 +274,14 @@ test('rejects a retrieval reference that did not return the target revision', as
   await h.close();
 });
 
-test('rejects a retrieval reference recorded for another scope', async () => {
+test('rejects a retrieval reference recorded for another project', async () => {
   const h = await createHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const retrieval = recordRetrieval(h, {
-    scope: 'shared',
-    scope_ids: ['shared'],
-    returned_ids: [{ id: head.source.id, revision_id: head.source.revision_id }],
+    filter: { mode: 'project', identifier: 'shared' },
+    searched_project_ids: ['shared'],
+    primary_project_id: 'shared',
+    returned_ids: [{ scope: 'shared', id: head.source.id, revision_id: head.source.revision_id }],
     item_count: 1
   });
   await expect(
@@ -298,7 +312,7 @@ test('replays an exact retry after its retrieval metadata has been pruned', asyn
   const h = await createHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const retrieval = recordRetrieval(h, {
-    returned_ids: [{ id: head.source.id, revision_id: head.source.revision_id }],
+    returned_ids: [{ scope: 'freellmapi', id: head.source.id, revision_id: head.source.revision_id }],
     item_count: 1,
     created_at: '2000-01-01T00:00:00.000Z'
   });
@@ -321,16 +335,19 @@ test('rejects a feedback request that names a stale revision', async () => {
   await h.close();
 });
 
-test('rejects a feedback request against a scope the caller may not read', async () => {
+test('records feedback against a note in another project', async () => {
   const h = await createHarness();
-  const head = await h.seed(lessonFixture, { status: 'active' });
-  await expect(
-    feedback(reviewerContext, requestFor(head, { scope: 'profile' }), h.deps)
-  ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+  const head = await h.seed(lessonFixture, { status: 'active', scope: 'profile' });
+  const result = await feedback(
+    reviewerContext,
+    { ...requestFor(head), scope: 'profile' },
+    h.deps
+  );
+  expect(result.recorded).toBe(true);
   await h.close();
 });
 
-test('authorizes every related note and rejects an inaccessible one', async () => {
+test('validates every related note and rejects an unknown one', async () => {
   const h = await createHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const related = await h.seed({ ...lessonFixture, title: 'Related lesson' }, { status: 'active' });
@@ -341,13 +358,20 @@ test('authorizes every related note and rejects an inaccessible one', async () =
   );
   expect(accepted.recorded).toBe(true);
 
-  const inaccessible = await h.seed(
-    { ...lessonFixture, title: 'Private profile lesson' },
+  const crossProject = await h.seed(
+    { ...lessonFixture, title: 'Cross-project lesson' },
     { scope: 'profile', status: 'active' }
   );
+  const crossAccepted = await feedback(
+    reviewerContext,
+    requestFor(head, { related_id: crossProject.source.id }),
+    h.deps
+  );
+  expect(crossAccepted.recorded).toBe(true);
+
   await expect(
-    feedback(reviewerContext, requestFor(head, { related_id: inaccessible.source.id }), h.deps)
-  ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    feedback(reviewerContext, requestFor(head, { related_id: uuid() }), h.deps)
+  ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
   await h.close();
 });
 
@@ -433,13 +457,19 @@ test('never persists the recall query in retrieval metadata', async () => {
     h.deps
   );
   expect(result.items.some((item) => item.id === head.source.id)).toBe(true);
-  const event = h.deps.journal.recordRetrieval(
-    retrievalEventFromRecall(reviewerContext, result, { scope: 'freellmapi', duration_ms: 2 })
+  const event = h.deps.journal.recordRetrievalV2(
+    retrievalEventFromRecall(reviewerContext, result, {
+      filter: { mode: 'project', identifier: 'freellmapi' },
+      searched_project_ids: ['freellmapi'],
+      primary_project_id: 'freellmapi',
+      duration_ms: 2
+    })
   );
   const rows = JSON.stringify(journalRows(h, 'retrieval_events'));
   expect(rows).not.toContain(QUERY_MARKER);
   expect(rows).not.toContain(NOTE_MARKER);
   expect(event.returned_ids).toContainEqual({
+    scope: 'freellmapi',
     id: head.source.id,
     revision_id: head.source.revision_id
   });
@@ -453,28 +483,17 @@ test('never persists the recall query in retrieval metadata', async () => {
   await h.close();
 });
 
-test('keeps feedback bound to the principal across token rotation without logging tokens', async () => {
+test('keeps feedback replay across token rotation without logging tokens', async () => {
   const h = await createHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
-  const digest = (token: string): string => createHash('sha256').update(token).digest('hex');
-  const credentials: CredentialRecord[] = [
-    { token_sha256: digest(ROTATED_TOKEN_ONE), principal: reviewerPrincipal },
-    { token_sha256: digest(ROTATED_TOKEN_TWO), principal: reviewerPrincipal }
-  ];
-  const before = authenticate(`Bearer ${ROTATED_TOKEN_ONE}`, credentials);
-  const after = authenticate(`Bearer ${ROTATED_TOKEN_TWO}`, credentials);
-  expect(after.id).toBe(before.id);
-  const rotatedContext = { ...reviewerContext, principal: after };
   const retrieval = recordRetrieval(h, {
-    returned_ids: [{ id: head.source.id, revision_id: head.source.revision_id }],
+    returned_ids: [{ scope: 'freellmapi', id: head.source.id, revision_id: head.source.revision_id }],
     item_count: 1
   });
-  const result = await feedback(
-    rotatedContext,
-    requestFor(head, { retrieval_id: retrieval.retrieval_id }),
-    h.deps
-  );
-  expect(result.recorded).toBe(true);
+  const request = requestFor(head, { retrieval_id: retrieval.retrieval_id });
+  const first = await feedback(reviewerContext, request, h.deps);
+  const second = await feedback(workerContext, request, h.deps);
+  expect(second.feedback_id).toBe(first.feedback_id);
   const audit = JSON.stringify([
     ...journalRows(h, 'audit_events'),
     ...journalRows(h, 'feedback_records')
@@ -535,7 +554,7 @@ test('prunes retrieval metadata after thirty days but keeps the feedback record'
   const head = await h.seed(lessonFixture, { status: 'active' });
   const retrieval = recordRetrieval(h, {
     retrieval_id: uuid(),
-    returned_ids: [{ id: head.source.id, revision_id: head.source.revision_id }],
+    returned_ids: [{ scope: 'freellmapi', id: head.source.id, revision_id: head.source.revision_id }],
     item_count: 1,
     created_at: '2000-01-01T00:00:00.000Z'
   });
@@ -590,12 +609,11 @@ test('prunes audit events after thirty days at the cutoff and keeps feedback unt
   await h.close();
 });
 
-test('rejects feedback against another caller retrieval even after it is pruned', async () => {
+test('rejects feedback against a pruned retrieval reference', async () => {
   const h = await createHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const retrieval = recordRetrieval(h, {
-    principal_id: workerPrincipal.id,
-    returned_ids: [{ id: head.source.id, revision_id: head.source.revision_id }],
+    returned_ids: [{ scope: 'freellmapi', id: head.source.id, revision_id: head.source.revision_id }],
     item_count: 1,
     created_at: '2000-01-01T00:00:00.000Z'
   });
@@ -615,13 +633,15 @@ test('records retrieval metadata through a real recall result', async () => {
     h.deps
   );
   const event = retrievalEventFromRecall(reviewerContext, result, {
-    scope: 'freellmapi',
+    filter: { mode: 'project', identifier: 'freellmapi' },
+    searched_project_ids: ['freellmapi'],
+    primary_project_id: 'freellmapi',
     duration_ms: 7
   });
   expect(event.retrieval_id).toBe(result.retrieval_id);
-  expect(event.principal_id).toBe(reviewerContext.principal.id);
+  expect(event.actor_id).toBe(reviewerContext.actor.id);
   expect(event.mode).toBe(result.mode);
-  const stored = h.deps.journal.recordRetrieval(event);
+  const stored = h.deps.journal.recordRetrievalV2(event);
   expect(stored.token_limit).toBe(result.budget.limit);
   await h.close();
 });

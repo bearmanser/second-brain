@@ -10,22 +10,25 @@ import {
 } from '../core/limits.js';
 import type { BrainDeps } from '../core/mutation.js';
 import type {
+  AuthenticatedContext,
   Head,
   ReadRequest,
   ReadResult,
-  RequestContext,
   ScopeConfig,
   SourceRef
 } from '../core/types.js';
-import { resolveScopes } from '../security/authorise.js';
+import { requiredProject } from '../projects/registry.js';
 import { countReferenceTokens } from '../retrieval/budget.js';
 import { modelVisibleRepresentation, toolResultByteLength } from '../mcp/tools.js';
 import {
-  finalizeStoredCursor,
-  reserveStoredCursor,
-  verifyCursor,
-  verifyStoredCursor,
-  type CursorPayload
+  finalizeStoredCursorV2,
+  reserveStoredCursorV2,
+  verifyCursorV2,
+  verifyLegacyCursor,
+  verifyStoredCursorV1,
+  verifyStoredCursorV2,
+  type CursorPayloadV1,
+  type CursorPayloadV2
 } from '../retrieval/cursor.js';
 
 export const READ_WARNING_HISTORICAL = 'historical';
@@ -100,6 +103,30 @@ function loadCursorSecret(deps: BrainDeps): Uint8Array {
   return new Uint8Array(bytes);
 }
 
+function toCursorV2(payload: CursorPayloadV1): CursorPayloadV2 {
+  return {
+    version: 2,
+    scope: payload.scope,
+    id: payload.id,
+    revision_id: payload.revision_id,
+    raw_hash: payload.raw_hash,
+    offset: payload.offset,
+    expires_at: payload.expires_at
+  };
+}
+
+function decodeCursor(
+  cursor: string,
+  secret: Uint8Array,
+  now: Date,
+  deps: BrainDeps
+): CursorPayloadV2 {
+  if (cursor.startsWith('r2.')) return verifyStoredCursorV2(cursor, secret, now, deps.journal);
+  if (cursor.startsWith('v2.')) return verifyCursorV2(cursor, secret, now);
+  if (cursor.startsWith('r1.')) return toCursorV2(verifyStoredCursorV1(cursor, secret, now, deps.journal));
+  return toCursorV2(verifyLegacyCursor(cursor, secret, now));
+}
+
 async function requireSelectedSource(
   scope: ScopeConfig,
   request: ReadRequest,
@@ -124,7 +151,7 @@ async function requireSelectedSource(
 async function loadHead(
   scope: ScopeConfig,
   request: ReadRequest,
-  cursor: CursorPayload | undefined,
+  cursor: CursorPayloadV2 | undefined,
   deps: BrainDeps
 ): Promise<Head> {
   const revisionId = cursor?.revision_id ?? request.revision_id;
@@ -199,22 +226,21 @@ export function paginate(
 }
 
 export async function read(
-  ctx: RequestContext,
+  ctx: AuthenticatedContext,
   input: ReadRequest,
   deps: BrainDeps
 ): Promise<ReadResult> {
   if (ctx.signal.aborted) throw cancelled();
-  const [scope] = resolveScopes(ctx.principal, input.scope, false, 'read', deps.scopeRegistry);
+  const scope = deps.scopeRegistry.require(requiredProject(input));
   const request = parseRequest(input);
   const now = deps.clock.now();
 
   if (ctx.signal.aborted) throw cancelled();
 
-  let cursor: CursorPayload | undefined;
+  let cursor: CursorPayloadV2 | undefined;
   if (request.cursor !== undefined) {
-    cursor = request.cursor.startsWith('r1.')
-      ? verifyStoredCursor(request.cursor, loadCursorSecret(deps), ctx, now, deps.journal)
-      : verifyCursor(request.cursor, loadCursorSecret(deps), ctx, now);
+    const secret = loadCursorSecret(deps);
+    cursor = decodeCursor(request.cursor, secret, now, deps);
     if (cursor.scope !== scope.id || cursor.id !== request.id) {
       throw invalidInput('read cursor does not belong to the requested note');
     }
@@ -273,8 +299,8 @@ export async function read(
     secret ??= loadCursorSecret(deps);
     return secret;
   };
-  const cursorPayload = (end: number): CursorPayload => ({
-    principal_id: ctx.principal.id,
+  const cursorPayload = (end: number): CursorPayloadV2 => ({
+    version: 2,
     scope: scope.id,
     id: head.revision.id,
     revision_id: head.revision.revision_id,
@@ -307,7 +333,7 @@ export async function read(
     Buffer.byteLength(result.markdown, 'utf8') <= RENDERED_NOTE_MAX_BYTES;
   const complete = candidate(remaining);
   if (fits(complete)) return complete;
-  const reservation = reserveStoredCursor(cursorPayload(offset), cursorSecret(), deps.journal);
+  const reservation = reserveStoredCursorV2(cursorPayload(offset), cursorSecret(), deps.journal);
   let finalized = false;
   try {
     let low = 0;
@@ -327,7 +353,7 @@ export async function read(
       throw limitExceeded('the read budget is too small for the source and pagination envelope');
     }
     const end = offset + best;
-    const nextCursor = finalizeStoredCursor(reservation, cursorPayload(end), deps.journal);
+    const nextCursor = finalizeStoredCursorV2(reservation, cursorPayload(end), deps.journal);
     finalized = true;
     return candidate(best, nextCursor);
   } finally {

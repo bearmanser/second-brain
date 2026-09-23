@@ -3,13 +3,11 @@ import type {
   BackendSearch,
   CaptureRequest,
   NoteContent,
-  NoteInput,
-  Principal,
-  RequestContext
+  NoteInput
 } from '../../src/core/types.js';
 import { capture } from '../../src/features/capture.js';
 import { fixtureIds, lessonFixture } from '../fixtures/content.js';
-import { ownerContext, reviewerContext, reviewerPrincipal, workerContext } from '../fixtures/principals.js';
+import { ownerContext, reviewerContext, workerContext } from '../fixtures/principals.js';
 import { createHarness } from '../support/harness.js';
 
 const key = (n: number): string => `00000000-0000-4000-8000-${n.toString(16).padStart(12, '0')}`;
@@ -88,7 +86,7 @@ test('does not promote a valid capture just because evidence was provided', asyn
 test('a pending project ensure does not block writes in an unrelated ready scope', async () => {
   const h = await createHarness();
   const operation = h.deps.journal.reserve({
-    principal_id: workerContext.principal.id,
+    principal_id: workerContext.actor.id,
     idempotency_key: key(900),
     tool: 'brain_project_ensure',
     scope: 'unrelated-project',
@@ -268,7 +266,7 @@ test('warns instead of assuming no duplicates when the similarity lookup fails',
   await h.close();
 });
 
-test('does not reject an authorized related note and rejects an unauthorized one', async () => {
+test('accepts readable cross-project related notes and rejects unknown references', async () => {
   const h = await createHarness();
   const own = await h.seed(lessonFixture, { scope: 'freellmapi', status: 'active' });
   const shared = await h.seed(lessonFixture, { scope: 'shared', status: 'active' });
@@ -277,7 +275,7 @@ test('does not reject an authorized related note and rejects an unauthorized one
   const allowed = await capture(reviewerContext, {
     idempotency_key: key(19),
     scope: 'freellmapi',
-    note: { ...lessonFixture, related_ids: [own.source.id, shared.source.id] }
+    note: { ...lessonFixture, related_ids: [own.source.id, shared.source.id, privateNote.source.id] }
   }, h.deps);
   expect(allowed.outcome).toBe('stored');
 
@@ -285,17 +283,9 @@ test('does not reject an authorized related note and rejects an unauthorized one
     capture(reviewerContext, {
       idempotency_key: key(20),
       scope: 'freellmapi',
-      note: { ...lessonFixture, related_ids: [privateNote.source.id] }
-    }, h.deps)
-  ).rejects.toThrow(/FORBIDDEN/);
-
-  await expect(
-    capture(reviewerContext, {
-      idempotency_key: key(21),
-      scope: 'freellmapi',
       note: { ...lessonFixture, related_ids: [fixtureIds.replacement] }
     }, h.deps)
-  ).rejects.toThrow(/FORBIDDEN/);
+  ).rejects.toThrow(/INVALID_INPUT/);
 
   expect(h.backend.create_calls).toHaveLength(1);
   await h.close();
@@ -416,15 +406,26 @@ test('rejects agent-supplied server-owned fields', async () => {
   await h.close();
 });
 
-test('authorizes the write scope before any backend write', async () => {
+test('resolves the destination project before any backend write', async () => {
   const h = await createHarness();
-  await expect(
-    capture(workerContext, { idempotency_key: key(30), scope: 'profile', note: lessonFixture }, h.deps)
-  ).rejects.toThrow(/FORBIDDEN/);
+  const receipt = await capture(
+    workerContext,
+    { idempotency_key: key(30), scope: 'profile', note: lessonFixture },
+    h.deps
+  );
+  expect(receipt.outcome).toBe('stored');
   await expect(
     capture(reviewerContext, { idempotency_key: key(31), scope: 'unknown-scope', note: lessonFixture }, h.deps)
-  ).rejects.toThrow(/FORBIDDEN/);
-  expect(h.backend.create_calls).toHaveLength(0);
+  ).rejects.toThrow(/NOT_FOUND/);
+  await expect(
+    capture(reviewerContext, {
+      idempotency_key: key(33),
+      project: 'freellmapi',
+      scope: 'shared',
+      note: lessonFixture
+    }, h.deps)
+  ).rejects.toThrow(/INVALID_INPUT/);
+  expect(h.backend.create_calls).toHaveLength(1);
   await h.close();
 });
 
@@ -530,51 +531,28 @@ test('marks the duplicate lookup unavailable when a search hit cannot be resolve
   await h.close();
 });
 
-test('does not let a write-only principal probe related ids or duplicate details', async () => {
+test('finds durable duplicate details and resolves related ids for the single token', async () => {
   const h = await createHarness();
   const seeded = await h.seed(lessonFixture, { scope: 'freellmapi', status: 'active' });
-  const writeOnlyPrincipal: Principal = {
-    id: '00000000-0000-4000-8000-0000000000ff',
-    role: 'worker',
-    read_scopes: [],
-    write_scopes: ['freellmapi'],
-    review_scopes: []
-  };
-  const writeOnlyContext: RequestContext = {
-    principal: writeOnlyPrincipal,
-    request_id: key(0xfe),
-    signal: new AbortController().signal
-  };
 
-  let searchCalls = 0;
-  const original = h.backend.search.bind(h.backend);
-  h.backend.search = async (input: BackendSearch) => {
-    searchCalls += 1;
-    return original(input);
-  };
-
-  const receipt = await capture(writeOnlyContext, {
+  const receipt = await capture(reviewerContext, {
     idempotency_key: key(45),
     scope: 'freellmapi',
-    note: { ...lessonFixture, title: 'Write-only capture' }
+    note: lessonFixture
   }, h.deps);
   expect(receipt.outcome).toBe('stored');
-  expect(receipt.possible_duplicates).toEqual([]);
-  expect(receipt.warnings).toContain('duplicate_check_unavailable');
-  expect(searchCalls).toBe(0);
+  expect(receipt.possible_duplicates.map((entry) => entry.id)).toContain(seeded.source.id);
 
-  await expect(
-    capture(writeOnlyContext, {
-      idempotency_key: key(46),
-      scope: 'freellmapi',
-      note: { ...lessonFixture, related_ids: [seeded.source.id] }
-    }, h.deps)
-  ).rejects.toThrow(/FORBIDDEN/);
-  expect(h.backend.create_calls).toHaveLength(1);
+  const related = await capture(reviewerContext, {
+    idempotency_key: key(46),
+    scope: 'freellmapi',
+    note: { ...lessonFixture, content: lessonContent({ lesson: 'A related claim resolved across projects.' }), related_ids: [seeded.source.id] }
+  }, h.deps);
+  expect(related.outcome).toBe('stored');
   await h.close();
 });
 
-test('withholds persisted duplicate details after read access is revoked', async () => {
+test('replay retains durable duplicate details for the single token', async () => {
   const h = await createHarness();
   const first = await capture(reviewerContext, {
     idempotency_key: key(50),
@@ -590,22 +568,12 @@ test('withholds persisted duplicate details after read access is revoked', async
   const second = await capture(reviewerContext, secondRequest, h.deps);
   expect(second.possible_duplicates.map((entry) => entry.id)).toContain(first.id);
 
-  const revokedPrincipal: Principal = { ...reviewerPrincipal, read_scopes: ['shared'] };
-  const revokedContext: RequestContext = {
-    principal: revokedPrincipal,
-    request_id: key(0xfd),
-    signal: new AbortController().signal
-  };
-  const replay = await capture(revokedContext, secondRequest, h.deps);
-
+  const replay = await capture(reviewerContext, secondRequest, h.deps);
   expect(replay.operation_id).toBe(second.operation_id);
   expect(replay.id).toBe(second.id);
   expect(replay.revision_id).toBe(second.revision_id);
   expect(replay.outcome).toBe(second.outcome);
-  expect(replay.possible_duplicates).toEqual([]);
-  expect(replay.warnings).toContain('duplicate_details_withheld');
-  expect(JSON.stringify(replay)).not.toContain(first.id);
-  expect(JSON.stringify(replay)).not.toContain(lessonFixture.title);
+  expect(replay.possible_duplicates.map((entry) => entry.id)).toContain(first.id);
   expect(h.backend.create_calls).toHaveLength(2);
   await h.close();
 });

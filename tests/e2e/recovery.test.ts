@@ -12,17 +12,13 @@ import { renderRevision } from '../../src/notes/codec.js';
 import { relativePathFor } from '../../src/notes/identity.js';
 import { JournalApprovalProvenance } from '../../src/notes/reconcile.js';
 import { buildManifest, verifyManifest } from '../../src/operations/backup.js';
-import { assertRecoveryMode, authenticateOwner, recoverPending } from '../../src/operations/recovery.js';
+import { assertRecoveryMode, recoverPending, requireRecoveryAuthorization } from '../../src/operations/recovery.js';
 import { Journal } from '../../src/storage/journal.js';
 import { recall } from '../../src/features/recall.js';
 import { lessonFixture } from '../fixtures/content.js';
 import { FakeBackend } from '../support/fake-backend.js';
-import {
-  ownerPrincipal,
-  reviewerContext,
-  reviewerPrincipal,
-  workerPrincipal
-} from '../fixtures/principals.js';
+import { reviewerContext } from '../fixtures/principals.js';
+import { SYSTEM_ACTOR } from '../../src/core/types.js';
 import {
   armFault,
   createCandidateIntent,
@@ -238,7 +234,7 @@ test('rebuilding the catalogue from Markdown excludes archived and superseded he
 test('marks unrecoverable operations as definitively failed', async () => {
   const h = await createHarness();
   const ghost = h.deps.journal.reserve({
-    principal_id: reviewerPrincipal.id,
+    principal_id: SYSTEM_ACTOR.id,
     idempotency_key: randomUUID(),
     tool: 'brain_capture',
     scope: 'ghost',
@@ -255,7 +251,7 @@ test('marks unrecoverable operations as definitively failed', async () => {
   } as unknown as PlannedWrite);
 
   const broken = h.deps.journal.reserve({
-    principal_id: reviewerPrincipal.id,
+    principal_id: SYSTEM_ACTOR.id,
     idempotency_key: randomUUID(),
     tool: 'brain_capture',
     scope: 'freellmapi',
@@ -280,7 +276,7 @@ test('marks unrecoverable operations as definitively failed', async () => {
 test('does not report failed when the terminal journal transition fails', async () => {
   const h = await createHarness();
   const ghost = h.deps.journal.reserve({
-    principal_id: reviewerPrincipal.id,
+    principal_id: SYSTEM_ACTOR.id,
     idempotency_key: randomUUID(),
     tool: 'brain_capture',
     scope: 'ghost',
@@ -315,7 +311,7 @@ test('does not report failed when the terminal journal transition fails', async 
 test('keeps a blocker when both the terminal transition and its verification fail', async () => {
   const h = await createHarness();
   const ghost = h.deps.journal.reserve({
-    principal_id: reviewerPrincipal.id,
+    principal_id: SYSTEM_ACTOR.id,
     idempotency_key: randomUUID(),
     tool: 'brain_capture',
     scope: 'ghost',
@@ -372,20 +368,16 @@ test('detects a missing operational database instead of initializing fresh', asy
   }
 });
 
-test('recover-state is owner-only and requires explicit recovery mode', () => {
+test('recover-state requires explicit recovery mode and the configured token', () => {
   const digest = (value: string): string =>
     createHash('sha256').update(value, 'utf8').digest('hex');
-  const credentials = [
-    { token_sha256: digest('worker-token'), principal: workerPrincipal },
-    { token_sha256: digest('owner-token'), principal: ownerPrincipal }
-  ];
+  const configured = digest('owner-token');
   expect(() => assertRecoveryMode(undefined)).toThrow(/mode/);
   expect(() => assertRecoveryMode('serve')).toThrow(/mode/);
   expect(() => assertRecoveryMode('recover')).not.toThrow();
-  expect(authenticateOwner('Bearer owner-token', credentials).role).toBe('owner');
-  expect(() => authenticateOwner('Bearer worker-token', credentials)).toThrow(/FORBIDDEN/);
-  expect(() => authenticateOwner(undefined, credentials)).toThrow(/UNAUTHENTICATED/);
-  expect(reviewerPrincipal.role).toBe('reviewer');
+  expect(() => requireRecoveryAuthorization('Bearer owner-token', configured)).not.toThrow();
+  expect(() => requireRecoveryAuthorization('Bearer worker-token', configured)).toThrow(/UNAUTHENTICATED/);
+  expect(() => requireRecoveryAuthorization(undefined, configured)).toThrow(/UNAUTHENTICATED/);
 });
 
 function structured(result: unknown): Record<string, unknown> {

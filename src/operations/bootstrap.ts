@@ -1,7 +1,7 @@
-import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import { access, chmod, chown, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
-import { isAbsolute, join, resolve } from 'node:path';
+import { isAbsolute, join, resolve, sep } from 'node:path';
 import { stringify } from 'yaml';
 import {
   BACKEND_TIMEOUT_MS,
@@ -10,16 +10,15 @@ import {
   INPUT_BODY_MAX_BYTES,
   MATERIALIZATION_TIMEOUT_MS,
   PROJECT_PROVISION_GLOBAL_PER_MINUTE,
-  PROJECT_PROVISION_PER_PRINCIPAL_PER_MINUTE,
   RECONCILE_INTERVAL_MS,
   RENDERED_NOTE_MAX_BYTES,
   SCOPE_ID_PATTERN,
   TOOL_RESULT_MAX_BYTES
 } from '../core/limits.js';
-import type { Principal, ScopeConfig } from '../core/types.js';
-import type { BrainConfig, CredentialRecord } from '../config/schema.js';
+import type { ScopeConfig } from '../core/types.js';
+import type { BrainConfig } from '../config/schema.js';
 import { BrainError } from '../contracts/errors.js';
-import { brainConfigSchema, credentialsFileSchema } from '../config/schema.js';
+import { brainConfigSchema, TOKEN_SHA256_PATTERN } from '../config/schema.js';
 import { hasPermission } from './permissions.js';
 
 export interface BootstrapOptions {
@@ -28,7 +27,6 @@ export interface BootstrapOptions {
   vault_path?: string;
   uid?: number;
   gid?: number;
-  owner_credential?: boolean;
 }
 
 export interface BootstrapResult {
@@ -36,20 +34,21 @@ export interface BootstrapResult {
   preserved: string[];
   vault_path: string;
   config_path: string;
+  env_path: string;
 }
 
 export const TOKEN_BYTES = 32;
 export const CURSOR_KEY_BYTES = 32;
 export const DEFAULT_VAULT_MOUNT = '/vault';
 export const DEFAULT_STATE_MOUNT = '/var/lib/second-brain';
-export const DEFAULT_CREDENTIALS_MOUNT = '/run/secrets/brain_credentials';
 export const DEFAULT_CURSOR_MOUNT = '/run/secrets/brain_cursor';
+export const TOKEN_ENV_KEY = 'BRAIN_TOKEN_SHA256';
 
 const CONFIG_RELATIVE = 'config/brain.yaml';
-const CREDENTIALS_RELATIVE = 'secrets/credentials.json';
-const REVIEWER_TOKEN_RELATIVE = 'secrets/brain-token';
+const TOKEN_RELATIVE = 'secrets/brain-token';
 const CURSOR_KEY_RELATIVE = 'secrets/cursor-key';
-const OWNER_TOKEN_RELATIVE = 'secrets/owner-token';
+const LEGACY_CREDENTIALS_RELATIVE = 'secrets/credentials.json';
+const ENV_RELATIVE = '.env';
 
 const SCOPE_RELATIVE_ROOTS: Record<string, string> = {
   freellmapi: 'Projects/freellmapi',
@@ -103,7 +102,6 @@ function buildConfig(scopes: ScopeConfig[]): BrainConfig {
     backend_endpoint: 'http://memory:8000/mcp',
     port: 7331,
     mounts: { vault: DEFAULT_VAULT_MOUNT, state: DEFAULT_STATE_MOUNT },
-    credentials_file: DEFAULT_CREDENTIALS_MOUNT,
     cursor_secret_file: DEFAULT_CURSOR_MOUNT,
     scopes,
     limits: {
@@ -114,7 +112,6 @@ function buildConfig(scopes: ScopeConfig[]): BrainConfig {
       materialization_timeout_ms: MATERIALIZATION_TIMEOUT_MS,
       reconcile_interval_ms: RECONCILE_INTERVAL_MS,
       concurrent_reads: CONCURRENT_READS,
-      project_provision_per_principal_per_minute: PROJECT_PROVISION_PER_PRINCIPAL_PER_MINUTE,
       project_provision_global_per_minute: PROJECT_PROVISION_GLOBAL_PER_MINUTE,
       dynamic_projects_max: DYNAMIC_PROJECTS_MAX
     },
@@ -148,6 +145,26 @@ async function readBinaryIfExists(path: string): Promise<Buffer | undefined> {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
   }
+}
+
+function isInside(parent: string, child: string): boolean {
+  const canonicalParent = resolve(parent);
+  const canonicalChild = resolve(child);
+  return canonicalChild === canonicalParent || canonicalChild.startsWith(`${canonicalParent}${sep}`);
+}
+
+function parseEnvDigests(text: string, path: string): string[] {
+  const digests: string[] = [];
+  for (const line of text.split('\n')) {
+    const match = /^\s*(?:export\s+)?BRAIN_TOKEN_SHA256\s*=\s*(.*)\s*$/.exec(line);
+    if (match === null) continue;
+    const value = match[1].replace(/^["']|["']$/g, '');
+    if (!TOKEN_SHA256_PATTERN.test(value)) {
+      throw invalidInput(`${path} contains a malformed ${TOKEN_ENV_KEY} assignment`);
+    }
+    digests.push(value);
+  }
+  return digests;
 }
 
 const DIRECTORY_ACCESS_MASK = fsConstants.R_OK | fsConstants.W_OK | fsConstants.X_OK;
@@ -207,43 +224,6 @@ async function ensureScopePath(
   }
 }
 
-function reviewerPrincipal(scope: string | undefined): Principal {
-  const readScopes = scope === undefined ? ['shared'] : [scope];
-  if (scope !== undefined && !readScopes.includes('shared')) readScopes.push('shared');
-  return {
-    id: randomUUID(),
-    role: 'reviewer',
-    read_scopes: readScopes,
-    write_scopes: scope === undefined ? [] : [scope],
-    review_scopes: scope === undefined ? [] : [scope]
-  };
-}
-
-function ownerPrincipal(scopes: ScopeConfig[]): Principal {
-  const ids = scopes.map((entry) => entry.id);
-  return {
-    id: randomUUID(),
-    role: 'owner',
-    read_scopes: ids,
-    write_scopes: ids,
-    review_scopes: ids
-  };
-}
-
-function parseCredentialsDocument(text: string): { credentials: CredentialRecord[] } {
-  let document: unknown;
-  try {
-    document = JSON.parse(text);
-  } catch {
-    throw invalidInput('secrets/credentials.json is not valid JSON; refusing to modify it');
-  }
-  const parsed = credentialsFileSchema.safeParse(document);
-  if (!parsed.success) {
-    throw invalidInput('secrets/credentials.json is invalid; refusing to modify it');
-  }
-  return { credentials: parsed.data.credentials };
-}
-
 async function applyOwnership(path: string, uid?: number, gid?: number): Promise<void> {
   if (uid === undefined && gid === undefined) return;
   try {
@@ -261,17 +241,16 @@ export async function bootstrap(options: BootstrapOptions): Promise<BootstrapRes
   const scope = options.scope === undefined ? undefined : requireScope(options.scope);
   const uid = options.uid;
   const gid = options.gid;
-  const wantOwner = options.owner_credential === true;
 
   await mkdir(root, { recursive: true });
   await mkdir(join(root, 'config'), { recursive: true });
   await mkdir(join(root, 'secrets'), { recursive: true, mode: 0o700 });
 
   const configPath = join(root, CONFIG_RELATIVE);
-  const credentialsPath = join(root, CREDENTIALS_RELATIVE);
-  const reviewerTokenPath = join(root, REVIEWER_TOKEN_RELATIVE);
+  const tokenPath = join(root, TOKEN_RELATIVE);
   const cursorPath = join(root, CURSOR_KEY_RELATIVE);
-  const ownerTokenPath = join(root, OWNER_TOKEN_RELATIVE);
+  const envPath = join(root, ENV_RELATIVE);
+  const legacyCredentialsPath = join(root, LEGACY_CREDENTIALS_RELATIVE);
 
   const scopes = buildScopes(scope);
   const created: string[] = [];
@@ -282,6 +261,13 @@ export async function bootstrap(options: BootstrapOptions): Promise<BootstrapRes
     : isAbsolute(options.vault_path)
       ? options.vault_path
       : resolve(root, options.vault_path);
+
+  for (const secretPath of [tokenPath, cursorPath, envPath]) {
+    if (isInside(vaultPath, secretPath)) {
+      throw invalidInput(`setup secrets must not live inside the vault: ${secretPath}`);
+    }
+  }
+
   let vaultInfo;
   try {
     vaultInfo = await stat(vaultPath);
@@ -328,16 +314,6 @@ export async function bootstrap(options: BootstrapOptions): Promise<BootstrapRes
     preserved.push(CONFIG_RELATIVE);
   }
 
-  const existingReviewer = await readIfExists(reviewerTokenPath);
-  const reviewerToken = existingReviewer === undefined ? newToken() : existingReviewer.trim();
-  if (existingReviewer === undefined) {
-    await writeFile(reviewerTokenPath, `${reviewerToken}\n`, { mode: SECRET_MODE });
-    await applyOwnership(reviewerTokenPath, uid, gid);
-    created.push(REVIEWER_TOKEN_RELATIVE);
-  } else {
-    preserved.push(REVIEWER_TOKEN_RELATIVE);
-  }
-
   const existingCursor = await readBinaryIfExists(cursorPath);
   if (existingCursor === undefined) {
     await writeFile(cursorPath, randomBytes(CURSOR_KEY_BYTES), { mode: SECRET_MODE });
@@ -347,72 +323,51 @@ export async function bootstrap(options: BootstrapOptions): Promise<BootstrapRes
     preserved.push(CURSOR_KEY_RELATIVE);
   }
 
-  const existingCredentials = await readIfExists(credentialsPath);
-  const credentialsDocument =
-    existingCredentials === undefined ? undefined : parseCredentialsDocument(existingCredentials);
-
-  let ownerToken: string | undefined;
-  const existingOwner = await readIfExists(ownerTokenPath);
-  if (wantOwner) {
-    if (existingOwner !== undefined) {
-      ownerToken = existingOwner.trim();
-      preserved.push(OWNER_TOKEN_RELATIVE);
-    } else if (
-      credentialsDocument !== undefined &&
-      credentialsDocument.credentials.some((record) => record.principal.role === 'owner')
-    ) {
-      throw invalidInput(
-        'an owner credential is recorded in secrets/credentials.json but secrets/owner-token is missing; restore the token file or remove the owner record before enabling owner_credential'
-      );
-    } else {
-      ownerToken = newToken();
-      await writeFile(ownerTokenPath, `${ownerToken}\n`, { mode: SECRET_MODE });
-      await applyOwnership(ownerTokenPath, uid, gid);
-      created.push(OWNER_TOKEN_RELATIVE);
+  const existingEnv = await readIfExists(envPath);
+  const envDigests = existingEnv === undefined ? [] : parseEnvDigests(existingEnv, envPath);
+  if (envDigests.length > 1) {
+    throw invalidInput(`${envPath} assigns ${TOKEN_ENV_KEY} more than once`);
+  }
+  const existingToken = await readIfExists(tokenPath);
+  let digest = envDigests[0];
+  if (existingToken !== undefined) {
+    const raw = existingToken.trim();
+    if (raw.length === 0) throw invalidInput('secrets/brain-token is empty');
+    const derived = tokenDigest(raw);
+    if (digest !== undefined && digest !== derived) {
+      throw invalidInput('secrets/brain-token does not match the configured BRAIN_TOKEN_SHA256');
     }
-  } else if (existingOwner !== undefined) {
-    preserved.push(OWNER_TOKEN_RELATIVE);
+    digest = derived;
+    preserved.push(TOKEN_RELATIVE);
+  }
+  if (digest === undefined) {
+    if ((await readIfExists(legacyCredentialsPath)) !== undefined) {
+      throw invalidInput(
+        `legacy credentials found at ${legacyCredentialsPath}; select one digest explicitly with ` +
+          `"auth migrate --credentials-file ${legacyCredentialsPath} --select-entry N" and set ${TOKEN_ENV_KEY}`
+      );
+    }
+    const token = newToken();
+    digest = tokenDigest(token);
+    await writeFile(tokenPath, `${token}\n`, { mode: SECRET_MODE });
+    await applyOwnership(tokenPath, uid, gid);
+    created.push(TOKEN_RELATIVE);
   }
 
-  if (credentialsDocument === undefined) {
-    const records: CredentialRecord[] = [
-      { token_sha256: tokenDigest(reviewerToken), principal: reviewerPrincipal(scope) }
-    ];
-    if (wantOwner && ownerToken !== undefined) {
-      records.push({ token_sha256: tokenDigest(ownerToken), principal: ownerPrincipal(scopes) });
-    }
-    await writeFile(credentialsPath, `${JSON.stringify({ credentials: records }, null, 2)}\n`, {
+  if (envDigests.length === 0) {
+    const separator = existingEnv === undefined || existingEnv.length === 0 || existingEnv.endsWith('\n')
+      ? ''
+      : '\n';
+    await writeFile(envPath, `${existingEnv ?? ''}${separator}${TOKEN_ENV_KEY}=${digest}\n`, {
       mode: SECRET_MODE
     });
-    await applyOwnership(credentialsPath, uid, gid);
-    created.push(CREDENTIALS_RELATIVE);
+    await applyOwnership(envPath, uid, gid);
+    created.push(ENV_RELATIVE);
   } else {
-    const records = credentialsDocument.credentials;
-    let changed = false;
-    const reviewerDigest = tokenDigest(reviewerToken);
-    if (!records.some((record) => record.token_sha256 === reviewerDigest)) {
-      records.push({ token_sha256: reviewerDigest, principal: reviewerPrincipal(scope) });
-      changed = true;
-    }
-    if (wantOwner && ownerToken !== undefined) {
-      const ownerDigest = tokenDigest(ownerToken);
-      if (!records.some((record) => record.token_sha256 === ownerDigest)) {
-        records.push({ token_sha256: ownerDigest, principal: ownerPrincipal(scopes) });
-        changed = true;
-      }
-    }
-    if (changed) {
-      await writeFile(credentialsPath, `${JSON.stringify({ credentials: records }, null, 2)}\n`, {
-        mode: SECRET_MODE
-      });
-      await applyOwnership(credentialsPath, uid, gid);
-      created.push(CREDENTIALS_RELATIVE);
-    } else {
-      preserved.push(CREDENTIALS_RELATIVE);
-    }
+    preserved.push(ENV_RELATIVE);
   }
 
   await chmod(join(root, 'secrets'), 0o700);
 
-  return { created, preserved, vault_path: vaultPath, config_path: configPath };
+  return { created, preserved, vault_path: vaultPath, config_path: configPath, env_path: envPath };
 }

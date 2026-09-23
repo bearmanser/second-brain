@@ -8,15 +8,16 @@ import type {
   CaptureRequest,
   MutationReceipt,
   NoteInput,
-  RequestContext,
+  AuthenticatedContext,
+  ProjectSelector,
   ScopeConfig,
   SourceRef,
   StoredRevision
 } from '../core/types.js';
 import { decodeRevision, makeEtag } from '../notes/codec.js';
-import { resolveScopes } from '../security/authorise.js';
+import { requiredProject } from '../projects/registry.js';
 import { assertNoCredentials } from '../security/redact.js';
-import { authorizeRelatedIds } from './related.js';
+import { validateRelatedIds } from './related.js';
 
 const CAPTURE_TOOL = 'brain_capture';
 const DUPLICATE_PAGE_SIZE = 5;
@@ -115,13 +116,8 @@ function rejectCredentialText(note: NoteInput): void {
   }
 }
 
-function authorizeScope(
-  ctx: RequestContext,
-  requested: string,
-  deps: BrainDeps
-): ScopeConfig {
-  const [scope] = resolveScopes(ctx.principal, requested, false, 'write', deps.scopeRegistry);
-  return scope;
+function resolveProject(request: ProjectSelector, deps: BrainDeps): ScopeConfig {
+  return deps.scopeRegistry.require(requiredProject(request));
 }
 
 function vaultRelativePath(scope: ScopeConfig, relativePath: string): string {
@@ -179,14 +175,10 @@ interface DuplicateLookup {
 }
 
 async function findPossibleDuplicates(
-  ctx: RequestContext,
   scope: ScopeConfig,
   note: NoteInput,
   deps: BrainDeps
 ): Promise<DuplicateLookup> {
-  if (!deps.scopeRegistry.permissions(ctx.principal, scope.id).can_read) {
-    return { duplicates: [], warnings: [DUPLICATE_CHECK_UNAVAILABLE] };
-  }
   let hits: BackendHit[];
   try {
     const result = await deps.backend.search({
@@ -218,34 +210,19 @@ async function findPossibleDuplicates(
   return { duplicates, warnings: partial ? [DUPLICATE_CHECK_UNAVAILABLE] : [] };
 }
 
-function filterReadableDuplicates(
-  ctx: RequestContext,
-  receipt: MutationReceipt,
-  deps: BrainDeps
-): MutationReceipt {
-  if (receipt.possible_duplicates.length === 0) return receipt;
-  const visible = receipt.possible_duplicates.filter(
-    (entry) => deps.scopeRegistry.permissions(ctx.principal, entry.scope).can_read
-  );
-  if (visible.length === receipt.possible_duplicates.length) return receipt;
-  const warnings = [...receipt.warnings];
-  if (!warnings.includes(DUPLICATE_DETAILS_WITHHELD)) warnings.push(DUPLICATE_DETAILS_WITHHELD);
-  return { ...receipt, possible_duplicates: visible, warnings };
-}
-
 export async function capture(
-  ctx: RequestContext,
+  ctx: AuthenticatedContext,
   input: CaptureRequest,
   deps: BrainDeps
 ): Promise<MutationReceipt> {
   const request = parseCaptureRequest(input);
-  const scope = authorizeScope(ctx, request.scope, deps);
+  const scope = resolveProject(request, deps);
   const note = normalizeNote(request.note);
 
-  await authorizeRelatedIds(ctx, note.related_ids, deps);
+  await validateRelatedIds(note.related_ids, deps);
   rejectCredentialText(note);
 
-  const lookup = await findPossibleDuplicates(ctx, scope, note, deps);
+  const lookup = await findPossibleDuplicates(scope, note, deps);
   const advisory: MutationAdvisory = {
     warnings: lookup.warnings,
     possible_duplicates: lookup.duplicates
@@ -277,5 +254,5 @@ export async function capture(
     extra_markdown: ''
   });
 
-  return filterReadableDuplicates(ctx, await deps.mutations.commit(ctx, intent, build), deps);
+  return deps.mutations.commit(ctx, intent, build);
 }

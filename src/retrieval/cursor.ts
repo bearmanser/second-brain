@@ -1,9 +1,18 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { BrainError } from '../contracts/errors.js';
-import { CURSOR_TTL_MS } from '../core/limits.js';
-import type { RequestContext } from '../core/types.js';
+import { CURSOR_TTL_MS, SCOPE_ID_PATTERN } from '../core/limits.js';
 
-export interface CursorPayload {
+export interface CursorPayloadV2 {
+  version: 2;
+  scope: string;
+  id: string;
+  revision_id: string;
+  raw_hash: string;
+  offset: number;
+  expires_at: string;
+}
+
+export interface CursorPayloadV1 {
   principal_id: string;
   scope: string;
   id: string;
@@ -13,7 +22,17 @@ export interface CursorPayload {
   expires_at: string;
 }
 
-export const CURSOR_FIELDS = [
+export const CURSOR_FIELDS_V2 = [
+  'version',
+  'scope',
+  'id',
+  'revision_id',
+  'raw_hash',
+  'offset',
+  'expires_at'
+] as const;
+
+export const CURSOR_FIELDS_V1 = [
   'principal_id',
   'scope',
   'id',
@@ -23,19 +42,9 @@ export const CURSOR_FIELDS = [
   'expires_at'
 ] as const;
 
-type CursorField = (typeof CURSOR_FIELDS)[number];
-
-const STRING_FIELDS: readonly CursorField[] = [
-  'principal_id',
-  'scope',
-  'id',
-  'revision_id',
-  'raw_hash',
-  'expires_at'
-];
-
 const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
 const UTC_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const MIN_SECRET_BYTES = 32;
 const STORED_CURSOR_SIGNATURE_BYTES = 16;
 
@@ -59,11 +68,15 @@ function isUtcInstant(value: string): boolean {
   return normalized === new Date(parsed).toISOString();
 }
 
-function canonicalBody(payload: CursorPayload): Buffer {
+function canonicalBodyV2(payload: CursorPayloadV2): Buffer {
   const ordered: Record<string, unknown> = {};
-  for (const field of CURSOR_FIELDS) {
-    ordered[field] = payload[field];
-  }
+  for (const field of CURSOR_FIELDS_V2) ordered[field] = payload[field];
+  return Buffer.from(JSON.stringify(ordered), 'utf8');
+}
+
+function canonicalBodyV1(payload: CursorPayloadV1): Buffer {
+  const ordered: Record<string, unknown> = {};
+  for (const field of CURSOR_FIELDS_V1) ordered[field] = payload[field];
   return Buffer.from(JSON.stringify(ordered), 'utf8');
 }
 
@@ -94,112 +107,162 @@ export interface StoredCursorReservation {
   token: string;
 }
 
-function parsePayload(value: unknown): CursorPayload {
+function requireString(record: Record<string, unknown>, field: string): string {
+  const value = record[field];
+  if (typeof value !== 'string' || value.length === 0) {
+    throw invalid(`read cursor ${field} is invalid`);
+  }
+  return value;
+}
+
+function requireOffset(record: Record<string, unknown>): number {
+  const offset = record.offset;
+  if (typeof offset !== 'number' || !Number.isSafeInteger(offset) || offset < 0) {
+    throw invalid('read cursor offset is invalid');
+  }
+  return offset;
+}
+
+function requireExpiry(value: string): string {
+  if (!isUtcInstant(value)) {
+    throw invalid('read cursor expires_at must be a valid UTC RFC3339 instant');
+  }
+  return value;
+}
+
+function parseV2(value: unknown): CursorPayloadV2 {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw invalid('read cursor body is not an object');
   }
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record);
   if (
-    keys.length !== CURSOR_FIELDS.length ||
-    !CURSOR_FIELDS.every((field) => Object.prototype.hasOwnProperty.call(record, field))
+    keys.length !== CURSOR_FIELDS_V2.length ||
+    !CURSOR_FIELDS_V2.every((field) => Object.prototype.hasOwnProperty.call(record, field))
   ) {
     throw invalid('read cursor body has unexpected fields');
   }
-  const strings: Record<string, string> = {};
-  for (const field of STRING_FIELDS) {
-    const entry = record[field];
-    if (typeof entry !== 'string' || entry.length === 0) {
-      throw invalid(`read cursor ${field} is invalid`);
-    }
-    strings[field] = entry;
-  }
-  if (!isUtcInstant(strings.expires_at)) {
-    throw invalid('read cursor expires_at must be a valid UTC RFC3339 instant');
-  }
-  const offset = record.offset;
-  if (typeof offset !== 'number' || !Number.isSafeInteger(offset) || offset < 0) {
-    throw invalid('read cursor offset is invalid');
-  }
+  if (record.version !== 2) throw invalid('read cursor version is invalid');
+  const scope = requireString(record, 'scope');
+  if (!SCOPE_ID_PATTERN.test(scope)) throw invalid('read cursor scope is invalid');
+  const rawHash = requireString(record, 'raw_hash');
+  if (!HASH_PATTERN.test(rawHash)) throw invalid('read cursor raw_hash is invalid');
   return {
-    principal_id: strings.principal_id,
-    scope: strings.scope,
-    id: strings.id,
-    revision_id: strings.revision_id,
-    raw_hash: strings.raw_hash,
-    offset,
-    expires_at: strings.expires_at
+    version: 2,
+    scope,
+    id: requireString(record, 'id'),
+    revision_id: requireString(record, 'revision_id'),
+    raw_hash: rawHash,
+    offset: requireOffset(record),
+    expires_at: requireExpiry(requireString(record, 'expires_at'))
   };
 }
 
-export function signCursor(payload: CursorPayload, secret: Uint8Array): string {
-  requireSecret(secret);
-  const body = canonicalBody(payload);
-  const signature = signatureOf(body, secret);
-  return `${encodeBase64Url(body)}.${encodeBase64Url(signature)}`;
+function parseV1(value: unknown): CursorPayloadV1 {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw invalid('read cursor body is not an object');
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (
+    keys.length !== CURSOR_FIELDS_V1.length ||
+    !CURSOR_FIELDS_V1.every((field) => Object.prototype.hasOwnProperty.call(record, field))
+  ) {
+    throw invalid('read cursor body has unexpected fields');
+  }
+  const rawHash = requireString(record, 'raw_hash');
+  if (!HASH_PATTERN.test(rawHash)) throw invalid('read cursor raw_hash is invalid');
+  return {
+    principal_id: requireString(record, 'principal_id'),
+    scope: requireString(record, 'scope'),
+    id: requireString(record, 'id'),
+    revision_id: requireString(record, 'revision_id'),
+    raw_hash: rawHash,
+    offset: requireOffset(record),
+    expires_at: requireExpiry(requireString(record, 'expires_at'))
+  };
 }
 
-export function reserveStoredCursor(
-  payload: CursorPayload,
+function checkExpiry(expiresAt: string, now: Date): void {
+  const expiry = Date.parse(expiresAt);
+  if (!Number.isFinite(expiry)) throw invalid('read cursor expiry is invalid');
+  const reference = now.getTime();
+  if (reference > expiry) throw invalid('read cursor has expired');
+  if (expiry - reference > CURSOR_TTL_MS) throw invalid('read cursor expiry is out of range');
+}
+
+export function signCursorV2(payload: CursorPayloadV2, secret: Uint8Array): string {
+  requireSecret(secret);
+  const body = canonicalBodyV2(payload);
+  const signature = signatureOf(body, secret);
+  return `v2.${encodeBase64Url(body)}.${encodeBase64Url(signature)}`;
+}
+
+export function reserveStoredCursorV2(
+  payload: CursorPayloadV2,
   secret: Uint8Array,
   store: CursorStore
 ): StoredCursorReservation {
   requireSecret(secret);
-  const body = canonicalBody(payload);
+  const body = canonicalBodyV2(payload);
   const cursorId = store.storeReadCursor(body.toString('utf8'), payload.expires_at);
   if (!Number.isSafeInteger(cursorId) || cursorId <= 0) {
     throw invalid('read cursor store returned an invalid id');
   }
   const id = cursorId.toString(36);
-  const signature = signatureOf(Buffer.from(`r1.${id}`, 'utf8'), secret).subarray(
+  const signature = signatureOf(Buffer.from(`r2.${id}`, 'utf8'), secret).subarray(
     0,
     STORED_CURSOR_SIGNATURE_BYTES
   );
-  return { cursor_id: cursorId, token: `r1.${id}.${encodeBase64Url(signature)}` };
+  return { cursor_id: cursorId, token: `r2.${id}.${encodeBase64Url(signature)}` };
 }
 
-export function finalizeStoredCursor(
+export function finalizeStoredCursorV2(
   reservation: StoredCursorReservation,
-  payload: CursorPayload,
+  payload: CursorPayloadV2,
   store: CursorStore
 ): string {
-  const body = canonicalBody(payload);
+  const body = canonicalBodyV2(payload);
   store.updateReadCursor(reservation.cursor_id, body.toString('utf8'), payload.expires_at);
   return reservation.token;
 }
 
-function validatePayload(payload: CursorPayload, ctx: RequestContext, now: Date): CursorPayload {
-  if (payload.principal_id !== ctx.principal.id) {
-    throw invalid('read cursor belongs to another principal');
-  }
-  const expiry = Date.parse(payload.expires_at);
-  if (!Number.isFinite(expiry)) {
-    throw invalid('read cursor expiry is invalid');
-  }
-  const reference = now.getTime();
-  if (reference > expiry) {
-    throw invalid('read cursor has expired');
-  }
-  if (expiry - reference > CURSOR_TTL_MS) {
-    throw invalid('read cursor expiry is out of range');
-  }
+export function verifyStoredCursorV2(
+  cursor: string,
+  secret: Uint8Array,
+  now: Date,
+  store: CursorStore
+): CursorPayloadV2 {
+  const { id } = verifyStoredToken(cursor, 'r2', secret);
+  return verifyStoredBodyV2(id, now, store);
+}
+
+export function verifyStoredCursorV1(
+  cursor: string,
+  secret: Uint8Array,
+  now: Date,
+  store: CursorStore
+): CursorPayloadV1 {
+  const { id } = verifyStoredToken(cursor, 'r1', secret);
+  const stored = store.getReadCursor(id);
+  if (stored === undefined) throw invalid('read cursor is unavailable');
+  const payload = parseV1(JSON.parse(stored));
+  checkExpiry(payload.expires_at, now);
   return payload;
 }
 
-export function verifyStoredCursor(
+function verifyStoredToken(
   cursor: string,
-  secret: Uint8Array,
-  ctx: RequestContext,
-  now: Date,
-  store: CursorStore
-): CursorPayload {
+  prefix: string,
+  secret: Uint8Array
+): { id: number } {
   requireSecret(secret);
   const parts = cursor.split('.');
-  if (parts.length !== 3 || parts[0] !== 'r1' || !/^[0-9a-z]+$/u.test(parts[1])) {
-    throw invalid('read cursor is not a stored token');
+  if (parts.length !== 3 || parts[0] !== prefix || !/^[0-9a-z]+$/u.test(parts[1])) {
+    throw invalid(`read cursor is not a ${prefix} stored token`);
   }
   const provided = decodeBase64Url(parts[2]);
-  const expected = signatureOf(Buffer.from(`r1.${parts[1]}`, 'utf8'), secret).subarray(
+  const expected = signatureOf(Buffer.from(`${prefix}.${parts[1]}`, 'utf8'), secret).subarray(
     0,
     STORED_CURSOR_SIGNATURE_BYTES
   );
@@ -208,23 +271,46 @@ export function verifyStoredCursor(
   }
   const id = Number.parseInt(parts[1], 36);
   if (!Number.isSafeInteger(id) || id <= 0) throw invalid('read cursor id is invalid');
-  const stored = store.getReadCursor(id);
-  if (stored === undefined) throw invalid('read cursor is unavailable');
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(stored);
-  } catch {
-    throw invalid('read cursor body is not valid JSON');
-  }
-  return validatePayload(parsePayload(decoded), ctx, now);
+  return { id };
 }
 
-export function verifyCursor(
+function verifyStoredBodyV2(id: number, now: Date, store: CursorStore): CursorPayloadV2 {
+  const stored = store.getReadCursor(id);
+  if (stored === undefined) throw invalid('read cursor is unavailable');
+  const payload = parseV2(JSON.parse(stored));
+  checkExpiry(payload.expires_at, now);
+  return payload;
+}
+
+export function verifyCursorV2(
   cursor: string,
   secret: Uint8Array,
-  ctx: RequestContext,
   now: Date
-): CursorPayload {
+): CursorPayloadV2 {
+  requireSecret(secret);
+  if (typeof cursor !== 'string' || !cursor.startsWith('v2.')) {
+    throw invalid('read cursor is not a v2 signed token');
+  }
+  const parts = cursor.split('.');
+  if (parts.length !== 3 || parts[0] !== 'v2' || parts[1].length === 0 || parts[2].length === 0) {
+    throw invalid('read cursor is not a signed token');
+  }
+  const body = decodeBase64Url(parts[1]);
+  const provided = decodeBase64Url(parts[2]);
+  const expected = signatureOf(body, secret);
+  if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
+    throw invalid('read cursor signature is invalid');
+  }
+  const payload = parseV2(JSON.parse(body.toString('utf8')));
+  checkExpiry(payload.expires_at, now);
+  return payload;
+}
+
+export function verifyLegacyCursor(
+  cursor: string,
+  secret: Uint8Array,
+  now: Date
+): CursorPayloadV1 {
   requireSecret(secret);
   if (typeof cursor !== 'string' || cursor.length === 0) {
     throw invalid('read cursor is missing');
@@ -239,12 +325,14 @@ export function verifyCursor(
   if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
     throw invalid('read cursor signature is invalid');
   }
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(body.toString('utf8'));
-  } catch {
-    throw invalid('read cursor body is not valid JSON');
-  }
-  const payload = parsePayload(decoded);
-  return validatePayload(payload, ctx, now);
+  const payload = parseV1(JSON.parse(body.toString('utf8')));
+  checkExpiry(payload.expires_at, now);
+  return payload;
+}
+
+export function signLegacyCursor(payload: CursorPayloadV1, secret: Uint8Array): string {
+  requireSecret(secret);
+  const body = canonicalBodyV1(payload);
+  const signature = signatureOf(body, secret);
+  return `${encodeBase64Url(body)}.${encodeBase64Url(signature)}`;
 }

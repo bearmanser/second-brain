@@ -11,7 +11,7 @@ import { review } from '../../src/features/review.js';
 import { renderRevision } from '../../src/notes/codec.js';
 import { relativePathFor } from '../../src/notes/identity.js';
 import { countReferenceTokens } from '../../src/retrieval/budget.js';
-import { signCursor } from '../../src/retrieval/cursor.js';
+import { signCursorV2 } from '../../src/retrieval/cursor.js';
 import { lessonFixture } from '../fixtures/content.js';
 import { reviewerContext, scopeFixtures, workerContext } from '../fixtures/principals.js';
 import { createHarness, type MemoryHarness } from '../support/harness.js';
@@ -105,12 +105,15 @@ test('reads the current head with an etag and source reference', async () => {
   await h.close();
 });
 
-test('rejects a scope the caller may not read', async () => {
+test('reads a note from any registered project with the single token', async () => {
   const h = await createHarness();
   await installSecret(h);
   await expect(
     read(workerContext, { scope: 'profile', id: randomUUID() }, h.deps)
-  ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+  ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  await expect(
+    read(workerContext, { scope: 'unknown-project', id: randomUUID() }, h.deps)
+  ).rejects.toMatchObject({ code: 'NOT_FOUND' });
   await h.close();
 });
 
@@ -415,7 +418,7 @@ test('returns NOT_FOUND when the source disappeared', async () => {
   await h.close();
 });
 
-test("rejects another caller's cursor", async () => {
+test('cursors are integrity tokens rather than caller credentials', async () => {
   const h = await createHarness();
   await installSecret(h);
   const head = await h.seed(longLesson(4000));
@@ -424,13 +427,13 @@ test("rejects another caller's cursor", async () => {
     { scope: 'freellmapi', id: head.revision.id, budget_tokens: 256 },
     h.deps
   );
-  await expect(
-    read(
-      workerContext,
-      { scope: 'freellmapi', id: head.revision.id, cursor: first.next_cursor as string },
-      h.deps
-    )
-  ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+  const second = await read(
+    workerContext,
+    { scope: 'freellmapi', id: head.revision.id, cursor: first.next_cursor as string },
+    h.deps
+  );
+  expect(second.markdown.length).toBeGreaterThan(0);
+  expect(second.source.revision_id).toBe(head.revision.revision_id);
   await h.close();
 });
 
@@ -438,9 +441,9 @@ test('rejects an expired cursor', async () => {
   const h = await createHarness();
   const secret = await installSecret(h);
   const head = await h.seed(longLesson(4000));
-  const expired = signCursor(
+  const expired = signCursorV2(
     {
-      principal_id: workerContext.principal.id,
+      version: 2,
       scope: 'freellmapi',
       id: head.revision.id,
       revision_id: head.revision.revision_id,
@@ -510,7 +513,7 @@ test('a cursor carries no path and cannot redirect the read outside its scope', 
   const future = new Date(Date.now() + 600_000).toISOString();
   const forged = forge(
     {
-      principal_id: workerContext.principal.id,
+      principal_id: 'legacy',
       scope: 'freellmapi',
       id: head.revision.id,
       revision_id: head.revision.revision_id,
@@ -525,9 +528,9 @@ test('a cursor carries no path and cannot redirect the read outside its scope', 
     read(workerContext, { scope: 'freellmapi', id: head.revision.id, cursor: forged }, h.deps)
   ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
 
-  const otherScope = signCursor(
+  const otherScope = signCursorV2(
     {
-      principal_id: workerContext.principal.id,
+      version: 2,
       scope: 'shared',
       id: head.revision.id,
       revision_id: head.revision.revision_id,

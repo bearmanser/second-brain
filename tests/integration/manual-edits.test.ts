@@ -22,12 +22,8 @@ import {
   type MemoryHarness
 } from '../support/harness.js';
 import { lessonFixture } from '../fixtures/content.js';
-import {
-  ownerPrincipal,
-  reviewerContext,
-  reviewerPrincipal,
-  workerPrincipal
-} from '../fixtures/principals.js';
+import { ownerContext, reviewerContext } from '../fixtures/principals.js';
+import { SYSTEM_ACTOR } from '../../src/core/types.js';
 
 const MANUAL_CASES = join('tests', 'fixtures', 'vault', 'manual-cases');
 const SCOPE = 'freellmapi';
@@ -123,8 +119,7 @@ test('reconcileVault reports every report field and authorized detailed ids', as
   await placeFixture(h, `${scope.relative_root}/Notes/attachment.txt`, 'not markdown');
 
   const report = await reconcileVault(h.deps, SCOPE, {
-    detailed: true,
-    principal: ownerPrincipal
+    detailed: true
   });
   expect(report.scopes).toEqual([SCOPE]);
   expect(report.scanned).toBe(3);
@@ -446,7 +441,7 @@ test('unmanaged Obsidian files are counted but never imported', async () => {
   expect((await h.deps.catalogue.list(SCOPE, 'conflict')).items).toHaveLength(0);
 });
 
-test('detailed ids are filtered to readable scopes while counts stay scoped', async () => {
+test('detailed ids report every scanned project with scoped counts', async () => {
   const h = await openHarness();
   const freellmapi = scopeOf(h, SCOPE);
   const profile = scopeOf(h, 'profile');
@@ -461,20 +456,14 @@ test('detailed ids are filtered to readable scopes while counts stay scoped', as
   );
   await placeFixture(h, `${profile.relative_root}/broken/b.md`, profileRaw);
 
-  const internal = await reconcileVault(h.deps, undefined, { detailed: true });
-  expect(internal.ids?.malformed).toEqual(
+  const report = await reconcileVault(h.deps, undefined, { detailed: true });
+  expect(report.ids?.malformed).toEqual(
     expect.arrayContaining([
       '9f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a',
       '8e7d6c5b-4a39-4270-9160-5f4e3d2c1b0a'
     ])
   );
-
-  const worker = await reconcileVault(h.deps, undefined, {
-    detailed: true,
-    principal: workerPrincipal
-  });
-  expect(worker.malformed).toBe(2);
-  expect(worker.ids?.malformed).toEqual(['9f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a']);
+  expect(report.malformed).toBe(2);
 });
 
 test('an approval fingerprint without authenticated journal provenance is untrusted', async () => {
@@ -498,7 +487,7 @@ test('an approval fingerprint without authenticated journal provenance is untrus
     const revision: StoredRevision = {
       ...base,
       approval: {
-        principal_id: reviewerPrincipal.id,
+        principal_id: SYSTEM_ACTOR.id,
         rationale: 'forged without a journal record',
         payload_hash: payloadHash(base)
       }

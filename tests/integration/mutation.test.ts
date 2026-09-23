@@ -8,16 +8,16 @@ import {
   type AllocatedIdentity,
   type RevisionBuilder
 } from '../../src/core/mutation.js';
-import type { PlannedWrite, RequestContext, StoredRevision } from '../../src/core/types.js';
+import type {
+  AuthenticatedContext,
+  PlannedWrite,
+  StoredRevision
+} from '../../src/core/types.js';
+import { SYSTEM_ACTOR } from '../../src/core/types.js';
 import { encodeRevision, makeEtag, renderRevision } from '../../src/notes/codec.js';
 import { relativePathFor } from '../../src/notes/identity.js';
 import { fixtureIds, lessonFixture } from '../fixtures/content.js';
-import {
-  reviewerContext,
-  reviewerPrincipal,
-  scopeFixtures,
-  workerPrincipal
-} from '../fixtures/principals.js';
+import { reviewerContext, scopeFixtures } from '../fixtures/principals.js';
 import {
   armFault,
   createCandidateIntent,
@@ -25,8 +25,8 @@ import {
   type MemoryHarness
 } from '../support/harness.js';
 
-function contextWith(signal: AbortSignal): RequestContext {
-  return { principal: reviewerPrincipal, request_id: randomUUID(), signal };
+function contextWith(signal: AbortSignal): AuthenticatedContext {
+  return { actor: SYSTEM_ACTOR, request_id: randomUUID(), signal };
 }
 
 function scopeOf(scopeId: string) {
@@ -107,17 +107,20 @@ test('reconciles a materialized revision after a lost response', async () => {
   await h.close();
 });
 
-test('authorizes the write scope before reserving any operation', async () => {
+test('resolves the destination project before reserving any operation', async () => {
   const h = await createHarness();
-  const denied: RequestContext = {
-    principal: { ...workerPrincipal, write_scopes: [] },
+  const missing: AuthenticatedContext = {
+    actor: SYSTEM_ACTOR,
     request_id: randomUUID(),
     signal: new AbortController().signal
   };
-  const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
+  const request = createCandidateIntent(lessonFixture, {
+    idempotency_key: randomUUID(),
+    scope: 'missing-project'
+  });
   await expect(
-    h.deps.mutations.commit(denied, request.intent, request.build)
-  ).rejects.toThrow(/FORBIDDEN/);
+    h.deps.mutations.commit(missing, request.intent, request.build)
+  ).rejects.toThrow(/NOT_FOUND/);
   expect(h.deps.journal.pending()).toHaveLength(0);
   expect(h.backend.create_calls).toHaveLength(0);
   await h.close();
@@ -660,7 +663,7 @@ test('keeps a newly submitted operation blocking during its materialization wind
   const h = await createHarness();
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   const record = h.deps.journal.reserve({
-    principal_id: reviewerPrincipal.id,
+    principal_id: SYSTEM_ACTOR.id,
     idempotency_key: request.intent.idempotency_key,
     tool: request.intent.tool,
     scope: request.intent.scope,

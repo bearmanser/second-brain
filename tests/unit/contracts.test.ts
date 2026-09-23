@@ -34,8 +34,7 @@ import {
   ownerContext,
   reviewerContext,
   scopeFixtures,
-  workerContext,
-  workerPrincipal
+  workerContext
 } from '../fixtures/principals.js';
 
 test('a session does not require lesson or evidence sections', () => {
@@ -490,10 +489,7 @@ test('publishes JSON schemas and validates each registered example', () => {
 
 test('defines the Section C types with stable fixture values', () => {
   expect(scopeFixtures.map((scope) => scope.id).sort()).toEqual(['freellmapi', 'profile', 'shared']);
-  expect(workerPrincipal.role).toBe('worker');
-  expect(workerPrincipal.review_scopes).toEqual([]);
-  expect(workerContext.signal).not.toBe(reviewerContext.signal);
-  expect(reviewerContext.signal).not.toBe(ownerContext.signal);
+  expect(workerContext.actor.id).toBe('system');
   expect(workerContext.signal.aborted).toBe(false);
   expect(workerContext.request_id).toMatch(/^[0-9a-f-]{36}$/);
   expect(lessonFixture.title).toBe('Compare direct and proxied TTFT');

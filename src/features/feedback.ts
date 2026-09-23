@@ -2,20 +2,22 @@ import { BrainError, isBrainError } from '../contracts/errors.js';
 import { feedbackRequestSchema } from '../contracts/protocol.js';
 import type { BrainDeps } from '../core/mutation.js';
 import type {
+  AuthenticatedContext,
   FeedbackRequest,
   FeedbackResult,
+  ProjectFilter,
+  ProjectSelector,
   RecallResult,
-  RequestContext,
+  RetrievalEventInputV2,
   ScopeConfig
 } from '../core/types.js';
-import { resolveScopes } from '../security/authorise.js';
+import { requiredProject } from '../projects/registry.js';
 import { assertNoCredentials } from '../security/redact.js';
 import type {
   AuditEvent,
-  RetrievalEventInput,
   RetrievalOutcome
 } from '../storage/journal.js';
-import { authorizeRelatedIds } from './related.js';
+import { validateRelatedIds } from './related.js';
 
 export { AUDIT_FIELDS, FEEDBACK_REASON_MAX_LENGTH } from '../storage/journal.js';
 
@@ -51,9 +53,8 @@ function parseRequest(input: FeedbackRequest): FeedbackRequest {
   return parsed.data as FeedbackRequest;
 }
 
-function authorizeTarget(ctx: RequestContext, requested: string, deps: BrainDeps): ScopeConfig {
-  const [scope] = resolveScopes(ctx.principal, requested, false, 'read', deps.scopeRegistry);
-  return scope;
+function resolveProject(request: ProjectSelector, deps: BrainDeps): ScopeConfig {
+  return deps.scopeRegistry.require(requiredProject(request));
 }
 
 async function requireTargetRevision(
@@ -74,29 +75,35 @@ async function requireTargetRevision(
 }
 
 function assertRetrievalBinding(
-  ctx: RequestContext,
   request: FeedbackRequest,
   scopeId: string,
   deps: BrainDeps
 ): void {
   const retrieval_id = request.retrieval_id;
   if (retrieval_id === undefined) return;
-  const event = deps.journal.getRetrieval(retrieval_id);
-  const valid =
-    event !== undefined &&
-    event.principal_id === ctx.principal.id &&
-    event.scope_ids.includes(scopeId) &&
-    event.returned_ids.some(
-      (entry) => entry.id === request.id && entry.revision_id === request.revision_id
-    );
-  if (!valid) {
-    throw invalidInput('the retrieval reference is not valid for this caller, scope, and revision');
+  const event = deps.journal.getRetrievalV2(retrieval_id);
+  if (event === undefined) {
+    throw invalidInput('the retrieval reference is not valid for this project and revision');
+  }
+  const returned = event.returned_ids.some(
+    (entry) => entry.id === request.id && entry.revision_id === request.revision_id
+  );
+  const inProject = event.returned_ids.some(
+    (entry) =>
+      entry.id === request.id &&
+      entry.revision_id === request.revision_id &&
+      (entry.scope === null
+        ? event.primary_project_id === scopeId || event.searched_project_ids.includes(scopeId)
+        : entry.scope === scopeId)
+  );
+  if (!returned || !inProject) {
+    throw invalidInput('the retrieval reference did not return this revision in this project');
   }
 }
 
 function recordAudit(
   deps: BrainDeps,
-  ctx: RequestContext,
+  ctx: AuthenticatedContext,
   outcome: string,
   started: number,
   noteCount = 0
@@ -143,23 +150,26 @@ export function logOperational(sink: OperationalLogSink, input: AuditFieldsInput
 }
 
 export interface RetrievalEventOptions {
-  scope: string;
+  filter: ProjectFilter;
+  searched_project_ids: string[];
+  primary_project_id: string | null;
   duration_ms: number;
   outcome?: RetrievalOutcome;
 }
 
 export function retrievalEventFromRecall(
-  ctx: RequestContext,
+  ctx: AuthenticatedContext,
   result: RecallResult,
   options: RetrievalEventOptions
-): RetrievalEventInput {
-  const scopeIds = [options.scope, ...result.items.map((item) => item.scope)];
+): RetrievalEventInputV2 {
   return {
     retrieval_id: result.retrieval_id,
-    principal_id: ctx.principal.id,
-    scope: options.scope,
-    scope_ids: [...new Set(scopeIds)],
+    actor_id: ctx.actor.id,
+    filter: options.filter,
+    searched_project_ids: [...options.searched_project_ids],
+    primary_project_id: options.primary_project_id,
     returned_ids: result.items.map((item) => ({
+      scope: item.scope,
       id: item.id,
       revision_id: item.revision_id
     })),
@@ -174,7 +184,7 @@ export function retrievalEventFromRecall(
 }
 
 export async function feedback(
-  ctx: RequestContext,
+  ctx: AuthenticatedContext,
   input: FeedbackRequest,
   deps: BrainDeps
 ): Promise<FeedbackResult> {
@@ -191,16 +201,16 @@ export async function feedback(
     throw error;
   }
   try {
-    const scope = authorizeTarget(ctx, request.scope, deps);
+    const scope = resolveProject(request, deps);
     if (request.related_id !== undefined) {
-      await authorizeRelatedIds(ctx, [request.related_id], deps);
+      await validateRelatedIds([request.related_id], deps);
     }
     assertNoCredentials(request.reason, 'reason');
     const warning = UNRESOLVED_VERDICTS.includes(request.verdict)
       ? FEEDBACK_WARNING_UNRESOLVED
       : undefined;
     const write = {
-      principal_id: ctx.principal.id,
+      principal_id: ctx.actor.id,
       idempotency_key: request.idempotency_key,
       scope: scope.id,
       logical_id: request.id,
@@ -217,7 +227,7 @@ export async function feedback(
       return { feedback_id: replay.entry.feedback_id, recorded: true };
     }
     await requireTargetRevision(scope, request, deps);
-    assertRetrievalBinding(ctx, request, scope.id, deps);
+    assertRetrievalBinding(request, scope.id, deps);
     const stored = deps.journal.recordFeedback(write);
     recordAudit(deps, ctx, 'recorded', started, 1);
     return { feedback_id: stored.entry.feedback_id, recorded: true };

@@ -30,6 +30,7 @@ export const READ_BUDGET_TOKENS_MAX = 8000;
 
 export const BACKEND_SEARCH_PAGES = 4;
 export const BACKEND_SEARCH_PAGE_SIZE = 40;
+export const BACKEND_SEARCH_CALL_BUDGET = 8;
 export const RECALL_MAX_SCOPES = 2;
 export const BACKEND_TIMEOUT_MS = 15_000;
 export const MATERIALIZATION_TIMEOUT_MS = 10_000;

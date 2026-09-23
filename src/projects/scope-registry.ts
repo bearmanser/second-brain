@@ -1,20 +1,16 @@
 import { BrainError } from '../contracts/errors.js';
 import type {
-  DynamicProjectGrant,
-  Principal,
-  RepositoryProjectRecord,
+  LegacyProjectBackendBinding,
+  PersistedProject,
+  Project,
+  ProjectAlias,
   ScopeConfig
 } from '../core/types.js';
-
-export interface ScopePermissions {
-  can_read: boolean;
-  can_write: boolean;
-  can_review: boolean;
-}
+import { ProjectRegistry } from './registry.js';
 
 export interface ScopeRegistrySource {
-  listReadyProjects(): RepositoryProjectRecord[];
-  listProjectGrants(principalId?: string): DynamicProjectGrant[];
+  listReadyProjects(): PersistedProject[];
+  getProjectBinding(projectId: string): LegacyProjectBackendBinding | undefined;
 }
 
 const RESERVED = new Set(['shared', 'profile']);
@@ -24,141 +20,135 @@ const invalidInput = (message: string): BrainError =>
 
 const conflict = (message: string): BrainError => new BrainError({ code: 'CONFLICT', message });
 
-const sameScope = (left: ScopeConfig, right: ScopeConfig): boolean =>
-  left.id === right.id &&
-  left.backend_project === right.backend_project &&
-  left.relative_root === right.relative_root &&
-  left.repository_aliases.length === right.repository_aliases.length &&
-  left.repository_aliases.every((alias, index) => alias === right.repository_aliases[index]);
-
 export class ScopeRegistry {
-  private readonly scopes = new Map<string, ScopeConfig>();
-  private readonly aliases = new Map<string, string>();
-  private readonly dynamicScopes = new Set<string>();
-  private readonly grants = new Map<string, DynamicProjectGrant>();
+  private readonly projects = new Map<string, Project>();
+  private readonly order: string[] = [];
+  private readonly bindings = new Map<string, LegacyProjectBackendBinding>();
+  private readonly staticAliases: ProjectAlias[] = [];
+  private readonly dynamic = new Set<string>();
+  private readonly quarantined = new Set<string>();
+  private registry: ProjectRegistry;
 
   constructor(staticScopes: readonly ScopeConfig[], source?: ScopeRegistrySource) {
     for (const scope of staticScopes) this.registerStatic(scope);
-    if (source === undefined) return;
-    const grantsByScope = new Map<string, DynamicProjectGrant[]>();
-    for (const grant of source.listProjectGrants()) {
-      const entries = grantsByScope.get(grant.scope) ?? [];
-      entries.push(grant);
-      grantsByScope.set(grant.scope, entries);
+    if (source !== undefined) {
+      for (const project of source.listReadyProjects()) {
+        this.registerDynamicProject(project.project, source.getProjectBinding(project.project.id));
+      }
     }
-    for (const project of source.listReadyProjects()) {
-      const projectGrants = grantsByScope.get(project.scope) ?? [];
-      this.registerDynamicScope(project);
-      for (const grant of projectGrants) this.registerGrant(project.scope, grant);
-    }
+    this.registry = this.buildRegistry();
   }
 
   all(): ScopeConfig[] {
-    return [...this.scopes.values()].map((scope) => ({
-      ...scope,
-      repository_aliases: [...scope.repository_aliases]
-    }));
+    return [...this.projects.values()]
+      .filter((project) => !this.quarantined.has(project.id))
+      .map((project) => this.scopeFor(project));
   }
 
   get(idOrAlias: string): ScopeConfig | undefined {
-    const direct = this.scopes.get(idOrAlias);
-    const resolved = direct ?? this.scopes.get(this.aliases.get(idOrAlias) ?? '');
-    return resolved === undefined
-      ? undefined
-      : { ...resolved, repository_aliases: [...resolved.repository_aliases] };
+    const project = this.registry.get(idOrAlias);
+    return project === undefined ? undefined : this.scopeFor(project);
   }
 
-  visibleTo(principal: Principal): ScopeConfig[] {
-    return this.all().filter((scope) => this.permissions(principal, scope.id).can_read);
+  require(idOrAlias: string): ScopeConfig {
+    const scope = this.get(idOrAlias);
+    if (scope === undefined) {
+      throw new BrainError({ code: 'NOT_FOUND', message: `project ${idOrAlias} is not configured` });
+    }
+    if (!this.isUsable(scope.id)) {
+      throw new BrainError({
+        code: 'RECOVERY_REQUIRED',
+        message: `project ${scope.id} requires recovery before it can be used`
+      });
+    }
+    return scope;
   }
 
-  permissions(principal: Principal, scopeOrAlias: string): ScopePermissions {
-    const scope = this.get(scopeOrAlias);
-    if (scope === undefined) return { can_read: false, can_write: false, can_review: false };
-    if (!this.dynamicScopes.has(scope.id)) {
-      return {
-        can_read: principal.read_scopes.includes(scope.id),
-        can_write: principal.write_scopes.includes(scope.id),
-        can_review:
-          principal.review_scopes.includes(scope.id) &&
-          (principal.role === 'reviewer' || principal.role === 'owner')
-      };
-    }
-    if (principal.role === 'owner') {
-      return { can_read: true, can_write: true, can_review: true };
-    }
-    const grant = this.grants.get(this.grantKey(principal.id, scope.id));
-    return grant === undefined
-      ? { can_read: false, can_write: false, can_review: false }
-      : {
-          can_read: grant.can_read,
-          can_write: grant.can_write,
-          can_review: grant.can_review && principal.role === 'reviewer'
-        };
+  isUsable(idOrAlias: string): boolean {
+    const project = this.registry.get(idOrAlias);
+    return project !== undefined && this.registry.isUsable(project.id);
   }
 
-  registerReadyProject(project: RepositoryProjectRecord, grant?: DynamicProjectGrant): void {
-    if (project.state !== 'ready') throw invalidInput('only ready repository projects can register');
-    this.registerDynamicScope(project);
-    if (grant !== undefined) this.registerGrant(project.scope, grant);
+  unusable(): ScopeConfig[] {
+    return [...this.projects.values()]
+      .filter((project) => this.quarantined.has(project.id))
+      .map((project) => this.scopeFor(project));
   }
 
-  quarantineProject(scope: string): void {
-    if (!this.dynamicScopes.delete(scope)) return;
-    this.scopes.delete(scope);
-    for (const key of this.grants.keys()) {
-      if (key.endsWith(`\u0000${scope}`)) this.grants.delete(key);
-    }
+  registerReadyProject(project: PersistedProject, binding?: LegacyProjectBackendBinding): void {
+    if (project.state !== 'ready') throw invalidInput('only ready projects can register');
+    this.registerDynamicProject(project.project, binding ?? this.bindings.get(project.project.id));
   }
 
-  private registerStatic(scope: ScopeConfig): void {
-    if (this.scopes.has(scope.id) || this.aliases.has(scope.id)) {
-      throw invalidInput(`static scope identifier ${scope.id} is duplicated`);
-    }
-    const copy = { ...scope, repository_aliases: [...scope.repository_aliases] };
-    this.scopes.set(copy.id, copy);
-    for (const alias of copy.repository_aliases) {
-      if (alias === copy.id) continue;
-      if (this.scopes.has(alias) || this.aliases.has(alias)) {
-        throw invalidInput(`static scope alias ${alias} is duplicated`);
-      }
-      this.aliases.set(alias, copy.id);
-    }
+  quarantineProject(idOrAlias: string): void {
+    const project = this.registry.get(idOrAlias);
+    if (project === undefined) return;
+    this.quarantined.add(project.id);
+    this.registry = this.buildRegistry();
   }
 
-  private registerDynamicScope(project: RepositoryProjectRecord): void {
-    if (project.state !== 'ready') throw invalidInput('only ready repository projects can register');
-    if (RESERVED.has(project.scope) || this.aliases.has(project.scope)) {
-      throw invalidInput(`dynamic scope ${project.scope} is reserved`);
-    }
-    const scope: ScopeConfig = {
-      id: project.scope,
-      backend_project: project.backend_project,
+  private buildRegistry(): ProjectRegistry {
+    return new ProjectRegistry(
+      [...this.projects.values()],
+      [...this.staticAliases],
+      [...this.quarantined]
+    );
+  }
+
+  private scopeFor(project: Project): ScopeConfig {
+    const binding = this.bindings.get(project.id);
+    return {
+      id: project.id,
+      backend_project: binding?.backend_project ?? project.id,
       relative_root: project.relative_root,
       repository_aliases: []
     };
-    const existing = this.scopes.get(scope.id);
+  }
+
+  private registerStatic(scope: ScopeConfig): void {
+    if (this.projects.has(scope.id)) {
+      throw invalidInput(`static project identifier ${scope.id} is duplicated`);
+    }
+    this.projects.set(scope.id, {
+      id: scope.id,
+      display_name: scope.id,
+      relative_root: scope.relative_root
+    });
+    this.order.push(scope.id);
+    for (const alias of scope.repository_aliases) {
+      if (alias === scope.id) continue;
+      this.staticAliases.push({ identifier: alias, project_id: scope.id });
+    }
+    this.bindings.set(scope.id, {
+      backend_project: scope.backend_project,
+      backend_relative_root: scope.relative_root
+    });
+  }
+
+  private registerDynamicProject(project: Project, binding?: LegacyProjectBackendBinding): void {
+    if (RESERVED.has(project.id)) {
+      throw invalidInput(`dynamic project ${project.id} is reserved`);
+    }
+    const existing = this.projects.get(project.id);
     if (existing !== undefined) {
-      if (!this.dynamicScopes.has(scope.id)) {
-        throw invalidInput(`dynamic scope ${scope.id} conflicts with static configuration`);
+      if (!this.dynamic.has(project.id)) {
+        throw invalidInput(`dynamic project ${project.id} conflicts with static configuration`);
       }
-      if (!sameScope(existing, scope)) {
-        throw conflict(`dynamic scope ${scope.id} was registered with a different mapping`);
+      if (
+        existing.relative_root !== project.relative_root ||
+        existing.repository_identity !== project.repository_identity ||
+        existing.display_name !== project.display_name
+      ) {
+        throw conflict(`dynamic project ${project.id} was registered with a different mapping`);
       }
+      if (binding !== undefined) this.bindings.set(project.id, binding);
+      this.registry = this.buildRegistry();
       return;
     }
-    this.scopes.set(scope.id, scope);
-    this.dynamicScopes.add(scope.id);
-  }
-
-  private registerGrant(scope: string, grant: DynamicProjectGrant): void {
-    if (grant.scope !== scope || grant.can_read !== true) {
-      throw invalidInput('dynamic project grant does not match the registered scope');
-    }
-    this.grants.set(this.grantKey(grant.principal_id, scope), { ...grant });
-  }
-
-  private grantKey(principalId: string, scope: string): string {
-    return `${principalId}\u0000${scope}`;
+    this.projects.set(project.id, { ...project });
+    this.order.push(project.id);
+    this.dynamic.add(project.id);
+    if (binding !== undefined) this.bindings.set(project.id, binding);
+    this.registry = this.buildRegistry();
   }
 }

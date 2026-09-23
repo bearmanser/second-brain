@@ -11,7 +11,7 @@ services:
       - "127.0.0.1:${BRAIN_PORT:-7331}:7331"
     environment:
       BRAIN_CONFIG: /run/brain/brain.yaml
-      BRAIN_CREDENTIALS: /run/secrets/brain_credentials
+      BRAIN_TOKEN_SHA256: ${BRAIN_TOKEN_SHA256:?Run setup to provision the token digest}
       BRAIN_HEALTH_TOKEN: /run/secrets/brain_token
       BRAIN_CURSOR_SECRET: /run/secrets/brain_cursor
       BRAIN_STATE_DIR: /var/lib/second-brain
@@ -21,7 +21,7 @@ services:
       - ${VAULT_PATH:-./vault}:/vault:ro
       - ./config/brain.yaml:/run/brain/brain.yaml:ro
       - brain-state:/var/lib/second-brain
-    secrets: [brain_credentials, brain_token, brain_cursor]
+    secrets: [brain_token, brain_cursor]
     depends_on:
       memory:
         condition: service_started
@@ -52,8 +52,6 @@ services:
     init: true
     restart: unless-stopped
 secrets:
-  brain_credentials:
-    file: ./secrets/credentials.json
   brain_token:
     file: ./secrets/brain-token
   brain_cursor:
