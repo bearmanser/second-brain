@@ -916,10 +916,11 @@ test.each([
 });
 
 test.each([
-  { stale: false, documentActivity: false, outcome: 'finalized' },
-  { stale: true, documentActivity: false, outcome: 'conflicted' },
-  { stale: false, documentActivity: true, outcome: 'recovery_required' }
-])('a pre-manifest legacy consolidation with old rows rechecks its read set and is $outcome', async ({ stale, documentActivity }) => {
+  { stale: false, documentActivity: false, completedRow: false, scenario: 'reserved rows', outcome: 'finalized' },
+  { stale: true, documentActivity: false, completedRow: false, scenario: 'changed head', outcome: 'conflicted' },
+  { stale: false, documentActivity: true, completedRow: false, scenario: 'document activity', outcome: 'recovery_required' },
+  { stale: false, documentActivity: false, completedRow: true, scenario: 'completed row', outcome: 'recovery_required' }
+])('a pre-manifest legacy consolidation with $scenario is $outcome', async ({ stale, documentActivity, completedRow }) => {
   const { ground, id, a, b } = await twoHeadGround();
   try {
     const key = randomUUID();
@@ -947,6 +948,7 @@ test.each([
       ground.operations.reserveSubordinate({ operation_id: operation.operation_id, effect_index,
         kind, key: subordinateKey, created_at: now, updated_at: now });
     }
+    if (completedRow) ground.operations.markSubordinate(operation.operation_id, 0, 'complete');
     expect(ground.store.hasConsolidationManifest(`${key}:consolidate`)).toBe(false);
     if (documentActivity) {
       const documentJournal = LocalWriteJournal.open(join(ground.sandbox.state, 'documents.sqlite'));
@@ -962,7 +964,7 @@ test.each([
     await ground.reopenStore();
     expect(ground.store.hasConsolidationManifest(`${key}:consolidate`)).toBe(false);
     const result = await ground.coordinator.recover();
-    if (documentActivity) {
+    if (documentActivity || completedRow) {
       expect(result.finalized).toBe(0);
       expect(result.conflicted).toBe(0);
       expect(result.blocking_operations).toContain(operation.operation_id);
@@ -970,6 +972,9 @@ test.each([
       expect(ground.store.hasConsolidationManifest(`${key}:consolidate`)).toBe(false);
       expect(ground.operations.listSubordinates(operation.operation_id).map((row) => row.key)).toEqual([
         `${key}:doc:0`, `${key}:remove:1`, `${key}:consolidate`
+      ]);
+      expect(ground.operations.listSubordinates(operation.operation_id).map((row) => row.state)).toEqual([
+        completedRow ? 'complete' : 'reserved', 'reserved', 'reserved'
       ]);
       expect((await ground.store.readPath('Knowledge/A.md')).raw).toBe(a.raw);
       expect((await ground.store.readPath('Knowledge/B.md')).raw).toBe(b.raw);

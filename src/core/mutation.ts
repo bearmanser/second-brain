@@ -1850,7 +1850,8 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
         }
         for (const [index, row] of existing.entries()) {
           const spec = historical[index];
-          if (row.effect_index !== index || row.key !== spec?.key || row.kind !== spec.kind || row.state === 'failed') {
+          if (row.effect_index !== index || row.key !== spec?.key || row.kind !== spec.kind ||
+              row.state === 'failed' || (!hasManifest && row.state === 'complete')) {
             throw localRecovery(`historical subordinate ${index} disagrees with its planned effect`);
           }
           const document = this.deps.documents.getDocumentReceipt(row.key)?.operation_id;
