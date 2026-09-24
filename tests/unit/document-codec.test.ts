@@ -699,6 +699,7 @@ test('source-shaped lines outside a genuine Sources section stay body text', () 
   const parsed = parseSources(document);
   expect(parsed.evidence).toEqual([{ kind: 'repository', ref: 'real', description: 'Real entry' }]);
   expect(parsed.evidence.some((entry) => entry.ref === 'fenced')).toBe(false);
+  expect(parsed.human).toContain('- **repository** `fenced` — Fenced example');
 });
 
 test('without a Sources heading no body line is reclassified as evidence', () => {
@@ -720,6 +721,7 @@ test('a source-shaped line after the Sources section is not evidence', () => {
   ].join('\n');
   const parsed = parseSources(document);
   expect(parsed.evidence).toEqual([{ kind: 'repository', ref: 'real', description: 'Real entry' }]);
+  expect(parsed.human).toContain('- **repository** `after` — Body text');
 });
 
 test('link label metacharacters are escaped and survive a round trip', () => {
@@ -767,6 +769,70 @@ test('a real Sources section after a fenced example parses only the real entries
   const parsed = parseSources(document);
   expect(parsed.evidence).toEqual([{ kind: 'repository', ref: 'real', description: 'Real entry' }]);
   expect(parsed.evidence.some((entry) => entry.ref === 'fake')).toBe(false);
+  expect(parsed.human).toContain('- **repository** `fake` — Fake example');
+});
+
+test('source-shaped lines outside Sources retain their original order in human', () => {
+  const parsed = parseSources([
+    '- **repository** `before` — Before',
+    '## Sources',
+    '',
+    '- **repository** `real` — Real',
+    'Human line.',
+    '## Related',
+    '- **repository** `after` — After'
+  ].join('\n'));
+  expect(parsed.evidence).toEqual([{ kind: 'repository', ref: 'real', description: 'Real' }]);
+  expect(parsed.human).toEqual([
+    '- **repository** `before` — Before',
+    'Human line.',
+    '- **repository** `after` — After'
+  ]);
+});
+
+test('a revision preserves a human section with the same heading as a generated section', () => {
+  const previous: NoteInput = {
+    title: 'Managed decision', tags: [], related_ids: [], evidence: [],
+    content: { kind: 'decision', context: 'Generated context.', decision: 'D.', rationale: 'R.' }
+  };
+  const base = documentFromNote(previous, { path: 'Managed decision.md' });
+  const human = '## Context\n\nGenerated context.\n\nHuman-authored second context.\n';
+  const edited = parseDocument(renderDocument({
+    ...base, body: base.body.replace('Generated context.\n\n## Decision', 'Human edited context.\n\n## Decision') + `\n${human}`
+  }), base.path);
+  const revised = reviseDocument(edited, {
+    ...previous,
+    content: { kind: 'decision', context: 'Updated context.', decision: 'D2.', rationale: 'R2.' }
+  }, { previous });
+  expect(revised.body).toContain('Human edited context.');
+  expect(revised.body).toContain('Updated context.');
+  expect(revised.body).toContain(human.trimEnd());
+  expect(revised.body.match(/^## Context$/gm)).toHaveLength(2);
+});
+
+test('a revision removes generated fenced field content but keeps human fenced code', () => {
+  const previous: NoteInput = {
+    title: 'Managed decision', tags: [], related_ids: [], evidence: [],
+    content: {
+      kind: 'decision', context: 'Old context.\n\n```ts\nconst old = true;\n```',
+      decision: 'D.', rationale: 'R.'
+    }
+  };
+  const base = documentFromNote(previous, { path: 'Managed decision.md' });
+  const humanCode = '```js\nconst human = true;\n```';
+  const edited = parseDocument(renderDocument({
+    ...base,
+    body: base.body.replace('const old = true;\n```', `const old = true;\n\`\`\`\n\n${humanCode}`)
+  }), base.path);
+  const revised = reviseDocument(edited, {
+    ...previous,
+    content: { kind: 'decision', context: 'New context.', decision: 'D2.', rationale: 'R2.' }
+  }, { previous });
+  expect(revised.body).toContain('New context.');
+  expect(revised.body).not.toContain('Old context.');
+  expect(revised.body).not.toContain('const old = true;');
+  expect(revised.body).not.toContain('```ts');
+  expect(revised.body).toContain(humanCode);
 });
 
 test('a revision replaces the generated Related section without duplicating it', () => {

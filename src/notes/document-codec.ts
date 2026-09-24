@@ -80,10 +80,8 @@ export interface ParsedSources {
 
 interface LineInfo {
   text: string;
-  section: string | undefined;
   headingDepth: number | undefined;
   headingTitle: string | undefined;
-  inCode: boolean;
 }
 
 function invalid(message: string, cause?: unknown): BrainError {
@@ -186,7 +184,6 @@ function analyzeSource(source: string): LineInfo[] {
   const lines = source.split('\n');
   const starts = lineStarts(lines);
   const children = topLevelNodes(source);
-  const codeRanges = collectCodeRanges(children);
   const headings: { title: string; depth: number; line: number }[] = [];
   for (const node of children) {
     const title = headingTitleOf(source, node);
@@ -206,10 +203,8 @@ function analyzeSource(source: string): LineInfo[] {
     const isHeadingLine = heading !== undefined && heading.line === line;
     infos.push({
       text: lines[line],
-      section: heading === undefined ? undefined : heading.title,
       headingDepth: isHeadingLine ? heading.depth : undefined,
-      headingTitle: isHeadingLine ? heading.title : undefined,
-      inCode: isInside(codeRanges, starts[line])
+      headingTitle: isHeadingLine ? heading.title : undefined
     });
   }
   return infos;
@@ -468,7 +463,7 @@ export function parseSources(section: string): ParsedSources {
   const headingLine = lineIndexAt(headingStart, starts);
   const endLine = endOffset >= section.length ? lines.length : lineIndexAt(endOffset, starts);
   const evidence: Evidence[] = [];
-  const human: string[] = [];
+  const human: string[] = lines.slice(0, headingLine).filter((text) => SOURCE_ENTRY_PATTERN.test(text));
   let start = headingLine + 1;
   if (start < endLine && lines[start].trim() === '') start += 1;
   for (let line = start; line < endLine; line += 1) {
@@ -491,6 +486,7 @@ export function parseSources(section: string): ParsedSources {
     }
     human.push(text);
   }
+  human.push(...lines.slice(endLine).filter((text) => SOURCE_ENTRY_PATTERN.test(text)));
   return { evidence, human };
 }
 
@@ -552,28 +548,38 @@ export function documentFromNote(note: NoteInput, meta: DocumentMetadata): Curre
 }
 
 interface GeneratedSkeleton {
-  headings: Set<string>;
-  lines: Map<string, Map<string, number>>;
+  sections: SectionBlock[];
 }
 
-function generatedSkeleton(previous: NoteInput): GeneratedSkeleton {
-  const infos = analyzeSource(renderNoteBody(previous));
-  const headings = new Set<string>();
-  const lines = new Map<string, Map<string, number>>();
-  for (const info of infos) {
-    if (info.headingDepth === 2 && info.headingTitle !== undefined) {
-      headings.add(info.headingTitle);
-      if (!lines.has(info.headingTitle)) lines.set(info.headingTitle, new Map());
-      continue;
+interface SectionBlock {
+  title: string | undefined;
+  start: number;
+  lines: LineInfo[];
+}
+
+function sectionBlocks(infos: LineInfo[]): SectionBlock[] {
+  const blocks: SectionBlock[] = [{ title: undefined, start: 0, lines: [] }];
+  for (let index = 0; index < infos.length; index += 1) {
+    const info = infos[index];
+    if (info.headingDepth !== undefined) {
+      blocks.push({ title: info.headingDepth === 2 ? info.headingTitle : undefined, start: index, lines: [] });
     }
-    if (info.headingDepth !== undefined) continue;
-    if (info.section === undefined) continue;
-    const counts = lines.get(info.section);
-    if (counts === undefined) continue;
+    blocks[blocks.length - 1].lines.push(info);
+  }
+  return blocks;
+}
+
+function contentCounts(block: SectionBlock): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const info of block.lines.slice(1)) {
     if (info.text.trim().length === 0) continue;
     counts.set(info.text, (counts.get(info.text) ?? 0) + 1);
   }
-  return { headings, lines };
+  return counts;
+}
+
+function generatedSkeleton(previous: NoteInput): GeneratedSkeleton {
+  return { sections: sectionBlocks(analyzeSource(renderNoteBody(previous))).filter((block) => block.title !== undefined) };
 }
 
 function subtractGenerated(
@@ -581,54 +587,59 @@ function subtractGenerated(
   previous: NoteInput
 ): { general: string[]; sections: Record<string, string[]> } {
   const skeleton = generatedSkeleton(previous);
-  const remaining = new Map<string, Map<string, number>>();
-  for (const [title, counts] of skeleton.lines) remaining.set(title, new Map(counts));
-  const infos = analyzeSource(body);
+  const blocks = sectionBlocks(analyzeSource(body));
+  const generated = new Map<number, Map<string, number>>();
+  let lastMatched = -1;
+  for (const section of skeleton.sections) {
+    const expected = contentCounts(section);
+    let chosen = -1;
+    let bestOverlap = -1;
+    let bestDistance = Infinity;
+    for (let index = lastMatched + 1; index < blocks.length; index += 1) {
+      const candidate = blocks[index];
+      if (candidate.title !== section.title) continue;
+      const present = contentCounts(candidate);
+      let overlap = 0;
+      for (const [text, count] of expected) overlap += Math.min(count, present.get(text) ?? 0);
+      const distance = Math.abs(candidate.start - section.start);
+      if (distance < bestDistance || (distance === bestDistance && overlap > bestOverlap)) {
+        chosen = index;
+        bestOverlap = overlap;
+        bestDistance = distance;
+      }
+    }
+    if (chosen < 0) continue;
+    generated.set(chosen, expected);
+    lastMatched = chosen;
+  }
   const generalLines: string[] = [];
   const sectionLines = new Map<string, string[]>();
-  const assign = (section: string | undefined, text: string): void => {
-    if (section === undefined) {
-      generalLines.push(text);
-      return;
-    }
-    const existing = sectionLines.get(section);
-    if (existing === undefined) sectionLines.set(section, [text]);
-    else existing.push(text);
-  };
   let headingRemoved = false;
-  for (const info of infos) {
-    if (info.inCode) {
-      assign(info.section, info.text);
-      continue;
-    }
-    if (info.headingDepth === 1) {
-      if (!headingRemoved) {
-        headingRemoved = true;
-        continue;
-      }
-      assign(info.section, info.text);
-      continue;
-    }
-    if (info.headingDepth === 2 && info.headingTitle !== undefined) {
-      if (skeleton.headings.has(info.headingTitle)) continue;
-      assign(info.section, info.text);
-      continue;
-    }
-    if (info.headingDepth !== undefined) {
-      assign(info.section, info.text);
-      continue;
-    }
-    if (info.section !== undefined) {
-      const counts = remaining.get(info.section);
-      if (counts !== undefined) {
-        const count = counts.get(info.text) ?? 0;
-        if (count > 0) {
-          counts.set(info.text, count - 1);
+  for (let index = 0; index < blocks.length; index += 1) {
+    const block = blocks[index];
+    const counts = generated.get(index);
+    if (counts === undefined) {
+      for (const info of block.lines) {
+        if (info.headingDepth === 1 && !headingRemoved) {
+          headingRemoved = true;
           continue;
         }
+        generalLines.push(info.text);
       }
+      continue;
     }
-    assign(info.section, info.text);
+    const title = block.title;
+    if (title === undefined) continue;
+    const remaining = sectionLines.get(title) ?? [];
+    for (const info of block.lines.slice(1)) {
+      const count = counts.get(info.text) ?? 0;
+      if (info.text.trim().length > 0 && count > 0) {
+        counts.set(info.text, count - 1);
+        continue;
+      }
+      remaining.push(info.text);
+    }
+    sectionLines.set(title, remaining);
   }
   const sections: Record<string, string[]> = {};
   for (const [title, lines] of sectionLines) {
