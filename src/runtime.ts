@@ -635,8 +635,8 @@ class BrainRuntimeImpl implements BrainRuntime {
       signal: this.shutdown.signal,
       interval_ms: this.config.limits.reconcile_interval_ms ?? RECONCILE_INTERVAL_MS,
       onReconcile: (report) => {
-        this.logCurrentReconcile(report);
         syncIndex(report);
+        this.logCurrentReconcile(report);
       },
       onError: (error) => this.log(internalDiagnostic(error))
     });
@@ -647,8 +647,8 @@ class BrainRuntimeImpl implements BrainRuntime {
         catalogue: current,
         signal: this.shutdown.signal
       });
-      this.logCurrentReconcile(report);
       syncIndex(report);
+      this.logCurrentReconcile(report);
     } catch (error) {
       if (!(isBrainError(error) && error.code === 'CANCELLED')) {
         this.log(internalDiagnostic(error));
@@ -662,6 +662,7 @@ class BrainRuntimeImpl implements BrainRuntime {
         `${report.added.length} added, ${report.changed.length} changed, ` +
         `${report.moved.length} moved, ${report.removed.length} removed, ` +
         `${report.malformed.length} malformed, ${report.duplicate_ids.length} duplicate_ids, ` +
+        `${report.identity_conflicts?.length ?? 0} identity_conflicts, ` +
         `${report.unresolved_links.length} unresolved_links`
     );
   }

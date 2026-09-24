@@ -354,6 +354,7 @@ export interface ReconcileCurrentVaultReport {
   removed: CurrentVaultRemoval[];
   malformed: CurrentVaultMalformed[];
   duplicate_ids: CurrentVaultDuplicate[];
+  identity_conflicts?: CurrentVaultDuplicate[];
   unresolved_links: CurrentVaultUnresolvedLink[];
 }
 
@@ -384,6 +385,7 @@ export async function reconcileCurrentVault(
     removed: [],
     malformed: [],
     duplicate_ids: [],
+    identity_conflicts: [],
     unresolved_links: []
   };
 
@@ -440,13 +442,21 @@ export async function reconcileCurrentVault(
       )
       .map((item) => ({ id: item.document.id, path: item.path }))
   );
+  const observedPaths = new Set(observed.map((item) => item.path));
 
   const duplicateIds = new Map<string, string[]>();
   const identityIds = [...new Set([...previousIdentityPaths.keys(), ...nextIdentityPaths.keys()])].sort();
   for (const id of identityIds) {
     const beforePaths = previousIdentityPaths.get(id) ?? [];
     const afterPaths = nextIdentityPaths.get(id) ?? [];
-    if (beforePaths.length <= 1 && afterPaths.length <= 1) continue;
+    const unresolvedPrior = beforePaths.some(
+      (path) => !observedPaths.has(path) && (listedPaths.has(path) || !report.complete)
+    );
+    const uncertainMove =
+      beforePaths.length > 0 &&
+      (unresolvedPrior || !report.complete) &&
+      afterPaths.some((path) => !beforePaths.includes(path));
+    if (beforePaths.length <= 1 && afterPaths.length <= 1 && !uncertainMove) continue;
     const pathList = [...new Set([...beforePaths, ...afterPaths])].sort();
     duplicateIds.set(id, pathList);
     report.duplicate_ids.push({ id, paths: pathList });
@@ -492,7 +502,7 @@ export async function reconcileCurrentVault(
     const id = item.document.id;
     if (id !== undefined && duplicateIds.has(id)) continue;
     const move = movesByTo.get(item.path);
-    if (move === undefined) continue;
+    if (move === undefined || !report.complete) continue;
     const source = previousByPath.get(move.from);
     if (source === undefined) continue;
     moveDestinations.add(item.path);
@@ -536,6 +546,13 @@ export async function reconcileCurrentVault(
     }
 
     if (prior.hash === item.raw_hash) continue;
+    if (!report.complete && prior.id !== id) {
+      report.identity_conflicts?.push({
+        id: id ?? prior.id ?? item.path,
+        paths: [item.path]
+      });
+      continue;
+    }
 
     let revisionId: string | undefined;
     if (id !== undefined && id === prior.id) {

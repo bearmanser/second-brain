@@ -235,6 +235,7 @@ export interface SearchIndex {
   replaceDocument(input: ReplaceDocumentInput): void;
   deletePath(path: string): void;
   paths(): string[];
+  identities(): { path: string; id: string | null }[];
   candidates(input: CandidateQuery): Candidate[];
   expandGraph(seedKeys: readonly string[], filters: GraphFilters, limit: number): GraphExpansion;
   upsert(entry: SearchIndexEntry): void;
@@ -290,6 +291,14 @@ class SearchIndexImpl implements SearchIndex {
 
   remove(path: string): void {
     this.deletePath(path);
+  }
+
+  identities(): { path: string; id: string | null }[] {
+    this.assertOpen();
+    return this.database.prepare('SELECT path, id FROM documents ORDER BY path').all() as {
+      path: string;
+      id: string | null;
+    }[];
   }
 
   private referencesFor(raw: string): IndexedReference[] {

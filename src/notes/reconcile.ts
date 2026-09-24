@@ -59,6 +59,7 @@ export interface SearchIndexSink {
   }): void;
   remove?(path: string): void;
   paths?(): string[];
+  identities?(): { path: string; id: string | null }[];
 }
 
 export interface IndexReconciledDocumentsInput {
@@ -74,17 +75,48 @@ export function indexReconciledDocuments(input: IndexReconciledDocumentsInput): 
   for (const duplicate of report.duplicate_ids) {
     for (const path of duplicate.paths) protectedPaths.add(path);
   }
-  const destructive = report.complete;
-  if (destructive) {
-    for (const moved of report.moved) {
-      if (!protectedPaths.has(moved.from)) index.remove?.(moved.from);
-    }
-  }
+  const indexed = index.identities?.() ?? [];
+  const byId = new Map(
+    indexed.filter((entry) => entry.id !== null).map((entry) => [entry.id, entry.path])
+  );
+  const byPath = new Map(indexed.map((entry) => [entry.path, entry.id]));
   const paths = new Set<string>();
   for (const source of report.added) paths.add(source.path);
   for (const change of report.changed) paths.add(change.path);
   for (const moved of report.moved) paths.add(moved.to);
+  const blocked = new Set<string>();
   for (const path of paths) {
+    const source = catalogue.getByPath(path);
+    if (source === undefined) continue;
+    const priorPath = source.id === undefined ? undefined : byId.get(source.id);
+    const priorId = byPath.get(path);
+    const collides = priorPath !== undefined && priorPath !== path;
+    const changesIdentity = priorId !== undefined && priorId !== (source.id ?? null);
+    if (
+      protectedPaths.has(path) ||
+      (collides && (!report.complete || protectedPaths.has(priorPath))) ||
+      (!report.complete && changesIdentity)
+    ) {
+      blocked.add(path);
+      if (collides && source.id !== undefined && !report.duplicate_ids.some((item) => item.id === source.id)) {
+        const conflict = { id: source.id, paths: [priorPath, path].sort() };
+        report.duplicate_ids.push(conflict);
+        for (const conflictPath of conflict.paths) protectedPaths.add(conflictPath);
+      }
+      if (!report.complete && changesIdentity && !report.identity_conflicts?.some((item) => item.paths.includes(path))) {
+        report.identity_conflicts ??= [];
+        report.identity_conflicts.push({ id: source.id ?? priorId ?? path, paths: [path] });
+      }
+    }
+  }
+  const destructive = report.complete;
+  if (destructive) {
+    for (const moved of report.moved) {
+      if (!protectedPaths.has(moved.from) && !blocked.has(moved.to)) index.remove?.(moved.from);
+    }
+  }
+  for (const path of paths) {
+    if (blocked.has(path)) continue;
     const raw = catalogue.rawFor(path);
     const source = catalogue.getByPath(path);
     if (raw === undefined || source === undefined) continue;

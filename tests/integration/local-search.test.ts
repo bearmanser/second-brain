@@ -1,6 +1,6 @@
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
 import { CurrentCatalogue, reconcileCurrentVault } from '../../src/notes/current-catalogue.js';
 import { indexReconciledDocuments, type ReconcileCurrentVaultReport } from '../../src/notes/reconcile.js';
 import { openSearchIndex } from '../../src/storage/search-index.js';
@@ -8,6 +8,28 @@ import { FileVault, scanVaultFilePaths } from '../../src/storage/vault.js';
 import { vaultSandbox } from '../helpers/vault-sandbox.js';
 
 const MANAGED_ID = '44b093c5-71db-4785-b9a5-bb8118304278';
+
+const walkFault = vi.hoisted(() => ({
+  afterListing: undefined as undefined | ((path: string) => Promise<void>),
+  afterStat: undefined as undefined | ((path: string) => Promise<void>)
+}));
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const fs = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...fs,
+    readdir: async (...args: Parameters<typeof fs.readdir>) => {
+      const entries = await fs.readdir(...args);
+      await walkFault.afterListing?.(String(args[0]));
+      return entries;
+    },
+    lstat: async (...args: Parameters<typeof fs.lstat>) => {
+      const stat = await fs.lstat(...args);
+      await walkFault.afterStat?.(String(args[0]));
+      return stat;
+    }
+  };
+});
 
 function frontmatterDocument(
   body: string,
@@ -423,6 +445,188 @@ test('a present file that becomes unparseable on a later scan keeps its index en
     await sandbox.dispose();
   }
 });
+
+test('an unreadable managed source cannot be displaced by a readable note with its id', async () => {
+  const sandbox = await vaultSandbox();
+  const catalogue = CurrentCatalogue.open({});
+  const index = openSearchIndex(':memory:');
+  try {
+    await mkdir(join(sandbox.vault, 'Knowledge'), { recursive: true });
+    const original = join(sandbox.vault, 'Knowledge', 'Original.md');
+    const contender = join(sandbox.vault, 'Knowledge', 'Contender.md');
+    await writeFile(original, frontmatterDocument('# Original\n\nprotectedword', { id: MANAGED_ID }));
+    const vault = new FileVault(sandbox.vault, []);
+    const first = await reconcileCurrentVault({ vault, catalogue });
+    indexReconciledDocuments({ catalogue, index, report: first });
+    await writeFile(original, Buffer.from([0xff, 0xfe]));
+    await writeFile(contender, frontmatterDocument('# Contender\n\ncontenderword', { id: MANAGED_ID }));
+
+    const second = await reconcileCurrentVault({ vault, catalogue });
+    indexReconciledDocuments({ catalogue, index, report: second });
+    expect(second.malformed.map((entry) => entry.path)).toContain('Knowledge/Original.md');
+    expect(second.duplicate_ids).toContainEqual({
+      id: MANAGED_ID,
+      paths: ['Knowledge/Contender.md', 'Knowledge/Original.md']
+    });
+    expect(second.moved).toEqual([]);
+    expect(index.paths()).toEqual(['Knowledge/Original.md']);
+    expect(index.candidates({ query: 'protectedword', limit: 10 })).toHaveLength(1);
+    expect(index.candidates({ query: 'contenderword', limit: 10 })).toHaveLength(0);
+    expect(catalogue.getByPath('Knowledge/Original.md')).toBeDefined();
+  } finally {
+    index.close();
+    catalogue.close();
+    await sandbox.dispose();
+  }
+});
+
+test('a partial scan does not plan a move or upsert its destination', async () => {
+  const sandbox = await vaultSandbox();
+  const catalogue = CurrentCatalogue.open({});
+  const index = openSearchIndex(':memory:');
+  try {
+    await mkdir(join(sandbox.vault, 'Knowledge'), { recursive: true });
+    await writeFile(join(sandbox.vault, 'Knowledge', 'Before.md'),
+      frontmatterDocument('# Before\n\noriginalword', { id: MANAGED_ID }));
+    const vault = new FileVault(sandbox.vault, []);
+    indexReconciledDocuments({ catalogue, index, report: await reconcileCurrentVault({ vault, catalogue }) });
+    await rm(join(sandbox.vault, 'Knowledge', 'Before.md'));
+    await writeFile(join(sandbox.vault, 'Knowledge', 'After.md'),
+      frontmatterDocument('# After\n\ndestinationword', { id: MANAGED_ID }));
+    const partialVault = {
+      listMarkdown: () => vault.listMarkdown(),
+      scanMarkdown: async () => ({ paths: ['Knowledge/After.md'], complete: false }),
+      readMarkdown: (path: string) => vault.readMarkdown(path)
+    };
+    const partial = await reconcileCurrentVault({ vault: partialVault, catalogue });
+    indexReconciledDocuments({ catalogue, index, report: partial });
+    expect(partial.moved).toEqual([]);
+    expect(partial.duplicate_ids).toContainEqual({
+      id: MANAGED_ID,
+      paths: ['Knowledge/After.md', 'Knowledge/Before.md']
+    });
+    expect(index.paths()).toEqual(['Knowledge/Before.md']);
+    expect(index.candidates({ query: 'originalword', limit: 10 })).toHaveLength(1);
+    expect(index.candidates({ query: 'destinationword', limit: 10 })).toHaveLength(0);
+    const complete = await reconcileCurrentVault({ vault, catalogue });
+    indexReconciledDocuments({ catalogue, index, report: complete });
+    expect(complete.moved).toEqual([{ id: MANAGED_ID, from: 'Knowledge/Before.md', to: 'Knowledge/After.md' }]);
+    expect(index.paths()).toEqual(['Knowledge/After.md']);
+  } finally {
+    index.close();
+    catalogue.close();
+    await sandbox.dispose();
+  }
+});
+
+test('a fresh catalogue cannot upsert a colliding id over a malformed indexed source', async () => {
+  const sandbox = await vaultSandbox();
+  const index = openSearchIndex(':memory:');
+  const catalogue = CurrentCatalogue.open({});
+  try {
+    await mkdir(join(sandbox.vault, 'Knowledge'), { recursive: true });
+    await writeFile(join(sandbox.vault, 'Knowledge', 'Original.md'), Buffer.from([0xff, 0xfe]));
+    await writeFile(join(sandbox.vault, 'Knowledge', 'Contender.md'),
+      frontmatterDocument('# Contender\n\ncontenderword', { id: MANAGED_ID }));
+    index.replaceDocument({
+      path: 'Knowledge/Original.md',
+      raw: frontmatterDocument('# Original\n\nprotectedword', { id: MANAGED_ID }),
+      etag: 'before'
+    });
+    const report = await reconcileCurrentVault({ vault: new FileVault(sandbox.vault, []), catalogue });
+    indexReconciledDocuments({ catalogue, index, report });
+    expect(report.malformed.map((entry) => entry.path)).toContain('Knowledge/Original.md');
+    expect(report.duplicate_ids).toContainEqual({
+      id: MANAGED_ID,
+      paths: ['Knowledge/Contender.md', 'Knowledge/Original.md']
+    });
+    expect(index.paths()).toEqual(['Knowledge/Original.md']);
+    expect(index.candidates({ query: 'protectedword', limit: 10 })).toHaveLength(1);
+  } finally {
+    index.close();
+    catalogue.close();
+    await sandbox.dispose();
+  }
+});
+
+test('a partial scan does not replace an indexed path when its managed id changes', async () => {
+  const sandbox = await vaultSandbox();
+  const catalogue = CurrentCatalogue.open({});
+  const index = openSearchIndex(':memory:');
+  try {
+    await mkdir(join(sandbox.vault, 'Knowledge'), { recursive: true });
+    const path = join(sandbox.vault, 'Knowledge', 'Identity.md');
+    await writeFile(path, frontmatterDocument('# Identity\n\noriginalword', { id: MANAGED_ID }));
+    const vault = new FileVault(sandbox.vault, []);
+    indexReconciledDocuments({ catalogue, index, report: await reconcileCurrentVault({ vault, catalogue }) });
+    const replacementId = 'af5028e7-d853-4af3-85a3-2a41f9297f30';
+    await writeFile(path, frontmatterDocument('# Identity\n\nreplacementword', { id: replacementId }));
+    const partialVault = {
+      listMarkdown: () => vault.listMarkdown(),
+      scanMarkdown: async () => ({ paths: ['Knowledge/Identity.md'], complete: false }),
+      readMarkdown: (file: string) => vault.readMarkdown(file)
+    };
+    const partial = await reconcileCurrentVault({ vault: partialVault, catalogue });
+    indexReconciledDocuments({ catalogue, index, report: partial });
+    expect(partial.changed).toEqual([]);
+    expect(partial.identity_conflicts).toContainEqual({ id: replacementId, paths: ['Knowledge/Identity.md'] });
+    expect(catalogue.getByPath('Knowledge/Identity.md')?.id).toBe(MANAGED_ID);
+    expect(index.candidates({ query: 'originalword', limit: 10 })).toHaveLength(1);
+    expect(index.candidates({ query: 'replacementword', limit: 10 })).toHaveLength(0);
+    const complete = await reconcileCurrentVault({ vault, catalogue });
+    indexReconciledDocuments({ catalogue, index, report: complete });
+    expect(index.candidates({ query: 'replacementword', limit: 10 })).toHaveLength(1);
+    expect(index.candidates({ query: 'originalword', limit: 10 })).toHaveLength(0);
+  } finally {
+    index.close();
+    catalogue.close();
+    await sandbox.dispose();
+  }
+});
+
+test.each(['directory disappears after lstat', 'entry disappears after readdir'])(
+  '%s marks the runtime inventory partial and retains existing indexed paths', async (scenario) => {
+    const sandbox = await vaultSandbox();
+    const catalogue = CurrentCatalogue.open({});
+    const index = openSearchIndex(':memory:');
+    try {
+      const folder = join(sandbox.vault, 'Knowledge');
+      await mkdir(folder, { recursive: true });
+      const note = join(folder, 'Keep.md');
+      await writeFile(note, '# Keep\n\nprotectedword\n');
+      const vault = new FileVault(sandbox.vault, []);
+      indexReconciledDocuments({ catalogue, index, report: await reconcileCurrentVault({ vault, catalogue }) });
+      expect(index.paths()).toEqual(['Knowledge/Keep.md']);
+      let triggered = false;
+      if (scenario === 'directory disappears after lstat') {
+        walkFault.afterStat = async (path) => {
+          if (path !== folder) return;
+          triggered = true;
+          await rm(folder, { recursive: true });
+        };
+      } else {
+        walkFault.afterListing = async (path) => {
+          if (path !== folder) return;
+          triggered = true;
+          await rm(note);
+        };
+      }
+      const report = await reconcileCurrentVault({ vault, catalogue });
+      expect(triggered).toBe(true);
+      expect(report.complete).toBe(false);
+      expect(report.removed).toEqual([]);
+      indexReconciledDocuments({ catalogue, index, report });
+      expect(index.paths()).toEqual(['Knowledge/Keep.md']);
+      expect(index.candidates({ query: 'protectedword', limit: 10 })).toHaveLength(1);
+    } finally {
+      walkFault.afterListing = undefined;
+      walkFault.afterStat = undefined;
+      index.close();
+      catalogue.close();
+      await sandbox.dispose();
+    }
+  }
+);
 
 test('an incomplete vault walk is treated as partial and never prunes the index', async () => {
   const index = openSearchIndex(':memory:');
