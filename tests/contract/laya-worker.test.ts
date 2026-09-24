@@ -381,6 +381,28 @@ describe('Laya worker supervision', () => {
     await expect(worker.score({ request_id: 't', query: 'q', candidates: candidates(1) })).resolves.toBeDefined();
   });
 
+  test('keeps the deadline watchdog on an active batch after its caller cancels', async () => {
+    const worker = await readyWorker('hang', { timeoutMs: 300 });
+    const pid = worker.health().pid as number;
+    const controller = new AbortController();
+    const started = performance.now();
+    const cancelled = rejection(worker.score({ request_id: 'hung', query: 'q', candidates: candidates(3), signal: controller.signal }));
+    const queued = rejection(worker.score({ request_id: 'queued', query: 'q', candidates: candidates(2, 'queued') }));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    controller.abort();
+    expect((await cancelled).reason).toBe('cancelled');
+    expect(worker.health().state).toBe('ready');
+    const queuedError = await queued;
+    const settledAfter = performance.now() - started;
+    expect(queuedError.reason).toBe('timeout');
+    expect(settledAfter).toBeLessThan(300 + 150);
+    await waitFor(() => !processAlive(pid), 1000);
+    expect(performance.now() - started).toBeLessThan(300 + 1000);
+    await waitFor(() => worker.health().state === 'ready');
+    expect(worker.health().pid).not.toBe(pid);
+    expect(worker.health().restarts_in_window).toBe(1);
+  });
+
   test('close terminates the child and rejects pending work', async () => {
     const worker = await readyWorker('hang');
     const pid = worker.health().pid as number;

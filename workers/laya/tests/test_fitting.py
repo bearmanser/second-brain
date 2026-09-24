@@ -9,10 +9,13 @@ from pathlib import Path
 from workers.laya.fitting import (
     MAX_SEGMENTS,
     TITLE_TOKEN_LIMIT,
+    WORD_JOINER,
     FittingError,
     InputTooLong,
     fit_state,
+    literal_text,
     render_state,
+    reserved_literals,
     select_segment,
 )
 
@@ -30,19 +33,24 @@ class FakeTokenizer:
     sep_token_id = 2
     mask_token_id = 4
     pad_token_id = 0
+    special_ids = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<mask>": 4}
+    all_special_tokens = ["<pad>", "<bos>", "<eos>", "<mask>"]
+    pattern = re.compile(r"<pad>|<bos>|<eos>|<mask>|[^\s<]+|<")
 
     def __init__(self):
         self.vocabulary = {}
         self.calls = 0
 
     def _id(self, word):
+        if word in self.special_ids:
+            return self.special_ids[word]
         if word not in self.vocabulary:
             self.vocabulary[word] = 10 + len(self.vocabulary)
         return self.vocabulary[word]
 
     def __call__(self, text, add_special_tokens=True, return_offsets_mapping=False):
         self.calls += 1
-        matches = list(re.finditer(r"\S+", text))
+        matches = list(self.pattern.finditer(text))
         result = {"input_ids": [self._id(match.group(0)) for match in matches]}
         if add_special_tokens:
             result["input_ids"] = [self.cls_token_id] + result["input_ids"] + [self.sep_token_id]
@@ -175,13 +183,44 @@ class FitStateTest(unittest.TestCase):
             fit_state(agent, "query", "Title", "Excerpt", self.question)
         self.assertEqual(caught.exception.code, "question_too_long")
 
-    def test_neutralizes_mask_tokens_without_losing_the_query(self):
+    def state_ids(self, agent, segment):
+        internal = {"t": "choice", "ins": self.question["instructions"], "crit": self.question["criteria"]}
+        prefix, _markers = sdk_sequence_contract(agent.tok, "", internal, agent.cfg["max_len"], agent.cfg["head_max_len"])
+        return list(segment.input_ids[len(prefix) - 1:-1])
+
+    def test_represents_reserved_literals_without_classifier_markers(self):
         agent = FakeAgent()
-        result = fit_state(agent, "find <mask> notes", "Title", "Body <mask> text", self.question)
+        excerpt = "Body <mask> text <eos> end"
+        result = fit_state(agent, "find <mask> notes", "Title <bos>", excerpt, self.question)
         segment = result.segments[0]
         self.assertFalse(result.truncated)
-        self.assertEqual(segment.excerpt, "Body <mask> text")
+        self.assertEqual(segment.excerpt, excerpt)
+        self.assertEqual(segment.title, "Title <bos>")
+        self.assertIn("Query:\nfind <" + WORD_JOINER + "mask> notes\n", segment.state)
+        self.assertIn("Title <" + WORD_JOINER + "bos>", segment.state)
+        self.assertIn("Body <" + WORD_JOINER + "mask> text <" + WORD_JOINER + "eos> end", segment.state)
         self.assertEqual(sum(1 for value in segment.input_ids if value == agent.tok.mask_token_id), 3)
+        state_ids = self.state_ids(agent, segment)
+        self.assertFalse(set(state_ids) & set(FakeTokenizer.special_ids.values()))
+        self.assertIn(agent.tok.vocabulary[WORD_JOINER + "mask>"], state_ids)
+        self.assertIn(agent.tok.vocabulary[WORD_JOINER + "eos>"], state_ids)
+
+    def test_query_consisting_only_of_a_reserved_literal_is_scored_literally(self):
+        agent = FakeAgent()
+        result = fit_state(agent, "<mask>", "Title", "Excerpt", self.question)
+        segment = result.segments[0]
+        self.assertFalse(result.truncated)
+        self.assertTrue(segment.state.startswith("Query:\n<" + WORD_JOINER + "mask>\n"))
+        self.assertEqual(sum(1 for value in segment.input_ids if value == agent.tok.mask_token_id), 3)
+        self.assertFalse(set(self.state_ids(agent, segment)) & set(FakeTokenizer.special_ids.values()))
+
+    def test_literal_representation_is_defined_and_idempotent_on_plain_text(self):
+        literals = reserved_literals(FakeTokenizer())
+        self.assertEqual(literals, ("<mask>", "<bos>", "<eos>", "<pad>"))
+        self.assertEqual(literal_text("<<mask>>", literals), "<<" + WORD_JOINER + "mask>>")
+        self.assertEqual(literal_text("plain text", literals), "plain text")
+        self.assertEqual(literal_text("<mask>", ()), "<mask>")
+        self.assertEqual(render_state("q", "t", "e"), "Query:\nq\n\nNote title:\nt\n\nNote excerpt:\ne")
 
     def test_rejects_unsupported_question_shapes(self):
         agent = FakeAgent()
@@ -280,6 +319,43 @@ class RealCheckpointFittingContractTest(unittest.TestCase):
         for segment in result.segments:
             self.assertEqual(segment.excerpt, excerpt[segment.excerpt_start:segment.excerpt_end])
         self.assert_sequence_contract(result)
+
+    def test_reserved_literals_reach_the_model_as_literal_text(self):
+        from laya.common import build_sequence
+
+        tok = self.agent.tok
+        internal = {"t": "choice", "ins": self.question["instructions"], "crit": self.question["criteria"]}
+        prefix, _markers = build_sequence(tok, "", internal, self.agent.cfg["max_len"], self.agent.cfg["head_max_len"])
+        literals = reserved_literals(tok)
+        reserved_ids = set(tok.all_special_ids)
+        for literal in literals:
+            encoded = tok(literal, add_special_tokens=False)["input_ids"]
+            if len(encoded) == 1:
+                reserved_ids.add(encoded[0])
+        self.assertIn("<mask>", literals)
+        self.assertIn("<eos>", literals)
+        self.assertIn("<unused5>", literals)
+        for query, piece in [
+            ("<mask>", "mask"),
+            ("find <mask> notes", "mask"),
+            ("<eos>", "eos"),
+            ("a <start_of_turn> b", "start"),
+            ("<unused5>", "unused"),
+        ]:
+            result = fit_state(self.agent, query, "Title", "Excerpt with <mask> inside", self.question)
+            self.assertFalse(result.truncated)
+            segment = result.segments[0]
+            ids = list(segment.input_ids)
+            state_ids = ids[len(prefix) - 1:-1]
+            self.assertEqual(ids.count(tok.mask_token_id), 3)
+            self.assertFalse(reserved_ids.intersection(state_ids), query)
+            self.assertIn(piece, tok.convert_ids_to_tokens(state_ids))
+            decoded = tok.decode(state_ids)
+            self.assertIn(literal_text(query, literals), decoded)
+            self.assertIn("Excerpt with <" + WORD_JOINER + "mask> inside", decoded)
+            self.assertEqual(segment.excerpt, "Excerpt with <mask> inside")
+            predicted = self.agent.predict_batch([segment.state], {"relevance": self.question}, batch_size=8)
+            self.assertEqual(predicted[0]["usage"]["input_tokens"], segment.input_tokens)
 
     def test_overlong_query_is_rejected(self):
         with self.assertRaises(InputTooLong):

@@ -9,8 +9,6 @@ import re
 import sys
 import warnings
 
-from laya import load
-
 from workers.laya.fitting import FittingError, InputTooLong, context_title, fit_state, select_segment
 from workers.laya.protocol import (
     MAX_LINE_BYTES,
@@ -25,6 +23,7 @@ from workers.laya.protocol import (
     validate_scores,
 )
 
+EXIT_ARGUMENTS_INVALID = 2
 EXIT_RUNTIME_INVALID = 3
 EXIT_LOAD_FAILED = 4
 RECHECK_MAX_BYTES = 1024 * 1024
@@ -36,6 +35,8 @@ WARMUP_EXCERPT = "Warm up excerpt."
 
 def load_local_agent(model_path):
     with contextlib.redirect_stdout(io.StringIO()):
+        from laya import load
+
         return load(model_path, device="cpu", fast=False)
 
 
@@ -226,9 +227,14 @@ def arguments(argv):
 
 
 def main(argv=None):
-    options = arguments(argv)
     channels = Channels()
     channels.diagnostic("worker_starting")
+    try:
+        with quiet():
+            options = arguments(argv)
+    except SystemExit:
+        channels.diagnostic("invalid_arguments")
+        return EXIT_ARGUMENTS_INVALID
     try:
         lock = verify_runtime(options.model_dir, options.lock)
         question_version, question = read_questions(options.questions)
@@ -245,6 +251,7 @@ def main(argv=None):
             with contextlib.suppress(RuntimeError):
                 torch.set_num_interop_threads(1)
             agent = load_local_agent(options.model_dir)
+            import laya
         recheck_small_files(options.model_dir, lock)
         warmup = fit_state(agent, WARMUP_QUERY, WARMUP_TITLE, WARMUP_EXCERPT, question)
         with quiet():
@@ -252,7 +259,6 @@ def main(argv=None):
     except Exception as error:
         channels.diagnostic("model_load_failed", type(error).__name__)
         return EXIT_LOAD_FAILED
-    import laya
 
     runtime = {
         "laya": laya.__version__,

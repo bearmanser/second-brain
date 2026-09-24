@@ -1,3 +1,5 @@
+import functools
+import re
 from dataclasses import dataclass
 
 TITLE_TOKEN_LIMIT = 32
@@ -6,6 +8,9 @@ MIN_EXCERPT_TOKENS = 16
 MAX_OPTION_TOKENS = 48
 MIN_OPTION_BUDGET = 16
 CHOICE_KEYS = ("A", "B", "C")
+WORD_JOINER = "\u2060"
+PLAIN_ADDED_TOKEN = re.compile(r"[\s\u2581]+")
+_RESERVED = {}
 
 
 class FittingError(Exception):
@@ -36,8 +41,54 @@ class FitResult:
     truncated: bool
 
 
-def render_state(query, title, excerpt):
-    return "Query:\n%s\n\nNote title:\n%s\n\nNote excerpt:\n%s" % (query, title, excerpt)
+def reserved_literals(tok):
+    literals = set(getattr(tok, "all_special_tokens", None) or ())
+    decoder = getattr(tok, "added_tokens_decoder", None)
+    if isinstance(decoder, dict):
+        literals.update(getattr(token, "content", token) for token in decoder.values())
+    mask = getattr(tok, "mask_token", None)
+    if mask:
+        literals.add(mask)
+    kept = [
+        literal
+        for literal in literals
+        if isinstance(literal, str) and len(literal) > 1 and not PLAIN_ADDED_TOKEN.fullmatch(literal)
+    ]
+    return tuple(sorted(kept, key=lambda literal: (-len(literal), literal)))
+
+
+@functools.lru_cache(maxsize=8)
+def _literal_pattern(literals):
+    return re.compile("|".join(re.escape(literal) for literal in literals))
+
+
+def literal_text(text, literals):
+    if not literals:
+        return text
+    return _literal_pattern(tuple(literals)).sub(lambda match: match.group(0)[0] + WORD_JOINER + match.group(0)[1:], text)
+
+
+def render_state(query, title, excerpt, literals=()):
+    return "Query:\n%s\n\nNote title:\n%s\n\nNote excerpt:\n%s" % (
+        literal_text(query, literals),
+        literal_text(title, literals),
+        literal_text(excerpt, literals),
+    )
+
+
+def _reserved(tok):
+    cached = _RESERVED.get(id(tok))
+    if cached is not None and cached[0] is tok:
+        return cached[1], cached[2]
+    literals = reserved_literals(tok)
+    ids = {getattr(tok, name, None) for name in ("mask_token_id", "cls_token_id", "sep_token_id", "pad_token_id")}
+    for literal in literals:
+        encoded = tok(literal, add_special_tokens=False)["input_ids"]
+        if len(encoded) == 1:
+            ids.add(encoded[0])
+    ids.discard(None)
+    _RESERVED[id(tok)] = (tok, literals, frozenset(ids))
+    return literals, frozenset(ids)
 
 
 def context_title(title, heading):
@@ -88,6 +139,7 @@ class _Fitter:
         self.internal = _internal_question(question)
         self.build = _sequence_builder(agent)
         self.mask = self.tok.mask_token
+        self.literals, self.reserved_ids = _reserved(self.tok)
         prefix, markers = self.build(self.tok, "", self.internal, self.max_len, self.head_max_len)
         self.prefix = list(prefix[:-1])
         self.markers = list(markers)
@@ -105,6 +157,9 @@ class _Fitter:
 
     def fits(self, state):
         return len(self.state_tokens(state)) <= self.capacity
+
+    def render(self, query, title, excerpt):
+        return render_state(query, title, excerpt, self.literals)
 
     def _verify_head(self):
         tok = self.tok
@@ -130,7 +185,7 @@ class _Fitter:
             raise FittingError("question_too_long")
 
     def segment(self, query, title, excerpt, start, end):
-        state = render_state(query, title, excerpt)
+        state = self.render(query, title, excerpt)
         ids, markers = self.build(self.tok, state, self.internal, self.max_len, self.head_max_len)
         ids = list(ids)
         state_ids = self.state_tokens(state)
@@ -138,7 +193,9 @@ class _Fitter:
             raise FittingError("sequence_contract")
         if ids != self.prefix + state_ids + [self.tok.sep_token_id] or len(ids) > self.max_len:
             raise FittingError("sequence_contract")
-        if self.neutral(query) not in self.neutral(state):
+        if self.neutral(state) != state or literal_text(query, self.literals) not in state:
+            raise FittingError("sequence_contract")
+        if self.reserved_ids.intersection(state_ids):
             raise FittingError("sequence_contract")
         return FittedSegment(
             state=state,
@@ -167,7 +224,7 @@ class _Fitter:
             while low <= high:
                 middle = (low + high) // 2
                 end = offsets[middle][1]
-                if self.fits(render_state(query, title, excerpt[start:end])):
+                if self.fits(self.render(query, title, excerpt[start:end])):
                     best = middle
                     low = middle + 1
                 else:
@@ -184,15 +241,15 @@ class _Fitter:
 
 def fit_state(agent, query, title, excerpt, question):
     fitter = _Fitter(agent, question)
-    if not fitter.fits(render_state(query, "", "")):
+    if not fitter.fits(fitter.render(query, "", "")):
         raise InputTooLong()
     short_title = fitter.shortened_title(title)
     for candidate in dict.fromkeys([title, short_title, ""]):
-        if fitter.fits(render_state(query, candidate, excerpt)):
+        if fitter.fits(fitter.render(query, candidate, excerpt)):
             segment = fitter.segment(query, candidate, excerpt, 0, len(excerpt))
             return FitResult(segments=(segment,), truncated=candidate != title)
     window_title = short_title
-    title_room = fitter.capacity - len(fitter.state_tokens(render_state(query, short_title, "")))
+    title_room = fitter.capacity - len(fitter.state_tokens(fitter.render(query, short_title, "")))
     if title_room < MIN_EXCERPT_TOKENS:
         window_title = ""
     return FitResult(segments=fitter.windows(query, window_title, excerpt), truncated=True)

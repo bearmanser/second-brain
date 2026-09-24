@@ -108,6 +108,7 @@ interface PendingRequest {
   resolve: (result: LayaScoreResult) => void;
   reject: (error: LayaWorkerError) => void;
   timer: NodeJS.Timeout;
+  deadlineAt: number;
   signal?: AbortSignal;
   onAbort?: () => void;
 }
@@ -226,6 +227,7 @@ export class LayaWorker {
   private stderrBuffer = '';
   private discardedStderr = 0;
   private active: Batch | null = null;
+  private activeWatchdog: NodeJS.Timeout | null = null;
   private waiting: Batch[] = [];
   private restarts: number[] = [];
   private circuitOpenUntil = 0;
@@ -318,6 +320,7 @@ export class LayaWorker {
         resolve,
         reject,
         timer: setTimeout(() => this.expire(request), this.timeoutMs),
+        deadlineAt: performance.now() + this.timeoutMs,
         signal: input.signal
       };
       request.batches = groups.map((items, index) => {
@@ -542,7 +545,7 @@ export class LayaWorker {
       return;
     }
     if (message.type === 'error') {
-      this.active = null;
+      this.clearActive();
       const reason: LayaUnavailableReason =
         message.code === 'input_too_long' ? 'input_too_long' : message.code === 'inference_failed' ? 'inference_failed' : 'invalid_request';
       this.settle(batch.owner, new LayaWorkerError(reason));
@@ -556,7 +559,7 @@ export class LayaWorker {
       this.fail('protocol_error');
       return;
     }
-    this.active = null;
+    this.clearActive();
     this.complete(batch, scores);
     this.pump();
   }
@@ -592,7 +595,17 @@ export class LayaWorker {
     const next = this.waiting.shift();
     if (next === undefined) return;
     this.active = next;
+    this.activeWatchdog = setTimeout(() => {
+      this.activeWatchdog = null;
+      if (this.active === next) this.fail('timeout');
+    }, Math.max(0, next.owner.deadlineAt - performance.now()));
     this.child.stdin.write(next.line);
+  }
+
+  private clearActive(): void {
+    if (this.activeWatchdog !== null) clearTimeout(this.activeWatchdog);
+    this.activeWatchdog = null;
+    this.active = null;
   }
 
   private expire(request: PendingRequest): void {
@@ -612,7 +625,7 @@ export class LayaWorker {
     const owners = new Set<PendingRequest>();
     if (this.active !== null) owners.add(this.active.owner);
     for (const batch of this.waiting) owners.add(batch.owner);
-    this.active = null;
+    this.clearActive();
     this.waiting = [];
     for (const owner of owners) this.settle(owner, new LayaWorkerError(reason));
   }

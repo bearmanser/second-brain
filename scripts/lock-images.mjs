@@ -1,10 +1,9 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const configDirectory = join(repoRoot, 'config');
 
 const digestPattern = /^([a-z0-9][a-z0-9._/-]*)@(sha256:[a-f0-9]{64})$/;
 const defaultDiscoveryInputs = {
@@ -17,10 +16,11 @@ function docker(args) {
 }
 
 function parseArguments(argv) {
-  const inputs = { ...defaultDiscoveryInputs };
+  const inputs = { ...defaultDiscoveryInputs, configDirectory: join(repoRoot, 'config') };
   for (let index = 0; index < argv.length; index += 1) {
     if (argv[index] === '--node') inputs.node = argv[index + 1];
     if (argv[index] === '--backend') inputs.backend = argv[index + 1];
+    if (argv[index] === '--config-dir') inputs.configDirectory = resolve(argv[index + 1]);
   }
   return inputs;
 }
@@ -43,8 +43,25 @@ function readJson(path) {
   return JSON.parse(readFileSync(path, 'utf8'));
 }
 
+function preservedSections(path) {
+  if (!existsSync(path)) return {};
+  let previous;
+  try {
+    previous = readJson(path);
+  } catch {
+    throw new Error(`Refusing to overwrite unreadable lock: ${path}`);
+  }
+  if (previous.laya === undefined) return {};
+  if (typeof previous.laya !== 'object' || previous.laya === null || Array.isArray(previous.laya)) {
+    throw new Error(`Refusing to overwrite lock with a malformed laya section: ${path}`);
+  }
+  return { laya: previous.laya };
+}
+
 const inputs = parseArguments(process.argv.slice(2));
+const configDirectory = inputs.configDirectory;
 const packageJson = readJson(join(repoRoot, 'package.json'));
+const preserved = preservedSections(join(configDirectory, 'dependency-lock.json'));
 
 const nodeImage = repodigest(inputs.node);
 const basicMemoryImage = repodigest(inputs.backend);
@@ -69,7 +86,8 @@ const lock = {
     transport: 'streamable-http',
     mcpPath: '/mcp',
     port: 8000
-  }
+  },
+  ...preserved
 };
 
 mkdirSync(configDirectory, { recursive: true });
@@ -80,4 +98,4 @@ writeFileSync(
   'utf8'
 );
 
-process.stdout.write(`Wrote config/dependency-lock.json and config/images.env for:\n${nodeImage}\n${basicMemoryImage}\n`);
+process.stdout.write(`Wrote ${join(configDirectory, 'dependency-lock.json')} and ${join(configDirectory, 'images.env')} for:\n${nodeImage}\n${basicMemoryImage}\n`);
