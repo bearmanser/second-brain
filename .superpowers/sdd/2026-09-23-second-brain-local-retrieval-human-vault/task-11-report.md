@@ -226,3 +226,32 @@ Base: `cdc6bfb`; committed separately without rewriting the earlier fixes.
 ## Not fixed
 
 No known Task 11 defect remains. The unrestricted `npm test` run is unverified because it exceeded the 360-second execution limit; its constituent required unit/contract and integration suites passed separately.
+
+---
+
+# Fix Round 5 (deferred search-index recovery)
+
+Base: `8cbb610`. New fix commit recorded separately; previous commits were not rewritten.
+
+## Finding fixed
+
+### Important — deferred same-ID upsert could be lost after conflict resolution
+
+The catalogue records a readable contender even when the disposable index must defer its upsert to protect an indexed, malformed same-ID original. On a later scan with the original deleted, the unchanged contender produces no catalogue delta, so delta-only index synchronization pruned the original without indexing the contender. Complete-scan synchronization now compares every catalogue document against indexed path, ID, and etag and upserts missing or stale documents, while retaining protected-path collision checks before each upsert. Incomplete scans retain the existing delta-only safe-upsert behavior; complete scans still prune absent, unprotected paths. The index exposes the stored etag alongside each indexed identity for this comparison.
+
+## Regression tests
+
+- `a deferred contender is indexed after its malformed same-id source is deleted`: fresh catalogue, protected malformed Original plus same-ID Contender, then delete Original; asserts no new catalogue delta, Contender searchable and Original absent after the next complete scan.
+- `a complete scan refreshes stale indexed content even without a catalogue delta`: replaces an index entry with stale content at the same path; complete scan restores current Markdown text and removes the stale term.
+- Both tests failed for the expected missing search result before the production fix, then passed after it. Existing protected-conflict, partial-scan, and true-deletion assertions were left intact.
+
+## Verification
+
+- `npx --yes --package=node@24 --package=npm@10 -c 'npm run typecheck && node_modules/.bin/vitest run tests/integration/local-search.test.ts'` — exit 0, 30 local-search tests passed.
+- `npx --yes --package=node@24 --package=npm@10 -c 'npm run verify'` — exit 0, 558 unit/contract tests (35 files), typecheck and build passed.
+- `npx --yes --package=node@24 --package=npm@10 -c 'npm run test:integration'` — exit 0, 492 integration tests (22 files) passed, including both new regressions.
+- `git diff --check` — exit 0.
+
+## Not fixed
+
+None in this finding.

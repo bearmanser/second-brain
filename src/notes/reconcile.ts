@@ -59,7 +59,7 @@ export interface SearchIndexSink {
   }): void;
   remove?(path: string): void;
   paths?(): string[];
-  identities?(): { path: string; id: string | null }[];
+  identities?(): { path: string; id: string | null; etag: string }[];
 }
 
 export interface IndexReconciledDocumentsInput {
@@ -79,17 +79,25 @@ export function indexReconciledDocuments(input: IndexReconciledDocumentsInput): 
   const byId = new Map(
     indexed.filter((entry) => entry.id !== null).map((entry) => [entry.id, entry.path])
   );
-  const byPath = new Map(indexed.map((entry) => [entry.path, entry.id]));
+  const byPath = new Map(indexed.map((entry) => [entry.path, entry]));
   const paths = new Set<string>();
   for (const source of report.added) paths.add(source.path);
   for (const change of report.changed) paths.add(change.path);
   for (const moved of report.moved) paths.add(moved.to);
+  if (report.complete && index.identities !== undefined) {
+    for (const source of catalogue.all()) {
+      const current = byPath.get(source.path);
+      if (current === undefined || current.etag !== source.etag || current.id !== (source.id ?? null)) {
+        paths.add(source.path);
+      }
+    }
+  }
   const blocked = new Set<string>();
   for (const path of paths) {
     const source = catalogue.getByPath(path);
     if (source === undefined) continue;
     const priorPath = source.id === undefined ? undefined : byId.get(source.id);
-    const priorId = byPath.get(path);
+    const priorId = byPath.get(path)?.id;
     const collides = priorPath !== undefined && priorPath !== path;
     const changesIdentity = priorId !== undefined && priorId !== (source.id ?? null);
     if (

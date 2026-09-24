@@ -549,6 +549,76 @@ test('a fresh catalogue cannot upsert a colliding id over a malformed indexed so
   }
 });
 
+test('a deferred contender is indexed after its malformed same-id source is deleted', async () => {
+  const sandbox = await vaultSandbox();
+  const index = openSearchIndex(':memory:');
+  const catalogue = CurrentCatalogue.open({});
+  try {
+    await mkdir(join(sandbox.vault, 'Knowledge'), { recursive: true });
+    const original = join(sandbox.vault, 'Knowledge', 'Original.md');
+    await writeFile(original, Buffer.from([0xff, 0xfe]));
+    await writeFile(join(sandbox.vault, 'Knowledge', 'Contender.md'),
+      frontmatterDocument('# Contender\n\ncontenderword', { id: MANAGED_ID }));
+    index.replaceDocument({
+      path: 'Knowledge/Original.md',
+      raw: frontmatterDocument('# Original\n\nprotectedword', { id: MANAGED_ID }),
+      etag: 'before'
+    });
+    const vault = new FileVault(sandbox.vault, []);
+    const conflicted = await reconcileCurrentVault({ vault, catalogue });
+    indexReconciledDocuments({ catalogue, index, report: conflicted });
+    expect(conflicted.complete).toBe(true);
+    expect(conflicted.duplicate_ids).toContainEqual({
+      id: MANAGED_ID,
+      paths: ['Knowledge/Contender.md', 'Knowledge/Original.md']
+    });
+    expect(index.paths()).toEqual(['Knowledge/Original.md']);
+    expect(index.candidates({ query: 'contenderword', limit: 10 })).toHaveLength(0);
+
+    await rm(original);
+    const recovered = await reconcileCurrentVault({ vault, catalogue });
+    expect(recovered.complete).toBe(true);
+    expect(recovered.added).toEqual([]);
+    expect(recovered.changed).toEqual([]);
+    expect(recovered.moved).toEqual([]);
+    indexReconciledDocuments({ catalogue, index, report: recovered });
+    expect(index.paths()).toEqual(['Knowledge/Contender.md']);
+    expect(index.candidates({ query: 'contenderword', limit: 10 }).map((item) => item.path)).toEqual([
+      'Knowledge/Contender.md'
+    ]);
+    expect(index.candidates({ query: 'protectedword', limit: 10 })).toHaveLength(0);
+  } finally {
+    index.close();
+    catalogue.close();
+    await sandbox.dispose();
+  }
+});
+
+test('a complete scan refreshes stale indexed content even without a catalogue delta', async () => {
+  const sandbox = await vaultSandbox();
+  const index = openSearchIndex(':memory:');
+  const catalogue = CurrentCatalogue.open({});
+  try {
+    await mkdir(join(sandbox.vault, 'Knowledge'), { recursive: true });
+    await writeFile(join(sandbox.vault, 'Knowledge', 'Current.md'), '# Current\n\ncurrentword');
+    const vault = new FileVault(sandbox.vault, []);
+    indexReconciledDocuments({ catalogue, index, report: await reconcileCurrentVault({ vault, catalogue }) });
+    index.replaceDocument({ path: 'Knowledge/Current.md', raw: '# Current\n\nstaleword', etag: 'old' });
+    expect(index.candidates({ query: 'staleword', limit: 10 })).toHaveLength(1);
+
+    const report = await reconcileCurrentVault({ vault, catalogue });
+    expect(report.complete).toBe(true);
+    expect(report.changed).toEqual([]);
+    indexReconciledDocuments({ catalogue, index, report });
+    expect(index.candidates({ query: 'currentword', limit: 10 })).toHaveLength(1);
+    expect(index.candidates({ query: 'staleword', limit: 10 })).toHaveLength(0);
+  } finally {
+    index.close();
+    catalogue.close();
+    await sandbox.dispose();
+  }
+});
+
 test('a partial scan does not replace an indexed path when its managed id changes', async () => {
   const sandbox = await vaultSandbox();
   const catalogue = CurrentCatalogue.open({});
