@@ -1332,6 +1332,7 @@ export interface LocalDocumentExecutor {
   readRevision(id: string, revisionId: string): Promise<DocumentStoreRevisionRead>;
   applyRename(plan: RenamePlan): Promise<RenameReceipt>;
   consolidate(input: DocumentStoreConsolidateInput): Promise<DocumentStorePutResult>;
+  getConsolidationReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
 }
 
 export interface LocalObservedCatalogueEntry {
@@ -1547,7 +1548,10 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
       progress_json: JSON.stringify({ preconditions_validated: true }),
       updated_at: this.now()
     });
-    return this.executePlan(record, planned);
+    this.persistSubordinates(record, planned);
+    const receipt = await this.executePlan(record, planned);
+    this.completeSubordinates(record, planned);
+    return receipt;
   }
 
   private async replay(
@@ -1650,6 +1654,58 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     });
   }
 
+  private subordinateSpecs(plan: LocalPlannedOperation): { kind: string; key: string }[] {
+    if (plan.kind === 'project_ensure') return [{ kind: 'project_ensure', key: 'project' }];
+    if (plan.kind === 'feedback') return [{ kind: 'feedback', key: 'feedback' }];
+    const specs: { kind: string; key: string }[] = [];
+    plan.effects.forEach((effect, index) => {
+      if (effect.kind === 'move') specs.push({ kind: 'move', key: `move:${index}` });
+      else if (effect.kind === 'remove') specs.push({ kind: 'remove', key: `remove:${index}` });
+      else specs.push({ kind: effect.kind, key: `doc:${index}` });
+    });
+    if (plan.effects.some((effect) => effect.kind === 'remove')) {
+      specs.push({ kind: 'consolidation', key: 'consolidate' });
+    }
+    (plan.reference_edits ?? []).forEach((_edit, index) =>
+      specs.push({ kind: 'reference_edit', key: `ref:${index}` })
+    );
+    return specs;
+  }
+
+  private persistSubordinates(
+    record: LocalOperationRecord,
+    plan: LocalPlannedOperation
+  ): void {
+    const existing = this.deps.operations.listSubordinates(record.operation_id);
+    this.subordinateSpecs(plan).forEach((spec, index) => {
+      const key = `${record.idempotency_key}:${spec.key}`;
+      const held = existing.find((entry) => entry.effect_index === index);
+      if (held !== undefined) {
+        if (held.key !== key) {
+          throw localRecovery('the persisted subordinate linkage changed for this operation');
+        }
+        return;
+      }
+      this.deps.operations.reserveSubordinate({
+        operation_id: record.operation_id,
+        effect_index: index,
+        kind: spec.kind,
+        key,
+        created_at: record.created_at,
+        updated_at: this.now()
+      });
+    });
+  }
+
+  private completeSubordinates(
+    record: LocalOperationRecord,
+    plan: LocalPlannedOperation
+  ): void {
+    this.subordinateSpecs(plan).forEach((_spec, index) => {
+      this.deps.operations.markSubordinate(record.operation_id, index, 'complete');
+    });
+  }
+
   private storageKeys(key: string, plan: LocalPlannedOperation): string[] {
     if (plan.kind === 'project_ensure') return [`${key}:project`];
     if (plan.kind === 'feedback') return [`${key}:feedback`];
@@ -1745,7 +1801,7 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
               condition.kind === 'note' &&
               condition.id === edit.managed?.id &&
               condition.expected.kind === 'present' &&
-              condition.expected.revision_id === edit.managed?.revision_id
+              condition.expected.path === edit.path
           );
           if (!bound) {
             throw localInvalid(`the read set does not bind managed reference edit ${edit.path}`);
@@ -2110,7 +2166,7 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
       revision_id: revisionId,
       path: targetPath,
       etag: final.etag,
-      indexed: last?.indexed ?? (moveReceipt !== undefined && moveReceipt.indexed.length > 0),
+      indexed: last?.indexed ?? moveReceipt?.moved_indexed ?? false,
       warnings: []
     };
     this.finalize(record, receipt, storageKey);
@@ -2123,6 +2179,22 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
   ): Promise<LocalOperationReceipt> {
     if (record.tool !== 'brain_review' || record.action !== 'resolve') {
       throw localInvalid('remove effects are only legal inside a resolve consolidation');
+    }
+    const consolidationKey = `${record.idempotency_key}:consolidate`;
+    const completed = this.deps.documents.getConsolidationReceipt(consolidationKey);
+    if (completed !== undefined) {
+      const doneReceipt: LocalOperationReceipt = {
+        kind: 'note',
+        operation_id: record.operation_id,
+        id: completed.id,
+        revision_id: completed.revision_id,
+        path: completed.path,
+        etag: completed.etag,
+        indexed: completed.indexed,
+        warnings: []
+      };
+      this.finalize(record, doneReceipt, consolidationKey);
+      return doneReceipt;
     }
     const heads = plan.heads;
     if (heads.length < 2) throw localInvalid('a consolidation requires at least two verified heads');

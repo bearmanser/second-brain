@@ -65,6 +65,7 @@ export interface RenameReceipt {
   moved: boolean;
   edited: string[];
   indexed: string[];
+  moved_indexed?: boolean;
   verified: boolean;
 }
 

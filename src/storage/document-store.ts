@@ -274,7 +274,7 @@ export interface DocumentIndexEntry {
   raw: string;
   etag: string;
   id?: string;
-  revision_id: string;
+  revision_id?: string;
 }
 
 export interface DocumentIndex {
@@ -289,6 +289,21 @@ export interface DocumentStoreFaults {
   afterReplace?(): void | Promise<void>;
   indexUpdate?(): void | Promise<void>;
   rename?: RenameFaults;
+  consolidation?: ConsolidationFaults;
+}
+
+export interface ConsolidationFaults {
+  afterManifest?(): void | Promise<void>;
+  afterHistory?(): void | Promise<void>;
+  beforeSurvivor?(): void | Promise<void>;
+  afterSurvivor?(): void | Promise<void>;
+  beforeReferenceEdit?(path: string): void | Promise<void>;
+  afterReferenceEdit?(path: string): void | Promise<void>;
+  beforeRemovalStage?(path: string): void | Promise<void>;
+  afterRemovalStage?(path: string): void | Promise<void>;
+  afterRemovalProgress?(path: string): void | Promise<void>;
+  afterDocumentComplete?(): void | Promise<void>;
+  beforeReceipt?(): void | Promise<void>;
 }
 
 export interface RenameFaults {
@@ -394,6 +409,7 @@ interface ConsolidationProgress {
   history?: boolean;
   primary?: boolean;
   references?: boolean;
+  references_done?: string[];
   removals?: Record<string, { staging: string; sha256: string; disposed: boolean }>;
   removals_done?: boolean;
 }
@@ -404,6 +420,7 @@ export interface DocumentStore {
   readRevision(id: string, revisionId: string): Promise<DocumentStoreRevisionRead>;
   applyRename(plan: RenamePlan): Promise<RenameReceipt>;
   consolidate(input: DocumentStoreConsolidateInput): Promise<DocumentStorePutResult>;
+  getConsolidationReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
   recover(): Promise<DocumentStoreRecoveryReport>;
   close(): Promise<void>;
 }
@@ -726,7 +743,12 @@ class LocalDocumentStore implements DocumentStore {
     if (input.removals.some((removal) => removal.path === input.path)) {
       throw invalidInput('the survivor path cannot also be removed');
     }
-    for (const edit of input.referenceEdits) vaultNoteSegments(edit.path);
+    for (const edit of input.referenceEdits) {
+      vaultNoteSegments(edit.path);
+      if (input.removals.some((removal) => removal.path === edit.path)) {
+        throw invalidInput(`reference edit ${edit.path} targets a file that will be removed`);
+      }
+    }
     const manifestJson = JSON.stringify(input);
     const existing = this.journal.findConsolidationByKey(input.idempotencyKey);
     if (existing !== undefined && existing.state === 'complete' && existing.receipt_json !== null) {
@@ -743,7 +765,16 @@ class LocalDocumentStore implements DocumentStore {
         created_at: timestamp,
         updated_at: timestamp
       }).record;
+    await this.runConsolidationFault('afterManifest', 'the consolidation manifest could not be persisted');
     return this.runConsolidation(record);
+  }
+
+  getConsolidationReceipt(idempotencyKey: string): DocumentStorePutResult | undefined {
+    const record = this.journal.findConsolidationByKey(idempotencyKey);
+    if (record !== undefined && record.state === 'complete' && record.receipt_json !== null) {
+      return JSON.parse(record.receipt_json) as DocumentStorePutResult;
+    }
+    return undefined;
   }
 
   private async ensureRevisionMetadata(
@@ -828,9 +859,11 @@ class LocalDocumentStore implements DocumentStore {
         failRecovery('consolidation history could not be persisted', error);
       }
       save('history_persisted', { history: true });
+      await this.runConsolidationFault('afterHistory', 'the consolidation history could not be persisted');
     }
 
     if (progress.primary !== true) {
+      await this.runConsolidationFault('beforeSurvivor', 'the resolution document could not be installed');
       await this.putSerialized({
         path: input.path,
         raw: input.raw,
@@ -842,24 +875,70 @@ class LocalDocumentStore implements DocumentStore {
         allowDuplicateIdPaths: input.removals.map((removal) => removal.path)
       });
       save('primary_applied', { primary: true });
+      await this.runConsolidationFault('afterSurvivor', 'the resolution document could not be recorded');
     }
 
     if (progress.references !== true) {
-      for (const [index, edit] of input.referenceEdits.entries()) {
-        await this.putSerialized({
-          path: edit.path,
-          raw: edit.raw,
-          expectedEtag: edit.expected_etag,
-          idempotencyKey: `${input.idempotencyKey}:ref:${index}`,
-          source: input.source,
-          ...(edit.managed === undefined
-            ? {}
-            : { revisionId: edit.managed.revision_id, parents: edit.managed.parents })
+      const groups = new Map<string, DocumentStoreReferenceEdit[]>();
+      for (const edit of input.referenceEdits) {
+        const list = groups.get(edit.path) ?? [];
+        list.push(edit);
+        groups.set(edit.path, list);
+      }
+      const done = new Set(progress.references_done ?? []);
+      let groupIndex = 0;
+      for (const [path, edits] of groups) {
+        groupIndex += 1;
+        if (done.has(path)) continue;
+        await this.runConsolidationFault(
+          'beforeReferenceEdit',
+          'the reference rewrite could not be applied',
+          path
+        );
+        const finalEdit = edits[edits.length - 1];
+        const targetRaw = finalEdit.raw;
+        const targetHash = sha256(targetRaw);
+        const current = await readNoteFile(this.vaultRoot, vaultNoteSegments(path), {
+          requireUtf8: false
         });
+        if (current === undefined) {
+          return failRecovery(`reference edit target ${path} is missing`);
+        }
+        if (current.hash !== targetHash) {
+          for (const edit of edits) {
+            if (edit.expected_etag !== current.hash) {
+              throw conflict(`reference edit target ${path} changed before the rewrite`);
+            }
+          }
+          if (finalEdit.managed !== undefined) {
+            await this.putSerialized({
+              path,
+              raw: targetRaw,
+              expectedEtag: current.hash,
+              idempotencyKey: `${input.idempotencyKey}:ref:${groupIndex}`,
+              source: input.source,
+              revisionId: finalEdit.managed.revision_id,
+              parents: finalEdit.managed.parents
+            });
+          } else {
+            await this.replaceUnmanaged(input.operationId, path, targetRaw, current.hash);
+          }
+        }
+        await this.runConsolidationFault(
+          'afterReferenceEdit',
+          'the reference rewrite could not be recorded',
+          path
+        );
+        done.add(path);
+        save('references_applied', { references_done: [...done] });
       }
       save('references_applied', { references: true });
     }
 
+    const installed = await readNoteFile(this.vaultRoot, vaultNoteSegments(input.path));
+    if (installed === undefined || installed.hash !== sha256(input.raw)) {
+      return failRecovery('the resolution document diverged before absorbed files were removed');
+    }
     if (progress.removals === undefined) progress = { ...progress, removals: {} };
     for (const removal of input.removals) {
       const entry = progress.removals?.[removal.path];
@@ -872,12 +951,17 @@ class LocalDocumentStore implements DocumentStore {
     if (finalPrimary === undefined) {
       return failRecovery('the resolution document disappeared before completion');
     }
+    if (finalPrimary.hash !== sha256(input.raw)) {
+      return failRecovery('the resolution document changed after it was installed');
+    }
     for (const removal of input.removals) {
       if ((await readNoteFile(this.vaultRoot, vaultNoteSegments(removal.path))) !== undefined) {
         return failRecovery(`absorbed path ${removal.path} is still present`);
       }
     }
 
+    await this.runConsolidationFault('afterDocumentComplete', 'the consolidation did not verify');
+    await this.runConsolidationFault('beforeReceipt', 'the consolidation receipt could not be written');
     const primaryRecord = this.journal.findByKey(`${input.idempotencyKey}:primary`);
     const stored = current.receipt_json;
     let receipt: DocumentStorePutResult;
@@ -933,6 +1017,11 @@ class LocalDocumentStore implements DocumentStore {
     if (observedId !== undefined && observedId !== removal.expected_id) {
       throw conflict(`absorbed path ${removal.path} no longer carries its expected identity`);
     }
+    await this.runConsolidationFault(
+      'beforeRemovalStage',
+      'the absorbed file could not be staged',
+      removal.path
+    );
     const stagedDirectory = await mkdtemp(join(dirname(target), '.consolidate-stage-'));
     const stagedPath = join(stagedDirectory, 'absorbed');
     try {
@@ -955,7 +1044,17 @@ class LocalDocumentStore implements DocumentStore {
       ...(progress.removals ?? {}),
       [removal.path]: { staging: stagedDirectory, sha256: observed.hash, disposed: false }
     };
+    await this.runConsolidationFault(
+      'afterRemovalStage',
+      'the staged absorbed file could not be verified',
+      removal.path
+    );
     save('removals_applied');
+    await this.runConsolidationFault(
+      'afterRemovalProgress',
+      'the removal progress could not be recorded',
+      removal.path
+    );
     await this.finishRemoval(removal, progress, save);
   }
 
@@ -992,6 +1091,62 @@ class LocalDocumentStore implements DocumentStore {
     if (this.index !== undefined) {
       try {
         this.index.remove?.(removal.path);
+      } catch {
+        undefined;
+      }
+    }
+  }
+
+  private async runConsolidationFault(
+    name: keyof ConsolidationFaults,
+    message: string,
+    detail?: string
+  ): Promise<void> {
+    const hooks = this.faults.consolidation as Record<string, unknown> | undefined;
+    if (hooks === undefined) return;
+    const hook = hooks[name as string];
+    if (typeof hook !== 'function') return;
+    try {
+      await (hook as (value?: string) => void | Promise<void>)(detail);
+    } catch (error) {
+      throw wrapIo(message, error);
+    }
+  }
+
+  private async replaceUnmanaged(
+    operationId: string,
+    path: string,
+    raw: string,
+    expectedEtag: string
+  ): Promise<void> {
+    const segments = vaultNoteSegments(path);
+    const target = join(this.vaultRoot, ...segments);
+    const current = await readNoteFile(this.vaultRoot, segments, { requireUtf8: false });
+    if (current === undefined) throw conflict(`reference edit target ${path} is missing`);
+    if (sha256(raw) === current.hash) return;
+    if (current.hash !== expectedEtag) {
+      throw conflict(`reference edit target ${path} changed before the rewrite`);
+    }
+    await this.revisions.persistPreimage(operationId, current.raw);
+    await ensureWriteChain(this.vaultRoot, segments);
+    const temp = await writeTemporary(target, segments[segments.length - 1], raw);
+    try {
+      await rename(temp, target);
+      await syncDirectory(dirname(target));
+    } finally {
+      await rm(temp, { force: true }).catch(() => undefined);
+    }
+    const after = await readNoteFile(this.vaultRoot, segments, { requireUtf8: false });
+    const hash = after?.hash ?? '';
+    this.journal.enqueueIndex({
+      path,
+      revision_id: operationId,
+      raw_hash: hash,
+      enqueued_at: this.clock.now().toISOString()
+    });
+    if (this.index !== undefined) {
+      try {
+        await this.index.upsert({ path, raw, etag: hash });
       } catch {
         undefined;
       }
@@ -1126,7 +1281,7 @@ class LocalDocumentStore implements DocumentStore {
   }
 
   private async runFault(
-    fault: Exclude<keyof DocumentStoreFaults, 'rename'>,
+    fault: Exclude<keyof DocumentStoreFaults, 'rename' | 'consolidation'>,
     message: string
   ): Promise<void> {
     const hook = this.faults[fault];
@@ -1549,6 +1704,7 @@ class LocalDocumentStore implements DocumentStore {
         moved: true,
         edited: editRows.map((edit) => edit.path),
         indexed,
+        moved_indexed: indexed.includes(manifest.to),
         verified: true
       };
       this.journal.updateMove(record.operation_id, {

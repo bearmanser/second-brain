@@ -3446,7 +3446,17 @@ const LOCAL_OPERATION_SCHEMA = [
      updated_at TEXT NOT NULL
    )`,
   `CREATE INDEX IF NOT EXISTS local_operations_state_idx
-     ON local_operations (state, updated_at, operation_id)`
+     ON local_operations (state, updated_at, operation_id)`,
+  `CREATE TABLE IF NOT EXISTS local_subordinate_operations (
+     operation_id TEXT NOT NULL,
+     effect_index INTEGER NOT NULL,
+     kind TEXT NOT NULL,
+     key TEXT NOT NULL UNIQUE,
+     state TEXT NOT NULL,
+     created_at TEXT NOT NULL,
+     updated_at TEXT NOT NULL,
+     PRIMARY KEY (operation_id, effect_index)
+   )`
 ];
 
 function requireLocalOperationState(value: string): LocalOperationJournalState {
@@ -3475,6 +3485,49 @@ function toLocalOperation(row: LocalOperationRow): LocalOperationRecord {
   };
 }
 
+export type LocalSubordinateState = 'reserved' | 'complete' | 'failed';
+
+export interface LocalSubordinateRecord {
+  operation_id: string;
+  effect_index: number;
+  kind: string;
+  key: string;
+  state: LocalSubordinateState;
+  created_at: string;
+  updated_at: string;
+}
+
+export type LocalSubordinateReservationResult =
+  | { kind: 'new'; record: LocalSubordinateRecord }
+  | { kind: 'replay'; record: LocalSubordinateRecord };
+
+interface LocalSubordinateRow {
+  operation_id: string;
+  effect_index: number;
+  kind: string;
+  key: string;
+  state: string;
+  created_at: string;
+  updated_at: string;
+}
+
+function requireLocalSubordinateState(value: string): LocalSubordinateState {
+  if (value === 'reserved' || value === 'complete' || value === 'failed') return value;
+  throw recoveryRequired('a local subordinate operation has an unknown stored state');
+}
+
+function toLocalSubordinate(row: LocalSubordinateRow): LocalSubordinateRecord {
+  return {
+    operation_id: row.operation_id,
+    effect_index: row.effect_index,
+    kind: row.kind,
+    key: row.key,
+    state: requireLocalSubordinateState(row.state),
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
 export class LocalOperationJournal {
   private readonly database: Database.Database;
   private closed = false;
@@ -3493,6 +3546,7 @@ export class LocalOperationJournal {
     try {
       database.pragma('foreign_keys = ON');
       database.pragma('synchronous = FULL');
+      database.pragma('busy_timeout = 5000');
       if (path !== ':memory:') database.pragma('journal_mode = WAL');
       for (const statement of LOCAL_OPERATION_SCHEMA) database.exec(statement);
       try {
@@ -3512,8 +3566,9 @@ export class LocalOperationJournal {
     input: LocalOperationReservation & { created_at: string; updated_at: string }
   ): LocalOperationReservationResult {
     this.assertOpen();
-    const existing = this.findByKey(input.idempotency_key);
-    if (existing !== undefined) {
+    const reconcile = (): LocalOperationReservationResult | undefined => {
+      const existing = this.findByKey(input.idempotency_key);
+      if (existing === undefined) return undefined;
       if (existing.payload_hash !== input.payload_hash || existing.tool !== input.tool) {
         throw new BrainError({
           code: 'IDEMPOTENCY_CONFLICT',
@@ -3521,31 +3576,106 @@ export class LocalOperationJournal {
         });
       }
       return { kind: 'replay', record: existing };
+    };
+    const run = this.database.transaction((): LocalOperationReservationResult => {
+      const existing = reconcile();
+      if (existing !== undefined) return existing;
+      try {
+        this.database
+          .prepare(
+            `INSERT INTO local_operations (
+               operation_id, idempotency_key, tool, action, project_id,
+               payload_hash, payload_json, plan_json, progress_json, state, storage_key,
+               receipt_json, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'pending', NULL, NULL, ?, ?)`
+          )
+          .run(
+            input.operation_id,
+            input.idempotency_key,
+            input.tool,
+            input.action,
+            input.project_id,
+            input.payload_hash,
+            input.payload_json,
+            input.created_at,
+            input.updated_at
+          );
+      } catch (error) {
+        const raced = reconcile();
+        if (raced !== undefined) return raced;
+        throw error;
+      }
+      const stored = this.findById(input.operation_id);
+      if (stored === undefined) {
+        throw recoveryRequired(`local operation ${input.operation_id} was not persisted`);
+      }
+      return { kind: 'new', record: stored };
+    });
+    return run.immediate();
+  }
+
+  reserveSubordinate(
+    input: {
+      operation_id: string;
+      effect_index: number;
+      kind: string;
+      key: string;
+      created_at: string;
+      updated_at: string;
+    }
+  ): LocalSubordinateReservationResult {
+    this.assertOpen();
+    const existing = this.database
+      .prepare('SELECT * FROM local_subordinate_operations WHERE key = ?')
+      .get(input.key) as LocalSubordinateRow | undefined;
+    if (existing !== undefined) {
+      if (existing.operation_id !== input.operation_id || existing.effect_index !== input.effect_index) {
+        throw new BrainError({
+          code: 'IDEMPOTENCY_CONFLICT',
+          message: `subordinate key ${input.key} is already bound to another effect`
+        });
+      }
+      return { kind: 'replay', record: toLocalSubordinate(existing) };
     }
     this.database
       .prepare(
-        `INSERT INTO local_operations (
-           operation_id, idempotency_key, tool, action, project_id,
-           payload_hash, payload_json, plan_json, progress_json, state, storage_key,
-           receipt_json, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'pending', NULL, NULL, ?, ?)`
+        `INSERT INTO local_subordinate_operations (
+           operation_id, effect_index, kind, key, state, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, 'reserved', ?, ?)`
       )
       .run(
         input.operation_id,
-        input.idempotency_key,
-        input.tool,
-        input.action,
-        input.project_id,
-        input.payload_hash,
-        input.payload_json,
+        input.effect_index,
+        input.kind,
+        input.key,
         input.created_at,
         input.updated_at
       );
-    const stored = this.findById(input.operation_id);
+    const stored = this.listSubordinates(input.operation_id).find(
+      (entry) => entry.effect_index === input.effect_index
+    );
     if (stored === undefined) {
-      throw recoveryRequired(`local operation ${input.operation_id} was not persisted`);
+      throw recoveryRequired(`subordinate operation ${input.key} was not persisted`);
     }
     return { kind: 'new', record: stored };
+  }
+
+  listSubordinates(operation_id: string): LocalSubordinateRecord[] {
+    this.assertOpen();
+    const rows = this.database
+      .prepare('SELECT * FROM local_subordinate_operations WHERE operation_id = ? ORDER BY effect_index ASC')
+      .all(operation_id) as LocalSubordinateRow[];
+    return rows.map(toLocalSubordinate);
+  }
+
+  markSubordinate(operation_id: string, effect_index: number, state: LocalSubordinateState): void {
+    this.assertOpen();
+    this.database
+      .prepare(
+        `UPDATE local_subordinate_operations SET state = ?, updated_at = ?
+         WHERE operation_id = ? AND effect_index = ?`
+      )
+      .run(state, new Date().toISOString(), operation_id, effect_index);
   }
 
   update(
