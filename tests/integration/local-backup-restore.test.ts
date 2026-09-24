@@ -4,6 +4,7 @@ import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { expect, test } from 'vitest';
 import {
+  assertLocalBackupManifest,
   importLocalVault,
   inspectDurableJournal,
   rebuildLocalIndex,
@@ -12,6 +13,7 @@ import {
   takeLocalBackup,
   verifyLocalBackup
 } from '../../src/operations/local-rebuild.js';
+import { InstanceLock } from '../../src/core/mutation.js';
 import { openDocumentStore } from '../../src/storage/document-store.js';
 import { Journal } from '../../src/storage/journal.js';
 import { openRevisionStore } from '../../src/storage/revision-store.js';
@@ -269,6 +271,66 @@ test('text search, reads, and safe writes work after a restore without model art
   }
 });
 
+test('a full-scope manifest missing durable state is not reported ok', async () => {
+  const s = await vaultSandbox();
+  try {
+    await mkdir(join(s.vault, 'Knowledge'), { recursive: true });
+    await writeFile(join(s.vault, 'Knowledge/Plain.md'), '# Plain\n', 'utf8');
+    const destination = join(dirname(s.vault), 'backup-no-durable');
+    const backup = await takeLocalBackup({ vault: s.vault, state: s.state, destination });
+    const report = await verifyLocalBackup(backup.manifest, {
+      vault: join(destination, 'vault'),
+      state: join(destination, 'state'),
+      config: join(destination, 'config')
+    });
+    expect(report.integrity_ok).toBe(true);
+    expect(report.durable_complete).toBe(false);
+    expect(report.ok).toBe(false);
+    expect(report.classification.current_content_recoverable).toBe(true);
+    expect(report.classification.history_recoverable).toBe(false);
+    expect(report.classification.idempotency_recoverable).toBe(false);
+    await expect(
+      restoreLocalBackup({
+        backupRoot: destination,
+        vault: join(dirname(s.vault), 'no-durable-vault'),
+        state: join(dirname(s.vault), 'no-durable-state')
+      })
+    ).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+  } finally {
+    await s.dispose();
+  }
+});
+
+test('local backup refuses to run while a writer holds the state lock', async () => {
+  const s = await vaultSandbox();
+  const lock = InstanceLock.acquire(s.state);
+  try {
+    await expect(
+      takeLocalBackup({ vault: s.vault, state: s.state, destination: join(dirname(s.vault), 'busy-backup') })
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+  } finally {
+    lock.release();
+    await s.dispose();
+  }
+});
+
+test('local backup can run with an explicit live-writer override', async () => {
+  const s = await vaultSandbox();
+  const lock = InstanceLock.acquire(s.state);
+  try {
+    const result = await takeLocalBackup({
+      vault: s.vault,
+      state: s.state,
+      destination: join(dirname(s.vault), 'override-backup'),
+      allowWriters: true
+    });
+    expect(result.files).toBeGreaterThan(0);
+  } finally {
+    lock.release();
+    await s.dispose();
+  }
+});
+
 test('token and cursor secrets are a separate protected category and never enter the vault', async () => {
   const s = await vaultSandbox();
   try {
@@ -288,6 +350,46 @@ test('token and cursor secrets are a separate protected category and never enter
     expect(existsSync(join(destination, 'vault', 'cursor.secret'))).toBe(false);
     const secretEntry = backup.manifest.files.find((file) => file.category === 'secrets');
     expect(secretEntry?.root).toBe('secrets');
+  } finally {
+    await s.dispose();
+  }
+});
+
+test('a manifest entry that escapes its store root is rejected', async () => {
+  const s = await vaultSandbox();
+  try {
+    const destination = join(dirname(s.vault), 'backup-traversal');
+    const backup = await takeLocalBackup({ vault: s.vault, state: s.state, destination });
+    const poisoned = {
+      ...backup.manifest,
+      files: backup.manifest.files.map((file, index) =>
+        index === 0 ? { ...file, path: '../../escape' } : file
+      )
+    };
+    expect(() => assertLocalBackupManifest(poisoned)).toThrowError(/relative|traversal/);
+    await expect(verifyLocalBackup(poisoned as never)).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+  } finally {
+    await s.dispose();
+  }
+});
+
+test('a vault-only backup never claims a secret category it did not capture', async () => {
+  const s = await vaultSandbox();
+  try {
+    const secret = join(dirname(s.vault), 'cursor.secret');
+    await writeFile(secret, 'k'.repeat(48), 'utf8');
+    const destination = join(dirname(s.vault), 'backup-vault-only-secret');
+    const backup = await takeLocalBackup({
+      vault: s.vault,
+      state: s.state,
+      destination,
+      scope: 'vault-only',
+      secrets: [secret]
+    });
+    expect(backup.sensitive).toBe(false);
+    expect(backup.manifest.sensitive).toBe(false);
+    expect(backup.manifest.sensitive_categories).toEqual([]);
+    expect(existsSync(join(destination, 'secrets'))).toBe(false);
   } finally {
     await s.dispose();
   }

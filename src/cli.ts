@@ -365,7 +365,8 @@ async function runLocalBackup(parsed: ParsedArguments, env: NodeJS.ProcessEnv): 
     ...(flagString(parsed.flags, 'config') === undefined
       ? {}
       : { config: flagString(parsed.flags, 'config') as string }),
-    secrets: flagList(parsed.flags, 'secret')
+    secrets: flagList(parsed.flags, 'secret'),
+    allowWriters: flagBoolean(parsed.flags, 'allow-live-writers')
   });
   process.stdout.write(
     `local backup: ${result.files} files (${result.manifest.scope}), manifest ${result.manifest_path}` +
@@ -410,7 +411,8 @@ async function runVerifyLocalBackup(parsed: ParsedArguments): Promise<number> {
       : { vault: join(root, 'vault'), state: join(root, 'state'), config: join(root, 'config'), secrets: join(root, 'secrets') };
   const report = await verifyLocalBackup(manifest, roots);
   process.stdout.write(
-    `local backup verify: ok=${report.ok} scope=${report.scope} files=${report.counts.files}` +
+    `local backup verify: ok=${report.ok} integrity=${report.integrity_ok} ` +
+      `durable=${report.durable_complete} scope=${report.scope} files=${report.counts.files}` +
       `${report.sensitive ? ' sensitive' : ''}; ${summariseRecoveryInput(report.classification)}\n`
   );
   for (const path of report.missing_files) process.stdout.write(`  missing ${path}\n`);

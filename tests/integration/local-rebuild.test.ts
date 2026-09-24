@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import Database from 'better-sqlite3';
 import { expect, test } from 'vitest';
 import { parseArguments } from '../../src/cli.js';
 import {
@@ -17,6 +18,17 @@ import { vaultSandbox } from '../helpers/vault-sandbox.js';
 async function seedJournal(state: string): Promise<void> {
   const journal = Journal.open(join(state, 'journal.db'));
   journal.close();
+}
+
+function approvalRowCount(state: string): number {
+  const database = new Database(join(state, 'journal.db'), { readonly: true });
+  try {
+    return (database.prepare('SELECT COUNT(*) AS count FROM operation_approvals').get() as {
+      count: number;
+    }).count;
+  } finally {
+    database.close();
+  }
 }
 
 async function seedNote(vault: string, state: string, path: string, raw: string) {
@@ -168,6 +180,83 @@ test('rebuilding refuses a damaged durable journal without deleting history', as
     expect(result.reason).toMatch(/journal/);
     const revisions = await readdir(join(s.state, 'history', stored.id, 'revisions'));
     expect(revisions.some((name) => name.endsWith('.md'))).toBe(true);
+  } finally {
+    await s.dispose();
+  }
+});
+
+test('rebuild-index leaves a healthy durable journal byte-for-byte unchanged', async () => {
+  const s = await vaultSandbox();
+  try {
+    await seedNote(s.vault, s.state, 'Knowledge/Alpha.md', '# Alpha\n\nalpha term\n');
+    await seedJournal(s.state);
+    const journalPath = join(s.state, 'journal.db');
+    const before = await readFile(journalPath);
+    const approvalsBefore = approvalRowCount(s.state);
+    const result = await rebuildLocalIndex({ vault: s.vault, state: s.state });
+    expect(result.status).toBe('rebuilt');
+    expect(await readFile(journalPath)).toEqual(before);
+    expect(approvalRowCount(s.state)).toBe(approvalsBefore);
+  } finally {
+    await s.dispose();
+  }
+});
+
+test('a journal needing approval-provenance recovery is reported, not repaired', async () => {
+  const s = await vaultSandbox();
+  try {
+    await seedNote(s.vault, s.state, 'Knowledge/Alpha.md', '# Alpha\n\nalpha term\n');
+    await seedJournal(s.state);
+    const database = new Database(join(s.state, 'journal.db'));
+    try {
+      const now = new Date().toISOString();
+      database
+        .prepare(
+          `INSERT INTO operations (
+             operation_id, principal_id, idempotency_key, tool, scope, payload_hash,
+             payload_json, plan_json, state, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          randomUUID(),
+          randomUUID(),
+          randomUUID(),
+          'test',
+          'brain',
+          'a'.repeat(64),
+          '{}',
+          JSON.stringify({ revision: { approval: { payload_hash: 'b'.repeat(64) } } }),
+          'prepared',
+          now,
+          now
+        );
+    } finally {
+      database.close();
+    }
+    expect(inspectDurableJournal(s.state)).toBe('backfill_required');
+    const result = await rebuildLocalIndex({ vault: s.vault, state: s.state });
+    expect(result.status).toBe('degraded');
+    if (result.status === 'degraded') expect(result.reason).toMatch(/recovery|approval/i);
+    expect(approvalRowCount(s.state)).toBe(0);
+  } finally {
+    await s.dispose();
+  }
+});
+
+test('a journal behind this release schema is reported instead of migrated', async () => {
+  const s = await vaultSandbox();
+  try {
+    await seedJournal(s.state);
+    const database = new Database(join(s.state, 'journal.db'));
+    try {
+      database.exec('DROP TABLE retrieval_labels');
+    } finally {
+      database.close();
+    }
+    expect(inspectDurableJournal(s.state)).toBe('migration_required');
+    const result = await rebuildLocalIndex({ vault: s.vault, state: s.state });
+    expect(result.status).toBe('degraded');
+    if (result.status === 'degraded') expect(result.reason).toMatch(/recover-state/);
   } finally {
     await s.dispose();
   }

@@ -173,7 +173,13 @@ node dist/cli.js backup-manifest \
 
 ### Local V2 store backup (`local-backup`)
 
-`node dist/cli.js local-backup --destination DIR [--vault-only] [--include-search-index] [--include-model-artifacts] [--config DIR] [--secret FILE]`
+`node dist/cli.js local-backup --destination DIR [--vault-only] [--include-search-index] [--include-model-artifacts] [--config DIR] [--secret FILE] [--allow-live-writers]`
+
+`local-backup` is a cold backup: it acquires the state `gateway.lock` and
+**fails closed** if a running runtime already holds it, so the vault and history
+are not captured at different points. `--allow-live-writers` is an explicit,
+unsafe override for an operator who has independently paused writers; it is not
+the normal path.
 
 The store-level backup writes `local-manifest.json` and a category-classified
 copy of the local V2 state:
@@ -181,7 +187,7 @@ copy of the local V2 state:
 - **vault** — the authoritative Markdown (never contains secrets);
 - **revision snapshots** — `state/history/`;
 - **journal** — `journal.db`, `documents.sqlite`, `operations.sqlite`, each
-  captured through the SQLite backup API while writers continue, so committed
+  captured through the SQLite backup API after writers are stopped, so committed
   WAL content is included and the live `.sqlite` file is never copied alone;
 - **migration manifests** — `state/migrations/`;
 - **config/version** — `config/version.json` and, when `--config` is given, the
@@ -205,10 +211,15 @@ vault-only import as historical recovery.
 A full restore into an empty directory recovers current content, revision
 history, and operation receipts; it refuses a vault-only backup, and refuses a
 non-empty destination. `node dist/cli.js verify-local-backup --manifest FILE
-[--root DIR | --vault V --state S --config C --secrets X]` validates every
-category checksum and reports which of current content, history, receipts, and
-index are recoverable. `rebuild-index` refuses when `journal.db` is missing or
-damaged while managed notes exist, so a rebuild never repairs durable state.
+[--root DIR | --vault V --state S --config C --secrets X]` reports integrity
+(every category checksum present and valid) and durability completeness
+separately: a `full`-scope manifest that omits durable history or
+`journal.db`/project records is not `ok`, and a full restore of such a manifest
+is refused rather than performed with warnings only. It also reports which of
+current content, history, receipts, and index are recoverable.
+`rebuild-index` refuses when `journal.db` is missing, damaged, behind on schema,
+or needs approval-provenance recovery while managed notes exist, so a rebuild
+never repairs durable state; run the explicit recovery command instead.
 
 ## Verify and restore
 
@@ -287,10 +298,11 @@ The script:
    `BRAIN_REBUILD_ACKNOWLEDGE=yes`) so nobody mistakes an index rebuild for operational
    recovery;
 3. pauses gateway mutations by stopping the `brain` service (only if it is running);
-4. runs the supported reindex inside the Basic Memory container:
-   `basic-memory reindex` (use `--full`/`--embeddings`/`--search` for a fuller or
-   narrower run), and fails if the reindex did not report completion or observed fewer
-   files than the Markdown revision count;
+4. rebuilds the local V2 search index from current Markdown with
+   `node dist/cli.js rebuild-index`, which stages, validates, and atomically
+   publishes the index and refuses if the durable journal is missing or damaged.
+   The legacy Basic Memory reindex step is retired for the local V2 runtime; the
+   `scripts/rebuild.sh` script still contains it and Task 18 replaces it;
 5. rebuilds the gateway catalogue from Markdown with
    `node dist/cli.js rebuild-catalogue`, which requires `journal.db` so authenticated
    approval provenance is preserved;
@@ -371,10 +383,10 @@ review, credentials, and limitations), see `docs/setup.md`.
 
 ## Observed environment notes
 
-- The pinned Basic Memory image advertises `reindex` and `doctor`; the supported
-  command used here is `basic-memory reindex` (verified against the pinned image,
-  which documents "Rebuild search indexes and/or vector embeddings without dropping
-  the database").
+- The legacy Basic Memory image advertises `reindex` and `doctor`, but `basic-memory
+  reindex` is **not** the supported reindex path for the local V2 runtime; use
+  `node dist/cli.js rebuild-index`. `scripts/rebuild.sh` still invokes the Basic
+  Memory reindex and Task 18 removes that step.
 - `tests/e2e/operations.test.ts` deploys a disposable Compose project (its own project
   name, port, vault, and volumes) and exercises the real stop/archive/restart cycle,
   the Compose-key volume mapping, `restore.sh --check`, `restore.sh --start` under a

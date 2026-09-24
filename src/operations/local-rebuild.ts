@@ -4,11 +4,11 @@ import { copyFile, lstat, mkdir, readdir, readFile, rename, rm, writeFile } from
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import Database from 'better-sqlite3';
 import { BrainError, isBrainError } from '../contracts/errors.js';
+import { InstanceLock } from '../core/mutation.js';
 import type { Clock } from '../core/types.js';
 import { APPLICATION_VERSION, SCHEMA_VERSION } from '../mcp/tools.js';
 import { CurrentCatalogue, reconcileCurrentVault } from '../notes/current-catalogue.js';
 import { indexReconciledDocuments } from '../notes/reconcile.js';
-import { Journal } from '../storage/journal.js';
 import type { SearchIndex } from '../storage/search-index.js';
 import { openSearchIndex } from '../storage/search-index.js';
 import { FileVault, scanVaultFilePaths } from '../storage/vault.js';
@@ -18,6 +18,14 @@ export const LOCAL_INDEX_SCHEMA_VERSION = 1;
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const JOURNAL_PATHS = ['state/journal.db', 'state/documents.sqlite', 'state/operations.sqlite'];
+const REQUIRED_JOURNAL_TABLES = [
+  'schema_migrations',
+  'operations',
+  'operation_approvals',
+  'projects_v2',
+  'feedback_records',
+  'retrieval_labels'
+] as const;
 
 export type LocalBackupScope = 'full' | 'vault-only';
 
@@ -86,6 +94,8 @@ export interface LocalBackupManifest {
 
 export interface LocalBackupVerification {
   ok: boolean;
+  integrity_ok: boolean;
+  durable_complete: boolean;
   format_version: number;
   scope: LocalBackupScope;
   classification: RecoveryClassification;
@@ -107,6 +117,7 @@ export interface TakeLocalBackupOptions {
   includeModelArtifacts?: boolean;
   config?: string;
   secrets?: readonly string[];
+  allowWriters?: boolean;
   clock?: Clock;
 }
 
@@ -185,7 +196,12 @@ export type RebuildLocalIndexResult =
       counts: LocalIndexCounts;
     };
 
-export type DurableJournalState = 'present' | 'missing' | 'damaged';
+export type DurableJournalState =
+  | 'present'
+  | 'missing'
+  | 'damaged'
+  | 'migration_required'
+  | 'backfill_required';
 
 function invalidInput(message: string, cause?: unknown): BrainError {
   return new BrainError({ code: 'INVALID_INPUT', message, cause });
@@ -224,18 +240,63 @@ export function classifyRecoveryInput(input: RecoveryInputPresence): RecoveryCla
   };
 }
 
+function pendingApprovalBackfill(database: Database.Database): number {
+  const approvals = new Set(
+    (
+      database.prepare('SELECT operation_id FROM operation_approvals').all() as {
+        operation_id: string;
+      }[]
+    ).map((row) => row.operation_id)
+  );
+  const rows = database
+    .prepare('SELECT operation_id, plan_json FROM operations WHERE plan_json IS NOT NULL')
+    .all() as { operation_id: string; plan_json: string }[];
+  let pending = 0;
+  for (const row of rows) {
+    if (approvals.has(row.operation_id)) continue;
+    let plan: unknown;
+    try {
+      plan = JSON.parse(row.plan_json);
+    } catch {
+      continue;
+    }
+    if (plan === null || typeof plan !== 'object') continue;
+    const revision = (plan as { revision?: unknown }).revision;
+    if (revision === null || typeof revision !== 'object') continue;
+    const approval = (revision as { approval?: unknown }).approval;
+    if (approval !== null && typeof approval === 'object') pending += 1;
+  }
+  return pending;
+}
+
 export function inspectDurableJournal(state: string): DurableJournalState {
   const path = join(resolve(state), 'journal.db');
   if (!existsSync(path)) return 'missing';
-  let journal: Journal | undefined;
+  let database: Database.Database | undefined;
   try {
-    journal = Journal.open(path, { requireExisting: true });
-    journal.durableStateSummary();
-    return 'present';
+    database = new Database(path, { readonly: true, fileMustExist: true });
+    if (database.pragma('quick_check', { simple: true }) !== 'ok') return 'damaged';
+    const tables = new Set(
+      (
+        database
+          .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+          .all() as { name: string }[]
+      ).map((row) => row.name)
+    );
+    for (const table of REQUIRED_JOURNAL_TABLES) {
+      if (!tables.has(table)) return 'migration_required';
+    }
+    const applied = database
+      .prepare('SELECT COUNT(*) AS count FROM schema_migrations')
+      .get() as { count: number };
+    if (applied.count === 0) return 'migration_required';
+    database.prepare('SELECT COUNT(*) AS count FROM operations').get();
+    database.prepare('SELECT COUNT(*) AS count FROM projects_v2').get();
+    return pendingApprovalBackfill(database) > 0 ? 'backfill_required' : 'present';
   } catch {
     return 'damaged';
   } finally {
-    journal?.close();
+    database?.close();
   }
 }
 
@@ -401,7 +462,6 @@ async function buildManifest(
     roots: LocalBackupRoots;
     scope: LocalBackupScope;
     sensitive: boolean;
-    categories: LocalBackupCategory[];
     sensitive_categories: LocalBackupCategory[];
     reproducible_categories: LocalBackupCategory[];
     created_at: string;
@@ -447,81 +507,83 @@ export async function takeLocalBackup(
   const destination = resolve(options.destination);
   const scope = options.scope ?? 'full';
   const clock = options.clock ?? { now: () => new Date() };
+  const sensitive = scope === 'full' && (options.secrets?.length ?? 0) > 0;
   await assertSafeRoot(vaultRoot, 'vault root');
   await assertSafeRoot(stateRoot, 'state root');
   await assertEmptyOrAbsent(destination, 'backup destination');
-  await mkdir(destination, { recursive: true, mode: 0o700 });
+  let lock: InstanceLock | undefined;
+  if (options.allowWriters !== true) {
+    lock = InstanceLock.acquire(stateRoot);
+  }
+  try {
+    await mkdir(destination, { recursive: true, mode: 0o700 });
 
-  await copyTree(vaultRoot, join(destination, 'vault'));
+    await copyTree(vaultRoot, join(destination, 'vault'));
 
-  const sensitive = (options.secrets?.length ?? 0) > 0;
-  const categories: LocalBackupCategory[] = ['vault', 'version_manifest'];
-
-  if (scope === 'full') {
-    await copyTree(join(stateRoot, 'history'), join(destination, 'state', 'history'));
-    for (const name of ['journal.db', 'documents.sqlite', 'operations.sqlite']) {
-      const source = join(stateRoot, name);
-      if (await snapshotSqliteDatabase(source, join(destination, 'state', name))) {
-        categories.push('journal');
+    if (scope === 'full') {
+      await copyTree(join(stateRoot, 'history'), join(destination, 'state', 'history'));
+      for (const name of ['journal.db', 'documents.sqlite', 'operations.sqlite']) {
+        await snapshotSqliteDatabase(join(stateRoot, name), join(destination, 'state', name));
+      }
+      await copyTree(join(stateRoot, 'migrations'), join(destination, 'state', 'migrations'));
+      if (options.includeSearchIndex === true) {
+        await copyTree(join(stateRoot, 'index'), join(destination, 'state', 'index'));
+      }
+      if (options.includeModelArtifacts === true) {
+        await copyTree(join(stateRoot, 'models'), join(destination, 'state', 'models'));
+      }
+      if (options.config !== undefined) {
+        await copyTree(resolve(options.config), join(destination, 'config'));
       }
     }
-    await copyTree(join(stateRoot, 'migrations'), join(destination, 'state', 'migrations'));
-    if (options.includeSearchIndex === true) {
-      await copyTree(join(stateRoot, 'index'), join(destination, 'state', 'index'));
-    }
-    if (options.includeModelArtifacts === true) {
-      await copyTree(join(stateRoot, 'models'), join(destination, 'state', 'models'));
-    }
-    if (options.config !== undefined) {
-      await copyTree(resolve(options.config), join(destination, 'config'));
-    }
-  }
 
-  const versionPath = join(destination, 'config', 'version.json');
-  await mkdir(dirname(versionPath), { recursive: true, mode: 0o700 });
-  await writeFile(
-    versionPath,
-    `${JSON.stringify(
-      {
-        application: APPLICATION_VERSION,
-        schema: SCHEMA_VERSION,
-        format_version: LOCAL_BACKUP_FORMAT_VERSION,
-        created_at: clock.now().toISOString()
+    const versionPath = join(destination, 'config', 'version.json');
+    await mkdir(dirname(versionPath), { recursive: true, mode: 0o700 });
+    await writeFile(
+      versionPath,
+      `${JSON.stringify(
+        {
+          application: APPLICATION_VERSION,
+          schema: SCHEMA_VERSION,
+          format_version: LOCAL_BACKUP_FORMAT_VERSION,
+          created_at: clock.now().toISOString()
+        },
+        null,
+        2
+      )}\n`,
+      'utf8'
+    );
+
+    if (scope === 'full' && sensitive) {
+      for (const secret of options.secrets ?? []) {
+        const absolute = resolve(secret);
+        const info = await lstat(absolute);
+        if (info.isSymbolicLink() || !info.isFile()) {
+          throw invalidInput(`secret ${absolute} must be a regular file`);
+        }
+        await copyTree(absolute, join(destination, 'secrets', absolute.split(sep).pop() as string));
+      }
+    }
+
+    const manifest = await buildManifest(destination, {
+      roots: {
+        vault: join(destination, 'vault'),
+        state: join(destination, 'state'),
+        config: join(destination, 'config'),
+        ...(sensitive ? { secrets: join(destination, 'secrets') } : {})
       },
-      null,
-      2
-    )}\n`,
-    'utf8'
-  );
-
-  if (scope === 'full' && sensitive) {
-    for (const secret of options.secrets ?? []) {
-      const absolute = resolve(secret);
-      const info = await lstat(absolute);
-      if (info.isSymbolicLink() || !info.isFile()) {
-        throw invalidInput(`secret ${absolute} must be a regular file`);
-      }
-      await copyTree(absolute, join(destination, 'secrets', absolute.split(sep).pop() as string));
-    }
+      scope,
+      sensitive,
+      sensitive_categories: sensitive ? ['secrets'] : [],
+      reproducible_categories: ['search_index', 'model_artifacts'],
+      created_at: clock.now().toISOString()
+    });
+    const manifestPath = join(destination, 'local-manifest.json');
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    return { manifest, manifest_path: manifestPath, files: manifest.files.length, sensitive };
+  } finally {
+    lock?.release();
   }
-
-  const manifest = await buildManifest(destination, {
-    roots: {
-      vault: join(destination, 'vault'),
-      state: join(destination, 'state'),
-      config: join(destination, 'config'),
-      ...(sensitive ? { secrets: join(destination, 'secrets') } : {})
-    },
-    scope,
-    sensitive,
-    categories: [...new Set(categories)],
-    sensitive_categories: sensitive ? ['secrets'] : [],
-    reproducible_categories: ['search_index', 'model_artifacts'],
-    created_at: clock.now().toISOString()
-  });
-  const manifestPath = join(destination, 'local-manifest.json');
-  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-  return { manifest, manifest_path: manifestPath, files: manifest.files.length, sensitive };
 }
 
 export async function readLocalBackupManifest(path: string): Promise<LocalBackupManifest> {
@@ -564,11 +626,33 @@ export function assertLocalBackupManifest(value: unknown): LocalBackupManifest {
     if (file === null || typeof file !== 'object') {
       throw invalidInput(`local backup manifest files[${index}] is not an object`);
     }
+    if (file.root !== 'vault' && file.root !== 'state' && file.root !== 'config' && file.root !== 'secrets') {
+      throw invalidInput(`local backup manifest files[${index}].root is not a known store`);
+    }
+    assertRelativeBackupEntry(file.path, `local backup manifest files[${index}].path`);
     if (typeof file.sha256 !== 'string' || !SHA256_PATTERN.test(file.sha256)) {
       throw invalidInput(`local backup manifest files[${index}].sha256 is not a sha256 digest`);
     }
   }
   return manifest;
+}
+
+function assertRelativeBackupEntry(value: unknown, label: string): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw invalidInput(`${label} must be a non-empty relative path`);
+  }
+  if (value.includes('\0') || value.includes('\\')) {
+    throw invalidInput(`${label} must not contain a null byte or backslash`);
+  }
+  if (value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value)) {
+    throw invalidInput(`${label} must be relative to its store root`);
+  }
+  for (const segment of value.split('/')) {
+    if (segment.length === 0 || segment === '.' || segment === '..') {
+      throw invalidInput(`${label} must not contain empty or traversal segments`);
+    }
+  }
+  return value;
 }
 
 function rootDirectory(
@@ -663,8 +747,15 @@ export async function verifyLocalBackup(
     journal: journalComplete,
     index: complete.includes('search_index')
   });
+  const integrityOk = missing.length === 0 && failures.length === 0 && vaultComplete;
+  const durableComplete =
+    manifest.scope === 'vault-only'
+      ? true
+      : complete.includes('revision_snapshots') && complete.includes('journal');
   return {
-    ok: missing.length === 0 && failures.length === 0 && vaultComplete,
+    ok: integrityOk && durableComplete,
+    integrity_ok: integrityOk,
+    durable_complete: durableComplete,
     format_version: manifest.format_version,
     scope: manifest.scope,
     classification,
@@ -712,7 +803,9 @@ export async function restoreLocalBackup(
   const verification = await verifyLocalBackup(manifest, mediaRoots);
   if (!verification.ok) {
     throw recoveryRequired(
-      `the local backup failed verification: ${verification.missing_files.length} missing, ` +
+      `the local backup failed verification: integrity ${verification.integrity_ok}, ` +
+        `durable completeness ${verification.durable_complete}; ` +
+        `${verification.missing_files.length} missing, ` +
         `${verification.checksum_failures.length} checksum failures`
     );
   }
@@ -859,6 +952,16 @@ export async function rebuildLocalIndex(
   if (durable === 'damaged') {
     return degraded('the durable operation journal is unreadable; an index rebuild does not repair durable state');
   }
+  if (durable === 'migration_required') {
+    return degraded(
+      'the durable operation journal schema is behind this release; run recover-state to migrate it explicitly instead of rebuilding the index'
+    );
+  }
+  if (durable === 'backfill_required') {
+    return degraded(
+      'the durable operation journal needs approval-provenance recovery; run recover-state instead; an index rebuild does not repair durable state'
+    );
+  }
   if (durable === 'missing' && (await vaultHasManagedNotes(vault))) {
     return degraded(
       'the durable operation journal is missing; restore it from a backup instead of rebuilding the index'
@@ -909,15 +1012,26 @@ export async function rebuildLocalIndex(
     await rm(staging, { force: true }).catch(() => undefined);
     return degraded(errorMessage(error));
   }
+  const previousPath = liveExists ? `${indexPath}.previous-${randomUUID()}` : undefined;
+  let previousMoved = false;
   try {
     await options.faults?.publish?.();
     await options.closePrevious?.();
+    if (previousPath !== undefined) {
+      await rename(indexPath, previousPath);
+      previousMoved = true;
+    }
     await rename(staging, indexPath);
     await writeFileAtomic(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`);
   } catch (error) {
     await rm(staging, { force: true }).catch(() => undefined);
+    if (previousMoved && previousPath !== undefined) {
+      await rm(indexPath, { force: true }).catch(() => undefined);
+      await rename(previousPath, indexPath).catch(() => undefined);
+    }
     return degraded(errorMessage(error));
   }
+  if (previousPath !== undefined) await rm(previousPath, { force: true }).catch(() => undefined);
   return {
     status: 'rebuilt',
     index_path: indexPath,
