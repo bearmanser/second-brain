@@ -12,8 +12,14 @@ import { extractLinks, isExternalTarget, type LinkReference } from './links.js';
 export const CURRENT_VAULT_DEBOUNCE_MS = 250;
 export const CURRENT_VAULT_RESCAN_INTERVAL_MS = 30_000;
 
+export interface CurrentVaultScan {
+  paths: string[];
+  complete: boolean;
+}
+
 export interface CurrentVault {
   listMarkdown(): Promise<string[]>;
+  scanMarkdown?(): Promise<CurrentVaultScan>;
   readMarkdown(
     relativePath: string
   ): Promise<{ raw: string; raw_hash: string; relative_path: string }>;
@@ -341,6 +347,7 @@ export interface CurrentVaultUnresolvedLink {
 
 export interface ReconcileCurrentVaultReport {
   scanned: number;
+  complete: boolean;
   added: CurrentSource[];
   changed: CurrentVaultChange[];
   moved: CurrentVaultMove[];
@@ -370,6 +377,7 @@ export async function reconcileCurrentVault(
   if (signal?.aborted) throw cancelled();
   const report: ReconcileCurrentVaultReport = {
     scanned: 0,
+    complete: true,
     added: [],
     changed: [],
     moved: [],
@@ -381,8 +389,16 @@ export async function reconcileCurrentVault(
 
   const previous = catalogue.all();
   const previousByPath = new Map(previous.map((source) => [source.path, source]));
-  const paths = [...(await vault.listMarkdown())].sort();
+  let paths: string[];
+  if (typeof vault.scanMarkdown === 'function') {
+    const scan = await vault.scanMarkdown();
+    paths = [...scan.paths].sort();
+    report.complete = scan.complete;
+  } else {
+    paths = [...(await vault.listMarkdown())].sort();
+  }
   report.scanned = paths.length;
+  const listedPaths = new Set(paths);
 
   const observed: ObservedDocument[] = [];
   for (const path of paths) {
@@ -544,13 +560,14 @@ export async function reconcileCurrentVault(
     });
   }
 
-  const observedPaths = new Set(observed.map((item) => item.path));
   const plannedRemovals: CurrentSource[] = [];
-  for (const source of previous) {
-    if (observedPaths.has(source.path)) continue;
-    if (movedFrom.has(source.path)) continue;
-    if (source.id !== undefined && duplicateIds.has(source.id)) continue;
-    plannedRemovals.push(source);
+  if (report.complete) {
+    for (const source of previous) {
+      if (listedPaths.has(source.path)) continue;
+      if (movedFrom.has(source.path)) continue;
+      if (source.id !== undefined && duplicateIds.has(source.id)) continue;
+      plannedRemovals.push(source);
+    }
   }
 
   if (signal?.aborted) throw cancelled();

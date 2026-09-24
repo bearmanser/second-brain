@@ -4,7 +4,7 @@ import { expect, test } from 'vitest';
 import { CurrentCatalogue, reconcileCurrentVault } from '../../src/notes/current-catalogue.js';
 import { indexReconciledDocuments, type ReconcileCurrentVaultReport } from '../../src/notes/reconcile.js';
 import { openSearchIndex } from '../../src/storage/search-index.js';
-import { FileVault } from '../../src/storage/vault.js';
+import { FileVault, scanVaultFilePaths } from '../../src/storage/vault.js';
 import { vaultSandbox } from '../helpers/vault-sandbox.js';
 
 const MANAGED_ID = '44b093c5-71db-4785-b9a5-bb8118304278';
@@ -377,6 +377,7 @@ test('an incomplete scan never prunes indexed entries', () => {
     index.replaceDocument({ path: 'Knowledge/Stale.md', raw: '# Stale\n\nstale term\n', etag: 's' });
     const emptyReport: ReconcileCurrentVaultReport = {
       scanned: 0,
+      complete: true,
       added: [],
       changed: [],
       moved: [],
@@ -385,13 +386,78 @@ test('an incomplete scan never prunes indexed entries', () => {
       duplicate_ids: [],
       unresolved_links: []
     };
-    indexReconciledDocuments({ catalogue, index, report: emptyReport, partial: true });
+    indexReconciledDocuments({ catalogue, index, report: { ...emptyReport, complete: false } });
     expect(index.candidates({ query: 'stale', limit: 10 })).toHaveLength(1);
     indexReconciledDocuments({ catalogue, index, report: emptyReport });
     expect(index.candidates({ query: 'stale', limit: 10 })).toHaveLength(0);
   } finally {
     index.close();
     catalogue.close();
+  }
+});
+
+test('a present file that becomes unparseable on a later scan keeps its index entry', async () => {
+  const sandbox = await vaultSandbox();
+  const index = openSearchIndex(':memory:');
+  try {
+    await mkdir(join(sandbox.vault, 'Knowledge'), { recursive: true });
+    await writeFile(join(sandbox.vault, 'Knowledge', 'Note.md'), '# Note\n\nkeeper term\n');
+    const vault = new FileVault(sandbox.vault, []);
+    const catalogue = CurrentCatalogue.open({});
+    const first = await reconcileCurrentVault({ vault, catalogue });
+    indexReconciledDocuments({ catalogue, index, report: first });
+    expect(index.candidates({ query: 'keeper', limit: 10 })).toHaveLength(1);
+
+    await writeFile(
+      join(sandbox.vault, 'Knowledge', 'Note.md'),
+      '---\nid: not-a-uuid\n---\n\n# Note\n\nkeeper term\n'
+    );
+    const second = await reconcileCurrentVault({ vault, catalogue });
+    expect(second.complete).toBe(true);
+    expect(second.malformed.map((entry) => entry.path)).toContain('Knowledge/Note.md');
+    expect(second.removed.map((entry) => entry.path)).not.toContain('Knowledge/Note.md');
+    indexReconciledDocuments({ catalogue, index, report: second });
+    expect(index.candidates({ query: 'keeper', limit: 10 })).toHaveLength(1);
+  } finally {
+    index.close();
+    await sandbox.dispose();
+  }
+});
+
+test('an incomplete vault walk is treated as partial and never prunes the index', async () => {
+  const index = openSearchIndex(':memory:');
+  const catalogue = CurrentCatalogue.open({});
+  try {
+    catalogue.upsert({ path: 'Knowledge/Keep.md', raw: '# Keep\n\nkeeper term\n', etag: 'k' });
+    index.replaceDocument({ path: 'Knowledge/Keep.md', raw: '# Keep\n\nkeeper term\n', etag: 'k' });
+    const vault = {
+      scanMarkdown: async () => ({ paths: [], complete: false }),
+      listMarkdown: async () => [],
+      readMarkdown: async () => {
+        throw new Error('the vault is unavailable');
+      }
+    };
+    const report = await reconcileCurrentVault({ vault, catalogue });
+    expect(report.complete).toBe(false);
+    expect(report.removed).toHaveLength(0);
+    indexReconciledDocuments({ catalogue, index, report });
+    expect(index.candidates({ query: 'keeper', limit: 10 })).toHaveLength(1);
+  } finally {
+    index.close();
+    catalogue.close();
+  }
+});
+
+test('a vault walk that cannot list a directory reports incompleteness', async () => {
+  const sandbox = await vaultSandbox();
+  try {
+    const missing = await scanVaultFilePaths(join(sandbox.vault, 'missing'));
+    expect(missing.paths).toEqual([]);
+    expect(missing.complete).toBe(false);
+    const present = await scanVaultFilePaths(sandbox.vault);
+    expect(present.complete).toBe(true);
+  } finally {
+    await sandbox.dispose();
   }
 });
 

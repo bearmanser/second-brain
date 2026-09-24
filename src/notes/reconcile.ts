@@ -65,14 +65,20 @@ export interface IndexReconciledDocumentsInput {
   catalogue: Pick<CurrentCatalogue, 'all' | 'rawFor' | 'getByPath'>;
   index: SearchIndexSink;
   report: ReconcileCurrentVaultReport;
-  partial?: boolean;
 }
 
 export function indexReconciledDocuments(input: IndexReconciledDocumentsInput): void {
   const { catalogue, index, report } = input;
-  const complete = input.partial !== true;
-  if (complete) {
-    for (const moved of report.moved) index.remove?.(moved.from);
+  const protectedPaths = new Set<string>();
+  for (const malformed of report.malformed) protectedPaths.add(malformed.path);
+  for (const duplicate of report.duplicate_ids) {
+    for (const path of duplicate.paths) protectedPaths.add(path);
+  }
+  const destructive = report.complete;
+  if (destructive) {
+    for (const moved of report.moved) {
+      if (!protectedPaths.has(moved.from)) index.remove?.(moved.from);
+    }
   }
   const paths = new Set<string>();
   for (const source of report.added) paths.add(source.path);
@@ -90,14 +96,13 @@ export function indexReconciledDocuments(input: IndexReconciledDocumentsInput): 
       ...(source.revision_id === undefined ? {} : { revision_id: source.revision_id })
     });
   }
-  if (!complete) return;
-  for (const removed of report.removed) index.remove?.(removed.path);
+  if (!destructive) return;
+  for (const removed of report.removed) {
+    if (!protectedPaths.has(removed.path)) index.remove?.(removed.path);
+  }
   if (typeof index.paths !== 'function') return;
   const live = new Set(catalogue.all().map((source) => source.path));
-  for (const malformed of report.malformed) live.add(malformed.path);
-  for (const duplicate of report.duplicate_ids) {
-    for (const path of duplicate.paths) live.add(path);
-  }
+  for (const path of protectedPaths) live.add(path);
   for (const indexed of index.paths()) {
     if (!live.has(indexed)) index.remove?.(indexed);
   }

@@ -136,15 +136,24 @@ export function vaultNoteSegments(relativePath: string): string[] {
   return segments;
 }
 
-export async function listVaultFilePaths(root: string): Promise<string[]> {
+export interface VaultInventory {
+  paths: string[];
+  complete: boolean;
+}
+
+export async function scanVaultFilePaths(root: string): Promise<VaultInventory> {
   const rootPath = resolve(root);
   const results: string[] = [];
+  let complete = true;
   const walk = async (directory: string, prefix: string): Promise<void> => {
     let entries;
     try {
       entries = await readdir(directory, { withFileTypes: true });
     } catch (error) {
-      if (hasErrno(error, 'ENOENT')) return;
+      if (hasErrno(error, 'ENOENT')) {
+        complete = false;
+        return;
+      }
       throw recoveryRequired(`vault directory ${directory} cannot be listed`, error);
     }
     entries.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
@@ -156,6 +165,7 @@ export async function listVaultFilePaths(root: string): Promise<string[]> {
       try {
         info = await lstat(absolute);
       } catch {
+        complete = false;
         continue;
       }
       if (info.isSymbolicLink()) continue;
@@ -168,7 +178,11 @@ export async function listVaultFilePaths(root: string): Promise<string[]> {
   };
   await walk(rootPath, '');
   results.sort();
-  return results;
+  return { paths: results, complete };
+}
+
+export async function listVaultFilePaths(root: string): Promise<string[]> {
+  return (await scanVaultFilePaths(root)).paths;
 }
 
 export interface ByteReader {
@@ -260,8 +274,15 @@ export class FileVault implements VaultPort {
   }
 
   async listMarkdown(): Promise<string[]> {
-    const paths = await listVaultFilePaths(this.root);
-    return paths.filter((path) => path.toLowerCase().endsWith('.md'));
+    return (await this.scanMarkdown()).paths;
+  }
+
+  async scanMarkdown(): Promise<VaultInventory> {
+    const inventory = await scanVaultFilePaths(this.root);
+    return {
+      paths: inventory.paths.filter((path) => path.toLowerCase().endsWith('.md')),
+      complete: inventory.complete
+    };
   }
 
   async readMarkdown(
