@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
-import { mkdir } from 'node:fs/promises';
+import { existsSync, readFileSync } from 'node:fs';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { expect, test } from 'vitest';
 import { ensureProject } from '../../src/features/project-ensure.js';
@@ -153,6 +153,13 @@ test('unpaired surrogates are replaced consistently before fitting and collision
       directory: 'Knowledge',
       title: 'x\uD800',
       occupied: ['Knowledge/x\uFFFD.md']
+    })
+  ).toBe('Knowledge/x\uFFFD (2).md');
+  expect(
+    allocateNotePath({
+      directory: 'Knowledge',
+      title: 'x\uFFFD',
+      occupied: ['Knowledge/x\uD800.md']
     })
   ).toBe('Knowledge/x\uFFFD (2).md');
   expect(() =>
@@ -356,6 +363,25 @@ test('project ensure never adopts an existing unregistered Projects directory', 
     expect(project?.relative_root).toBe('Projects/example human-made');
     expect(existsSync(humanRoot)).toBe(true);
     expect(existsSync(join(vault, project?.relative_root ?? 'missing'))).toBe(true);
+  } finally {
+    await h.close();
+  }
+});
+
+test('project ensure fails closed when the Projects inventory cannot be read', async () => {
+  const h = await createHarness();
+  try {
+    const vault = h.deps.config.mounts.vault;
+    const projectsPath = join(vault, 'Projects');
+    await writeFile(projectsPath, 'not a directory\n');
+    await expect(
+      ensureProject(workerContext, request('https://github.com/example/fail-closed.git'), h.deps)
+    ).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(
+      h.deps.journal.getProjectByIdentity('github.com/example/fail-closed')
+    ).toBeUndefined();
+    expect(h.deps.journal.countProjects()).toBe(0);
+    expect(readFileSync(projectsPath, 'utf8')).toBe('not a directory\n');
   } finally {
     await h.close();
   }

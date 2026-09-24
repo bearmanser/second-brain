@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readdirSync } from 'node:fs';
+import { readdirSync, type Dirent } from 'node:fs';
 import { join } from 'node:path';
 import { BrainError, isBrainError } from '../contracts/errors.js';
 import { projectEnsureRequestSchema } from '../contracts/protocol.js';
@@ -79,14 +79,30 @@ interface PlannedProjectIdentity {
   relativeRoot: string;
 }
 
+function readProjectsDirectory(projectsDirectory: string): Dirent[] {
+  try {
+    return readdirSync(projectsDirectory, { withFileTypes: true });
+  } catch (error) {
+    if (
+      typeof error === 'object' &&
+      error !== null &&
+      (error as { code?: unknown }).code === 'ENOENT'
+    ) {
+      return [];
+    }
+    throw new BrainError({
+      code: 'RECOVERY_REQUIRED',
+      message: 'the vault project directory cannot be inspected',
+      cause: error
+    });
+  }
+}
+
 function vaultProjectRoots(deps: BrainDeps): string[] {
   const projectsDirectory = join(deps.config.mounts.vault, PROJECTS_ROOT);
-  try {
-    const entries = readdirSync(projectsDirectory, { withFileTypes: true });
-    return entries.map((entry) => `${PROJECTS_ROOT}/${entry.name}`);
-  } catch {
-    return [];
-  }
+  return readProjectsDirectory(projectsDirectory).map(
+    (entry) => `${PROJECTS_ROOT}/${entry.name}`
+  );
 }
 
 function occupiedProjectRoots(deps: BrainDeps): string[] {
