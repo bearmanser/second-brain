@@ -1336,6 +1336,7 @@ export interface LocalDocumentExecutor {
   consolidate(input: DocumentStoreConsolidateInput): Promise<DocumentStorePutResult>;
   getConsolidationReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
   hasConsolidationManifest?(idempotencyKey: string): boolean;
+  getConsolidationOperationId?(idempotencyKey: string): string | undefined;
   recover?(): Promise<{ recovered: string[]; pending: string[] }>;
   getDocumentReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
   getMoveReceipt(idempotencyKey: string): RenameReceipt | undefined;
@@ -1803,6 +1804,59 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
       );
     }
     if (existing.length > 0) {
+      if (compatibleConsolidation && existing.some((row) => row.key !== expectedKeys[row.effect_index])) {
+        const historical = plan.kind === 'note' ? [
+          ...plan.effects.map((effect, index) => ({
+            key: `${record.idempotency_key}:${effect.kind === 'move' ? `move:${index}` :
+              effect.kind === 'remove' ? `remove:${index}` : `doc:${index}`}`,
+            kind: effect.kind
+          })),
+          { key: expectedKeys[0], kind: 'consolidation' },
+          ...(plan.reference_edits ?? []).map((_edit, index) => ({
+            key: `${record.idempotency_key}:ref:${index}`, kind: 'reference_edit'
+          }))
+        ] : [];
+        const manifestId = this.deps.documents.getConsolidationOperationId?.(expectedKeys[0]);
+        const primaryReceipt = this.deps.documents.getDocumentReceipt(`${record.idempotency_key}:consolidate:primary`);
+        const consolidatedReceipt = this.deps.documents.getConsolidationReceipt(expectedKeys[0]);
+        const primaryDocumentId = consolidatedReceipt?.operation_id ?? primaryReceipt?.operation_id;
+        const primaryIndex = plan.kind === 'note' ? plan.effects.findIndex((effect) => effect.kind === 'write') : -1;
+        if (manifestId !== record.operation_id || existing.length > historical.length ||
+            (consolidatedReceipt !== undefined && primaryReceipt !== undefined &&
+              consolidatedReceipt.operation_id !== primaryReceipt.operation_id) ||
+            this.deps.documents.getDocumentReceipt(expectedKeys[0]) !== undefined ||
+            this.deps.documents.getMoveReceipt(expectedKeys[0]) !== undefined) {
+          throw localRecovery('the persisted historical subordinate batch is ambiguous');
+        }
+        for (const [index, row] of existing.entries()) {
+          const spec = historical[index];
+          if (row.effect_index !== index || row.key !== spec?.key || row.kind !== spec.kind || row.state === 'failed') {
+            throw localRecovery(`historical subordinate ${index} disagrees with its planned effect`);
+          }
+          const document = this.deps.documents.getDocumentReceipt(row.key)?.operation_id;
+          const move = this.deps.documents.getMoveReceipt(row.key)?.operation_id;
+          const candidates = [
+            document, move,
+            ...(index === primaryIndex ? [primaryDocumentId] : []),
+            ...(spec.kind === 'consolidation' ? [manifestId] : [])
+          ].filter((id): id is string => id !== undefined);
+          if ((spec.kind !== 'write' && spec.kind !== 'consolidation' && (document !== undefined || move !== undefined)) ||
+              new Set(candidates).size > 1 ||
+              (row.document_operation_id !== null &&
+                (candidates.length !== 1 || row.document_operation_id !== candidates[0]))) {
+            throw localRecovery(`historical subordinate ${index} has ambiguous document linkage`);
+          }
+        }
+        this.deps.operations.replaceLegacyConsolidationSubordinates({
+          operation_id: record.operation_id,
+          expected: existing,
+          key: expectedKeys[0],
+          document_operation_id: primaryDocumentId ?? null,
+          created_at: record.created_at,
+          updated_at: this.now()
+        });
+        return;
+      }
       if (existing.length !== expectedKeys.length || expectedKeys.some((key, index) =>
         existing.find((row) => row.key === key)?.effect_index !== (
           specs[index].key.startsWith('doc:') && Number(specs[index].key.slice(4)) >= 1000
@@ -2608,6 +2662,7 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
         indexed: completed.indexed,
         warnings: []
       };
+      this.deps.operations.markSubordinate(record.operation_id, 0, 'complete');
       this.finalize(record, doneReceipt, consolidationKey);
       return doneReceipt;
     }

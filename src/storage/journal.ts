@@ -3712,6 +3712,39 @@ export class LocalOperationJournal {
     return rows.map(toLocalSubordinate);
   }
 
+  replaceLegacyConsolidationSubordinates(input: {
+    operation_id: string;
+    expected: readonly LocalSubordinateRecord[];
+    key: string;
+    document_operation_id: string | null;
+    created_at: string;
+    updated_at: string;
+  }): void {
+    this.assertOpen();
+    try {
+      this.database.transaction(() => {
+        const current = this.listSubordinates(input.operation_id);
+        if (JSON.stringify(current) !== JSON.stringify(input.expected)) {
+          throw recoveryRequired('the historical subordinate rows changed during rebinding');
+        }
+        const occupying = this.findSubordinateByKey(input.key);
+        if (occupying !== undefined && occupying.operation_id !== input.operation_id) {
+          throw recoveryRequired('the historical consolidation key belongs to another operation');
+        }
+        this.database.prepare('DELETE FROM local_subordinate_operations WHERE operation_id = ?')
+          .run(input.operation_id);
+        this.database.prepare(
+          `INSERT INTO local_subordinate_operations
+             (operation_id, effect_index, kind, key, document_operation_id, state, created_at, updated_at)
+           VALUES (?, 0, 'consolidation', ?, ?, 'reserved', ?, ?)`
+        ).run(input.operation_id, input.key, input.document_operation_id, input.created_at, input.updated_at);
+      }).immediate();
+    } catch (error) {
+      if (isBrainError(error)) throw error;
+      throw recoveryRequired('the historical consolidation linkage could not be rebound', error);
+    }
+  }
+
   setSubordinateDocumentOperation(
     operation_id: string,
     effect_index: number,

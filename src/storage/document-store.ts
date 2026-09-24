@@ -424,6 +424,7 @@ export interface DocumentStore {
   consolidate(input: DocumentStoreConsolidateInput): Promise<DocumentStorePutResult>;
   getConsolidationReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
   hasConsolidationManifest(idempotencyKey: string): boolean;
+  getConsolidationOperationId(idempotencyKey: string): string | undefined;
   recallExclusions(): { paths: Set<string>; ids: Set<string> };
   getDocumentReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
   getMoveReceipt(idempotencyKey: string): RenameReceipt | undefined;
@@ -785,6 +786,10 @@ class LocalDocumentStore implements DocumentStore {
     return this.journal.findConsolidationByKey(idempotencyKey) !== undefined;
   }
 
+  getConsolidationOperationId(idempotencyKey: string): string | undefined {
+    return this.journal.findConsolidationByKey(idempotencyKey)?.operation_id;
+  }
+
   recallExclusions(): { paths: Set<string>; ids: Set<string> } {
     const paths = new Set(this.journal.listIndex().filter((row) => row.revision_id === 'remove')
       .map((row) => row.path));
@@ -1068,7 +1073,7 @@ class LocalDocumentStore implements DocumentStore {
     const inventory = await scanVaultFilePaths(this.vaultRoot);
     if (!inventory.complete) return failRecovery('the final consolidation inventory is incomplete');
     const currentPaths: string[] = [];
-    for (const path of inventory.paths) {
+    for (const path of inventory.paths.filter((candidate) => candidate.endsWith('.md'))) {
       const file = await readNoteFile(this.vaultRoot, vaultNoteSegments(path));
       if (file === undefined) return failRecovery(`the final inventory changed at ${path}`);
       try {
