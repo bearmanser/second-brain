@@ -24,9 +24,15 @@ import {
 import { runAgentPilot } from './agent.mjs';
 import { runInstructionProbe } from './instruction.mjs';
 import {
+  EVALUATION_MODES,
+  buildCrossModeReport,
+  dedupeLogicalIds,
   summariseLocalRetrieval,
+  type CrossModeObservation,
+  type CrossModeQuery,
   type LocalEvaluationQuery
 } from '../../src/retrieval/evaluation.js';
+import { readEvaluationDataset } from '../../src/retrieval/evaluation-dataset.js';
 import {
   EVAL_CLIENT_NAME,
   EVAL_CLIENT_VERSION,
@@ -322,41 +328,8 @@ export interface LocalDatasetRunOutput {
   metrics: ReturnType<typeof summariseLocalRetrieval>;
 }
 
-function stringList(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
-}
-
-function labelMap(value: unknown): Map<string, 0 | 1 | 2> {
-  const labels = new Map<string, 0 | 1 | 2>();
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return labels;
-  for (const [id, raw] of Object.entries(value as Record<string, unknown>)) {
-    if (raw === 0 || raw === 1 || raw === 2) labels.set(id, raw);
-  }
-  return labels;
-}
-
 export async function readLocalDataset(path: string): Promise<LocalEvaluationQuery[]> {
-  const raw = await readFile(path, 'utf8');
-  const queries: LocalEvaluationQuery[] = [];
-  for (const [index, line] of raw.split('\n').entries()) {
-    if (line.trim().length === 0) continue;
-    const parsed = JSON.parse(line) as Record<string, unknown>;
-    queries.push({
-      query_id: typeof parsed.query_id === 'string' ? parsed.query_id : String(index),
-      ...(typeof parsed.query === 'string' ? { query: parsed.query } : {}),
-      ...(typeof parsed.slice === 'string' ? { slice: parsed.slice } : {}),
-      candidates: stringList(parsed.candidates),
-      ...(parsed.graph_candidates === undefined
-        ? {}
-        : { graph_candidates: stringList(parsed.graph_candidates) }),
-      labels: labelMap(parsed.labels),
-      ...(typeof parsed.direct_answer === 'string' ? { direct_answer: parsed.direct_answer } : {}),
-      ...(parsed.no_answer === true ? { no_answer: true } : {}),
-      ...(parsed.fallback === true ? { fallback: true } : {}),
-      ...(typeof parsed.latency_ms === 'number' ? { latency_ms: parsed.latency_ms } : {})
-    });
-  }
-  return queries;
+  return (await readEvaluationDataset(path)).queries;
 }
 
 async function runLocalDatasetEvaluation(
@@ -365,15 +338,14 @@ async function runLocalDatasetEvaluation(
 ): Promise<{ output: LocalDatasetRunOutput; failed: boolean }> {
   const datasetPath = args.get('dataset');
   if (datasetPath === undefined) throw new Error('--dataset is required for --backend local');
-  const raw = await readFile(datasetPath);
-  const queries = await readLocalDataset(datasetPath);
+  const dataset = await readEvaluationDataset(datasetPath);
   const output: LocalDatasetRunOutput = {
     run_id: `local-${new Date().toISOString()}-${randomUUID().slice(0, 8)}`,
     mode,
     backend: 'local',
     dataset: datasetPath,
-    dataset_sha256: createHash('sha256').update(raw).digest('hex'),
-    metrics: summariseLocalRetrieval(queries)
+    dataset_sha256: dataset.sha256,
+    metrics: summariseLocalRetrieval(dataset.queries)
   };
   const outPath = args.get('out') ?? join(REPO_ROOT, 'tests/eval/results', `local-${mode}.json`);
   await writeJson(outPath, output);
@@ -400,10 +372,128 @@ function formatLocalDatasetSummary(output: LocalDatasetRunOutput): string {
   ].join('\n');
 }
 
+export interface LocalComparisonRunOutput {
+  run_id: string;
+  backend: 'local';
+  dataset: string;
+  dataset_sha256: string;
+  report: ReturnType<typeof buildCrossModeReport>;
+}
+
+function comparisonObservations(
+  query: LocalEvaluationQuery,
+  fallbackLaya: boolean
+): CrossModeObservation[] {
+  const textRanked = dedupeLogicalIds(query.candidates);
+  const graphRanked = dedupeLogicalIds(query.graph_candidates ?? []);
+  const merged = dedupeLogicalIds([...textRanked, ...graphRanked]);
+  const latency = query.latency_ms;
+  return [
+    {
+      mode: 'local_text',
+      ranked: textRanked,
+      available: true,
+      ...(latency === undefined ? {} : { latency_ms: latency })
+    },
+    {
+      mode: 'local_text_graph',
+      ranked: merged,
+      graph_ranked: graphRanked,
+      available: true,
+      ...(latency === undefined ? {} : { latency_ms: latency })
+    },
+    {
+      mode: 'laya_reranked',
+      ranked: textRanked,
+      available: true,
+      fallback: fallbackLaya,
+      ...(latency === undefined ? {} : { latency_ms: latency })
+    }
+  ];
+}
+
+async function runLocalComparison(
+  args: Map<string, string>,
+  modelAvailable: boolean
+): Promise<LocalComparisonRunOutput> {
+  const datasetPath = args.get('dataset');
+  if (datasetPath === undefined) throw new Error('--dataset is required for --compare');
+  const dataset = await readEvaluationDataset(datasetPath);
+  const queries: CrossModeQuery[] = dataset.queries.map((query) => ({
+    query_id: query.query_id,
+    slice: query.slice ?? 'unspecified',
+    labels: query.labels,
+    eligible: dedupeLogicalIds([...query.candidates, ...(query.graph_candidates ?? [])]),
+    ...(query.direct_answer === undefined ? {} : { direct_answer: query.direct_answer }),
+    ...(query.no_answer === true ? { no_answer: true } : {}),
+    modes: comparisonObservations(query, !modelAvailable)
+  }));
+  const report = buildCrossModeReport(queries, {
+    model_artifacts_available: modelAvailable,
+    rss_bytes: process.memoryUsage().rss
+  });
+  const output: LocalComparisonRunOutput = {
+    run_id: `local-compare-${new Date().toISOString()}-${randomUUID().slice(0, 8)}`,
+    backend: 'local',
+    dataset: datasetPath,
+    dataset_sha256: dataset.sha256,
+    report
+  };
+  const outPath = args.get('out') ?? join(REPO_ROOT, 'tests/eval/results', 'local-comparison.json');
+  await writeJson(outPath, output);
+  return output;
+}
+
+function formatComparisonSummary(output: LocalComparisonRunOutput): string {
+  const report = output.report;
+  const lines = [
+    `run ${output.run_id}`,
+    `backend local; dataset ${output.dataset} (${output.dataset_sha256.slice(0, 12)})`,
+    `queries ${report.universe.queries}; eligible documents ${report.universe.documents}`
+  ];
+  for (const mode of EVALUATION_MODES) {
+    const entry = report.modes[mode];
+    if (!entry.available) {
+      lines.push(`${mode}: NOT RUN`);
+      continue;
+    }
+    const suffix =
+      mode === 'legacy_baseline'
+        ? ` (frozen aggregate: recall@5 ${report.legacy_baseline.recall_at_5}, precision@5 ${report.legacy_baseline.precision_at_5}, mean ${report.legacy_baseline.mean_elapsed_ms} ms; V2 metrics not measured)`
+        : '';
+    const modelSuffix =
+      mode === 'laya_reranked' && report.not_run.includes('laya_reranked')
+        ? ' (model-backed NOT RUN; lexical fallback order)'
+        : '';
+    lines.push(
+      `${mode}${suffix}${modelSuffix}: recall@50 ${String(entry.candidate_recall_at_50)}; ` +
+        `nDCG@10 ${String(entry.ndcg_at_10)}; MRR ${String(entry.mrr)}; ` +
+        `fallback ${entry.fallback_rate}; p50 ${String(entry.latency_p50_ms)} ms; ` +
+        `p95 ${String(entry.latency_p95_ms)} ms; rss ${String(entry.rss_bytes_peak)}`
+    );
+  }
+  for (const [mode, slices] of Object.entries(report.by_slice)) {
+    for (const [slice, entry] of Object.entries(slices).sort(([left], [right]) => (left < right ? -1 : 1))) {
+      lines.push(
+        `  ${mode} / ${slice}: queries ${entry.queries}; recall@50 ${String(entry.candidate_recall_at_50)}; ` +
+          `nDCG@10 ${String(entry.ndcg_at_10)}; MRR ${String(entry.mrr)}; fallback ${entry.fallback_rate}; ` +
+          `p50 ${String(entry.latency_p50_ms)} ms`
+      );
+    }
+  }
+  for (const note of report.notes) lines.push(`note: ${note}`);
+  return lines.join('\n');
+}
+
 export async function main(argv: string[]): Promise<number> {
   const invocation = parseEvaluationArgs(argv);
   const args = parseArgs(argv);
   if (invocation.action === 'retrieval') {
+    if (args.get('compare') === 'true' || invocation.mode === 'compare') {
+      const output = await runLocalComparison(args, args.get('model-artifacts') === 'true');
+      process.stdout.write(`${formatComparisonSummary(output)}\n`);
+      return 0;
+    }
     if (invocation.backend === 'local' || invocation.dataset !== undefined) {
       const { output } = await runLocalDatasetEvaluation(args, invocation.mode ?? 'text');
       process.stdout.write(`${formatLocalDatasetSummary(output)}\n`);

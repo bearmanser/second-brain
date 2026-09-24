@@ -38,6 +38,7 @@ export interface RetrievalLabelInput {
   label: RetrievalLabelValue;
   rubric_version?: string;
   evidence_ref?: string;
+  notes?: string;
   approved?: boolean;
   voided_at?: string | null;
   created_at?: string;
@@ -77,6 +78,87 @@ export function defaultApproved(source: RetrievalLabelSource): boolean {
 
 export function isExportableLabel(entry: Pick<RetrievalLabelEntry, 'approved' | 'voided_at'>): boolean {
   return entry.approved && entry.voided_at === null;
+}
+
+export class ConflictingLabelError extends Error {
+  readonly code = 'IDEMPOTENCY_CONFLICT';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConflictingLabelError';
+  }
+}
+
+export interface RetrievalLabelStore {
+  recordRetrievalLabel(input: RetrievalLabelInput): RetrievalLabelEntry;
+  listRetrievalLabels(): RetrievalLabelEntry[];
+  voidRetrievalLabel(label_id: string, voided_at?: string): number;
+}
+
+export interface AuthorRetrievalLabelInput extends RetrievalLabelInput {
+  current: LabelSourceVersion;
+}
+
+export interface AuthorRetrievalLabelResult {
+  label_id: string;
+  recorded: boolean;
+  created: boolean;
+}
+
+function sameSourceIdentity(
+  left: Pick<RetrievalLabelInput, 'logical_id' | 'path' | 'source_hash'>,
+  right: Pick<RetrievalLabelInput, 'logical_id' | 'path' | 'source_hash'>
+): boolean {
+  return (
+    (left.logical_id ?? left.path ?? left.source_hash) ===
+    (right.logical_id ?? right.path ?? right.source_hash)
+  );
+}
+
+function sameJudgment(left: RetrievalLabelInput, right: RetrievalLabelInput): boolean {
+  return (
+    left.label === right.label &&
+    left.source_type === right.source_type &&
+    left.source_hash === right.source_hash &&
+    (left.question_version ?? null) === (right.question_version ?? null) &&
+    (left.model_fingerprint ?? null) === (right.model_fingerprint ?? null) &&
+    (left.candidate_position ?? null) === (right.candidate_position ?? null)
+  );
+}
+
+export function authorRetrievalLabel(
+  store: RetrievalLabelStore,
+  input: AuthorRetrievalLabelInput
+): AuthorRetrievalLabelResult {
+  const { current, ...label } = input;
+  assertFreshLabel(
+    {
+      source_hash: label.source_hash,
+      ...(label.revision_id === undefined ? {} : { revision_id: label.revision_id })
+    },
+    current
+  );
+  if (label.source_type === 'agent_proposed') label.approved = false;
+  const anchored = store
+    .listRetrievalLabels()
+    .filter(
+      (entry) =>
+        entry.voided_at === null &&
+        entry.trace_id === label.trace_id &&
+        entry.query_id === label.query_id &&
+        sameSourceIdentity(entry, label)
+    );
+  const identical = anchored.find((entry) => sameJudgment(entry, label));
+  if (identical !== undefined) {
+    return { label_id: identical.label_id, recorded: true, created: false };
+  }
+  if (anchored.length > 0) {
+    throw new ConflictingLabelError(
+      'a different judgment already exists for this trace, query, and source; void it first'
+    );
+  }
+  const stored = store.recordRetrievalLabel(label);
+  return { label_id: stored.label_id, recorded: true, created: true };
 }
 
 function labelKey(entry: RetrievalLabelInput): string {
@@ -201,6 +283,7 @@ export interface LabeledRetrievalManifest {
   dataset_sha256: string | null;
   model_fingerprints: string[];
   question_versions: string[];
+  content_sha256: string;
   counts: LabeledRetrievalCounts;
   limitations: string[];
   manifest_hash: string;
@@ -214,6 +297,7 @@ export interface LabeledRetrievalCounts {
   unjudged: number;
   excluded_not_approved: number;
   excluded_voided: number;
+  excluded_missing_text: number;
 }
 
 export interface LabeledRetrievalExport {
@@ -287,8 +371,18 @@ export async function exportLabeledRetrieval(
   const rubricVersion = options.rubricVersion ?? DEFAULT_RUBRIC_VERSION;
   const entries = options.labels.map(normalise);
   const exportable = entries.filter(isExportableLabel);
-  const assignment = assignSplits(exportable, options.splitSeed);
-  const rows = exportable
+  const hasText = (entry: RetrievalLabelEntry): boolean => {
+    if (!includeText) return true;
+    if (options.textLookup === undefined) return false;
+    return (
+      options.textLookup.queryText(entry.query_id) !== undefined &&
+      options.textLookup.noteText(entry.source_hash) !== undefined
+    );
+  };
+  const contentEligible = exportable.filter(hasText);
+  const excludedMissingText = exportable.length - contentEligible.length;
+  const assignment = assignSplits(contentEligible, options.splitSeed);
+  const rows = contentEligible
     .map((entry) =>
       rowFor(
         entry,
@@ -309,7 +403,7 @@ export async function exportLabeledRetrieval(
     synthetic: 0
   };
   const bySplit: Record<RetrievalSplit, number> = { train: 0, dev: 0, test: 0 };
-  for (const entry of exportable) {
+  for (const entry of contentEligible) {
     bySource[entry.source_type] += 1;
     bySplit[assignment.split_for.get(entry.label_id) as RetrievalSplit] += 1;
   }
@@ -330,13 +424,17 @@ export async function exportLabeledRetrieval(
   }
   const counts: LabeledRetrievalCounts = {
     labels: entries.length,
-    exported: exportable.length,
+    exported: contentEligible.length,
     by_source: bySource,
     by_split: bySplit,
     unjudged,
     excluded_not_approved: entries.filter((entry) => !entry.approved).length,
-    excluded_voided: entries.filter((entry) => entry.approved && entry.voided_at !== null).length
+    excluded_voided: entries.filter((entry) => entry.approved && entry.voided_at !== null).length,
+    excluded_missing_text: excludedMissingText
   };
+  const contentSha256 = createHash('sha256')
+    .update(rows.map((row) => canonical(row)).join('\n'), 'utf8')
+    .digest('hex');
   const manifestCore = {
     version: 1,
     include_text: includeText,
@@ -346,6 +444,7 @@ export async function exportLabeledRetrieval(
     dataset_sha256: options.datasetSha256 ?? null,
     model_fingerprints: [...(options.modelFingerprints ?? [])].sort(),
     question_versions: [...(options.questionVersions ?? [])].sort(),
+    content_sha256: contentSha256,
     counts,
     limitations: assignment.limitations
   };

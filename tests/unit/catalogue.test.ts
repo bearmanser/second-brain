@@ -242,7 +242,8 @@ test('reconciles a single revision into a unique head and stays rebuildable', as
     { version: 7 },
     { version: 8 },
     { version: 9 },
-    { version: 10 }
+    { version: 10 },
+    { version: 11 }
   ]);
   database.close();
 });

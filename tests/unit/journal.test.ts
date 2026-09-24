@@ -415,7 +415,8 @@ test('applies versioned migrations in order and reruns them idempotently', () =>
     { version: 7 },
     { version: 8 },
     { version: 9 },
-    { version: 10 }
+    { version: 10 },
+    { version: 11 }
   ]);
   expect(second.get(record.record.operation_id)?.idempotency_key).toBe('c1');
   probe.close();
@@ -599,7 +600,7 @@ test('upgrades a migration-7 database without changing prior operation rows', ()
   expect(upgraded.get('legacy-operation')).toMatchObject({ idempotency_key: 'legacy-key' });
   const probe = new Database(path);
   expect(probe.prepare('SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1').get()).toEqual({
-    version: 10
+    version: 11
   });
   expect(
     probe.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'projects_v2'").get()

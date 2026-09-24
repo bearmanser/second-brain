@@ -7,13 +7,15 @@ import { createHash } from 'node:crypto';
 import {
   assertFreshLabel,
   assignSplits,
+  authorRetrievalLabel,
+  ConflictingLabelError,
   defaultApproved,
   exportLabeledRetrieval,
   isExportableLabel,
   StaleLabelError,
   type RetrievalLabelInput
 } from '../../src/retrieval/feedback-export.js';
-import { parseArguments } from '../../src/cli.js';
+import { parseArguments, runCli } from '../../src/cli.js';
 import { parseEvaluationArgs } from '../eval/run.mjs';
 import { Journal } from '../../src/storage/journal.js';
 
@@ -263,6 +265,34 @@ test('the feedback export CLI parses its exact command line', () => {
   expect(parsed.flags.get('split-seed')).toBe('20260923');
 });
 
+test('the feedback label CLI parses its exact command line', () => {
+  const hash = 'a'.repeat(64);
+  const parsed = parseArguments([
+    'feedback',
+    'label',
+    '--query-id',
+    'q-1',
+    '--source-type',
+    'human_reviewed',
+    '--label',
+    '2',
+    '--source-hash',
+    hash,
+    '--path',
+    'Projects/Beta/Note.md',
+    '--notes',
+    'direct support'
+  ]);
+  expect(parsed.command).toBe('feedback');
+  expect(parsed.positionals).toEqual(['label']);
+  expect(parsed.flags.get('query-id')).toBe('q-1');
+  expect(parsed.flags.get('source-type')).toBe('human_reviewed');
+  expect(parsed.flags.get('label')).toBe('2');
+  expect(parsed.flags.get('source-hash')).toBe(hash);
+  expect(parsed.flags.get('path')).toBe('Projects/Beta/Note.md');
+  expect(parsed.flags.get('notes')).toBe('direct support');
+});
+
 test('retrieval labels are durable and a voided judgment is removable', () => {
   const journal = Journal.open(':memory:');
   try {
@@ -329,6 +359,173 @@ test('retrieval traces persist versioning, fallback, and candidate positions', (
   }
 });
 
+test('authorRetrievalLabel is idempotent, rejects stale hashes, and never approves agent usage', () => {
+  const journal = Journal.open(':memory:');
+  try {
+    const base = {
+      trace_id: 'trace-1',
+      query_id: 'q1',
+      source_type: 'human_reviewed' as const,
+      source_hash: 'a'.repeat(64),
+      logical_id: 'doc-a',
+      label: 2 as const,
+      current: { source_hash: 'a'.repeat(64) }
+    };
+    const first = authorRetrievalLabel(journal, base);
+    expect(first.created).toBe(true);
+    const replay = authorRetrievalLabel(journal, base);
+    expect(replay).toMatchObject({ created: false, recorded: true, label_id: first.label_id });
+    expect(journal.listRetrievalLabels()).toHaveLength(1);
+    expect(() => authorRetrievalLabel(journal, { ...base, label: 1 })).toThrow(ConflictingLabelError);
+    expect(() =>
+      authorRetrievalLabel(journal, { ...base, current: { source_hash: 'b'.repeat(64) } })
+    ).toThrow(StaleLabelError);
+    const agent = authorRetrievalLabel(journal, {
+      ...base,
+      logical_id: 'doc-b',
+      source_hash: 'c'.repeat(64),
+      current: { source_hash: 'c'.repeat(64) },
+      source_type: 'agent_proposed'
+    });
+    expect(journal.getRetrievalLabel(agent.label_id)?.approved).toBe(false);
+  } finally {
+    journal.close();
+  }
+});
+
+test('manifest_hash covers exported label content, not only counts', async () => {
+  const first = await exportLabeledRetrieval({
+    output: temporaryOutput(),
+    includeText: false,
+    splitSeed: 1,
+    labels: [label({ query_id: 'q1', source_hash: 'a'.repeat(64), label: 1 })]
+  });
+  const second = await exportLabeledRetrieval({
+    output: temporaryOutput(),
+    includeText: false,
+    splitSeed: 1,
+    labels: [label({ query_id: 'q1', source_hash: 'a'.repeat(64), label: 2 })]
+  });
+  expect(first.counts.exported).toBe(second.counts.exported);
+  expect(first.manifest.content_sha256).not.toBe(second.manifest.content_sha256);
+  expect(first.manifest.manifest_hash).not.toBe(second.manifest.manifest_hash);
+});
+
+test('the manifest records aggregated model fingerprints and question versions', async () => {
+  const labels = [label({ query_id: 'q1', source_hash: 'a'.repeat(64) })];
+  const withMetadata = await exportLabeledRetrieval({
+    output: temporaryOutput(),
+    includeText: false,
+    splitSeed: 1,
+    labels,
+    modelFingerprints: ['f'.repeat(64)],
+    questionVersions: ['relevance-2026-09-23.1']
+  });
+  expect(withMetadata.manifest.model_fingerprints).toEqual(['f'.repeat(64)]);
+  expect(withMetadata.manifest.question_versions).toEqual(['relevance-2026-09-23.1']);
+  const withoutMetadata = await exportLabeledRetrieval({
+    output: temporaryOutput(),
+    includeText: false,
+    splitSeed: 1,
+    labels
+  });
+  expect(withoutMetadata.manifest.manifest_hash).not.toBe(withMetadata.manifest.manifest_hash);
+});
+
+test('include-text is fail-closed per row when text is unavailable', async () => {
+  const output = temporaryOutput();
+  const result = await exportLabeledRetrieval({
+    output,
+    includeText: true,
+    splitSeed: 1,
+    labels: [label({ query_id: 'q1', source_hash: 'a'.repeat(64) })],
+    textLookup: { queryText: () => 'PRIVATE QUERY', noteText: () => undefined }
+  });
+  expect(result.counts.exported).toBe(0);
+  expect(result.counts.excluded_missing_text).toBe(1);
+  expect(rows(output)).toHaveLength(0);
+});
+
+test('feedback label and void round-trip through the CLI over a temporary state volume', async () => {
+  const state = mkdtempSync(join(tmpdir(), 'feedback-state-'));
+  temporaryDirectories.push(state);
+  const output = join(state, 'laya-training.jsonl');
+  const voidedOutput = join(state, 'voided.jsonl');
+  const hash = 'a'.repeat(64);
+  const labelArgs = [
+    'feedback',
+    'label',
+    '--state',
+    state,
+    '--trace-id',
+    'trace-e2e',
+    '--query-id',
+    'q-e2e',
+    '--source-type',
+    'human_reviewed',
+    '--label',
+    '2',
+    '--source-hash',
+    hash,
+    '--current-hash',
+    hash,
+    '--logical-id',
+    'note-a',
+    '--question-version',
+    'relevance-2026-09-23.1',
+    '--model-fingerprint',
+    'f'.repeat(64),
+    '--notes',
+    'direct support'
+  ];
+  expect(await runCli(labelArgs, {})).toBe(0);
+  expect(await runCli(labelArgs, {})).toBe(0);
+  expect(
+    await runCli(['feedback', 'export', '--state', state, '--output', output, '--split-seed', '20260923'], {})
+  ).toBe(0);
+  const exported = rows(output);
+  expect(exported).toHaveLength(1);
+  expect(exported[0]?.label).toBe(2);
+  expect(exported[0]?.source_type).toBe('human_reviewed');
+  expect(exported[0]?.model_fingerprint).toBe('f'.repeat(64));
+  expect(exported[0]?.question_version).toBe('relevance-2026-09-23.1');
+
+  const labelId = String(exported[0]?.label_id);
+  expect(await runCli(['feedback', 'void', '--state', state, '--label-id', labelId], {})).toBe(0);
+  expect(
+    await runCli(['feedback', 'export', '--state', state, '--output', voidedOutput, '--split-seed', '20260923'], {})
+  ).toBe(0);
+  expect(rows(voidedOutput)).toHaveLength(0);
+});
+
+test('the CLI label boundary rejects a stale source hash', async () => {
+  const state = mkdtempSync(join(tmpdir(), 'feedback-stale-'));
+  temporaryDirectories.push(state);
+  await expect(
+    runCli(
+      [
+        'feedback',
+        'label',
+        '--state',
+        state,
+        '--query-id',
+        'q-stale',
+        '--source-type',
+        'human_reviewed',
+        '--label',
+        '1',
+        '--source-hash',
+        'a'.repeat(64),
+        '--current-hash',
+        'b'.repeat(64),
+        '--logical-id',
+        'note-b'
+      ],
+      {}
+    )
+  ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+});
+
 interface FixtureLine {
   query_id: string;
   query: string;
@@ -350,6 +547,7 @@ test('the frozen local-retrieval fixture has 100 to 300 judged synthetic queries
   expect(lines.length).toBeLessThanOrEqual(300);
   const ids = lines.map((line) => line.query_id);
   expect(new Set(ids).size).toBe(ids.length);
+  const embeddedHashes = new Map<string, string>();
   for (const line of lines) {
     expect(Object.keys(line.labels).length).toBeGreaterThan(0);
     for (const value of Object.values(line.labels)) {
@@ -357,8 +555,17 @@ test('the frozen local-retrieval fixture has 100 to 300 judged synthetic queries
     }
     for (const note of line.notes) {
       expect(createHash('sha256').update(note.text, 'utf8').digest('hex')).toBe(note.source_hash);
+      const previous = embeddedHashes.get(note.source_hash);
+      if (previous !== undefined) expect(previous).toBe(note.text);
+      embeddedHashes.set(note.source_hash, note.text);
     }
   }
+  const committedHashes = JSON.parse(
+    readFileSync(join(dirname(fixture), 'source-hashes.json'), 'utf8')
+  ) as Record<string, string>;
+  const committedValues = [...new Set(Object.values(committedHashes))].sort();
+  const embeddedValues = [...new Set(embeddedHashes.keys())].sort();
+  expect(embeddedValues).toEqual(committedValues);
   expect(lines.some((line) => line.language === 'no')).toBe(true);
   expect(lines.some((line) => line.no_answer === true)).toBe(true);
   expect(dirname(fixture)).toContain('local-retrieval');

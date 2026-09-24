@@ -1,15 +1,20 @@
 import { expect, test } from 'vitest';
 import {
+  RERANK_QUESTION_ID,
+  buildCrossModeReport,
+  dedupeLogicalIds,
+  legacyLogicalId,
   meanMetric,
   mrrAtK,
   ndcgAtK,
   noAnswerFalsePositive,
   percentile,
   recallAtK,
+  retrievalQueryId,
   summariseLocalRetrieval,
   unjudgedAtK
 } from '../../src/retrieval/evaluation.js';
-import type { LocalEvaluationQuery } from '../../src/retrieval/evaluation.js';
+import type { CrossModeQuery, LocalEvaluationQuery } from '../../src/retrieval/evaluation.js';
 
 test('candidate recall measures missing relevant documents', () => {
   expect(recallAtK(new Set(['a', 'b']), ['a', 'c'], 50)).toBe(0.5);
@@ -124,4 +129,100 @@ test('local retrieval summary keeps lexical and graph recall on their own bounds
   expect(metrics.by_slice.english?.candidate_recall_at_50).toBeCloseTo(0.5);
   expect(metrics.by_slice['no-answer']?.no_answer_false_positives).toBe(1);
   expect(metrics.by_slice['no-answer']?.measurable_recall).toBe(0);
+});
+
+test('retrieval query identifiers are stable across whitespace and case but split distinct questions', () => {
+  expect(retrievalQueryId({ query: '  Hello   World ' })).toBe(
+    retrievalQueryId({ query: 'hello world' })
+  );
+  expect(retrievalQueryId({ query: 'a' })).not.toBe(retrievalQueryId({ query: 'b' }));
+  expect(retrievalQueryId({ query: 'x', kinds: ['decision', 'fact'] })).toBe(
+    retrievalQueryId({ query: 'x', kinds: ['fact', 'decision'] })
+  );
+});
+
+test('legacy revision paths map to the same logical id and dedupe repeats', () => {
+  const mapping = new Map([
+    ['revision-1', 'logical-1'],
+    ['History/Old.md', 'logical-2']
+  ]);
+  expect(legacyLogicalId({ revision_id: 'revision-1' }, mapping)).toBe('logical-1');
+  expect(legacyLogicalId({ path: 'History/Old.md' }, mapping)).toBe('logical-2');
+  expect(legacyLogicalId({ logical_id: 'logical-3', path: 'ignored.md' }, mapping)).toBe('logical-3');
+  expect(dedupeLogicalIds(['a', undefined, 'a', '', 'b'])).toEqual(['a', 'b']);
+});
+
+function comparisonQueries(): CrossModeQuery[] {
+  return [
+    {
+      query_id: 'direct',
+      slice: 'english',
+      labels: new Map<string, 0 | 1 | 2>([
+        ['doc-a', 2],
+        ['doc-b', 1]
+      ]),
+      eligible: ['doc-a', 'doc-b', 'doc-c'],
+      direct_answer: 'doc-a',
+      modes: [
+        { mode: 'local_text', ranked: ['doc-a', 'doc-b'], available: true, latency_ms: 10 },
+        {
+          mode: 'local_text_graph',
+          ranked: ['doc-a', 'doc-b', 'doc-c'],
+          graph_ranked: ['doc-c'],
+          available: true,
+          latency_ms: 11
+        },
+        {
+          mode: 'laya_reranked',
+          ranked: ['doc-a', 'doc-b'],
+          available: true,
+          fallback: true,
+          latency_ms: 12
+        }
+      ]
+    },
+    {
+      query_id: 'none',
+      slice: 'no-answer',
+      labels: new Map<string, 0 | 1 | 2>([['doc-c', 0]]),
+      eligible: ['doc-c'],
+      no_answer: true,
+      modes: [
+        { mode: 'local_text', ranked: ['doc-c'], available: true, latency_ms: 20 },
+        { mode: 'local_text_graph', ranked: ['doc-c'], graph_ranked: [], available: true, latency_ms: 21 },
+        { mode: 'laya_reranked', ranked: ['doc-c'], available: true, fallback: true, latency_ms: 22 }
+      ]
+    }
+  ];
+}
+
+test('the cross-mode harness reports every mode on the frozen eligible universe', () => {
+  const report = buildCrossModeReport(comparisonQueries(), {
+    model_artifacts_available: false,
+    rss_bytes: 123456
+  });
+  expect(report.universe).toEqual({ queries: 2, documents: 3 });
+  expect(report.modes.legacy_baseline.available).toBe(true);
+  expect(report.modes.legacy_baseline.candidate_recall_at_50).toBeNull();
+  expect(report.legacy_baseline.recall_at_5).toBe(0.9286);
+  expect(report.legacy_baseline.mean_elapsed_ms).toBe(44.8);
+  expect(report.legacy_baseline.corpus_sha256).toBe(
+    '5d6ef74fc946144fca514621fd38461a3f73450d1415ea5bbbfe1d73c845569e'
+  );
+  expect(report.modes.local_text.candidate_recall_at_50).toBeCloseTo(1);
+  expect(report.modes.local_text.ndcg_at_10).toBeCloseTo(1);
+  expect(report.modes.local_text.mrr).toBeCloseTo(1);
+  expect(report.modes.local_text.graph_recall_at_50).toBeNull();
+  expect(report.modes.local_text_graph.candidate_recall_at_50).toBeCloseTo(1);
+  expect(report.modes.local_text_graph.graph_recall_at_50).toBeCloseTo(0);
+  expect(report.modes.local_text_graph.graph_recall_bound).toBe(10);
+  expect(report.modes.laya_reranked.fallback_rate).toBeCloseTo(1);
+  expect(report.modes.laya_reranked.model_backed).toBe(false);
+  expect(report.modes.local_text.rss_bytes_peak).toBe(123456);
+  expect(report.modes.local_text.latency_p50_ms).toBe(10);
+  expect(report.modes.local_text.latency_p95_ms).toBe(20);
+  expect(report.not_run).toContain('laya_reranked');
+  expect(report.by_slice.local_text.english?.queries).toBe(1);
+  expect(report.by_slice.local_text['no-answer']?.measurable_recall).toBe(0);
+  expect(RERANK_QUESTION_ID).toBe('note_relevance');
 });

@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 export const CANDIDATE_RECALL_K = 50;
 export const GRADED_NDCG_K = 10;
 
@@ -162,6 +164,7 @@ function metricsFor(queries: readonly LocalEvaluationQuery[]): LocalSliceMetrics
   let noAnswerFalsePositives = 0;
   let fallback = 0;
   const latencies: number[] = [];
+  const graphMeasured = queries.some((query) => query.graph_candidates !== undefined);
   for (const query of queries) {
     const relevant = relevantSet(query.labels);
     if (relevant.size > 0) measurable += 1;
@@ -186,7 +189,7 @@ function metricsFor(queries: readonly LocalEvaluationQuery[]): LocalSliceMetrics
     queries: queries.length,
     measurable_recall: measurable,
     candidate_recall_at_50: meanMetric(candidateRecall),
-    graph_recall_at_50: meanMetric(graphRecall),
+    graph_recall_at_50: graphMeasured ? meanMetric(graphRecall) : null,
     ndcg_at_10: meanMetric(ndcg),
     mrr: meanMetric(mrr),
     unjudged_candidates: unjudged,
@@ -212,4 +215,252 @@ export function summariseLocalRetrieval(
   const overall = metricsFor(queries);
   const noAnswerQueries = queries.filter((query) => query.no_answer === true).length;
   return { ...overall, no_answer_queries: noAnswerQueries, graph_recall_bound: GRAPH_RECALL_BOUND, by_slice: bySlice };
+}
+
+export const LEXICAL_QUESTION_ID = 'fts5_lexical';
+export const LEXICAL_QUESTION_VERSION = 'lexical-2026-09-23.1';
+export const RERANK_QUESTION_ID = 'note_relevance';
+
+export interface RetrievalQueryIdentityInput {
+  query: string;
+  topics?: readonly string[];
+  phase?: string;
+  kinds?: readonly string[];
+  include_candidates?: boolean;
+  include_superseded?: boolean;
+  include_archived?: boolean;
+}
+
+export function retrievalQueryId(input: RetrievalQueryIdentityInput): string {
+  const material = JSON.stringify({
+    query: input.query.replace(/\s+/gu, ' ').trim().toLowerCase(),
+    topics: [...(input.topics ?? [])]
+      .map((topic) => topic.replace(/\s+/gu, ' ').trim().toLowerCase())
+      .filter((topic) => topic.length > 0)
+      .sort(),
+    phase: input.phase ?? null,
+    kinds: [...(input.kinds ?? [])].sort(),
+    include_candidates: input.include_candidates === true,
+    include_superseded: input.include_superseded === true,
+    include_archived: input.include_archived === true
+  });
+  return createHash('sha256').update(material, 'utf8').digest('hex').slice(0, 32);
+}
+
+export interface LegacyRevisionReference {
+  logical_id?: string;
+  revision_id?: string;
+  path?: string;
+}
+
+export function legacyLogicalId(
+  reference: LegacyRevisionReference,
+  mapping: ReadonlyMap<string, string> = new Map()
+): string | undefined {
+  if (reference.logical_id !== undefined) return reference.logical_id;
+  if (reference.revision_id !== undefined && mapping.has(reference.revision_id)) {
+    return mapping.get(reference.revision_id);
+  }
+  if (reference.path !== undefined && mapping.has(reference.path)) return mapping.get(reference.path);
+  return reference.path ?? reference.revision_id;
+}
+
+export function dedupeLogicalIds(ids: readonly (string | undefined)[]): string[] {
+  const seen = new Set<string>();
+  const output: string[] = [];
+  for (const id of ids) {
+    if (id === undefined || id.length === 0 || seen.has(id)) continue;
+    seen.add(id);
+    output.push(id);
+  }
+  return output;
+}
+
+export const EVALUATION_MODES = [
+  'legacy_baseline',
+  'local_text',
+  'local_text_graph',
+  'laya_reranked'
+] as const;
+export type EvaluationMode = (typeof EVALUATION_MODES)[number];
+
+export const LEGACY_BASELINE_SOURCE = 'docs/evaluation/vault-v2-baseline.md';
+
+export interface FrozenLegacyBaseline {
+  source: string;
+  run_id: string;
+  backend: string;
+  corpus_sha256: string;
+  judgments_sha256: string;
+  notes: number;
+  queries: number;
+  positive_cases: number;
+  negative_cases: number;
+  recall_at_5: number;
+  precision_at_5: number;
+  negative_cases_passed: number;
+  leakage_events: number;
+  mean_elapsed_ms: number;
+}
+
+export const FROZEN_LEGACY_BASELINE: FrozenLegacyBaseline = {
+  source: LEGACY_BASELINE_SOURCE,
+  run_id: 'retrieval-2026-09-23T20:13:15.669Z-98b9adf0',
+  backend: 'basic-memory-docker',
+  corpus_sha256: '5d6ef74fc946144fca514621fd38461a3f73450d1415ea5bbbfe1d73c845569e',
+  judgments_sha256: '4e1e395fde4bd148a78b7c05219e496a435b43901a6d009121fe66aa54f64305',
+  notes: 11,
+  queries: 23,
+  positive_cases: 14,
+  negative_cases: 9,
+  recall_at_5: 0.9286,
+  precision_at_5: 0.8536,
+  negative_cases_passed: 9,
+  leakage_events: 0,
+  mean_elapsed_ms: 44.8
+};
+
+export interface CrossModeObservation {
+  mode: EvaluationMode;
+  ranked: readonly string[];
+  available: boolean;
+  graph_ranked?: readonly string[];
+  latency_ms?: number;
+  rss_bytes?: number;
+  fallback?: boolean;
+  model_backed?: boolean;
+}
+
+export interface CrossModeQuery {
+  query_id: string;
+  slice: string;
+  labels: ReadonlyMap<string, 0 | 1 | 2>;
+  eligible: readonly string[];
+  direct_answer?: string;
+  no_answer?: boolean;
+  modes: readonly CrossModeObservation[];
+}
+
+export interface ModeMetrics extends LocalSliceMetrics {
+  available: boolean;
+  model_backed: boolean;
+  graph_recall_bound: number;
+  rss_bytes_peak: number | null;
+}
+
+export interface CrossModeReport {
+  universe: { queries: number; documents: number };
+  modes: Record<EvaluationMode, ModeMetrics>;
+  by_slice: Record<EvaluationMode, Record<string, LocalSliceMetrics>>;
+  legacy_baseline: FrozenLegacyBaseline;
+  not_run: EvaluationMode[];
+  notes: string[];
+}
+
+export interface CrossModeOptions {
+  model_artifacts_available?: boolean;
+  rss_bytes?: number;
+}
+
+function unavailableMode(): ModeMetrics {
+  return {
+    available: false,
+    model_backed: false,
+    queries: 0,
+    measurable_recall: 0,
+    candidate_recall_at_50: null,
+    graph_recall_at_50: null,
+    graph_recall_bound: GRAPH_RECALL_BOUND,
+    ndcg_at_10: null,
+    mrr: null,
+    unjudged_candidates: 0,
+    no_answer_false_positives: 0,
+    fallback_rate: 0,
+    latency_p50_ms: null,
+    latency_p95_ms: null,
+    rss_bytes_peak: null
+  };
+}
+
+function observationToQuery(query: CrossModeQuery, observation: CrossModeObservation): LocalEvaluationQuery {
+  return {
+    query_id: query.query_id,
+    slice: query.slice,
+    candidates: dedupeLogicalIds(observation.ranked),
+    ...(observation.graph_ranked === undefined
+      ? {}
+      : { graph_candidates: dedupeLogicalIds(observation.graph_ranked) }),
+    labels: query.labels,
+    ...(query.direct_answer === undefined ? {} : { direct_answer: query.direct_answer }),
+    ...(query.no_answer === true ? { no_answer: true } : {}),
+    ...(observation.fallback === true ? { fallback: true } : {}),
+    ...(observation.latency_ms === undefined ? {} : { latency_ms: observation.latency_ms })
+  };
+}
+
+export function buildCrossModeReport(
+  queries: readonly CrossModeQuery[],
+  options: CrossModeOptions = {}
+): CrossModeReport {
+  const modelAvailable = options.model_artifacts_available === true;
+  const modes = {} as Record<EvaluationMode, ModeMetrics>;
+  const bySlice = {} as Record<EvaluationMode, Record<string, LocalSliceMetrics>>;
+  const documents = new Set<string>();
+  for (const query of queries) {
+    for (const id of query.eligible) documents.add(id);
+    for (const observation of query.modes) {
+      for (const id of observation.ranked) documents.add(id);
+      for (const id of observation.graph_ranked ?? []) documents.add(id);
+    }
+  }
+  for (const mode of EVALUATION_MODES) {
+    if (mode === 'legacy_baseline') {
+      modes[mode] = { ...unavailableMode(), available: true };
+      bySlice[mode] = {};
+      continue;
+    }
+    const availableObservations = queries.flatMap((query) => {
+      const observation = query.modes.find((entry) => entry.mode === mode);
+      return observation === undefined || !observation.available
+        ? []
+        : [{ query, observation }];
+    });
+    if (availableObservations.length === 0) {
+      modes[mode] = unavailableMode();
+      bySlice[mode] = {};
+      continue;
+    }
+    const evaluations = availableObservations.map(({ query, observation }) =>
+      observationToQuery(query, observation)
+    );
+    const summary = summariseLocalRetrieval(evaluations);
+    const rssValues = availableObservations
+      .map(({ observation }) => observation.rss_bytes)
+      .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+    modes[mode] = {
+      ...summary,
+      available: true,
+      model_backed: availableObservations.some(({ observation }) => observation.model_backed === true),
+      rss_bytes_peak: rssValues.length === 0 ? (options.rss_bytes ?? null) : Math.max(...rssValues)
+    };
+    bySlice[mode] = summary.by_slice;
+  }
+  const notes = [
+    `legacy baseline is the frozen aggregate recorded in ${LEGACY_BASELINE_SOURCE}; V2 candidate Recall@50, nDCG@10, MRR, RSS, and fallback rate were not measured on that pre-V2 run`
+  ];
+  const notRun: EvaluationMode[] = [];
+  if (!modelAvailable) {
+    notRun.push('laya_reranked');
+    notes.push(
+      'laya_reranked model-backed measurement is NOT RUN: no prepared Laya model artifacts; the reported laya_reranked metrics are the lexical fallback ordering with fallback rate 1'
+    );
+  }
+  return {
+    universe: { queries: queries.length, documents: documents.size },
+    modes,
+    by_slice: bySlice,
+    legacy_baseline: FROZEN_LEGACY_BASELINE,
+    not_run: notRun,
+    notes
+  };
 }

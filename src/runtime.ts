@@ -27,7 +27,7 @@ import { capture, captureLocal } from './features/capture.js';
 import { feedback, feedbackLocal, retrievalEventFromRecall } from './features/feedback.js';
 import { ensureProject, projectEnsureLocal } from './features/project-ensure.js';
 import { read, readLocal } from './features/read.js';
-import { recallLocal, recallTraced } from './features/recall.js';
+import { recallLocalTraced, recallTraced, type LocalRecallTrace } from './features/recall.js';
 import { review, reviewLocal } from './features/review.js';
 import { status, statusLocal } from './features/status.js';
 import { createHttpApp } from './mcp/http.js';
@@ -150,6 +150,7 @@ function localRecallEvent(
   ctx: AuthenticatedContext,
   request: RecallRequestInput,
   result: RecallResult,
+  trace: LocalRecallTrace,
   started: number,
   log: (line: string) => void
 ): RecallResult {
@@ -163,8 +164,16 @@ function localRecallEvent(
       primary_project_id: null,
       duration_ms: Math.max(0, Date.now() - started)
     });
-    const fallback = fallbackReasonOf(result);
-    local.journal.recordRetrievalV2(fallback === undefined ? event : { ...event, fallback_reason: fallback });
+    const fallback = trace.fallback_reason ?? fallbackReasonOf(result);
+    local.journal.recordRetrievalV2({
+      ...event,
+      query_id: trace.query_id,
+      question_id: trace.question_id,
+      question_version: trace.question_version,
+      candidate_positions: trace.candidate_positions,
+      ...(trace.model_fingerprint === undefined ? {} : { model_fingerprint: trace.model_fingerprint }),
+      ...(fallback === undefined ? {} : { fallback_reason: fallback })
+    });
   } catch (error) {
     log(internalDiagnostic(error));
   }
@@ -190,8 +199,8 @@ function buildLocalServices(
     projectEnsure: (ctx, request): Promise<ProjectEnsureResult> => projectEnsureLocal(ctx, request, local),
     recall: async (ctx, request): Promise<RecallResult> => {
       const started = Date.now();
-      const result = await recallLocal(ctx, request, local);
-      return localRecallEvent(local, ctx, request, result, started, log);
+      const { result, trace } = await recallLocalTraced(ctx, request, local);
+      return localRecallEvent(local, ctx, request, result, trace, started, log);
     }
   };
 }

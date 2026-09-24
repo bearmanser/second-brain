@@ -23,8 +23,7 @@ export { AUDIT_FIELDS, FEEDBACK_REASON_MAX_LENGTH } from '../storage/journal.js'
 
 import type { LocalHandlerDeps } from '../core/types.js';
 import {
-  assertFreshLabel,
-  type RetrievalLabelEntry,
+  authorRetrievalLabel,
   type RetrievalLabelInput
 } from '../retrieval/feedback-export.js';
 import {
@@ -306,6 +305,7 @@ export async function feedbackLocal(
 export interface RetrievalLabelResult {
   label_id: string;
   recorded: boolean;
+  created: boolean;
 }
 
 export async function labelRetrieval(
@@ -322,20 +322,13 @@ export async function labelRetrieval(
     input.logical_id !== undefined
       ? currentByReferenceDeps(deps, { id: input.logical_id })
       : currentByReferenceDeps(deps, { path: input.path as string });
-  assertFreshLabel(
-    {
-      source_hash: input.source_hash,
-      ...(input.revision_id === undefined ? {} : { revision_id: input.revision_id })
-    },
-    {
+  return authorRetrievalLabel(deps.journal, {
+    ...input,
+    ...(source.id === undefined ? {} : { logical_id: source.id }),
+    path: source.path,
+    current: {
       source_hash: source.hash,
       ...(source.revision_id === undefined ? {} : { revision_id: source.revision_id })
     }
-  );
-  const stored: RetrievalLabelEntry = deps.journal.recordRetrievalLabel({
-    ...input,
-    ...(source.id === undefined ? {} : { logical_id: source.id }),
-    path: source.path
   });
-  return { label_id: stored.label_id, recorded: true };
 }

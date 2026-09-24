@@ -74,6 +74,7 @@ export interface RerankResult {
   mode: 'text' | 'reranked';
   warnings: string[];
   model_fingerprint?: string;
+  question_version?: string;
 }
 
 export interface FinalCandidatePolicy {
@@ -241,7 +242,8 @@ export async function rerankCandidates(input: RerankInput): Promise<RerankResult
     items,
     mode: 'reranked',
     warnings: [],
-    ...(typeof result.model_fingerprint === 'string' ? { model_fingerprint: result.model_fingerprint } : {})
+    ...(typeof result.model_fingerprint === 'string' ? { model_fingerprint: result.model_fingerprint } : {}),
+    ...(typeof result.question_version === 'string' ? { question_version: result.question_version } : {})
   };
 }
 

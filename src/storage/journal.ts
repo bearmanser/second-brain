@@ -306,6 +306,7 @@ interface RetrievalLabelRow {
   label: number;
   rubric_version: string;
   evidence_ref: string | null;
+  notes: string | null;
   approved: number;
   voided_at: string | null;
   created_at: string;
@@ -868,6 +869,7 @@ function toRetrievalLabel(row: RetrievalLabelRow): RetrievalLabelEntry {
     label: row.label as RetrievalLabelValue,
     rubric_version: row.rubric_version,
     ...(row.evidence_ref === null ? {} : { evidence_ref: row.evidence_ref }),
+    ...(row.notes === null ? {} : { notes: row.notes }),
     approved: row.approved === 1,
     voided_at: row.voided_at,
     created_at: row.created_at
@@ -936,6 +938,9 @@ function normalizeRetrievalLabel(
     ...(input.evidence_ref === undefined
       ? {}
       : { evidence_ref: requireBoundedText(input.evidence_ref, 'evidence_ref', 512) }),
+    ...(input.notes === undefined
+      ? {}
+      : { notes: requireBoundedText(input.notes, 'notes', 2048) }),
     approved,
     voided_at: input.voided_at === undefined ? null : requireTimestamp(input.voided_at, 'voided_at'),
     created_at:
@@ -2269,8 +2274,8 @@ export class Journal {
           `INSERT INTO retrieval_labels (
             label_id, trace_id, source_type, query_id, question_id, question_version,
             model_fingerprint, logical_id, path, revision_id, source_hash, candidate_position,
-            label, rubric_version, evidence_ref, approved, voided_at, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            label, rubric_version, evidence_ref, notes, approved, voided_at, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           normalized.label_id,
@@ -2288,6 +2293,7 @@ export class Journal {
           normalized.label,
           normalized.rubric_version ?? DEFAULT_RUBRIC_VERSION,
           normalized.evidence_ref ?? null,
+          normalized.notes ?? null,
           normalized.approved ? 1 : 0,
           normalized.voided_at ?? null,
           normalized.created_at

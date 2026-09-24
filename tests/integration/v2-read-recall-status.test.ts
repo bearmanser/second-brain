@@ -12,9 +12,17 @@ import { SYSTEM_ACTOR } from '../../src/core/types.js';
 import { CurrentCatalogue } from '../../src/notes/current-catalogue.js';
 import { readLocal } from '../../src/features/read.js';
 import { recallLocal } from '../../src/features/recall.js';
+import { recallLocalTraced } from '../../src/features/recall.js';
+import {
+  LEXICAL_QUESTION_ID,
+  LEXICAL_QUESTION_VERSION,
+  RERANK_QUESTION_ID,
+  retrievalQueryId
+} from '../../src/retrieval/evaluation.js';
 import { statusLocal } from '../../src/features/status.js';
 import { reviewLocal } from '../../src/features/review.js';
 import { captureLocal } from '../../src/features/capture.js';
+import { retrievalEventFromRecall } from '../../src/features/feedback.js';
 import { buildLocalHandlerDeps, reconcileDeps, type LocalBrain } from '../../src/features/local-support.js';
 import { openDocumentStore, type DocumentStore } from '../../src/storage/document-store.js';
 import { Journal, LocalOperationJournal } from '../../src/storage/journal.js';
@@ -706,4 +714,69 @@ test('the deleted local brain facade leaves the canonical handlers as the only i
   expect(runtime).toMatch(/readLocal/);
   expect(runtime).toMatch(/recallLocal/);
   expect(runtime).toMatch(/statusLocal/);
+});
+
+test('a real recall and rerank path populates trace identifiers, positions, and reranker metadata', async () => {
+  const worker = new FakeWorker((candidates) =>
+    Promise.resolve(scored(candidates, () => 0.5))
+  );
+  const ground = await openGround({ worker });
+  const disabled = await openGround({ worker: new FakeWorker((candidates) => Promise.resolve(scored(candidates, () => 0.5)), 'disabled') });
+  try {
+    await put(ground, 'Knowledge/Alpha.md', doc('# Alpha trace\n\nalphatrace body\n', { id: randomUUID() }));
+    await put(ground, 'Knowledge/Beta.md', doc('# Beta trace\n\nalphatrace other\n', { id: randomUUID() }));
+    await put(disabled, 'Knowledge/Gamma.md', doc('# Gamma trace\n\nalphatrace disabled\n', { id: randomUUID() }));
+    const c = ctx();
+
+    const lexical = await recallLocalTraced(c, { query: 'alphatrace', limit: 5 }, ground.deps);
+    expect(lexical.result.items.length).toBeGreaterThan(0);
+    expect(lexical.trace.query_id).toBe(retrievalQueryId({ query: 'alphatrace' }));
+    expect(lexical.trace.question_id).toBe(LEXICAL_QUESTION_ID);
+    expect(lexical.trace.question_version).toBe(LEXICAL_QUESTION_VERSION);
+    expect(lexical.trace.candidate_positions).toHaveLength(lexical.result.items.length);
+    expect(lexical.trace.model_fingerprint).toBeUndefined();
+
+    const reranked = await recallLocalTraced(
+      c,
+      { query: 'alphatrace', limit: 5, mode: 'reranked' },
+      ground.deps
+    );
+    expect(reranked.result.mode).toBe('reranked');
+    expect(reranked.trace.question_id).toBe(RERANK_QUESTION_ID);
+    expect(reranked.trace.question_version).toBe('relevance-2026-09-23.1');
+    expect(reranked.trace.model_fingerprint).toBe(FINGERPRINT);
+    expect(reranked.trace.candidate_positions).toHaveLength(reranked.result.items.length);
+    expect(reranked.trace.fallback_reason).toBeUndefined();
+
+    const fallback = await recallLocalTraced(c, { query: 'alphatrace', mode: 'reranked' }, disabled.deps);
+    expect(fallback.trace.fallback_reason).toBe('disabled');
+
+    const event = retrievalEventFromRecall(c, reranked.result, {
+      filter: { mode: 'all' },
+      searched_project_ids: [],
+      primary_project_id: null,
+      duration_ms: 1
+    });
+    ground.journal.recordRetrievalV2({
+      ...event,
+      query_id: reranked.trace.query_id,
+      question_id: reranked.trace.question_id,
+      question_version: reranked.trace.question_version,
+      candidate_positions: reranked.trace.candidate_positions,
+      ...(reranked.trace.model_fingerprint === undefined
+        ? {}
+        : { model_fingerprint: reranked.trace.model_fingerprint })
+    });
+    const stored = ground.journal.getRetrievalV2(event.retrieval_id);
+    expect(stored).toMatchObject({
+      query_id: reranked.trace.query_id,
+      question_id: RERANK_QUESTION_ID,
+      question_version: 'relevance-2026-09-23.1',
+      model_fingerprint: FINGERPRINT,
+      candidate_positions: reranked.trace.candidate_positions
+    });
+  } finally {
+    await ground.dispose();
+    await disabled.dispose();
+  }
 });

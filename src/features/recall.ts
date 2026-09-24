@@ -43,6 +43,12 @@ import {
   type RerankedCandidate
 } from '../retrieval/reranker.js';
 import { phaseKinds, rankEligible, type EligibleHit } from '../retrieval/rank.js';
+import {
+  LEXICAL_QUESTION_ID,
+  LEXICAL_QUESTION_VERSION,
+  RERANK_QUESTION_ID,
+  retrievalQueryId
+} from '../retrieval/evaluation.js';
 import { reconcileRetrievalDeps, sourceRefManaged } from './local-support.js';
 
 export const RECALL_WARNING_SEARCH_TRUNCATED = 'search_truncated';
@@ -794,13 +800,33 @@ function graphEdgeReason(
   return undefined;
 }
 
-export async function recallLocal(
+export interface LocalRecallTrace {
+  query_id: string;
+  question_id: string;
+  question_version: string;
+  model_fingerprint?: string;
+  candidate_positions: number[];
+  fallback_reason?: string;
+}
+
+export async function recallLocalTraced(
   ctx: AuthenticatedContext,
   input: RecallRequest,
   deps: LocalHandlerDeps
-): Promise<RecallResult> {
+): Promise<{ result: RecallResult; trace: LocalRecallTrace }> {
   if (ctx.signal.aborted) throw localRecallCancelled();
   const request = parseLocalRecall(input);
+  const traceQueryId = retrievalQueryId({
+    query: request.query,
+    ...(request.topics === undefined ? {} : { topics: request.topics }),
+    ...(request.phase === undefined ? {} : { phase: request.phase }),
+    ...(request.kinds === undefined ? {} : { kinds: request.kinds }),
+    include_candidates: request.include_candidates === true,
+    include_superseded: request.include_superseded === true,
+    include_archived: request.include_archived === true
+  });
+  let rerankModelFingerprint: string | undefined;
+  let rerankQuestionVersion: string | undefined;
   const scope = normalizeRecallScope(request, {
     canonicalId: (identifier) => deps.projects.canonicalId(identifier)
   });
@@ -880,6 +906,8 @@ export async function recallLocal(
         });
         ordered = result.items;
         executed = result.mode;
+        rerankModelFingerprint = result.model_fingerprint;
+        rerankQuestionVersion = result.question_version;
         warnings.push(...result.warnings);
       } catch (error) {
         if (error instanceof RerankerUnavailableError) {
@@ -912,6 +940,11 @@ export async function recallLocal(
   });
 
   const items: (SourceRef & { excerpt: string; reasons: string[] })[] = [];
+  const candidatePositions: number[] = [];
+  const positionOf = new Map<string, number>();
+  ordered.forEach((candidate, index) => {
+    if (!positionOf.has(candidate.chunk_key)) positionOf.set(candidate.chunk_key, index);
+  });
   let staleExcluded = false;
   for (const candidate of selected) {
     if (excluded.paths.has(candidate.path) || excluded.ids.has(candidate.id ?? '')) continue;
@@ -934,6 +967,7 @@ export async function recallLocal(
     const itemWarnings: string[] = [];
     if (source.status === 'superseded' && request.include_superseded === true) itemWarnings.push('superseded');
     if (source.status === 'archived' && request.include_archived === true) itemWarnings.push('archived');
+    candidatePositions.push(positionOf.get(candidate.chunk_key) ?? candidate.candidate_position);
     items.push({
       ...sourceRefManaged(deps, source, itemWarnings),
       excerpt: candidate.text,
@@ -948,7 +982,7 @@ export async function recallLocal(
   }
 
   const budgetLimit = clampRecallBudget(request.budget_tokens);
-  return packRecall(
+  const result = packRecall(
     items,
     {
       retrieval_id: deps.ids.next(),
@@ -959,4 +993,28 @@ export async function recallLocal(
     budgetLimit,
     deps.config.result_delivery
   );
+  const fallbackWarning = warnings.find((warning) => warning.startsWith('reranker_unavailable:'));
+  const usedRerankerVersion =
+    executed === 'reranked' ? rerankQuestionVersion : undefined;
+  const trace: LocalRecallTrace = {
+    query_id: traceQueryId,
+    question_id: usedRerankerVersion === undefined ? LEXICAL_QUESTION_ID : RERANK_QUESTION_ID,
+    question_version: usedRerankerVersion ?? LEXICAL_QUESTION_VERSION,
+    candidate_positions: candidatePositions,
+    ...(usedRerankerVersion !== undefined && rerankModelFingerprint !== undefined
+      ? { model_fingerprint: rerankModelFingerprint }
+      : {}),
+    ...(fallbackWarning === undefined
+      ? {}
+      : { fallback_reason: fallbackWarning.slice('reranker_unavailable:'.length) })
+  };
+  return { result, trace };
+}
+
+export async function recallLocal(
+  ctx: AuthenticatedContext,
+  input: RecallRequest,
+  deps: LocalHandlerDeps
+): Promise<RecallResult> {
+  return (await recallLocalTraced(ctx, input, deps)).result;
 }

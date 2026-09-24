@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { loadTokenDigest } from './config/load.js';
 import { BrainError, isBrainError } from './contracts/errors.js';
@@ -36,7 +36,17 @@ import { buildInspectionReport, renderInspectionReport } from './operations/vaul
 import { rollbackVaultMigration } from './operations/vault-v2/rollback.js';
 import { verifyVaultMigration } from './operations/vault-v2/verify.js';
 import { ScopeRegistry } from './projects/scope-registry.js';
-import { exportLabeledRetrieval, type LabelTextLookup } from './retrieval/feedback-export.js';
+import {
+  authorRetrievalLabel,
+  ConflictingLabelError,
+  exportLabeledRetrieval,
+  RETRIEVAL_LABEL_SOURCES,
+  RETRIEVAL_LABEL_VALUES,
+  StaleLabelError,
+  type LabelTextLookup
+} from './retrieval/feedback-export.js';
+import { readEvaluationDataset } from './retrieval/evaluation-dataset.js';
+import { retrievalQueryId } from './retrieval/evaluation.js';
 import { generateBearerToken } from './security/authenticate.js';
 import { BasicMemoryBackend } from './storage/basic-memory.js';
 import { Journal } from './storage/journal.js';
@@ -582,91 +592,241 @@ interface EvaluationDataset {
   dataset_id: string;
   sha256: string;
   lookup: LabelTextLookup;
+  candidatesByQuery: Map<string, string[]>;
 }
 
 async function loadEvaluationDataset(path: string): Promise<EvaluationDataset> {
-  let raw: string;
-  try {
-    raw = await readFile(path, 'utf8');
-  } catch {
-    throw invalidInput(`evaluation dataset cannot be read: ${path}`);
-  }
-  const queryText = new Map<string, string>();
-  const noteText = new Map<string, string>();
-  for (const line of raw.split('\n')) {
-    if (line.trim().length === 0) continue;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      throw invalidInput(`evaluation dataset is not valid JSONL: ${path}`);
-    }
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
-    const record = parsed as Record<string, unknown>;
-    if (typeof record.query_id === 'string' && typeof record.query === 'string') {
-      queryText.set(record.query_id, record.query);
-    }
-    if (Array.isArray(record.notes)) {
-      for (const note of record.notes) {
-        if (note === null || typeof note !== 'object') continue;
-        const entry = note as Record<string, unknown>;
-        if (typeof entry.source_hash === 'string' && typeof entry.text === 'string') {
-          noteText.set(entry.source_hash, entry.text);
-        }
-      }
-    }
-  }
+  const parsed = await readEvaluationDataset(path).catch(() => {
+    throw invalidInput(`evaluation dataset cannot be read or parsed: ${path}`);
+  });
   return {
     dataset_id: path,
-    sha256: createHash('sha256').update(raw).digest('hex'),
+    sha256: parsed.sha256,
     lookup: {
-      queryText: (query_id) => queryText.get(query_id),
-      noteText: (source_hash) => noteText.get(source_hash)
-    }
+      queryText: (query_id) => parsed.queryText.get(query_id),
+      noteText: (source_hash) => parsed.noteText.get(source_hash)
+    },
+    candidatesByQuery: parsed.candidatesByQuery
   };
 }
 
-async function runFeedback(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promise<number> {
-  const subcommand = parsed.positionals[0];
-  if (subcommand !== 'export') throw invalidInput(`feedback requires the export subcommand\n${USAGE}`);
-  const output = flagString(parsed.flags, 'output');
-  if (output === undefined) throw invalidInput('feedback export requires --output');
+function feedbackState(parsed: ParsedArguments, env: NodeJS.ProcessEnv): string {
+  const state = flagString(parsed.flags, 'state');
+  return state === undefined ? resolveConfig(env).mounts.state : resolve(state);
+}
+
+function feedbackVault(parsed: ParsedArguments, env: NodeJS.ProcessEnv): string {
+  const vault = flagString(parsed.flags, 'vault');
+  return vault === undefined ? resolveConfig(env).mounts.vault : resolve(vault);
+}
+
+function requiredFlag(parsed: ParsedArguments, name: string, message: string): string {
+  const value = flagString(parsed.flags, name);
+  if (value === undefined) throw invalidInput(message);
+  return value;
+}
+
+async function runFeedbackExport(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promise<number> {
+  const output = requiredFlag(parsed, 'output', 'feedback export requires --output');
   const splitSeed = flagNumber(parsed.flags, 'split-seed');
   if (splitSeed === undefined) throw invalidInput('feedback export requires --split-seed');
   const includeText = flagBoolean(parsed.flags, 'include-text');
-  const config = resolveConfig(env);
+  const state = feedbackState(parsed, env);
   const datasetPath =
-    flagString(parsed.flags, 'dataset') ??
-    join(config.mounts.state, 'evaluations', 'retrieval.jsonl');
-  const lock = InstanceLock.acquire(config.mounts.state);
+    flagString(parsed.flags, 'dataset') ?? join(state, 'evaluations', 'retrieval.jsonl');
+  const lock = InstanceLock.acquire(state);
   let journal: Journal | undefined;
   try {
-    journal = Journal.open(join(config.mounts.state, 'journal.db'), { requireExisting: true });
+    journal = Journal.open(join(state, 'journal.db'), { requireExisting: true });
     let dataset: EvaluationDataset | undefined;
     try {
       dataset = await loadEvaluationDataset(datasetPath);
     } catch (error) {
       if (includeText) throw error;
     }
+    const labels = journal.listRetrievalLabels();
+    const modelFingerprints = [
+      ...new Set(
+        labels
+          .map((entry) => entry.model_fingerprint)
+          .filter((value): value is string => value !== undefined)
+      )
+    ];
+    const questionVersions = [
+      ...new Set(
+        labels
+          .map((entry) => entry.question_version)
+          .filter((value): value is string => value !== undefined)
+      )
+    ];
     const result = await exportLabeledRetrieval({
       output,
       includeText,
       splitSeed,
-      labels: journal.listRetrievalLabels(),
+      labels,
+      modelFingerprints,
+      questionVersions,
       ...(dataset === undefined
         ? {}
-        : { datasetId: dataset.dataset_id, datasetSha256: dataset.sha256, textLookup: dataset.lookup })
+        : {
+            datasetId: dataset.dataset_id,
+            datasetSha256: dataset.sha256,
+            textLookup: dataset.lookup,
+            candidatesByQuery: dataset.candidatesByQuery
+          })
     });
     process.stdout.write(
       `feedback export: ${result.counts.exported} labels exported ` +
         `(${result.counts.excluded_not_approved} not approved, ${result.counts.excluded_voided} voided, ` +
-        `${result.counts.unjudged} unjudged); manifest ${result.manifest.manifest_hash}\n`
+        `${result.counts.excluded_missing_text} missing text, ${result.counts.unjudged} unjudged); ` +
+        `manifest ${result.manifest.manifest_hash}\n`
     );
     return 0;
   } finally {
     journal?.close();
     lock.release();
   }
+}
+
+async function runFeedbackLabel(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promise<number> {
+  const queryIdFlag = flagString(parsed.flags, 'query-id');
+  const queryText = flagString(parsed.flags, 'query');
+  const phase = flagString(parsed.flags, 'phase');
+  const query_id =
+    queryIdFlag ??
+    (queryText === undefined
+      ? undefined
+      : retrievalQueryId({ query: queryText, ...(phase === undefined ? {} : { phase }) }));
+  if (query_id === undefined) throw invalidInput('feedback label requires --query-id or --query');
+  const sourceType = requiredFlag(parsed, 'source-type', 'feedback label requires --source-type');
+  if (!(RETRIEVAL_LABEL_SOURCES as readonly string[]).includes(sourceType)) {
+    throw invalidInput(
+      `feedback label --source-type must be one of ${RETRIEVAL_LABEL_SOURCES.join(', ')}`
+    );
+  }
+  const value = flagNumber(parsed.flags, 'label');
+  if (value === undefined || !RETRIEVAL_LABEL_VALUES.includes(value as 0 | 1 | 2)) {
+    throw invalidInput('feedback label --label must be 0, 1, or 2');
+  }
+  const sourceHash = requiredFlag(parsed, 'source-hash', 'feedback label requires --source-hash');
+  if (!/^[a-f0-9]{64}$/i.test(sourceHash)) {
+    throw invalidInput('feedback label --source-hash must be a 64 character hexadecimal digest');
+  }
+  const logicalId = flagString(parsed.flags, 'logical-id');
+  const path = flagString(parsed.flags, 'path');
+  if (logicalId === undefined && path === undefined) {
+    throw invalidInput('feedback label requires --logical-id or --path');
+  }
+  const revisionId = flagString(parsed.flags, 'revision-id');
+  const currentHashFlag = flagString(parsed.flags, 'current-hash');
+  const currentRevisionId = flagString(parsed.flags, 'current-revision-id');
+  let currentSourceHash: string;
+  if (currentHashFlag !== undefined) {
+    if (!/^[a-f0-9]{64}$/i.test(currentHashFlag)) {
+      throw invalidInput('feedback label --current-hash must be a 64 character hexadecimal digest');
+    }
+    currentSourceHash = currentHashFlag.toLowerCase();
+  } else if (path !== undefined) {
+    const vault = feedbackVault(parsed, env);
+    const absoluteVault = resolve(vault);
+    const absolutePath = resolve(absoluteVault, path);
+    if (absolutePath !== absoluteVault && !absolutePath.startsWith(`${absoluteVault}${sep}`)) {
+      throw invalidInput('feedback label --path must stay inside the vault');
+    }
+    let raw: Buffer;
+    try {
+      raw = await readFile(absolutePath);
+    } catch {
+      throw invalidInput(`feedback label cannot read the source at ${path}`);
+    }
+    currentSourceHash = createHash('sha256').update(raw).digest('hex');
+  } else {
+    throw invalidInput('feedback label requires --current-hash or --path to verify freshness');
+  }
+  const candidatePosition = flagNumber(parsed.flags, 'candidate-position');
+  const state = feedbackState(parsed, env);
+  const lock = InstanceLock.acquire(state);
+  let journal: Journal | undefined;
+  try {
+    journal = Journal.open(join(state, 'journal.db'));
+    const result = authorRetrievalLabel(journal, {
+      trace_id: flagString(parsed.flags, 'trace-id') ?? 'manual',
+      query_id,
+      source_type: sourceType as (typeof RETRIEVAL_LABEL_SOURCES)[number],
+      source_hash: sourceHash.toLowerCase(),
+      label: value as 0 | 1 | 2,
+      ...(logicalId === undefined ? {} : { logical_id: logicalId }),
+      ...(path === undefined ? {} : { path }),
+      ...(revisionId === undefined ? {} : { revision_id: revisionId }),
+      ...(flagString(parsed.flags, 'question-id') === undefined
+        ? {}
+        : { question_id: flagString(parsed.flags, 'question-id') as string }),
+      ...(flagString(parsed.flags, 'question-version') === undefined
+        ? {}
+        : { question_version: flagString(parsed.flags, 'question-version') as string }),
+      ...(flagString(parsed.flags, 'model-fingerprint') === undefined
+        ? {}
+        : { model_fingerprint: flagString(parsed.flags, 'model-fingerprint') as string }),
+      ...(candidatePosition === undefined ? {} : { candidate_position: candidatePosition }),
+      ...(flagString(parsed.flags, 'rubric-version') === undefined
+        ? {}
+        : { rubric_version: flagString(parsed.flags, 'rubric-version') as string }),
+      ...(flagString(parsed.flags, 'evidence-ref') === undefined
+        ? {}
+        : { evidence_ref: flagString(parsed.flags, 'evidence-ref') as string }),
+      ...(flagString(parsed.flags, 'notes') === undefined
+        ? {}
+        : { notes: flagString(parsed.flags, 'notes') as string }),
+      ...(flagString(parsed.flags, 'query-family') === undefined
+        ? {}
+        : { query_family: flagString(parsed.flags, 'query-family') as string }),
+      ...(flagString(parsed.flags, 'source-family') === undefined
+        ? {}
+        : { source_family: flagString(parsed.flags, 'source-family') as string }),
+      ...(flagBoolean(parsed.flags, 'approve') ? { approved: true } : {}),
+      current: {
+        source_hash: currentSourceHash,
+        ...(currentRevisionId === undefined ? {} : { revision_id: currentRevisionId })
+      }
+    });
+    process.stdout.write(
+      `feedback label: ${result.created ? 'created' : 'replay'} ${result.label_id}\n`
+    );
+    return 0;
+  } catch (error) {
+    if (error instanceof StaleLabelError || error instanceof ConflictingLabelError) {
+      throw invalidInput(error.message);
+    }
+    throw error;
+  } finally {
+    journal?.close();
+    lock.release();
+  }
+}
+
+async function runFeedbackVoid(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promise<number> {
+  const labelId = requiredFlag(parsed, 'label-id', 'feedback void requires --label-id');
+  const state = feedbackState(parsed, env);
+  const lock = InstanceLock.acquire(state);
+  let journal: Journal | undefined;
+  try {
+    journal = Journal.open(join(state, 'journal.db'), { requireExisting: true });
+    const voidedAt = flagString(parsed.flags, 'voided-at');
+    const changed = journal.voidRetrievalLabel(labelId, voidedAt);
+    process.stdout.write(`feedback void: ${changed} label(s) voided\n`);
+    return changed === 1 ? 0 : 1;
+  } finally {
+    journal?.close();
+    lock.release();
+  }
+}
+
+async function runFeedback(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promise<number> {
+  const subcommand = parsed.positionals[0];
+  if (subcommand === 'export') return runFeedbackExport(parsed, env);
+  if (subcommand === 'label') return runFeedbackLabel(parsed, env);
+  if (subcommand === 'void') return runFeedbackVoid(parsed, env);
+  throw invalidInput(`feedback requires the export, label, or void subcommand\n${USAGE}`);
 }
 
 export async function runCli(
