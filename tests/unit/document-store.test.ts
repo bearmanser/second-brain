@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, readdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { expect, test } from 'vitest';
+import { RENDERED_NOTE_MAX_BYTES } from '../../src/core/limits.js';
 import { openDocumentStore } from '../../src/storage/document-store.js';
 import { vaultSandbox } from '../helpers/vault-sandbox.js';
 
@@ -14,7 +15,8 @@ function sha256(raw: string): string {
 
 async function revisionFileNames(state: string, id: string): Promise<string[]> {
   try {
-    return (await readdir(join(state, 'history', id, 'revisions'))).sort();
+    const names = await readdir(join(state, 'history', id, 'revisions'));
+    return names.filter((name) => name.endsWith('.md')).sort();
   } catch {
     return [];
   }
@@ -336,6 +338,194 @@ test('parallel writes with one idempotency key converge on one receipt', async (
     const [first, second] = await Promise.all([store.put(input), store.put(input)]);
     expect(first.revision_id).toBe(second.revision_id);
     expect(await revisionFileNames(s.state, first.id)).toHaveLength(1);
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
+test('overlapping vault and state roots are rejected', async () => {
+  const s = await vaultSandbox();
+  try {
+    await expect(openDocumentStore({ vault: s.vault, state: s.vault })).rejects.toMatchObject({
+      code: 'INVALID_INPUT'
+    });
+    await mkdir(join(s.vault, 'state'), { recursive: true });
+    await expect(
+      openDocumentStore({ vault: s.vault, state: join(s.vault, 'state') })
+    ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+    await mkdir(join(s.state, 'vault'), { recursive: true });
+    await expect(
+      openDocumentStore({ vault: join(s.state, 'vault'), state: s.state })
+    ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+  } finally {
+    await s.dispose();
+  }
+});
+
+test('a symlinked history directory is rejected', async () => {
+  const s = await vaultSandbox();
+  try {
+    const outside = join(s.state, '..', 'outside-history');
+    await mkdir(outside, { recursive: true });
+    await symlink(outside, join(s.state, 'history'));
+    await expect(openDocumentStore(s)).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+  } finally {
+    await s.dispose();
+  }
+});
+
+test('a symlinked per-note history component is rejected', async () => {
+  const s = await vaultSandbox();
+  const id = '44b093c5-71db-4785-b9a5-bb8118304278';
+  try {
+    await mkdir(join(s.state, 'history'), { recursive: true });
+    const outside = join(s.state, '..', 'outside-note');
+    await mkdir(outside, { recursive: true });
+    await symlink(outside, join(s.state, 'history', id));
+    const store = await openDocumentStore(s);
+    try {
+      await expect(
+        store.put({
+          path: 'Inbox/Symlinked history.md',
+          raw: `---\nid: ${id}\ntype: note\nstatus: candidate\n---\n\n# X\n`,
+          expectedEtag: null,
+          idempotencyKey: 'symlinked-history',
+          source: 'test'
+        })
+      ).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+      expect(await readdir(outside)).toEqual([]);
+    } finally {
+      await store.close();
+    }
+  } finally {
+    await s.dispose();
+  }
+});
+
+test('an uncatalogued human note carrying a managed id blocks a new write with that id', async () => {
+  const s = await vaultSandbox();
+  const id = '44b093c5-71db-4785-b9a5-bb8118304278';
+  const store = await openDocumentStore(s);
+  try {
+    await mkdir(join(s.vault, 'Inbox'), { recursive: true });
+    await writeFile(
+      join(s.vault, 'Inbox/Human copy.md'),
+      `---\nid: ${id}\ntype: note\nstatus: candidate\n---\n\n# Human copy\n`
+    );
+    await expect(
+      store.put({
+        path: 'Inbox/Agent.md',
+        raw: `---\nid: ${id}\ntype: note\nstatus: candidate\n---\n\n# Agent\n`,
+        expectedEtag: null,
+        idempotencyKey: 'uncatalogued-duplicate',
+        source: 'test'
+      })
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(await readdir(join(s.vault, 'Inbox'))).toEqual(['Human copy.md']);
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
+test('a tampered historical revision fails its byte-integrity check', async () => {
+  const s = await vaultSandbox();
+  const store = await openDocumentStore(s);
+  try {
+    const result = await store.put({
+      path: 'Inbox/Integrity.md',
+      raw: '# Integrity\n',
+      expectedEtag: null,
+      idempotencyKey: 'integrity',
+      source: 'test'
+    });
+    const revisionPath = join(s.state, 'history', result.id, 'revisions', `${result.revision_id}.md`);
+    await writeFile(revisionPath, '# Tampered\n');
+    await expect(store.readRevision(result.id, result.revision_id)).rejects.toMatchObject({
+      code: 'RECOVERY_REQUIRED'
+    });
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
+test('invalid UTF-8 history is rejected', async () => {
+  const s = await vaultSandbox();
+  const store = await openDocumentStore(s);
+  try {
+    const result = await store.put({
+      path: 'Inbox/Utf8.md',
+      raw: '# Utf8\n',
+      expectedEtag: null,
+      idempotencyKey: 'utf8',
+      source: 'test'
+    });
+    const revisionPath = join(s.state, 'history', result.id, 'revisions', `${result.revision_id}.md`);
+    await writeFile(revisionPath, Buffer.from([0xff, 0xfe, 0x00, 0x01]));
+    await expect(store.readRevision(result.id, result.revision_id)).rejects.toMatchObject({
+      code: 'RECOVERY_REQUIRED'
+    });
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
+test('a revision whose recorded bytes belong to another logical id is rejected', async () => {
+  const s = await vaultSandbox();
+  const store = await openDocumentStore(s);
+  try {
+    const result = await store.put({
+      path: 'Inbox/Identity.md',
+      raw: '# Identity\n',
+      expectedEtag: null,
+      idempotencyKey: 'identity',
+      source: 'test'
+    });
+    const directory = join(s.state, 'history', result.id, 'revisions');
+    const foreign = '---\nid: 11111111-1111-4111-8111-111111111111\ntype: note\nstatus: candidate\n---\n\n# Foreign\n';
+    await writeFile(join(directory, `${result.revision_id}.md`), foreign);
+    await writeFile(join(directory, `${result.revision_id}.sha256`), sha256(foreign));
+    await expect(store.readRevision(result.id, result.revision_id)).rejects.toMatchObject({
+      code: 'RECOVERY_REQUIRED'
+    });
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
+test('an oversized current note is rejected before hashing', async () => {
+  const s = await vaultSandbox();
+  const store = await openDocumentStore(s);
+  try {
+    await mkdir(join(s.vault, 'Inbox'), { recursive: true });
+    await writeFile(join(s.vault, 'Inbox/Huge.md'), 'x'.repeat(RENDERED_NOTE_MAX_BYTES + 1));
+    await expect(store.readPath('Inbox/Huge.md')).rejects.toMatchObject({ code: 'LIMIT_EXCEEDED' });
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
+test('an oversized historical revision is rejected before hashing', async () => {
+  const s = await vaultSandbox();
+  const store = await openDocumentStore(s);
+  try {
+    const result = await store.put({
+      path: 'Inbox/Huge revision.md',
+      raw: '# Huge revision\n',
+      expectedEtag: null,
+      idempotencyKey: 'huge-revision',
+      source: 'test'
+    });
+    const revisionPath = join(s.state, 'history', result.id, 'revisions', `${result.revision_id}.md`);
+    await writeFile(revisionPath, 'x'.repeat(RENDERED_NOTE_MAX_BYTES + 1));
+    await expect(store.readRevision(result.id, result.revision_id)).rejects.toMatchObject({
+      code: 'RECOVERY_REQUIRED'
+    });
   } finally {
     await store.close();
     await s.dispose();

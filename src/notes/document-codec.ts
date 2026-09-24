@@ -761,25 +761,27 @@ function subtractGenerated(
     let chosen = -1;
     let bestOverlap = -1;
     let bestDistance = Infinity;
-    let ambiguous = false;
-    let candidates = 0;
+    let bestCount = 0;
     for (let index = lastMatched + 1; index < nextBound; index += 1) {
       const candidate = blocks[index];
       if (candidate.title !== section.title) continue;
-      candidates += 1;
       const overlap = overlapCount(expected, counts[index]);
       const distance = Math.abs(candidate.start - section.start);
-      if (overlap > bestOverlap || (overlap === bestOverlap && distance < bestDistance)) {
+      if (overlap > bestOverlap) {
         chosen = index;
         bestOverlap = overlap;
         bestDistance = distance;
+        bestCount = 1;
+      } else if (overlap === bestOverlap) {
+        bestCount += 1;
+        if (distance < bestDistance) {
+          chosen = index;
+          bestDistance = distance;
+        }
       }
     }
     if (chosen < 0) continue;
-    if (bestOverlap === 0 && candidates > 1) {
-      ambiguous = true;
-    }
-    if (ambiguous) continue;
+    if (bestCount > 1) continue;
     const aligned = alignedLines(expectedTokens, tokens[chosen]);
     if (aligned === undefined) continue;
     generated.set(chosen, aligned);

@@ -1002,6 +1002,39 @@ test('a human same-name heading survives when attribution is ambiguous', () => {
   expect(revised.body.match(/^## Context$/gm)?.length ?? 0).toBeGreaterThanOrEqual(2);
 });
 
+test('competing positive-overlap same-name sections are both preserved when attribution is indistinguishable', () => {
+  const previous: NoteInput = {
+    title: 'Managed decision',
+    tags: [],
+    related_ids: [],
+    evidence: [],
+    content: { kind: 'decision', context: 'Generated context.', decision: 'D.', rationale: 'R.' }
+  };
+  const base = documentFromNote(previous, { path: 'Managed decision.md' });
+  const human = '## Context\n\nGenerated context.\n\nHuman-added context body.\n\n';
+  const edited = parseDocument(
+    renderDocument({
+      ...base,
+      body: base.body.replace(
+        '## Context\n\nGenerated context.',
+        `${human}## Context\n\nGenerated context.`
+      )
+    }),
+    base.path
+  );
+  const revised = reviseDocument(
+    edited,
+    {
+      ...previous,
+      content: { kind: 'decision', context: 'Updated context.', decision: 'D2.', rationale: 'R2.' }
+    },
+    { previous }
+  );
+  expect(revised.body).toContain('## Context\n\nGenerated context.\n\nHuman-added context body.');
+  expect(revised.body).toContain('Updated context.');
+  expect(revised.body.match(/^## Context$/gm)?.length ?? 0).toBeGreaterThanOrEqual(3);
+});
+
 test('unresolvable attribution never deletes a base heading', () => {
   const previous: NoteInput = {
     title: 'Managed note',

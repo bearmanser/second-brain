@@ -2448,6 +2448,8 @@ export interface LocalWriteReservation {
   expected_etag: string | null;
   id: string | null;
   revision_id: string | null;
+  preimage_hash: string | null;
+  revision_hash: string | null;
 }
 
 export type LocalWriteState =
@@ -2459,8 +2461,6 @@ export type LocalWriteState =
   | 'failed';
 
 export interface LocalWriteRecord extends LocalWriteReservation {
-  preimage_hash: string | null;
-  revision_hash: string | null;
   state: LocalWriteState;
   indexed: boolean;
   receipt_json: string | null;
@@ -2655,8 +2655,8 @@ export class LocalWriteJournal {
       .prepare(
         `INSERT INTO local_write_operations (
            operation_id, idempotency_key, tool, path, payload_hash, source,
-           expected_etag, id, revision_id, state, indexed, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', 0, ?)`
+           expected_etag, id, revision_id, preimage_hash, revision_hash, state, indexed, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', 0, ?)`
       )
       .run(
         input.operation_id,
@@ -2668,6 +2668,8 @@ export class LocalWriteJournal {
         input.expected_etag,
         input.id,
         input.revision_id,
+        input.preimage_hash,
+        input.revision_hash,
         input.updated_at
       );
     const stored = this.findById(input.operation_id);
@@ -2731,6 +2733,16 @@ export class LocalWriteJournal {
       .prepare('SELECT * FROM local_write_operations WHERE revision_id = ? ORDER BY updated_at DESC LIMIT 1')
       .get(revision_id) as LocalWriteRow | undefined;
     return row === undefined ? undefined : toLocalWrite(row);
+  }
+
+  listIncomplete(): LocalWriteRecord[] {
+    this.assertOpen();
+    const rows = this.database
+      .prepare(
+        "SELECT * FROM local_write_operations WHERE state NOT IN ('complete', 'conflict', 'failed') ORDER BY updated_at ASC, operation_id ASC"
+      )
+      .all() as LocalWriteRow[];
+    return rows.map(toLocalWrite);
   }
 
   recordDocument(input: LocalDocumentRecord): void {

@@ -42,7 +42,8 @@ function failingIndex(): DocumentIndex & { attempts: number } {
 
 async function revisionCount(state: string, id: string): Promise<number> {
   try {
-    return (await readdir(join(state, 'history', id, 'revisions'))).length;
+    const names = await readdir(join(state, 'history', id, 'revisions'));
+    return names.filter((name) => name.endsWith('.md')).length;
   } catch {
     return 0;
   }
@@ -390,6 +391,132 @@ test('revision reads never return a partial or out-of-vault destination', async 
     ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
   } finally {
     await store.close();
+    await s.dispose();
+  }
+});
+
+test('a crash after replacement but before journal and catalogue updates is recovered without replaying the write', async () => {
+  const s = await vaultSandbox();
+  let crashed = false;
+  const store = await openDocumentStore({
+    vault: s.vault,
+    state: s.state,
+    faults: {
+      afterReplace() {
+        if (!crashed) {
+          crashed = true;
+          throw new Error('simulated crash after replacement');
+        }
+      }
+    }
+  });
+  const path = 'Inbox/Post replace.md';
+  let info;
+  try {
+    await expect(
+      store.put({
+        path,
+        raw: '# Post replace\n',
+        expectedEtag: null,
+        idempotencyKey: 'post-replace',
+        source: 'test'
+      })
+    ).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    info = await stat(join(s.vault, path));
+    expect(await readFile(join(s.vault, path), 'utf8')).toContain('Post replace');
+  } finally {
+    await store.close();
+  }
+  const index = recordingIndex();
+  const restarted = await openDocumentStore({ vault: s.vault, state: s.state, index });
+  try {
+    const read = await restarted.readPath(path);
+    expect(read.id).toBeTruthy();
+    expect(read.revision_id).toBeTruthy();
+    expect(read.raw).toContain('Post replace');
+    const historical = await restarted.readRevision(read.id!, read.revision_id!);
+    expect(historical.raw).toContain('Post replace');
+    expect(index.entries).toHaveLength(1);
+    expect(index.entries[0]?.path).toBe(path);
+    const after = await stat(join(s.vault, path));
+    expect(after.mtimeMs).toBe(info!.mtimeMs);
+    expect(after.ino).toBe(info!.ino);
+    const replay = await restarted.put({
+      path,
+      raw: '# Post replace\n',
+      expectedEtag: null,
+      idempotencyKey: 'post-replace',
+      source: 'test'
+    });
+    expect(replay.indexed).toBe(true);
+  } finally {
+    await restarted.close();
+    await s.dispose();
+  }
+});
+
+test('a retry after a partially completed replacement resumes instead of conflicting', async () => {
+  const s = await vaultSandbox();
+  let fail = true;
+  const store = await openDocumentStore({
+    vault: s.vault,
+    state: s.state,
+    faults: {
+      afterReplace() {
+        if (fail) throw new Error('simulated crash after replacement');
+      }
+    }
+  });
+  try {
+    const input = {
+      path: 'Inbox/Resume.md',
+      raw: '# Resume\n',
+      expectedEtag: null,
+      idempotencyKey: 'resume-after-replace',
+      source: 'test'
+    };
+    await expect(store.put(input)).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    fail = false;
+    const result = await store.put(input);
+    expect(result.revision_id).toBeTruthy();
+    expect(await revisionCount(s.state, result.id)).toBe(1);
+    expect((await store.readPath(input.path)).revision_id).toBe(result.revision_id);
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
+test('a write without a search index reports indexed false and completes once an index exists', async () => {
+  const s = await vaultSandbox();
+  const first = await openDocumentStore(s);
+  try {
+    const result = await first.put({
+      path: 'Inbox/No index.md',
+      raw: '# No index\n',
+      expectedEtag: null,
+      idempotencyKey: 'no-index',
+      source: 'test'
+    });
+    expect(result.indexed).toBe(false);
+  } finally {
+    await first.close();
+  }
+  const index = recordingIndex();
+  const restarted = await openDocumentStore({ vault: s.vault, state: s.state, index });
+  try {
+    expect(index.entries).toHaveLength(1);
+    expect(index.entries[0]?.path).toBe('Inbox/No index.md');
+    const replay = await restarted.put({
+      path: 'Inbox/No index.md',
+      raw: '# No index\n',
+      expectedEtag: null,
+      idempotencyKey: 'no-index',
+      source: 'test'
+    });
+    expect(replay.indexed).toBe(true);
+  } finally {
+    await restarted.close();
     await s.dispose();
   }
 });

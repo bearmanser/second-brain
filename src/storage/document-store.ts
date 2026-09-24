@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { link, lstat, mkdir, open, readFile, rename, rm } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { link, lstat, mkdir, open, realpath, rename, rm } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { BrainError, isBrainError } from '../contracts/errors.js';
 import { RENDERED_NOTE_MAX_BYTES } from '../core/limits.js';
 import type { Clock, IdSource } from '../core/types.js';
@@ -9,7 +10,7 @@ import { parseDocument, renderDocument } from '../notes/document-codec.js';
 import { collisionKey } from '../notes/paths.js';
 import { LocalWriteJournal, type LocalWriteRecord } from './journal.js';
 import { openRevisionStore, type RevisionStore } from './revision-store.js';
-import { listVaultFilePaths, vaultNoteSegments } from './vault.js';
+import { listVaultFilePaths, readBoundedBytes, vaultNoteSegments } from './vault.js';
 
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const IDEMPOTENCY_KEY_MAX_LENGTH = 256;
@@ -33,6 +34,10 @@ function conflict(message: string): BrainError {
   return new BrainError({ code: 'CONFLICT', message });
 }
 
+function limitExceeded(message: string): BrainError {
+  return new BrainError({ code: 'LIMIT_EXCEEDED', message });
+}
+
 function recoveryRequired(message: string, cause?: unknown): BrainError {
   return new BrainError({ code: 'RECOVERY_REQUIRED', message, cause });
 }
@@ -53,13 +58,17 @@ function wrapIo(message: string, error: unknown): BrainError {
   return isBrainError(error) ? error : recoveryRequired(message, error);
 }
 
+function isInside(parent: string, child: string): boolean {
+  return child === parent || child.startsWith(`${parent}${sep}`);
+}
+
 async function syncDirectory(directory: string): Promise<void> {
   let handle: FileHandle | undefined;
   try {
     handle = await open(directory, 'r');
     await handle.sync();
-  } catch {
-    return;
+  } catch (error) {
+    throw recoveryRequired(`directory ${directory} could not be fsynced`, error);
   } finally {
     if (handle !== undefined) await handle.close();
   }
@@ -96,11 +105,29 @@ async function readNoteFile(
     throw forbidden(`path ${segments.join('/')} is a symbolic link`);
   }
   if (!info.isFile()) throw forbidden(`path ${segments.join('/')} is not a regular file`);
+  if (info.size > RENDERED_NOTE_MAX_BYTES) {
+    throw limitExceeded(
+      `file ${segments.join('/')} is ${info.size} bytes and exceeds the ${RENDERED_NOTE_MAX_BYTES} byte limit`
+    );
+  }
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (hasErrno(error, 'ELOOP')) {
+      throw forbidden(`path ${segments.join('/')} contains a symbolic link`);
+    }
+    throw recoveryRequired(`file ${segments.join('/')} cannot be opened`, error);
+  }
   let buffer: Buffer;
   try {
-    buffer = await readFile(target);
-  } catch (error) {
-    throw recoveryRequired(`file ${segments.join('/')} cannot be read`, error);
+    const bounded = await readBoundedBytes(handle, RENDERED_NOTE_MAX_BYTES);
+    if (bounded.kind === 'overflow') {
+      throw limitExceeded(`file ${segments.join('/')} exceeds the ${RENDERED_NOTE_MAX_BYTES} byte limit`);
+    }
+    buffer = bounded.buffer;
+  } finally {
+    await handle.close();
   }
   const raw = buffer.toString('utf8');
   if (!Buffer.from(raw, 'utf8').equals(buffer)) {
@@ -182,6 +209,7 @@ export interface DocumentStoreFaults {
   journalPrepare?(): void | Promise<void>;
   historyPersist?(): void | Promise<void>;
   beforeReplace?(): void | Promise<void>;
+  afterReplace?(): void | Promise<void>;
   indexUpdate?(): void | Promise<void>;
 }
 
@@ -297,6 +325,16 @@ class LocalDocumentStore implements DocumentStore {
     if (stateInfo === undefined || stateInfo.isSymbolicLink() || !stateInfo.isDirectory()) {
       throw recoveryRequired(`state root ${stateRoot} is not a safe directory`);
     }
+    let vaultReal: string;
+    let stateReal: string;
+    try {
+      [vaultReal, stateReal] = await Promise.all([realpath(vaultRoot), realpath(stateRoot)]);
+    } catch (error) {
+      throw recoveryRequired('the vault and state roots could not be resolved', error);
+    }
+    if (isInside(vaultReal, stateReal) || isInside(stateReal, vaultReal)) {
+      throw invalidInput('the vault and state roots must not overlap');
+    }
     const journalPath = join(stateRoot, 'documents.sqlite');
     const journal = LocalWriteJournal.open(journalPath);
     let revisions: RevisionStore;
@@ -373,10 +411,16 @@ class LocalDocumentStore implements DocumentStore {
     if (record !== undefined && record.state === 'conflict') {
       throw conflict('the operation previously ended in conflict and cannot be retried');
     }
+
+    const id = record?.id ?? parsed.id ?? observedId ?? existingByPath?.id ?? this.ids.next();
+    const revisionId = record?.revision_id ?? this.ids.next();
+    const document = parsed.id === undefined ? { ...parsed, id } : parsed;
+    const rawToWrite = parsed.id === undefined ? renderDocument(document) : input.raw;
+    const revisionHash = sha256(rawToWrite);
+    const preimageHash = observed?.hash ?? null;
+
     if (record === undefined) {
       await this.runFault('journalPrepare', 'the write journal could not be prepared');
-      const allocatedId =
-        parsed.id ?? observedId ?? existingByPath?.id ?? this.ids.next();
       const reserved = this.journal.reserve({
         operation_id: this.ids.next(),
         idempotency_key: input.idempotencyKey,
@@ -385,24 +429,17 @@ class LocalDocumentStore implements DocumentStore {
         payload_hash: hash,
         source: input.source,
         expected_etag: input.expectedEtag,
-        id: allocatedId,
-        revision_id: this.ids.next(),
+        id,
+        revision_id: revisionId,
+        preimage_hash: preimageHash,
+        revision_hash: revisionHash,
         updated_at: timestamp
       });
       record = reserved.record;
     }
 
-    const id = record.id ?? parsed.id ?? observedId ?? existingByPath?.id ?? this.ids.next();
-    const revisionId = record.revision_id ?? this.ids.next();
-    const document = parsed.id === undefined ? { ...parsed, id } : parsed;
-    const rawToWrite = parsed.id === undefined ? renderDocument(document) : input.raw;
-    const revisionHash = sha256(rawToWrite);
-
-    let alreadyMaterialized = false;
-    if (observed !== undefined && record.revision_hash !== null && observed.hash === record.revision_hash) {
-      const observedDocument = parseDocument(observed.raw, input.path);
-      alreadyMaterialized = observedDocument.id === id;
-    }
+    const alreadyMaterialized =
+      observed !== undefined && observed.hash === revisionHash && observedId === id;
 
     if (!alreadyMaterialized) {
       if (observed === undefined) {
@@ -440,11 +477,16 @@ class LocalDocumentStore implements DocumentStore {
         this.markConflict(record, timestamp);
         throw conflict(`logical id ${id} already exists at ${byId.path}`);
       }
+      const vaultConflict = await this.findUncataloguedId(id, input.path);
+      if (vaultConflict !== undefined) {
+        this.markConflict(record, timestamp);
+        throw conflict(`logical id ${id} already exists at ${vaultConflict}`);
+      }
     }
 
     try {
       await this.faults.historyPersist?.();
-      if (observed !== undefined) {
+      if (!alreadyMaterialized && observed !== undefined) {
         await this.revisions.persistPreimage(id, observed.raw);
       }
       await this.revisions.persistRevision(id, revisionId, rawToWrite);
@@ -453,7 +495,7 @@ class LocalDocumentStore implements DocumentStore {
     }
     record = this.journal.update(record.operation_id, {
       state: 'history_persisted',
-      preimage_hash: observed?.hash ?? null,
+      preimage_hash: preimageHash,
       revision_hash: revisionHash,
       updated_at: timestamp
     });
@@ -466,7 +508,7 @@ class LocalDocumentStore implements DocumentStore {
       try {
         await this.faults.beforeReplace?.();
         const recheck = await readNoteFile(this.vaultRoot, segments);
-        if ((recheck?.hash ?? null) !== (observed?.hash ?? null)) {
+        if ((recheck?.hash ?? null) !== preimageHash) {
           this.markConflict(record, timestamp);
           throw conflict(`path ${input.path} changed immediately before replacement`);
         }
@@ -482,6 +524,7 @@ class LocalDocumentStore implements DocumentStore {
       } finally {
         await rm(tempPath, { force: true }).catch(() => undefined);
       }
+      await this.runFault('afterReplace', 'the materialized write could not be journaled');
     }
 
     const after = await readNoteFile(this.vaultRoot, segments);
@@ -489,54 +532,89 @@ class LocalDocumentStore implements DocumentStore {
       this.markConflict(record, timestamp);
       throw conflict(`path ${input.path} diverged from the persisted revision after replacement`);
     }
+    return this.finalize(record, after, id, revisionId, timestamp, true);
+  }
+
+  private async findUncataloguedId(id: string, targetPath: string): Promise<string | undefined> {
+    const targetKey = collisionKey(targetPath);
+    const paths = await listVaultFilePaths(this.vaultRoot);
+    for (const candidate of paths) {
+      if (!candidate.endsWith('.md')) continue;
+      if (collisionKey(candidate) === targetKey) continue;
+      let segments: string[];
+      try {
+        segments = vaultNoteSegments(candidate);
+      } catch {
+        continue;
+      }
+      const observed = await readNoteFile(this.vaultRoot, segments);
+      if (observed === undefined) continue;
+      let candidateId: string | undefined;
+      try {
+        candidateId = parseDocument(observed.raw, candidate).id;
+      } catch {
+        continue;
+      }
+      if (candidateId === id) return candidate;
+    }
+    return undefined;
+  }
+
+  private async finalize(
+    record: LocalWriteRecord,
+    observed: { raw: string; hash: string },
+    id: string,
+    revisionId: string,
+    timestamp: string,
+    applyIndexFault: boolean
+  ): Promise<DocumentStorePutResult> {
     this.journal.recordDocument({
-      path: input.path,
+      path: record.path,
       id,
       revision_id: revisionId,
-      raw_hash: after.hash,
-      etag: after.hash,
+      raw_hash: observed.hash,
+      etag: observed.hash,
       updated_at: timestamp
     });
-    record = this.journal.update(record.operation_id, {
+    this.journal.update(record.operation_id, {
       state: 'materialized',
-      revision_hash: after.hash,
+      revision_hash: observed.hash,
       updated_at: timestamp
     });
-
     this.journal.enqueueIndex({
-      path: input.path,
+      path: record.path,
       revision_id: revisionId,
-      raw_hash: after.hash,
+      raw_hash: observed.hash,
       enqueued_at: timestamp
     });
-    let indexed = true;
-    try {
-      await this.faults.indexUpdate?.();
-      if (this.index !== undefined) {
+    let indexed = false;
+    if (this.index !== undefined) {
+      try {
+        if (applyIndexFault) await this.faults.indexUpdate?.();
         await this.index.upsert({
-          path: input.path,
-          raw: after.raw,
-          etag: after.hash,
+          path: record.path,
+          raw: observed.raw,
+          etag: observed.hash,
           id,
           revision_id: revisionId
         });
+        indexed = true;
+      } catch {
+        indexed = false;
       }
-    } catch {
-      indexed = false;
     }
-    if (indexed) this.journal.dequeueIndex(input.path);
-
+    if (indexed) this.journal.dequeueIndex(record.path);
     const receipt: DocumentStorePutResult = {
       id,
-      path: input.path,
-      etag: after.hash,
+      path: record.path,
+      etag: observed.hash,
       revision_id: revisionId,
       indexed
     };
     this.journal.update(record.operation_id, {
       state: 'complete',
       indexed,
-      revision_hash: after.hash,
+      revision_hash: observed.hash,
       receipt_json: JSON.stringify(receipt),
       updated_at: this.clock.now().toISOString()
     });
@@ -589,10 +667,62 @@ class LocalDocumentStore implements DocumentStore {
 
   async recover(): Promise<DocumentStoreRecoveryReport> {
     this.assertOpen();
-    const rows = this.journal.listIndex();
+    const recovered = new Set<string>();
+    const pending = new Set<string>();
+    for (const record of this.journal.listIncomplete()) {
+      const outcome = await this.completeIncomplete(record);
+      if (outcome === 'recovered') {
+        recovered.add(record.path);
+        pending.delete(record.path);
+      } else if (outcome === 'pending') {
+        pending.add(record.path);
+      }
+    }
+    const indexReport = await this.reconcileIndex();
+    for (const path of indexReport.recovered) {
+      recovered.add(path);
+      pending.delete(path);
+    }
+    for (const path of indexReport.pending) pending.add(path);
+    return { recovered: [...recovered], pending: [...pending] };
+  }
+
+  private async completeIncomplete(
+    record: LocalWriteRecord
+  ): Promise<'recovered' | 'pending' | 'skip'> {
+    if (record.id === null || record.revision_id === null || record.revision_hash === null) {
+      return 'skip';
+    }
+    let segments: string[];
+    try {
+      segments = vaultNoteSegments(record.path);
+    } catch {
+      return 'skip';
+    }
+    const observed = await readNoteFile(this.vaultRoot, segments);
+    if (observed === undefined || observed.hash !== record.revision_hash) return 'skip';
+    let observedId: string | undefined;
+    try {
+      observedId = parseDocument(observed.raw, record.path).id;
+    } catch {
+      return 'skip';
+    }
+    if (observedId !== record.id) return 'skip';
+    const receipt = await this.finalize(
+      record,
+      observed,
+      record.id,
+      record.revision_id,
+      this.clock.now().toISOString(),
+      false
+    );
+    return receipt.indexed ? 'recovered' : 'pending';
+  }
+
+  private async reconcileIndex(): Promise<DocumentStoreRecoveryReport> {
     const recovered: string[] = [];
     const pending: string[] = [];
-    for (const row of rows) {
+    for (const row of this.journal.listIndex()) {
       let segments: string[];
       try {
         segments = vaultNoteSegments(row.path);
@@ -605,36 +735,45 @@ class LocalDocumentStore implements DocumentStore {
         pending.push(row.path);
         continue;
       }
-      const document = parseDocument(observed.raw, row.path);
-      const catalogue = this.journal.findDocumentByPath(row.path);
-      const id = document.id ?? catalogue?.id;
+      if (this.index === undefined) {
+        pending.push(row.path);
+        continue;
+      }
+      let id: string | undefined;
       try {
-        if (this.index !== undefined) {
-          await this.index.upsert({
-            path: row.path,
-            raw: observed.raw,
-            etag: observed.hash,
-            ...(id === undefined ? {} : { id }),
-            revision_id: row.revision_id
-          });
-        }
+        id = parseDocument(observed.raw, row.path).id;
+      } catch {
+        pending.push(row.path);
+        continue;
+      }
+      try {
+        await this.index.upsert({
+          path: row.path,
+          raw: observed.raw,
+          etag: observed.hash,
+          ...(id === undefined ? {} : { id }),
+          revision_id: row.revision_id
+        });
       } catch {
         pending.push(row.path);
         continue;
       }
       this.journal.dequeueIndex(row.path);
-      const operation = this.journal.findByRevision(row.revision_id);
-      if (operation !== undefined && operation.receipt_json !== null && !operation.indexed) {
-        const receipt = JSON.parse(operation.receipt_json) as DocumentStorePutResult;
-        this.journal.update(operation.operation_id, {
-          indexed: true,
-          receipt_json: JSON.stringify({ ...receipt, indexed: true }),
-          updated_at: this.clock.now().toISOString()
-        });
-      }
+      this.markOperationIndexed(row.revision_id);
       recovered.push(row.path);
     }
     return { recovered, pending };
+  }
+
+  private markOperationIndexed(revisionId: string): void {
+    const operation = this.journal.findByRevision(revisionId);
+    if (operation === undefined || operation.receipt_json === null || operation.indexed) return;
+    const receipt = JSON.parse(operation.receipt_json) as DocumentStorePutResult;
+    this.journal.update(operation.operation_id, {
+      indexed: true,
+      receipt_json: JSON.stringify({ ...receipt, indexed: true }),
+      updated_at: this.clock.now().toISOString()
+    });
   }
 
   async close(): Promise<void> {
