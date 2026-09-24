@@ -79,6 +79,30 @@ Notes start in the `candidate` lifecycle. Candidates are excluded from ordinary
 recall unless the caller asks for them. Captures reject obvious credential
 patterns and oversized bodies before any durable local write.
 
+## Writing and navigation policy
+
+The vault is a human-browsable Obsidian vault, so agent writes follow the same
+conventions a person would use (see `docs/obsidian.md` for the generated
+templates, Bases views, and setup guidance):
+
+- Resolve an existing note before creating a duplicate; prefer an existing
+  canonical link over a new page.
+- Title files descriptively so the generated filename stays readable, and keep
+  collision suffixes meaningful instead of opaque identifiers or UUIDs.
+- Prefer canonical vault-relative links (`[[canonical/path|alias]]`) and
+  meaningful aliases; a bare alias is not an unambiguous file target.
+- Use the `type` property for the category and a small set of topic `tags`.
+- Record supported sources in the `## Sources` section rather than machine-only
+  blobs.
+- Preserve explicit supersession; never infer approval or supersession from a
+  model score.
+- Make no automatic "adopt Laya" decision note merely because an implementation
+  plan exists.
+
+Obsidian updates internal links automatically for renames performed inside the
+app. Service-side renames and moves are journaled and rewrite only genuine
+resolvable references (Task 8); they are not a substitute for either behavior.
+
 ## Candidate review
 
 `brain_review` is the only lifecycle-changing surface:

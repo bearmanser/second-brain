@@ -1,0 +1,30 @@
+filters:
+  and:
+    - 'file.ext == "md"'
+    - '!file.inFolder("Templates")'
+views:
+  - type: table
+    name: Recent notes
+    sort:
+      - property: note.updated
+        direction: DESC
+      - property: file.mtime
+        direction: DESC
+    order:
+      - file.name
+      - note.type
+      - note.status
+      - note.project
+      - note.updated
+      - file.mtime
+  - type: table
+    name: Daily notes
+    filters:
+      and:
+        - 'file.inFolder("Daily")'
+    sort:
+      - property: file.name
+        direction: DESC
+    order:
+      - file.name
+      - file.mtime

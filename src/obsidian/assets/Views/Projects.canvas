@@ -1,0 +1,95 @@
+{
+  "nodes": [
+    {
+      "id": "home",
+      "type": "file",
+      "file": "Home.md",
+      "x": 0,
+      "y": 0,
+      "width": 300,
+      "height": 200
+    },
+    {
+      "id": "projects",
+      "type": "file",
+      "file": "Views/Projects.base",
+      "x": 360,
+      "y": 0,
+      "width": 320,
+      "height": 260
+    },
+    {
+      "id": "decisions",
+      "type": "file",
+      "file": "Views/Active decisions.base",
+      "x": 720,
+      "y": 0,
+      "width": 320,
+      "height": 260
+    },
+    {
+      "id": "tasks",
+      "type": "file",
+      "file": "Views/Tasks.base",
+      "x": 0,
+      "y": 280,
+      "width": 320,
+      "height": 260
+    },
+    {
+      "id": "recent",
+      "type": "file",
+      "file": "Views/Recent notes.base",
+      "x": 360,
+      "y": 280,
+      "width": 320,
+      "height": 260
+    },
+    {
+      "id": "architecture-note",
+      "type": "text",
+      "text": "Architecture notes live under each project's Architecture folder.",
+      "x": 720,
+      "y": 280,
+      "width": 320,
+      "height": 200
+    }
+  ],
+  "edges": [
+    {
+      "id": "edge-home-projects",
+      "fromNode": "home",
+      "fromSide": "right",
+      "toNode": "projects",
+      "toSide": "left"
+    },
+    {
+      "id": "edge-projects-decisions",
+      "fromNode": "projects",
+      "fromSide": "right",
+      "toNode": "decisions",
+      "toSide": "left"
+    },
+    {
+      "id": "edge-projects-tasks",
+      "fromNode": "projects",
+      "fromSide": "bottom",
+      "toNode": "tasks",
+      "toSide": "top"
+    },
+    {
+      "id": "edge-tasks-recent",
+      "fromNode": "tasks",
+      "fromSide": "right",
+      "toNode": "recent",
+      "toSide": "left"
+    },
+    {
+      "id": "edge-recent-architecture",
+      "fromNode": "recent",
+      "fromSide": "right",
+      "toNode": "architecture-note",
+      "toSide": "left"
+    }
+  ]
+}

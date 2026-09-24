@@ -1,0 +1,16 @@
+filters:
+  and:
+    - 'file.ext == "md"'
+    - 'note.type == "task"'
+    - '!file.inFolder("Templates")'
+views:
+  - type: table
+    name: Tasks
+    groupBy:
+      property: note.task_status
+      direction: ASC
+    order:
+      - file.name
+      - note.task_status
+      - note.project
+      - note.updated

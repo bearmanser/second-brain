@@ -1,0 +1,13 @@
+filters:
+  and:
+    - 'file.ext == "md"'
+    - 'note.status == "candidate"'
+    - '!file.inFolder("Templates")'
+views:
+  - type: table
+    name: Review queue
+    order:
+      - file.name
+      - note.type
+      - note.project
+      - note.created

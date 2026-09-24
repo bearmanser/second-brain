@@ -8,6 +8,7 @@ import type { Clock, IdSource } from './core/types.js';
 import { MutationCoordinator, InstanceLock, type BrainDeps } from './core/mutation.js';
 import { installShutdownHandlers, main, resolveConfig } from './main.js';
 import { APPLICATION_VERSION, SCHEMA_VERSION } from './mcp/tools.js';
+import { installObsidianAssets } from './obsidian/install.js';
 import { RevisionCatalogue } from './notes/catalogue.js';
 import { JournalApprovalProvenance } from './notes/reconcile.js';
 import {
@@ -52,7 +53,8 @@ export type CliCommand =
   | 'validate-store-links'
   | 'verify-backup'
   | 'auth'
-  | 'vault-v2';
+  | 'vault-v2'
+  | 'obsidian';
 
 export const CLI_COMMANDS: readonly CliCommand[] = [
   'serve',
@@ -66,7 +68,8 @@ export const CLI_COMMANDS: readonly CliCommand[] = [
   'validate-store-links',
   'verify-backup',
   'auth',
-  'vault-v2'
+  'vault-v2',
+  'obsidian'
 ];
 
 export interface ParsedArguments {
@@ -80,7 +83,7 @@ const systemIds: IdSource = { next: () => randomUUID() };
 
 const USAGE = [
   'usage: node dist/cli.js <command> [options]',
-  'commands: serve | setup | health | recover | recover-state | rebuild-catalogue | backup-manifest | validate-archive | validate-store-links | verify-backup | auth | vault-v2'
+  'commands: serve | setup | health | recover | recover-state | rebuild-catalogue | backup-manifest | validate-archive | validate-store-links | verify-backup | auth | vault-v2 | obsidian'
 ].join('\n');
 
 function invalidInput(message: string): BrainError {
@@ -555,6 +558,23 @@ async function runVaultV2(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Prom
   throw invalidInput(`vault-v2 requires a subcommand\n${USAGE}`);
 }
 
+async function runObsidian(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promise<number> {
+  const subcommand = parsed.positionals[0];
+  if (subcommand !== 'init') throw invalidInput(`obsidian requires the init subcommand\n${USAGE}`);
+  if (!flagBoolean(parsed.flags, 'create-only')) {
+    throw invalidInput('obsidian init requires --create-only');
+  }
+  const vault = flagString(parsed.flags, 'vault') ?? resolveConfig(env).mounts.vault;
+  const result = await installObsidianAssets({ vault, mode: 'create-only' });
+  process.stdout.write(
+    `obsidian init: ${result.created.length} created, ${result.unchanged.length} unchanged, ` +
+      `${result.conflicts.length} conflicts\n`
+  );
+  for (const path of result.created) process.stdout.write(`  created ${path}\n`);
+  for (const path of result.conflicts) process.stdout.write(`  conflict ${path}\n`);
+  return 0;
+}
+
 export async function runCli(
   argv: readonly string[],
   env: NodeJS.ProcessEnv = process.env
@@ -589,6 +609,8 @@ export async function runCli(
       return runAuth(parsed);
     case 'vault-v2':
       return runVaultV2(parsed, env);
+    case 'obsidian':
+      return runObsidian(parsed, env);
   }
 }
 

@@ -1,0 +1,14 @@
+filters:
+  and:
+    - 'file.ext == "md"'
+    - 'note.type == "decision"'
+    - 'note.status == "active"'
+    - '!file.inFolder("Templates")'
+views:
+  - type: table
+    name: Active decisions
+    order:
+      - file.name
+      - note.project
+      - note.updated
+      - note.tags

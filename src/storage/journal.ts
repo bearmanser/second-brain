@@ -1830,7 +1830,8 @@ export class Journal {
     const row = this.database
       .prepare(
         `SELECT EXISTS(SELECT 1 FROM operations LIMIT 1)
-          OR EXISTS(SELECT 1 FROM feedback_records LIMIT 1) AS present`
+          OR EXISTS(SELECT 1 FROM feedback_records LIMIT 1)
+          OR EXISTS(SELECT 1 FROM projects_v2 LIMIT 1) AS present`
       )
       .get() as { present: number };
     return row.present === 1;

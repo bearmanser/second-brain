@@ -12,6 +12,7 @@ import type {
   ProjectProvisioningPlan
 } from '../core/types.js';
 import { PROJECTS_ROOT, allocateProjectRoot, collisionKey, safeBasename } from '../notes/paths.js';
+import { writeProjectIndex } from '../obsidian/project-index.js';
 import {
   normalizeRepositoryIdentity,
   scopeCandidateForRepository,
@@ -567,6 +568,22 @@ export async function projectEnsureLocal(
   if (result.kind !== 'project_ensure') {
     throw localRecoveryRequired('project ensure returned a non-project receipt');
   }
+  const warnings = [...result.warnings];
+  const resolved = deps.projects.resolve(result.project_id);
+  if (resolved !== undefined) {
+    try {
+      writeProjectIndex(deps.vaultRoot, {
+        id: resolved.id,
+        display_name: resolved.display_name,
+        relative_root: resolved.relative_root,
+        ...(resolved.repository_identity === undefined
+          ? {}
+          : { repository_identity: resolved.repository_identity })
+      });
+    } catch {
+      warnings.push('project_page_unavailable');
+    }
+  }
   return {
     operation_id: result.operation_id,
     repository_identity: result.repository_identity,
@@ -576,6 +593,6 @@ export async function projectEnsureLocal(
     created: result.created,
     backend_ready: false,
     materialized: result.materialized,
-    warnings: result.warnings
+    warnings
   };
 }
