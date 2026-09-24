@@ -404,7 +404,9 @@ test('a supersede plan must bind every replacement in its supersession chain', a
         revision_id: randomUUID(), raw: managed(sourceId, 'superseded'), parents: [] } }] });
     await expect(ground.coordinator.run(intent, () => plan([sourceCondition, middleCondition]) as LocalPlannedOperation))
       .rejects.toMatchObject({ code: 'INVALID_INPUT' });
-    expect(ground.operations.findByKey(key)?.plan_json).toBeNull();
+    expect(ground.operations.findByKey(key)).toBeUndefined();
+    await expect(ground.coordinator.run(intent, () => plan([sourceCondition, middleCondition]) as LocalPlannedOperation))
+      .rejects.toMatchObject({ code: 'INVALID_INPUT' });
     const completeKey = randomUUID();
     await expect(ground.coordinator.run({ ...intent, idempotency_key: completeKey,
       payload: { ...intent.payload, idempotency_key: completeKey } } as LocalOperationIntent,

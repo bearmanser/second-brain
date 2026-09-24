@@ -28,7 +28,7 @@ import {
 import { contentKindForType, type CurrentDocument } from '../notes/document.js';
 import { NOTE_REGISTRY } from '../notes/registry.js';
 import { collectRenameSnapshots, planRename } from '../notes/rename.js';
-import { extractLinks } from '../notes/links.js';
+import { anchorExists, extractAnchors, extractLinks } from '../notes/links.js';
 import { resolveLink } from '../notes/link-resolver.js';
 import type {
   AuthenticatedContext as LocalContext,
@@ -652,11 +652,12 @@ function previousInputForRevision(base: CurrentDocument): LocalNoteInput {
 function preservedDocument(
   base: CurrentDocument,
   note: LocalNoteInput,
-  status: CurrentDocument['status']
+  status: CurrentDocument['status'],
+  generated: LocalNoteInput | undefined
 ): CurrentDocument {
   const now = new Date().toISOString();
   return reviseDocument(base, note, {
-    previous: previousInputForRevision(base),
+    previous: generated === undefined ? previousInputForRevision(base) : normalizeNote(generated),
     meta: {
       status, updated: now,
       ...(note.type === undefined ? {} : { type: note.type }),
@@ -708,18 +709,8 @@ async function deriveReferenceEdits(
     : { ...file });
   const removed = new Set(absorbed);
   const affected = new Set<string>();
-  const anchor = (fragment: string): boolean => {
-    let decoded: string;
-    try { decoded = decodeURIComponent(fragment); } catch { return false; }
-    if (decoded.startsWith('^')) {
-      return resolvedRaw.includes(decoded);
-    }
-    return resolvedRaw.split('\n').some((line) => {
-      const match = /^#{1,6}\s+(.+?)\s*#*\s*$/.exec(line);
-      return match !== null && match[1].trim().toLowerCase().replace(/[^\p{L}\p{N} -]/gu, '')
-        .replace(/\s+/g, '-') === decoded.toLowerCase();
-    });
-  };
+  const anchors = extractAnchors(resolvedRaw);
+  const anchor = (fragment: string): boolean => anchorExists(anchors, fragment);
   const catalogue = new Map(originals.filter((file) => file.path.endsWith('.md'))
     .map((file) => [file.path, deps.catalogue.getByPath(file.path)?.id]));
   for (const file of originals) {
@@ -809,9 +800,11 @@ async function resolvePlan(
     }
   }
   await deps.mutations.verifyConflictHeads(operation.id, expected);
-  const ordered = [...heads].sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
-  const survivor = ordered[0];
-  const absorbed = ordered.slice(1);
+  const survivorPath = await deps.mutations.selectSurvivorPath(operation.id, heads);
+  const survivor = heads.find((head) => head.path === survivorPath);
+  if (survivor === undefined) throw recoveryRequired('the selected survivor is not a verified head');
+  const absorbed = heads.filter((head) => head !== survivor)
+    .sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
   const removals = absorbed.map((head) => ({
     kind: 'remove' as const,
     path: head.path,
@@ -820,7 +813,8 @@ async function resolvePlan(
     expected_etag: head.etag
   }));
   const base = await readDocument(deps, survivor.path);
-  const document = preservedDocument(base, operation.note, 'candidate');
+  const document = preservedDocument(base, operation.note, 'candidate',
+    deps.mutations.latestGeneratedNote(operation.id));
   const rewrites = await deriveReferenceEdits(
     deps,
     operation.id,
@@ -885,19 +879,25 @@ export async function reviewLocal(
   if (ctx.signal.aborted) throw new BrainError({ code: 'CANCELLED', message: 'the review was cancelled' });
   const request = parseRequest(input, true);
   const operation = request.operation;
-  const selected = request.project === undefined && request.scope === undefined
-    ? undefined
-    : deps.projects.resolve(request.project ?? request.scope)?.id;
-  if (request.project !== undefined && request.scope !== undefined &&
-      deps.projects.resolve(request.project)?.id !== deps.projects.resolve(request.scope)?.id) {
-    throw localInvalidInput('project and scope select different projects');
-  }
+  const identifier = request.project ?? request.scope;
+  let selected: string | undefined;
+  const selectProject = (): string | undefined => {
+    if (identifier === undefined) return undefined;
+    const id = deps.projects.resolve(identifier)?.id;
+    if (request.project !== undefined && request.scope !== undefined &&
+        id !== deps.projects.resolve(request.scope)?.id) {
+      throw localInvalidInput('project and scope select different projects');
+    }
+    selected = id;
+    return id;
+  };
   const requireProjectPath = (path: string): void => {
     if (selected !== undefined && scopeForPathDeps(deps, path) !== selected) {
       throw conflict(`path ${path} is outside the selected project`);
     }
   };
   if (operation.action === 'list') {
+    selectProject();
     await reconcileDeps(deps);
     const sources = operation.filter === 'candidate' ? deps.catalogue.all().filter((source) => source.status === 'candidate')
       : deps.catalogue.conflictIds().flatMap((id) => deps.catalogue.conflictsFor(id));
@@ -909,7 +909,14 @@ export async function reviewLocal(
   const intent: LocalOperationIntent = {
     tool: 'brain_review',
     action: operation.action,
-    project_id: selected ?? null,
+    project_id: null,
+    ...(identifier === undefined ? {} : {
+      project_selection: {
+        selector: JSON.stringify({ project: request.project ?? null, scope: request.scope ?? null }),
+        identifier,
+        resolve: () => selectProject() ?? null
+      }
+    }),
     idempotency_key: operation.idempotency_key,
     payload: operation,
     preconditions: operation.action === 'resolve'
@@ -1056,7 +1063,8 @@ export async function reviewLocal(
         };
       } else {
         if (operation.action !== 'revise') throw localInvalidInput('unsupported review action');
-        document = preservedDocument(base, operation.note, 'candidate');
+        document = preservedDocument(base, operation.note, 'candidate',
+          deps.mutations.latestGeneratedNote(source.id as string));
       }
       return {
         kind: 'note',

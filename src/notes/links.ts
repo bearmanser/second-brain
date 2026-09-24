@@ -401,6 +401,65 @@ export function extractLinks(raw: string): LinkReference[] {
   return references;
 }
 
+export interface DocumentAnchors {
+  headings: string[];
+  blocks: string[];
+}
+
+const BLOCK_ID_PATTERN = /(?:^|\s)\^([A-Za-z0-9-]+)$/;
+
+function normalizeAnchorText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+export function extractAnchors(raw: string): DocumentAnchors {
+  const anchors: DocumentAnchors = { headings: [], blocks: [] };
+  if (typeof raw !== 'string') return anchors;
+  const split = splitFrontmatter(raw);
+  let tree: { children?: MarkdownNode[] } | undefined;
+  try {
+    tree = fromMarkdown(split.body) as unknown as { children?: MarkdownNode[] };
+  } catch {
+    return anchors;
+  }
+  const visit = (nodes: MarkdownNode[]): void => {
+    for (const node of nodes) {
+      if (node.type === 'code' || node.type === 'inlineCode' || node.type === 'html') continue;
+      if (node.type === 'heading') {
+        const text = textContent(node.children);
+        if (text !== undefined && normalizeAnchorText(text).length > 0) {
+          anchors.headings.push(normalizeAnchorText(text));
+        }
+        continue;
+      }
+      if (node.type === 'paragraph' || node.type === 'tableCell') {
+        const last = node.children?.at(-1);
+        if (last?.type === 'text' && typeof last.value === 'string') {
+          const match = BLOCK_ID_PATTERN.exec(last.value.replace(/\s+$/, ''));
+          if (match !== null) anchors.blocks.push(match[1]);
+        }
+        continue;
+      }
+      if (node.children !== undefined) visit(node.children);
+    }
+  };
+  visit(tree?.children ?? []);
+  return anchors;
+}
+
+export function anchorExists(anchors: DocumentAnchors, fragment: string): boolean {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(fragment);
+  } catch {
+    return false;
+  }
+  if (decoded.startsWith('^')) return anchors.blocks.includes(decoded.slice(1));
+  const segments = decoded.split('#').map(normalizeAnchorText);
+  if (segments.some((segment) => segment.length === 0)) return false;
+  return segments.every((segment) => anchors.headings.includes(segment));
+}
+
 export function extractRelationships(raw: string): RelationshipEdge[] {
   if (typeof raw !== 'string') return [];
   const split = splitFrontmatter(raw);

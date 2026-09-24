@@ -374,9 +374,16 @@ export interface LocalExpectedHead {
   etag: string;
 }
 
+export interface LocalProjectSelection {
+  selector: string;
+  identifier: string;
+  resolve(): string | null;
+}
+
 interface LocalOperationBase {
   project_id: string | null;
   idempotency_key: string;
+  project_selection?: LocalProjectSelection;
 }
 
 type LocalReviewAction = Exclude<ReviewRequest['operation']['action'], 'list' | 'approve' | 'archive'>;
@@ -606,6 +613,8 @@ export interface LocalMutationCoordinatorPort {
   recover(): Promise<LocalRecoveryReport>;
   enumerateConflictHeads(id: string): Promise<LocalConflictHead[]>;
   verifyConflictHeads(id: string, expected: readonly LocalExpectedHead[]): Promise<void>;
+  selectSurvivorPath(id: string, heads: readonly LocalConflictHead[]): Promise<string>;
+  latestGeneratedNote(id: string): NoteInput | undefined;
 }
 
 export interface ResolvedProject {

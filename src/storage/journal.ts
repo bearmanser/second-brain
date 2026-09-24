@@ -1118,6 +1118,12 @@ export class Journal {
     }
   }
 
+  idempotencyKeyProject(idempotency_key: string): { project_id: string | null } | undefined {
+    this.assertOpen();
+    const key = this.getIdempotencyKey(idempotency_key);
+    return key === undefined ? undefined : { project_id: key.project_id ?? null };
+  }
+
   isKeyBlocked(idempotency_key: string): boolean {
     this.assertOpen();
     const key = this.getIdempotencyKey(idempotency_key);
@@ -3406,6 +3412,7 @@ export interface LocalOperationReservation {
   project_id: string | null;
   payload_hash: string;
   payload_json: string;
+  project_selector?: string;
 }
 
 export interface LocalOperationRecord extends LocalOperationReservation {
@@ -3437,6 +3444,7 @@ interface LocalOperationRow {
   receipt_json: string | null;
   created_at: string;
   updated_at: string;
+  project_selector?: string | null;
 }
 
 const LOCAL_OPERATION_SCHEMA = [
@@ -3495,6 +3503,8 @@ function toLocalOperation(row: LocalOperationRow): LocalOperationRecord {
     project_id: row.project_id,
     payload_hash: row.payload_hash,
     payload_json: row.payload_json,
+    ...(row.project_selector === null || row.project_selector === undefined
+      ? {} : { project_selector: row.project_selector }),
     plan_json: row.plan_json,
     progress_json: row.progress_json,
     state: requireLocalOperationState(row.state),
@@ -3582,6 +3592,11 @@ export class LocalOperationJournal {
       } catch {
         undefined;
       }
+      try {
+        database.exec('ALTER TABLE local_operations ADD COLUMN project_selector TEXT');
+      } catch {
+        undefined;
+      }
     } catch (error) {
       database.close();
       if (isBrainError(error)) throw error;
@@ -3617,8 +3632,8 @@ export class LocalOperationJournal {
             `INSERT INTO local_operations (
                operation_id, idempotency_key, tool, action, project_id,
                payload_hash, payload_json, plan_json, progress_json, state, storage_key,
-               receipt_json, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'pending', NULL, NULL, ?, ?)`
+               receipt_json, created_at, updated_at, project_selector
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'pending', NULL, NULL, ?, ?, ?)`
           )
           .run(
             operationId,
@@ -3629,7 +3644,8 @@ export class LocalOperationJournal {
             input.payload_hash,
             input.payload_json,
             input.created_at,
-            input.updated_at
+            input.updated_at,
+            input.project_selector ?? null
           );
       } catch (error) {
         const raced = reconcile();
@@ -3804,7 +3820,7 @@ export class LocalOperationJournal {
     fields: Partial<
       Pick<
         LocalOperationRecord,
-        'plan_json' | 'progress_json' | 'state' | 'storage_key' | 'receipt_json' | 'updated_at'
+        'plan_json' | 'progress_json' | 'state' | 'storage_key' | 'receipt_json' | 'updated_at' | 'project_id'
       >
     >
   ): LocalOperationRecord {
@@ -3815,10 +3831,11 @@ export class LocalOperationJournal {
     this.database
       .prepare(
         `UPDATE local_operations
-           SET plan_json = ?, progress_json = ?, state = ?, storage_key = ?, receipt_json = ?, updated_at = ?
+           SET project_id = ?, plan_json = ?, progress_json = ?, state = ?, storage_key = ?, receipt_json = ?, updated_at = ?
            WHERE operation_id = ?`
       )
       .run(
+        next.project_id,
         next.plan_json,
         next.progress_json,
         next.state,
@@ -3846,6 +3863,46 @@ export class LocalOperationJournal {
       .prepare('SELECT * FROM local_operations WHERE idempotency_key = ?')
       .get(idempotency_key) as LocalOperationRow | undefined;
     return row === undefined ? undefined : toLocalOperation(row);
+  }
+
+  release(operation_id: string): void {
+    this.assertOpen();
+    const run = this.database.transaction(() => {
+      const subordinates = this.database
+        .prepare('SELECT COUNT(*) AS count FROM local_subordinate_operations WHERE operation_id = ?')
+        .get(operation_id) as { count: number };
+      const effects = this.database
+        .prepare('SELECT COUNT(*) AS count FROM local_feedback_effects WHERE operation_id = ?')
+        .get(operation_id) as { count: number };
+      if (subordinates.count > 0 || effects.count > 0) {
+        throw recoveryRequired(`local operation ${operation_id} has durable effects and cannot be released`);
+      }
+      const result = this.database
+        .prepare(
+          `DELETE FROM local_operations
+             WHERE operation_id = ? AND plan_json IS NULL AND receipt_json IS NULL
+               AND state IN ('pending', 'recovery_required')`
+        )
+        .run(operation_id);
+      if (result.changes !== 1) {
+        throw recoveryRequired(`local operation ${operation_id} is not a releasable plan-less reservation`);
+      }
+    });
+    run.immediate();
+  }
+
+  listFinalizedForNote(id: string): LocalOperationRecord[] {
+    this.assertOpen();
+    const rows = this.database
+      .prepare(
+        `SELECT * FROM local_operations
+           WHERE state = 'finalized' AND receipt_json IS NOT NULL
+             AND json_valid(receipt_json) AND json_extract(receipt_json, '$.kind') = 'note'
+             AND json_extract(receipt_json, '$.id') = ?
+           ORDER BY created_at DESC, rowid DESC`
+      )
+      .all(id) as LocalOperationRow[];
+    return rows.map(toLocalOperation);
   }
 
   listIncomplete(): LocalOperationRecord[] {

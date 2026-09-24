@@ -297,12 +297,23 @@ export async function captureLocal(
   if (ctx.signal.aborted) throw new BrainError({ code: 'CANCELLED', message: 'the capture was cancelled' });
   const request = parseLocalCapture(input);
   const note = normalizeNote(request.note);
-  const resolved = deps.projects.resolve(request.project ?? request.scope);
+  const identifier = request.project ?? request.scope;
+  let resolved: ReturnType<LocalHandlerDeps['projects']['resolve']>;
 
   const intent: LocalOperationIntent = {
     tool: 'brain_capture',
     action: 'capture',
-    project_id: resolved?.id ?? null,
+    project_id: null,
+    ...(identifier === undefined ? {} : {
+      project_selection: {
+        selector: JSON.stringify({ project: request.project ?? null, scope: request.scope ?? null }),
+        identifier,
+        resolve: () => {
+          resolved = deps.projects.resolve(identifier);
+          return resolved?.id ?? null;
+        }
+      }
+    }),
     idempotency_key: request.idempotency_key,
     payload: request,
     preconditions: {}

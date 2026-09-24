@@ -22,7 +22,7 @@ import { openDocumentStore, type DocumentStore } from '../../src/storage/documen
 import { Journal, LocalOperationJournal } from '../../src/storage/journal.js';
 import { openRevisionStore, type RevisionStore } from '../../src/storage/revision-store.js';
 import { openSearchIndex } from '../../src/storage/search-index.js';
-import { FileVault } from '../../src/storage/vault.js';
+import { FileVault, scanVaultFilePaths } from '../../src/storage/vault.js';
 import { renderDocument, parseDocument, documentFromNote } from '../../src/notes/document-codec.js';
 import { vaultSandbox } from '../helpers/vault-sandbox.js';
 import { normalizeRepositoryIdentity, scopeCandidateForRepository } from '../../src/projects/identity.js';
@@ -241,40 +241,47 @@ test('every review lifecycle action works through the local coordinator', async 
       },
       ground.deps
     );
-    const superseded = await reviewLocal(
-      c,
-      {
-        operation: {
-          action: 'supersede',
-          idempotency_key: randomUUID(),
-          id: captured.id,
-          expected_etag: ground.catalogue.getById(captured.id)?.etag as string,
-          rationale: 'superseded',
-          replacement_id: replacement.id
-        }
-      },
-      ground.deps
-    );
+    const supersedeRequest = {
+      operation: {
+        action: 'supersede' as const,
+        idempotency_key: randomUUID(),
+        id: captured.id,
+        expected_etag: ground.catalogue.getById(captured.id)?.etag as string,
+        rationale: 'superseded',
+        replacement_id: replacement.id
+      }
+    };
+    const superseded = await reviewLocal(c, supersedeRequest, ground.deps);
     expect('outcome' in superseded && superseded.outcome).toBe('stored');
+    expect(await reviewLocal(c, supersedeRequest, ground.deps)).toEqual(superseded);
+    await expect(reviewLocal(c, { operation: { ...supersedeRequest.operation, rationale: 'different' } }, ground.deps))
+      .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+    await expect(reviewLocal(c, { operation: { ...supersedeRequest.operation, replacement_id: randomUUID() } }, ground.deps))
+      .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
     await refresh(ground);
     expect(ground.catalogue.getById(captured.id)?.status).toBe('superseded');
 
-    const archived = await reviewLocal(
-      c,
-      {
-        operation: {
-          action: 'archive',
-          idempotency_key: randomUUID(),
-          id: replacement.id,
-          expected_etag: ground.catalogue.getById(replacement.id)?.etag as string,
-          rationale: 'archive'
-        }
-      },
-      ground.deps
-    );
+    const archiveRequest = {
+      operation: {
+        action: 'archive' as const,
+        idempotency_key: randomUUID(),
+        id: replacement.id,
+        expected_etag: ground.catalogue.getById(replacement.id)?.etag as string,
+        rationale: 'archive'
+      }
+    };
+    const archived = await reviewLocal(c, archiveRequest, ground.deps);
     expect('outcome' in archived && archived.outcome).toBe('stored');
+    expect(await reviewLocal(c, archiveRequest, ground.deps)).toEqual(archived);
+    await expect(reviewLocal(c, { operation: { ...archiveRequest.operation, rationale: 'different' } }, ground.deps))
+      .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+    await expect(reviewLocal(c, { operation: { ...archiveRequest.operation, action: 'approve' as const } }, ground.deps))
+      .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
     await refresh(ground);
     expect(ground.catalogue.getById(replacement.id)?.status).toBe('archived');
+    await restartGround(ground);
+    expect(await reviewLocal(c, archiveRequest, ground.deps)).toEqual(archived);
+    expect(await reviewLocal(c, supersedeRequest, ground.deps)).toEqual(superseded);
   } finally {
     await ground.dispose();
   }
@@ -546,10 +553,12 @@ test('resolve uses the accepted consolidation and preserves branches for history
       operation: { action: 'list', filter: 'conflict' } }, ground.deps);
     expect('items' in filteredConflicts && filteredConflicts.items.some((item) => item.id === id)).toBe(false);
     const expected = heads.map((head) => ({ revision_id: head.revision_id, etag: head.etag }));
+    const missingAnchorKey = randomUUID();
     await expect(reviewLocal(c, { operation: {
-      action: 'resolve', idempotency_key: randomUUID(), id,
+      action: 'resolve', idempotency_key: missingAnchorKey, id,
       expected_heads: expected, rationale: 'missing anchor', note: note('resolved', 'no anchor')
     } }, ground.deps)).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(ground.operations.findByKey(missingAnchorKey)).toBeUndefined();
     await expect(reviewLocal(c, { project: 'shared', operation: {
       action: 'resolve', idempotency_key: randomUUID(), id,
       expected_heads: expected, rationale: 'wrong project', note: note('resolved', 'resolved')
@@ -570,6 +579,7 @@ test('resolve uses the accepted consolidation and preserves branches for history
       ground.deps
     );
     expect('outcome' in result && result.revision_id).toBeTruthy();
+    await restartGround(ground);
     expect(await reviewLocal(c, resolveRequest, ground.deps)).toEqual(result);
     await expect(reviewLocal(c, { operation: { ...resolveRequest.operation, rationale: 'different' } }, ground.deps))
       .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
@@ -577,6 +587,17 @@ test('resolve uses the accepted consolidation and preserves branches for history
     expect(resolution?.receipt).toMatchObject({ revision_id: (result as { revision_id: string }).revision_id });
     const metadata = await ground.revisions.readRevisionMetadata(id, (result as { revision_id: string }).revision_id);
     expect(metadata?.parents.map((parent) => parent.revision_id).sort()).toEqual([aRev, bRev, cRev].sort());
+    const branchBytes = [[aRev, aRaw], [bRev, bRaw], [cRev, cRaw]] as const;
+    const sha = (raw: string): string => createHash('sha256').update(raw, 'utf8').digest('hex');
+    expect([...(metadata?.parents ?? [])].sort((l, r) => (l.revision_id < r.revision_id ? -1 : 1)))
+      .toEqual(branchBytes.map(([revision, raw]) => ({ revision_id: revision, raw_hash: sha(raw) }))
+        .sort((l, r) => (l.revision_id < r.revision_id ? -1 : 1)));
+    for (const [revision, raw] of branchBytes) {
+      expect((await ground.store.readRevision(id, revision)).raw).toBe(raw);
+      expect((await ground.revisions.readRevision(id, revision)).raw).toBe(raw);
+      expect((await ground.revisions.readRevisionMetadata(id, revision)).parents)
+        .toEqual([{ revision_id: rootRev, raw_hash: rootHash }]);
+    }
     await expect(ground.store.readPath('Knowledge/B.md')).rejects.toBeDefined();
     await expect(ground.store.readPath('Knowledge/C.md')).rejects.toBeDefined();
     expect((await ground.store.readPath('Knowledge/Backlinks.md')).raw).toContain('[[Knowledge/A#Anchor|B]] and [[Knowledge/A#Anchor|C]]');
@@ -818,4 +839,285 @@ test('writes succeed while the model is disabled', async () => {
   } finally {
     await ground.dispose();
   }
+});
+
+function sha256(raw: string): string {
+  return createHash('sha256').update(raw, 'utf8').digest('hex');
+}
+
+async function seedAncestor(ground: Ground, id: string): Promise<{ revision_id: string; raw_hash: string }> {
+  const raw = `---\nid: ${id}\nbrain_schema_version: 2\ntype: note\nstatus: candidate\n---\n\n# root\n\nroot\n`;
+  const revision = randomUUID();
+  await ground.revisions.persistRevision(id, revision, raw);
+  await ground.revisions.persistRevisionMetadata({ id, revision_id: revision, parents: [], created_at: new Date().toISOString() });
+  return { revision_id: revision, raw_hash: sha256(raw) };
+}
+
+async function seedExternalHead(
+  ground: Ground,
+  id: string,
+  path: string,
+  raw: string,
+  parent: { revision_id: string; raw_hash: string }
+): Promise<string> {
+  const revision = randomUUID();
+  await ground.revisions.persistRevision(id, revision, raw);
+  await ground.revisions.persistRevisionMetadata({ id, revision_id: revision, parents: [parent], created_at: new Date().toISOString() });
+  const absolute = join(ground.vaultRoot, path);
+  await mkdir(dirname(absolute), { recursive: true });
+  await writeFile(absolute, raw);
+  await ground.revisions.bindCurrent(id, path, revision, sha256(raw));
+  return revision;
+}
+
+function forkRaw(id: string, marker: string): string {
+  return `---\nid: ${id}\nbrain_schema_version: 2\ntype: note\nstatus: candidate\n---\n\n# ${marker}\n\n${marker}\n`;
+}
+
+function resolveNote(body: string): NoteInput {
+  return { ...note('resolved', 'resolved'), content: { kind: 'note', summary: 'resolved', body_markdown: body } };
+}
+
+test('finalized requests replay and conflict after their project selector stops resolving', async () => {
+  const ground = await openGround();
+  const c = ctx();
+  try {
+    const captureRequest = { project: 'shared', idempotency_key: randomUUID(), note: note('Shared note', 'shared') };
+    const captured = await captureLocal(c, captureRequest, ground.deps);
+    const approveRequest = { project: 'shared', operation: {
+      action: 'approve' as const, idempotency_key: randomUUID(), id: captured.id,
+      expected_etag: captured.etag as string, rationale: 'shared approval'
+    } };
+    const approved = await reviewLocal(c, approveRequest, ground.deps);
+    const feedbackRequest = { scope: 'shared', idempotency_key: randomUUID(), id: captured.id,
+      revision_id: captured.revision_id as string, verdict: 'useful' as const, reason: 'shared feedback' };
+    const recorded = await feedbackLocal(c, feedbackRequest, ground.deps);
+    const config = ground.brain.config as unknown as { scopes: { id: string }[] };
+    config.scopes = config.scopes.filter((scope) => scope.id !== 'shared');
+    await restartGround(ground);
+    expect(() => ground.deps.projects.resolve('shared')).toThrow();
+
+    expect(await captureLocal(c, captureRequest, ground.deps)).toEqual(captured);
+    await expect(captureLocal(c, { ...captureRequest, note: note('Shared note', 'changed') }, ground.deps))
+      .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+    await expect(captureLocal(c, { ...captureRequest, idempotency_key: randomUUID() }, ground.deps))
+      .rejects.toMatchObject({ code: 'NOT_FOUND' });
+
+    expect(await reviewLocal(c, approveRequest, ground.deps)).toEqual(approved);
+    await expect(reviewLocal(c, { ...approveRequest, operation: { ...approveRequest.operation, rationale: 'changed' } }, ground.deps))
+      .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+    await expect(reviewLocal(c, { project: 'profile', operation: approveRequest.operation }, ground.deps))
+      .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+    await expect(reviewLocal(c, { project: 'renamed', operation: approveRequest.operation }, ground.deps))
+      .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+    await expect(reviewLocal(c, { ...approveRequest, operation: { ...approveRequest.operation, idempotency_key: randomUUID() } }, ground.deps))
+      .rejects.toMatchObject({ code: 'NOT_FOUND' });
+
+    expect(await feedbackLocal(c, feedbackRequest, ground.deps)).toEqual(recorded);
+    await expect(feedbackLocal(c, { ...feedbackRequest, reason: 'changed' }, ground.deps))
+      .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+    await expect(feedbackLocal(c, { ...feedbackRequest, idempotency_key: randomUUID() }, ground.deps))
+      .rejects.toMatchObject({ code: 'NOT_FOUND' });
+  } finally { await ground.dispose(); }
+});
+
+test('rejected planning releases the key and a pre-plan crash is released by recovery without effects', async () => {
+  const ground = await openGround();
+  const c = ctx();
+  try {
+    const captured = await captureLocal(c, { idempotency_key: randomUUID(), note: note('Released', 'released') }, ground.deps);
+    const staleKey = randomUUID();
+    await expect(reviewLocal(c, { operation: { action: 'approve', idempotency_key: staleKey, id: captured.id,
+      expected_etag: 'f'.repeat(64), rationale: 'stale' } }, ground.deps)).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(ground.operations.findByKey(staleKey)).toBeUndefined();
+    const retried = await reviewLocal(c, { operation: { action: 'approve', idempotency_key: staleKey, id: captured.id,
+      expected_etag: captured.etag as string, rationale: 'fresh' } }, ground.deps);
+    expect('outcome' in retried && retried.outcome).toBe('stored');
+
+    const relatedKey = randomUUID();
+    const target = await captureLocal(c, { idempotency_key: randomUUID(), note: note('Late target', 'target') }, ground.deps);
+    const revision = { operation: { action: 'revise' as const, idempotency_key: relatedKey, id: target.id,
+      expected_etag: target.etag as string, rationale: 'link', note: { ...note('Late target', 'linked'), related_ids: [randomUUID()] } } };
+    await expect(reviewLocal(c, revision, ground.deps)).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+    expect(ground.operations.findByKey(relatedKey)).toBeUndefined();
+
+    const replacement = await captureLocal(c, { idempotency_key: randomUUID(), note: note('Pending replacement', 'r') }, ground.deps);
+    const supersedeRequest = { operation: { action: 'supersede' as const, idempotency_key: randomUUID(), id: captured.id,
+      expected_etag: ground.catalogue.getById(captured.id)?.etag as string, rationale: 'replace',
+      replacement_id: replacement.id } };
+    await expect(reviewLocal(c, supersedeRequest, ground.deps)).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(ground.operations.findByKey(supersedeRequest.operation.idempotency_key)).toBeUndefined();
+    await reviewLocal(c, { operation: { action: 'approve', idempotency_key: randomUUID(), id: replacement.id,
+      expected_etag: replacement.etag as string, rationale: 'activate' } }, ground.deps);
+    const superseded = await reviewLocal(c, supersedeRequest, ground.deps);
+    expect('outcome' in superseded && superseded.outcome).toBe('stored');
+    expect(await reviewLocal(c, supersedeRequest, ground.deps)).toEqual(superseded);
+
+    const now = new Date().toISOString();
+    const crashedKey = randomUUID();
+    const crashed = ground.operations.reserve({ operation_id: randomUUID(), idempotency_key: crashedKey,
+      tool: 'brain_capture', action: 'capture', project_id: null, payload_hash: 'c'.repeat(64),
+      payload_json: '{}', created_at: now, updated_at: now });
+    const inProcessKey = randomUUID();
+    ground.operations.reserve({ operation_id: randomUUID(), idempotency_key: inProcessKey,
+      tool: 'brain_capture', action: 'capture', project_id: null, payload_hash: 'd'.repeat(64),
+      payload_json: '{}', created_at: now, updated_at: now });
+    const inProcess = await captureLocal(c, { idempotency_key: inProcessKey, note: note('In process', 'x') }, ground.deps);
+    expect(inProcess.outcome).toBe('stored');
+    const before = (await scanVaultFilePaths(ground.vaultRoot)).paths.slice().sort();
+    await restartGround(ground);
+    const report = await ground.deps.mutations.recover();
+    expect(report.blocking_operations).not.toContain(crashed.record.operation_id);
+    expect(ground.deps.mutations.status(crashed.record.operation_id)).toBeUndefined();
+    expect(ground.operations.findByKey(crashedKey)).toBeUndefined();
+    expect((await scanVaultFilePaths(ground.vaultRoot)).paths.slice().sort()).toEqual(before);
+    const afterCrash = await captureLocal(c, { idempotency_key: crashedKey, note: note('After crash', 'y') }, ground.deps);
+    expect(afterCrash.outcome).toBe('stored');
+    expect(await captureLocal(c, { idempotency_key: crashedKey, note: note('After crash', 'y') }, ground.deps)).toEqual(afterCrash);
+  } finally { await ground.dispose(); }
+});
+
+test('project-filtered status finds its own ensure operation across replay and restart', async () => {
+  const ground = await openGround();
+  const c = ctx();
+  try {
+    const request = { idempotency_key: randomUUID(), remote_url: 'https://github.com/example/status-filter.git' };
+    const ensured = await projectEnsureLocal(c, request, ground.deps);
+    expect(ground.operations.findById(ensured.operation_id)?.project_id).toBe(ensured.project_id);
+    for (const selector of [{ project: ensured.project_id }, { scope: ensured.project_id }, { project: ensured.repository_identity }]) {
+      expect((await localStatus(c, { ...selector, operation_id: ensured.operation_id }, ground.brain)).operation)
+        .toMatchObject({ operation_id: ensured.operation_id, project_id: ensured.project_id, created: true });
+    }
+    expect(await projectEnsureLocal(c, request, ground.deps)).toEqual(ensured);
+    await restartGround(ground);
+    expect((await localStatus(c, { project: ensured.project_id, operation_id: ensured.operation_id }, ground.brain)).operation)
+      .toMatchObject({ operation_id: ensured.operation_id, created: true });
+    await expect(localStatus(c, { project: 'shared', operation_id: ensured.operation_id }, ground.brain))
+      .rejects.toMatchObject({ code: 'NOT_FOUND' });
+
+    const identity = normalizeRepositoryIdentity('https://github.com/example/legacy-status.git');
+    const legacyProject = scopeCandidateForRepository(identity);
+    const legacyOperation = randomUUID();
+    const now = new Date().toISOString();
+    ground.operations.reserve({ operation_id: legacyOperation, idempotency_key: randomUUID(),
+      tool: 'brain_project_ensure', action: 'ensure', project_id: null,
+      payload_hash: 'e'.repeat(64), payload_json: '{}', created_at: now, updated_at: now });
+    ground.operations.update(legacyOperation, { plan_json: JSON.stringify({
+      kind: 'project_ensure', repository_identity: identity, project_id: legacyProject,
+      relative_root: 'Projects/Legacy-status', display_name: 'Legacy status',
+      created_by_actor_id: SYSTEM_ACTOR.id, created: true,
+      read_set: [{ kind: 'project', repository_identity: identity, expected: { kind: 'absent' } }]
+    }), updated_at: now });
+    await restartGround(ground);
+    await ground.deps.mutations.recover();
+    expect(ground.operations.findById(legacyOperation)?.payload_hash).toBe('e'.repeat(64));
+    expect((await localStatus(c, { project: legacyProject, operation_id: legacyOperation }, ground.brain)).operation)
+      .toMatchObject({ operation_id: legacyOperation, project_id: legacyProject });
+  } finally { await ground.dispose(); }
+});
+
+test('resolve fragments must be real anchors of the survivor, not text in code or link labels', async () => {
+  const ground = await openGround();
+  const c = ctx();
+  try {
+    const id = randomUUID();
+    const root = await seedAncestor(ground, id);
+    await seedExternalHead(ground, id, 'Knowledge/FA.md', forkRaw(id, 'fork A'), root);
+    await seedExternalHead(ground, id, 'Knowledge/FB.md', forkRaw(id, 'fork B'), root);
+    await writeFile(join(ground.vaultRoot, 'Knowledge/Refs.md'), '[[Knowledge/FB#^blk|block]] and [[Knowledge/FB#Hidden]]\n');
+    await refresh(ground);
+    const expected = (await ground.deps.mutations.enumerateConflictHeads(id))
+      .map((head) => ({ revision_id: head.revision_id, etag: head.etag }));
+    const attempt = (body: string, key = randomUUID()) => reviewLocal(c, { operation: {
+      action: 'resolve', idempotency_key: key, id, expected_heads: expected, rationale: 'anchors',
+      note: resolveNote(body) } }, ground.deps);
+    await expect(attempt('## Hidden\n\n```\ntext ^blk\n```\n')).rejects.toMatchObject({ code: 'CONFLICT' });
+    await expect(attempt('## Hidden\n\nsee `^blk`\n')).rejects.toMatchObject({ code: 'CONFLICT' });
+    await expect(attempt('## Hidden\n\n[label ^blk](https://example.com)\n')).rejects.toMatchObject({ code: 'CONFLICT' });
+    await expect(attempt('## Hidden\n\nsee [[Elsewhere#^blk]]\n')).rejects.toMatchObject({ code: 'CONFLICT' });
+    await expect(attempt('## Hidden\n\nsee [[Elsewhere|alias ^blk]]\n')).rejects.toMatchObject({ code: 'CONFLICT' });
+    await expect(attempt('```\n## Hidden\n```\n\ntext ^blk\n')).rejects.toMatchObject({ code: 'CONFLICT' });
+    await expect(attempt('Mention ^blk inline here\n\n## Hidden\n')).rejects.toMatchObject({ code: 'CONFLICT' });
+    const key = randomUUID();
+    const resolved = await attempt('## Hidden\n\nreal block ^blk\n', key);
+    expect('outcome' in resolved && resolved.outcome).toBe('stored');
+    expect((await ground.store.readPath('Knowledge/Refs.md')).raw)
+      .toBe('[[Knowledge/FA#^blk|block]] and [[Knowledge/FA#Hidden]]\n');
+  } finally { await ground.dispose(); }
+});
+
+test('resolve keeps the durable pre-conflict canonical path instead of the lexical first head', async () => {
+  const ground = await openGround();
+  const c = ctx();
+  try {
+    const id = randomUUID();
+    const canonical = 'Knowledge/Zed canonical.md';
+    const rootRaw = forkRaw(id, 'root');
+    const rootRevision = randomUUID();
+    const root = await ground.store.put({ path: canonical, raw: rootRaw, expectedEtag: null,
+      idempotencyKey: randomUUID(), source: 'seed', revisionId: rootRevision, parents: [] });
+    const zRaw = forkRaw(id, 'canonical branch');
+    const zRevision = randomUUID();
+    await ground.store.put({ path: canonical, raw: zRaw, expectedEtag: root.etag, idempotencyKey: randomUUID(),
+      source: 'seed', revisionId: zRevision, parents: [{ revision_id: rootRevision, raw_hash: sha256(rootRaw) }] });
+    const copyRaw = forkRaw(id, 'copied branch');
+    const copyRevision = await seedExternalHead(ground, id, 'Knowledge/Alpha copy.md', copyRaw,
+      { revision_id: rootRevision, raw_hash: sha256(rootRaw) });
+    await refresh(ground);
+    const heads = await ground.deps.mutations.enumerateConflictHeads(id);
+    expect(heads.map((head) => head.path).sort()).toEqual(['Knowledge/Alpha copy.md', canonical]);
+    expect(await ground.deps.mutations.selectSurvivorPath(id, heads)).toBe(canonical);
+    const result = await reviewLocal(c, { operation: { action: 'resolve', idempotency_key: randomUUID(), id,
+      expected_heads: heads.map((head) => ({ revision_id: head.revision_id, etag: head.etag })),
+      rationale: 'keep canonical', note: resolveNote('merged\n') } }, ground.deps);
+    expect('outcome' in result && result.outcome).toBe('stored');
+    expect((await ground.store.readPath(canonical)).raw).toContain('merged');
+    await expect(ground.store.readPath('Knowledge/Alpha copy.md')).rejects.toBeDefined();
+    expect((await ground.store.readRevision(id, copyRevision)).raw).toBe(copyRaw);
+    expect((await ground.store.readRevision(id, zRevision)).raw).toBe(zRaw);
+
+    const lexicalId = randomUUID();
+    const lexicalRoot = await seedAncestor(ground, lexicalId);
+    await seedExternalHead(ground, lexicalId, 'Knowledge/Zulu.md', forkRaw(lexicalId, 'zulu'), lexicalRoot);
+    await seedExternalHead(ground, lexicalId, 'Knowledge/Échelle.md', forkRaw(lexicalId, 'accent'), lexicalRoot);
+    await seedExternalHead(ground, lexicalId, 'Knowledge/alpha.md', forkRaw(lexicalId, 'lower'), lexicalRoot);
+    await refresh(ground);
+    const lexicalHeads = await ground.deps.mutations.enumerateConflictHeads(lexicalId);
+    expect(await ground.deps.mutations.selectSurvivorPath(lexicalId, lexicalHeads)).toBe('Knowledge/Zulu.md');
+  } finally { await ground.dispose(); }
+});
+
+test('revising a note whose body contains level-two headings leaves no stale generated text', async () => {
+  const ground = await openGround();
+  const c = ctx();
+  try {
+    const initial: NoteInput = { ...note('Headed body', 'headed'), content: { kind: 'note', summary: 'first summary',
+      body_markdown: '## Details\n\nold detail line\n\n## More\n\nold more line\n' } };
+    const captured = await captureLocal(c, { idempotency_key: randomUUID(), note: initial }, ground.deps);
+    const path = ground.catalogue.getById(captured.id)?.path as string;
+    const absolute = join(ground.vaultRoot, path);
+    const { readFile } = await import('node:fs/promises');
+    await writeFile(absolute, `${await readFile(absolute, 'utf8')}\n## Human notes\n\nmine stays\n`);
+    await refresh(ground);
+    const revise = async (body: string, summary: string): Promise<string> => {
+      await reviewLocal(c, { operation: { action: 'revise', idempotency_key: randomUUID(), id: captured.id,
+        expected_etag: ground.catalogue.getById(captured.id)?.etag as string, rationale: 'rewrite body',
+        note: { ...initial, content: { kind: 'note', summary, body_markdown: body } } } }, ground.deps);
+      await refresh(ground);
+      return (await ground.store.readPath(path)).raw;
+    };
+    const first = await revise('## Fresh\n\nnew line\n', 'second summary');
+    expect(first).toContain('new line');
+    expect(first).toContain('mine stays');
+    expect(first).not.toContain('old detail line');
+    expect(first).not.toContain('old more line');
+    expect(first).not.toContain('first summary');
+    expect(first.match(/## Human notes/g)).toHaveLength(1);
+    const second = await revise('## Final\n\nfinal line\n', 'third summary');
+    expect(second).toContain('final line');
+    expect(second).toContain('mine stays');
+    expect(second).not.toContain('new line');
+    expect(second).not.toContain('## Fresh');
+    expect(second).not.toContain('second summary');
+  } finally { await ground.dispose(); }
 });

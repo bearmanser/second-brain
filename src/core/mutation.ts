@@ -69,10 +69,15 @@ import type {
   LocalPlannedOperation,
   LocalReadCondition,
   LocalReadSet,
-  LocalRecoveryReport
+  LocalRecoveryReport,
+  NoteInput
 } from './types.js';
 
 const POLL_INTERVAL_MS = 20;
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
 const UNCERTAIN_WRITE_CODES = ['BACKEND_UNAVAILABLE', 'EMBEDDINGS_UNAVAILABLE', 'BACKEND_PROTOCOL_ERROR'] as const;
 const REVISION_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -1337,6 +1342,7 @@ export interface LocalDocumentExecutor {
   getConsolidationReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
   hasConsolidationManifest?(idempotencyKey: string): boolean;
   hasDocumentActivity?(idempotencyKey: string): boolean;
+  materializedPath?(id: string, revisionId: string): string | undefined;
   getConsolidationOperationId?(idempotencyKey: string): string | undefined;
   recover?(): Promise<{ recovered: string[]; pending: string[] }>;
   getDocumentReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
@@ -1456,17 +1462,81 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
   status(operation_id: string): LocalOperationStatus | undefined {
     const record = this.deps.operations.findById(operation_id);
     if (record === undefined) return undefined;
+    const receipt = record.receipt_json === null
+      ? undefined
+      : JSON.parse(record.receipt_json) as LocalOperationReceipt;
     const status: LocalOperationStatus = {
       operation_id: record.operation_id,
       tool: record.tool,
       action: record.action,
-      project_id: record.project_id,
+      project_id: record.project_id ?? this.ensuredProject(record, receipt),
       state: record.state
     };
-    if (record.receipt_json !== null) {
-      status.receipt = JSON.parse(record.receipt_json) as LocalOperationReceipt;
-    }
+    if (receipt !== undefined) status.receipt = receipt;
     return status;
+  }
+
+  private ensuredProject(
+    record: LocalOperationRecord,
+    receipt: LocalOperationReceipt | undefined
+  ): string | null {
+    if (record.tool !== 'brain_project_ensure') return null;
+    if (receipt?.kind === 'project_ensure') return receipt.project_id;
+    if (record.plan_json === null) return null;
+    try {
+      const plan = JSON.parse(record.plan_json) as { kind?: unknown; project_id?: unknown };
+      return plan.kind === 'project_ensure' && typeof plan.project_id === 'string' ? plan.project_id : null;
+    } catch {
+      return null;
+    }
+  }
+
+  latestGeneratedNote(id: string): NoteInput | undefined {
+    for (const record of this.deps.operations.listFinalizedForNote(id)) {
+      let request: { tool?: unknown; action?: unknown; payload?: { note?: unknown; id?: unknown } };
+      try {
+        request = JSON.parse(record.payload_json) as typeof request;
+      } catch {
+        return undefined;
+      }
+      const note = request.payload?.note;
+      if (note === undefined) continue;
+      if (typeof note !== 'object' || note === null) return undefined;
+      if (request.tool === 'brain_capture' ||
+          (request.tool === 'brain_review' && request.payload?.id === id &&
+            (request.action === 'revise' || request.action === 'resolve'))) {
+        return note as NoteInput;
+      }
+      return undefined;
+    }
+    return undefined;
+  }
+
+  async selectSurvivorPath(id: string, heads: readonly LocalConflictHead[]): Promise<string> {
+    if (heads.length === 0) throw localConflict(`note ${id} has no conflict heads`);
+    const ordered = [...heads].sort((left, right) => compareCodeUnits(left.path, right.path));
+    const fallback = ordered[0].path;
+    const materialized = this.deps.documents.materializedPath;
+    if (materialized === undefined || this.deps.revisions === undefined) return fallback;
+    const lineages = new Map<string, Set<string>>();
+    for (const head of heads) lineages.set(head.revision_id, await this.collectAncestors(id, head.revision_id));
+    const headRevisions = new Set(heads.map((head) => head.revision_id));
+    const all = [...lineages.values()];
+    const common = [...all[0]].filter((revision) =>
+      !headRevisions.has(revision) && all.every((lineage) => lineage.has(revision)));
+    const commonLineages = new Map<string, Set<string>>();
+    for (const revision of common) commonLineages.set(revision, await this.collectAncestors(id, revision));
+    const latest = common.filter((revision) => !common.some((other) =>
+      other !== revision && (commonLineages.get(other) as Set<string>).has(revision)));
+    const headPaths = new Set(heads.map((head) => head.path));
+    const recorded = new Set<string>();
+    for (const revision of latest) {
+      const path = materialized.call(this.deps.documents, id, revision);
+      if (path !== undefined) recorded.add(path);
+    }
+    if (recorded.size !== 1) return fallback;
+    const [path] = [...recorded];
+    return headPaths.has(path) ? path : fallback;
   }
 
   recover(): Promise<LocalRecoveryReport> {
@@ -1478,6 +1548,10 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
       let recovered = 0;
       let stillPending = 0;
       for (const record of pending) {
+        if (record.plan_json === null && this.releasable(record)) {
+          this.deps.operations.release(record.operation_id);
+          continue;
+        }
         if (record.plan_json === null) {
           this.deps.operations.update(record.operation_id, {
             state: 'recovery_required',
@@ -1531,38 +1605,91 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     });
   }
 
+  private replayIntent(intent: LocalOperationIntent, record: LocalOperationRecord): LocalOperationIntent {
+    const selection = intent.project_selection;
+    if (intent.tool !== 'brain_review' || selection === undefined) return intent;
+    if (record.project_selector !== undefined && record.project_selector === selection.selector) {
+      return { ...intent, project_id: record.project_id } as LocalOperationIntent;
+    }
+    let resolved: string | null | undefined;
+    try {
+      resolved = selection.resolve();
+    } catch {
+      resolved = undefined;
+    }
+    if (resolved !== undefined) return { ...intent, project_id: resolved } as LocalOperationIntent;
+    if (record.project_id !== null && selection.identifier === record.project_id) {
+      return { ...intent, project_id: record.project_id } as LocalOperationIntent;
+    }
+    throw new BrainError({
+      code: 'IDEMPOTENCY_CONFLICT',
+      message: `idempotency key ${intent.idempotency_key} was used for a different request`
+    });
+  }
+
+  private releasable(record: LocalOperationRecord): boolean {
+    return record.plan_json === null && record.receipt_json === null &&
+      (record.state === 'pending' || record.state === 'recovery_required') &&
+      this.deps.operations.listSubordinates(record.operation_id).length === 0 &&
+      this.deps.documents.hasDocumentActivity?.(record.idempotency_key) !== true;
+  }
+
+  private releaseQuietly(operationId: string): void {
+    try {
+      this.deps.operations.release(operationId);
+    } catch {
+      undefined;
+    }
+  }
+
   private async runSerialized(
     intent: LocalOperationIntent,
     prepare: () => Promise<LocalOperationPlan>
   ): Promise<LocalOperationReceipt> {
-    const request = canonicalRequest(intent);
     const existing = this.deps.operations.findByKey(intent.idempotency_key);
-    if (existing !== undefined) return this.replay(intent, existing, request.hash);
+    if (existing !== undefined && !(existing.plan_json === null && this.releasable(existing))) {
+      const replayed = this.replayIntent(intent, existing);
+      return this.replay(replayed, existing, canonicalRequest(replayed).hash);
+    }
+    if (existing !== undefined) this.deps.operations.release(existing.operation_id);
+    const selected = intent.project_selection === undefined
+      ? intent
+      : { ...intent, project_id: intent.project_selection.resolve() } as LocalOperationIntent;
+    const request = canonicalRequest(selected);
     const now = this.now();
     const reserved = this.deps.operations.reserve({
-      idempotency_key: intent.idempotency_key,
-      tool: intent.tool,
-      action: intent.action,
-      project_id: intent.project_id,
+      idempotency_key: selected.idempotency_key,
+      tool: selected.tool,
+      action: selected.action,
+      project_id: selected.project_id,
       payload_hash: request.hash,
       payload_json: request.json,
+      ...(intent.project_selection === undefined ? {} : { project_selector: intent.project_selection.selector }),
       created_at: now,
       updated_at: now
     }, () => this.deps.ids.next());
-    if (reserved.kind === 'replay') return this.replay(intent, reserved.record, request.hash);
+    if (reserved.kind === 'replay') return this.replay(selected, reserved.record, request.hash);
     const record = reserved.record;
-    const plan = await prepare();
-    const observed = await this.observe(intent);
-    const identity = this.allocate(record, intent, observed);
-    const planned = await plan(identity, observed);
-    this.assertPlanReadSet(planned);
-    await this.bindPlanToIntent(intent, planned);
+    let observed: LocalObservedState;
+    let planned: LocalPlannedOperation;
+    try {
+      const plan = await prepare();
+      observed = await this.observe(selected);
+      const identity = this.allocate(record, selected, observed);
+      planned = await plan(identity, observed);
+      this.assertPlanReadSet(planned);
+      await this.bindPlanToIntent(selected, planned);
+      this.assertNoPendingOverlap(record, planned);
+    } catch (error) {
+      this.releaseQuietly(record.operation_id);
+      throw error;
+    }
     this.deps.operations.update(record.operation_id, {
+      ...(planned.kind === 'project_ensure' ? { project_id: planned.project_id } : {}),
       plan_json: JSON.stringify(planned),
       storage_key: JSON.stringify(this.storageKeys(record.idempotency_key, planned)),
       updated_at: this.now()
     });
-    this.assertNoPendingOverlap(record, planned);
     await this.persistObservedHeads(planned, observed);
     try {
       await this.recheckPlan(planned);

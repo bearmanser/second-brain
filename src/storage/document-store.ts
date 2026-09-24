@@ -425,6 +425,7 @@ export interface DocumentStore {
   getConsolidationReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
   hasConsolidationManifest(idempotencyKey: string): boolean;
   hasDocumentActivity(idempotencyKey: string): boolean;
+  materializedPath(id: string, revisionId: string): string | undefined;
   getConsolidationOperationId(idempotencyKey: string): string | undefined;
   recallExclusions(): { paths: Set<string>; ids: Set<string> };
   getDocumentReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
@@ -789,6 +790,12 @@ class LocalDocumentStore implements DocumentStore {
 
   hasDocumentActivity(idempotencyKey: string): boolean {
     return this.journal.hasOperationWithPrefix(`${idempotencyKey}:`);
+  }
+
+  materializedPath(id: string, revisionId: string): string | undefined {
+    const record = this.journal.findByRevision(revisionId);
+    if (record === undefined || record.id !== id || record.state !== 'complete') return undefined;
+    return record.path;
   }
 
   getConsolidationOperationId(idempotencyKey: string): string | undefined {

@@ -254,10 +254,35 @@ export async function feedbackLocal(
   if (ctx.signal.aborted) throw new BrainError({ code: 'CANCELLED', message: 'the feedback was cancelled' });
   const request = parseRequest(input);
   assertNoCredentials(request.reason, 'reason');
+  const warning = UNRESOLVED_VERDICTS.includes(request.verdict)
+    ? FEEDBACK_WARNING_UNRESOLVED
+    : undefined;
+  const writeFor = (scope: string): Parameters<typeof deps.journal.recordFeedback>[0] => ({
+    principal_id: ctx.actor.id,
+    idempotency_key: request.idempotency_key,
+    scope,
+    logical_id: request.id,
+    revision_id: request.revision_id,
+    ...(request.retrieval_id === undefined ? {} : { retrieval_id: request.retrieval_id }),
+    ...(request.related_id === undefined ? {} : { related_id: request.related_id }),
+    verdict: request.verdict,
+    reason: request.reason,
+    ...(warning === undefined ? {} : { warning })
+  });
+  const known = deps.journal.idempotencyKeyProject(request.idempotency_key);
+  if (known !== undefined) {
+    const replay = deps.journal.replayFeedback(writeFor(known.project_id ?? 'brain'));
+    if (replay !== undefined) return { feedback_id: replay.entry.feedback_id, recorded: true };
+  }
+  const identifier = request.project ?? request.scope;
+  const selected = identifier === undefined ? undefined : deps.projects.resolve(identifier)?.id;
   await reconcileDeps(deps);
   const source = currentByReferenceDeps(deps, { id: request.id });
   if (source.id === undefined) {
     throw localNotFound(`note ${request.id} has no managed revision to record feedback against`);
+  }
+  if (selected !== undefined && scopeForPathDeps(deps, source.path) !== selected) {
+    throw new BrainError({ code: 'CONFLICT', message: `note ${request.id} is outside the selected project` });
   }
   try {
     await deps.documents.readRevision(source.id, request.revision_id);
@@ -267,20 +292,6 @@ export async function feedbackLocal(
     }
     throw error;
   }
-  const warning = UNRESOLVED_VERDICTS.includes(request.verdict)
-    ? FEEDBACK_WARNING_UNRESOLVED
-    : undefined;
-  const stored = deps.journal.recordFeedback({
-    principal_id: ctx.actor.id,
-    idempotency_key: request.idempotency_key,
-    scope: scopeForPathDeps(deps, source.path),
-    logical_id: source.id,
-    revision_id: request.revision_id,
-    ...(request.retrieval_id === undefined ? {} : { retrieval_id: request.retrieval_id }),
-    ...(request.related_id === undefined ? {} : { related_id: request.related_id }),
-    verdict: request.verdict,
-    reason: request.reason,
-    ...(warning === undefined ? {} : { warning })
-  });
+  const stored = deps.journal.recordFeedback(writeFor(scopeForPathDeps(deps, source.path)));
   return { feedback_id: stored.entry.feedback_id, recorded: true };
 }
