@@ -15,6 +15,8 @@ export interface OrderableCandidate {
   candidate_position: number;
   line_from: number;
   line_to: number;
+  start_offset: number;
+  end_offset: number;
   relevance_score?: number;
 }
 
@@ -38,17 +40,17 @@ export function selectDistinctCandidateChunks<T extends OrderableCandidate>(
   maxPerNote: number = DEFAULT_MAX_CANDIDATES_PER_NOTE
 ): T[] {
   const limit = Number.isFinite(maxPerNote) ? Math.max(0, Math.trunc(maxPerNote)) : candidates.length;
-  const keptByNote = new Map<string, Array<{ chunk_key: string; line_from: number; line_to: number }>>();
+  const keptByNote = new Map<string, Array<{ chunk_key: string; start_offset: number; end_offset: number }>>();
   const selected: T[] = [];
   for (const candidate of candidates) {
     const kept = keptByNote.get(candidate.document_key) ?? [];
     if (kept.some((entry) => entry.chunk_key === candidate.chunk_key)) continue;
     if (kept.length >= limit) continue;
     const overlaps = kept.some(
-      (entry) => candidate.line_from <= entry.line_to && entry.line_from <= candidate.line_to
+      (entry) => candidate.start_offset < entry.end_offset && entry.start_offset < candidate.end_offset
     );
     if (overlaps) continue;
-    kept.push({ chunk_key: candidate.chunk_key, line_from: candidate.line_from, line_to: candidate.line_to });
+    kept.push({ chunk_key: candidate.chunk_key, start_offset: candidate.start_offset, end_offset: candidate.end_offset });
     keptByNote.set(candidate.document_key, kept);
     selected.push(candidate);
   }

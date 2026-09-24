@@ -219,6 +219,8 @@ export async function rerankCandidates(input: RerankInput): Promise<RerankResult
       }),
       expired
     ]);
+    if (callerAborted()) return fallback('cancelled');
+    if (controller.signal.aborted || Date.now() >= deadlineAt) return fallback('timeout');
   } catch (error) {
     if (callerAborted()) return fallback('cancelled');
     if (controller.signal.aborted || error === deadlineError) return fallback('timeout');
