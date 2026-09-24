@@ -623,7 +623,12 @@ class BrainRuntimeImpl implements BrainRuntime {
     const syncIndex = (report: ReconcileCurrentVaultReport): void => {
       if (index === undefined) return;
       try {
-        indexReconciledDocuments({ catalogue: current, index, report });
+        indexReconciledDocuments({
+          catalogue: current,
+          index,
+          report,
+          partial: !this.indexCoversVault(report.scanned)
+        });
       } catch (error) {
         this.log(internalDiagnostic(error));
       }
@@ -653,6 +658,16 @@ class BrainRuntimeImpl implements BrainRuntime {
       if (!(isBrainError(error) && error.code === 'CANCELLED')) {
         this.log(internalDiagnostic(error));
       }
+    }
+  }
+
+  private indexCoversVault(scanned: number): boolean {
+    if (scanned > 0) return true;
+    try {
+      readdirSync(this.config.mounts.vault);
+      return true;
+    } catch {
+      return false;
     }
   }
 

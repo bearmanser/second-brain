@@ -2,7 +2,7 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { expect, test } from 'vitest';
 import { CurrentCatalogue, reconcileCurrentVault } from '../../src/notes/current-catalogue.js';
-import { indexReconciledDocuments } from '../../src/notes/reconcile.js';
+import { indexReconciledDocuments, type ReconcileCurrentVaultReport } from '../../src/notes/reconcile.js';
 import { openSearchIndex } from '../../src/storage/search-index.js';
 import { FileVault } from '../../src/storage/vault.js';
 import { vaultSandbox } from '../helpers/vault-sandbox.js';
@@ -330,6 +330,68 @@ test('a note deleted while the index is closed is pruned on restart', async () =
     secondCatalogue.close();
   } finally {
     await sandbox.dispose();
+  }
+});
+
+test('a malformed note on restart keeps its index entry while a deleted note is pruned', async () => {
+  const sandbox = await vaultSandbox();
+  const databasePath = join(sandbox.state, 'search.sqlite');
+  try {
+    await mkdir(join(sandbox.vault, 'Knowledge'), { recursive: true });
+    await writeFile(join(sandbox.vault, 'Knowledge', 'Keep.md'), '# Keep\n\nkeeper term\n');
+    await writeFile(join(sandbox.vault, 'Knowledge', 'Gone.md'), '# Gone\n\ngoner term\n');
+    const vault = new FileVault(sandbox.vault, []);
+    const firstCatalogue = CurrentCatalogue.open({});
+    const first = openSearchIndex(databasePath);
+    const firstReport = await reconcileCurrentVault({ vault, catalogue: firstCatalogue });
+    indexReconciledDocuments({ catalogue: firstCatalogue, index: first, report: firstReport });
+    expect(first.candidates({ query: 'keeper', limit: 10 })).toHaveLength(1);
+    expect(first.candidates({ query: 'goner', limit: 10 })).toHaveLength(1);
+    first.close();
+    firstCatalogue.close();
+
+    await writeFile(
+      join(sandbox.vault, 'Knowledge', 'Keep.md'),
+      '---\nid: not-a-uuid\n---\n\n# Keep\n\nkeeper term\n'
+    );
+    await rm(join(sandbox.vault, 'Knowledge', 'Gone.md'));
+
+    const secondCatalogue = CurrentCatalogue.open({});
+    const second = openSearchIndex(databasePath);
+    const secondReport = await reconcileCurrentVault({ vault, catalogue: secondCatalogue });
+    expect(secondReport.malformed.map((entry) => entry.path)).toContain('Knowledge/Keep.md');
+    indexReconciledDocuments({ catalogue: secondCatalogue, index: second, report: secondReport });
+    expect(second.candidates({ query: 'keeper', limit: 10 })).toHaveLength(1);
+    expect(second.candidates({ query: 'goner', limit: 10 })).toHaveLength(0);
+    second.close();
+    secondCatalogue.close();
+  } finally {
+    await sandbox.dispose();
+  }
+});
+
+test('an incomplete scan never prunes indexed entries', () => {
+  const index = openSearchIndex(':memory:');
+  const catalogue = CurrentCatalogue.open({});
+  try {
+    index.replaceDocument({ path: 'Knowledge/Stale.md', raw: '# Stale\n\nstale term\n', etag: 's' });
+    const emptyReport: ReconcileCurrentVaultReport = {
+      scanned: 0,
+      added: [],
+      changed: [],
+      moved: [],
+      removed: [],
+      malformed: [],
+      duplicate_ids: [],
+      unresolved_links: []
+    };
+    indexReconciledDocuments({ catalogue, index, report: emptyReport, partial: true });
+    expect(index.candidates({ query: 'stale', limit: 10 })).toHaveLength(1);
+    indexReconciledDocuments({ catalogue, index, report: emptyReport });
+    expect(index.candidates({ query: 'stale', limit: 10 })).toHaveLength(0);
+  } finally {
+    index.close();
+    catalogue.close();
   }
 });
 
