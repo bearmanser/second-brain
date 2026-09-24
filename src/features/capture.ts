@@ -19,6 +19,22 @@ import { requiredProject } from '../projects/registry.js';
 import { assertNoCredentials } from '../security/redact.js';
 import { validateRelatedIds } from './related.js';
 
+import { documentFromNote, renderDocument } from '../notes/document-codec.js';
+import { allocateNotePath } from '../notes/paths.js';
+import type {
+  AuthenticatedContext as LocalContext,
+  LocalHandlerDeps,
+  LocalOperationIntent,
+  LocalOperationPlan,
+  MutationReceipt as LocalMutationReceipt
+} from '../core/types.js';
+import {
+  mutationReceipt,
+  reconcileDeps,
+  sourceRefForDeps,
+  validateRelatedIdsLocal
+} from './local-support.js';
+
 const CAPTURE_TOOL = 'brain_capture';
 const DUPLICATE_PAGE_SIZE = 5;
 export const DUPLICATE_CHECK_UNAVAILABLE = 'duplicate_check_unavailable';
@@ -255,4 +271,91 @@ export async function capture(
   });
 
   return deps.mutations.commit(ctx, intent, build);
+}
+
+export const DUPLICATE_LOOKUP_LIMIT = 5;
+export const DUPLICATE_CHECK_UNAVAILABLE_LOCAL = 'duplicate_check_unavailable';
+
+function parseLocalCapture(input: CaptureRequest): CaptureRequest {
+  const parsed = captureRequestSchema.safeParse(input);
+  if (!parsed.success) {
+    const detail = parsed.error.issues
+      .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
+      .join('; ');
+    throw invalidInput(`capture request is invalid: ${detail}`);
+  }
+  return parsed.data;
+}
+
+export async function captureLocal(
+  ctx: LocalContext,
+  input: CaptureRequest,
+  deps: LocalHandlerDeps
+): Promise<LocalMutationReceipt> {
+  if (ctx.signal.aborted) throw new BrainError({ code: 'CANCELLED', message: 'the capture was cancelled' });
+  const request = parseLocalCapture(input);
+  const note = normalizeNote(request.note);
+  validateRelatedIdsLocal(note.related_ids, deps);
+  rejectCredentialText(note);
+  await reconcileDeps(deps);
+
+  const resolved = deps.projects.resolve(request.project ?? request.scope);
+  const directory = resolved?.relative_root ?? 'Inbox';
+  const occupied = deps.catalogue.all().map((source) => source.path);
+  const warnings: string[] = [];
+  let duplicates: LocalMutationReceipt['possible_duplicates'] = [];
+  try {
+    duplicates = deps.catalogue
+      .all()
+      .filter((source) => source.title.toLowerCase() === note.title.toLowerCase())
+      .slice(0, DUPLICATE_LOOKUP_LIMIT)
+      .map((source) => sourceRefForDeps(deps, source));
+  } catch {
+    warnings.push(DUPLICATE_CHECK_UNAVAILABLE_LOCAL);
+  }
+
+  const intent: LocalOperationIntent = {
+    tool: 'brain_capture',
+    action: 'capture',
+    project_id: resolved?.id ?? null,
+    idempotency_key: request.idempotency_key,
+    payload: request,
+    preconditions: {}
+  };
+  const plan: LocalOperationPlan = (identity) => {
+    if (identity.kind !== 'note') throw invalidInput('capture requires a note identity');
+    const path = allocateNotePath({ directory, title: note.title, occupied });
+    const now = deps.clock.now().toISOString();
+    const document = documentFromNote(note, {
+      path,
+      status: 'candidate',
+      ...(resolved === undefined ? {} : { project: `[[${resolved.relative_root}]]` }),
+      tags: note.tags,
+      created: now,
+      updated: now
+    });
+    return {
+      kind: 'note',
+      heads: [],
+      parents: [],
+      read_set: [{ kind: 'path', path, expected: { kind: 'absent' } }],
+      effects: [
+        {
+          kind: 'write',
+          write: {
+            path,
+            raw: renderDocument(document),
+            id: identity.note_id,
+            revision_id: identity.revision_id,
+            parents: []
+          }
+        }
+      ]
+    };
+  };
+  const result = await deps.mutations.run(intent, plan);
+  const receipt = mutationReceipt(result, warnings);
+  receipt.possible_duplicates = duplicates;
+  await reconcileDeps(deps);
+  return receipt;
 }

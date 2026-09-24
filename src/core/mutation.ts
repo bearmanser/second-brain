@@ -2234,8 +2234,9 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
         catch (error) {
           if (isBrainError(error) && error.code === 'NOT_FOUND') {
             parents = [];
+          } else {
+            throw error;
           }
-          throw error;
         }
       }
       heads.push({
@@ -2612,8 +2613,8 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
         project_id: plan.project_id,
         relative_root: plan.relative_root,
         created: plan.created,
-        materialized: false,
-        warnings: ['effect_not_applied']
+        materialized: true,
+        warnings: []
       };
       this.finalize(record, receipt, storageKey);
       return receipt;

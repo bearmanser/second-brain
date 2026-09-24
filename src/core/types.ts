@@ -598,6 +598,8 @@ export interface LocalMutationCoordinatorPort {
   run(intent: LocalOperationIntent, plan: LocalOperationPlan): Promise<LocalOperationReceipt>;
   status(operation_id: string): LocalOperationStatus | undefined;
   recover(): Promise<LocalRecoveryReport>;
+  enumerateConflictHeads(id: string): Promise<LocalConflictHead[]>;
+  verifyConflictHeads(id: string, expected: readonly LocalExpectedHead[]): Promise<void>;
 }
 
 export interface ResolvedProject {

@@ -21,6 +21,14 @@ import { validateRelatedIds } from './related.js';
 
 export { AUDIT_FIELDS, FEEDBACK_REASON_MAX_LENGTH } from '../storage/journal.js';
 
+import type { LocalHandlerDeps } from '../core/types.js';
+import {
+  currentByReferenceDeps,
+  notFound as localNotFound,
+  reconcileDeps,
+  scopeForPathDeps
+} from './local-support.js';
+
 export const FEEDBACK_TOOL = 'brain_feedback';
 export const FEEDBACK_WARNING_UNRESOLVED = 'unresolved_quality_concern';
 
@@ -235,4 +243,44 @@ export async function feedback(
     recordAudit(deps, ctx, 'rejected', started);
     throw error;
   }
+}
+
+
+export async function feedbackLocal(
+  ctx: AuthenticatedContext,
+  input: FeedbackRequest,
+  deps: LocalHandlerDeps
+): Promise<FeedbackResult> {
+  if (ctx.signal.aborted) throw new BrainError({ code: 'CANCELLED', message: 'the feedback was cancelled' });
+  const request = parseRequest(input);
+  assertNoCredentials(request.reason, 'reason');
+  await reconcileDeps(deps);
+  const source = currentByReferenceDeps(deps, { id: request.id });
+  if (source.id === undefined) {
+    throw localNotFound(`note ${request.id} has no managed revision to record feedback against`);
+  }
+  try {
+    await deps.documents.readRevision(source.id, request.revision_id);
+  } catch (error) {
+    if (isBrainError(error) && error.code === 'NOT_FOUND') {
+      throw localNotFound(`revision ${request.revision_id} of note ${request.id} does not exist`);
+    }
+    throw error;
+  }
+  const warning = UNRESOLVED_VERDICTS.includes(request.verdict)
+    ? FEEDBACK_WARNING_UNRESOLVED
+    : undefined;
+  const stored = deps.journal.recordFeedback({
+    principal_id: ctx.actor.id,
+    idempotency_key: request.idempotency_key,
+    scope: scopeForPathDeps(deps, source.path),
+    logical_id: source.id,
+    revision_id: request.revision_id,
+    ...(request.retrieval_id === undefined ? {} : { retrieval_id: request.retrieval_id }),
+    ...(request.related_id === undefined ? {} : { related_id: request.related_id }),
+    verdict: request.verdict,
+    reason: request.reason,
+    ...(warning === undefined ? {} : { warning })
+  });
+  return { feedback_id: stored.entry.feedback_id, recorded: true };
 }

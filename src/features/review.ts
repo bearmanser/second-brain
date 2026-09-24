@@ -18,6 +18,35 @@ import { requiredProject } from '../projects/registry.js';
 import { assertNoCredentials } from '../security/redact.js';
 import { validateRelatedIds } from './related.js';
 
+import {
+  documentFromNote,
+  parseDocument,
+  parseSources,
+  renderDocument,
+  reviseDocument
+} from '../notes/document-codec.js';
+import { contentKindForType, type CurrentDocument } from '../notes/document.js';
+import { collectRenameSnapshots, planRename } from '../notes/rename.js';
+import type {
+  AuthenticatedContext as LocalContext,
+  LocalExpectedHead,
+  LocalHandlerDeps,
+  LocalOperationIntent,
+  LocalOperationPlan,
+  LocalReferenceEdit,
+  LocalReadCondition,
+  MutationReceipt as LocalMutationReceipt,
+  NoteInput as LocalNoteInput,
+  ReviewListResult as LocalReviewListResult
+} from '../core/types.js';
+import {
+  currentByReferenceDeps,
+  invalidInput as localInvalidInput,
+  mutationReceipt,
+  reconcileDeps,
+  sourceRefForDeps
+} from './local-support.js';
+
 const REVIEW_TOOL = 'brain_review';
 const FACTUAL_KINDS: readonly string[] = ['lesson', 'fact', 'decision', 'playbook'];
 const STRUCTURAL_REASONS: readonly string[] = [
@@ -588,4 +617,419 @@ export async function review(
     case 'adopt':
       throw invalidInput('the legacy review path does not support move or adopt');
   }
+}
+
+
+function previousInputForRevision(base: CurrentDocument): LocalNoteInput {
+  return {
+    title: base.title,
+    tags: [...base.tags],
+    content: {
+      kind: 'note',
+      summary: base.title,
+      body_markdown: contentKindForType(base.type) === 'note' ? '' : base.body
+    },
+    evidence: [],
+    related_ids: []
+  };
+}
+
+function preservedDocument(
+  base: CurrentDocument,
+  note: LocalNoteInput,
+  status: CurrentDocument['status']
+): CurrentDocument {
+  const now = new Date().toISOString();
+  if (contentKindForType(base.type) === 'note') {
+    return reviseDocument(base, note, {
+      previous: previousInputForRevision(base),
+      meta: { status, updated: now }
+    });
+  }
+  return documentFromNote(note, {
+    path: base.path,
+    ...(base.id === undefined ? {} : { id: base.id }),
+    status,
+    ...(base.project === undefined ? {} : { project: base.project }),
+    aliases: base.aliases,
+    tags: base.tags,
+    created: base.created,
+    updated: now,
+    properties: base.properties
+  });
+}
+
+async function readDocument(deps: LocalHandlerDeps, path: string): Promise<CurrentDocument> {
+  const file = await deps.documents.readPath(path);
+  return parseDocument(file.raw, path);
+}
+
+function approveEvidenceOk(base: CurrentDocument): boolean {
+  const kind = contentKindForType(base.type);
+  if (!FACTUAL_KINDS.includes(kind)) return true;
+  const parsed = parseSources(base.body);
+  return parsed.evidence.some((entry) => entry.kind !== 'hypothesis');
+}
+
+function noteReadCondition(source: {
+  id: string;
+  path: string;
+  revision_id: string;
+  etag: string;
+}): LocalReadCondition {
+  return {
+    kind: 'note',
+    id: source.id,
+    expected: {
+      kind: 'present',
+      path: source.path,
+      revision_id: source.revision_id,
+      etag: source.etag
+    }
+  };
+}
+
+async function deriveReferenceEdits(
+  deps: LocalHandlerDeps,
+  logicalId: string,
+  absorbed: readonly string[],
+  survivor: string
+): Promise<LocalReferenceEdit[]> {
+  const files = await collectRenameSnapshots(deps.vaultRoot);
+  const removed = new Set(absorbed);
+  const merged = new Map<string, LocalReferenceEdit>();
+  for (const from of absorbed) {
+    const plan = planRename({
+      from,
+      to: survivor,
+      files,
+      idempotency_key: `resolve:${logicalId}:${from}`
+    });
+    const blocking = plan.conflicts.filter(
+      (entry) => !(entry.reason === 'target_occupied' && entry.path === survivor)
+    );
+    if (blocking.length > 0) {
+      throw conflict(`the resolution cannot rewrite references from ${from}`);
+    }
+    for (const unresolved of plan.unresolved) {
+      if (unresolved.path === survivor || unresolved.path === from) continue;
+      if (unresolved.reason === 'ambiguous') {
+        throw conflict(
+          `an ambiguous reference to ${from} in ${unresolved.path} blocks the resolution`
+        );
+      }
+    }
+    for (const edit of plan.edits) {
+      if (removed.has(edit.path) || edit.path === survivor) continue;
+      const existing = merged.get(edit.path);
+      if (existing !== undefined) {
+        if (existing.raw !== edit.raw) {
+          throw conflict(`references in ${edit.path} cannot be composed safely`);
+        }
+        continue;
+      }
+      const source = deps.catalogue.getByPath(edit.path);
+      merged.set(edit.path, {
+        path: edit.path,
+        expected_etag: edit.expected_hash,
+        raw: edit.raw,
+        ...(source?.id === undefined
+          ? {}
+          : {
+              managed: {
+                id: source.id,
+                revision_id: deps.ids.next(),
+                parents: []
+              }
+            })
+      });
+    }
+  }
+  return [...merged.values()];
+}
+
+async function resolvePlan(
+  deps: LocalHandlerDeps,
+  operation: Extract<ReviewRequest['operation'], { action: 'resolve' }>
+): Promise<LocalOperationPlan> {
+  const heads = await deps.mutations.enumerateConflictHeads(operation.id);
+  if (heads.length < 2) {
+    throw conflict(`note ${operation.id} does not have a resolvable fork`);
+  }
+  const expected = operation.expected_heads;
+  if (expected.length !== heads.length) {
+    throw conflict('resolve requires exactly the complete set of current conflict heads');
+  }
+  for (const head of expected) {
+    if (!heads.some((candidate) => candidate.revision_id === head.revision_id && candidate.etag === head.etag)) {
+      throw conflict('resolve requires exactly the complete set of current conflict heads');
+    }
+  }
+  await deps.mutations.verifyConflictHeads(operation.id, expected);
+  const ordered = [...heads].sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
+  const survivor = ordered[0];
+  const absorbed = ordered.slice(1);
+  const survivors = new Set([survivor.path]);
+  const removals = absorbed.map((head) => ({
+    kind: 'remove' as const,
+    path: head.path,
+    expected_id: operation.id,
+    expected_revision_id: head.revision_id,
+    expected_etag: head.etag
+  }));
+  const referenceEdits = await deriveReferenceEdits(
+    deps,
+    operation.id,
+    absorbed.map((head) => head.path),
+    survivor.path
+  );
+  const base = await readDocument(deps, survivor.path);
+  const parents = heads.map((head) => ({ revision_id: head.revision_id, raw_hash: head.etag }));
+  return (identity) => {
+    if (identity.kind !== 'note') throw localInvalidInput('resolve requires a note identity');
+    const document = preservedDocument(base, operation.note, 'candidate');
+    const resolved: CurrentDocument = { ...document, path: survivor.path };
+    const readSet: LocalReadCondition[] = [
+      {
+        kind: 'heads',
+        id: operation.id,
+        expected_heads: heads.map((head) => ({ revision_id: head.revision_id, etag: head.etag }))
+      },
+      ...heads.map((head) =>
+        noteReadCondition({ id: operation.id, path: head.path, revision_id: head.revision_id, etag: head.etag })
+      ),
+      ...referenceEdits.map((edit): LocalReadCondition => {
+        if (edit.managed !== undefined) {
+          const source = deps.catalogue.getByPath(edit.path);
+          return noteReadCondition({
+            id: edit.managed.id,
+            path: edit.path,
+            revision_id: source?.revision_id ?? source?.hash ?? edit.expected_etag,
+            etag: edit.expected_etag
+          });
+        }
+        return { kind: 'path', path: edit.path, expected: { kind: 'present', etag: edit.expected_etag } };
+      })
+    ];
+    return {
+      kind: 'note',
+      heads,
+      parents,
+      read_set: readSet as unknown as import('../core/types.js').LocalReadSet,
+      effects: [
+        {
+          kind: 'write',
+          write: {
+            path: survivor.path,
+            raw: renderDocument(resolved),
+            id: operation.id,
+            revision_id: identity.revision_id,
+            parents
+          }
+        },
+        ...removals
+      ],
+      reference_edits: referenceEdits
+    };
+  };
+}
+
+export async function reviewLocal(
+  ctx: LocalContext,
+  input: ReviewRequest,
+  deps: LocalHandlerDeps
+): Promise<LocalMutationReceipt | LocalReviewListResult> {
+  if (ctx.signal.aborted) throw new BrainError({ code: 'CANCELLED', message: 'the review was cancelled' });
+  const request = parseRequest(input);
+  await reconcileDeps(deps);
+  const operation = request.operation;
+  if (operation.action === 'list') {
+    const items = deps.catalogue
+      .all()
+      .filter((source) => (operation.filter === 'candidate' ? source.status === 'candidate' : false))
+      .map((source) => sourceRefForDeps(deps, source));
+    return { items };
+  }
+  if (operation.action === 'resolve') {
+    const plan = await resolvePlan(deps, operation);
+    const intent: LocalOperationIntent = {
+      tool: 'brain_review',
+      action: 'resolve',
+      project_id: null,
+      idempotency_key: operation.idempotency_key,
+      payload: operation,
+      preconditions: { id: operation.id, expected_heads: [...operation.expected_heads] }
+    };
+    const result = await deps.mutations.run(intent, plan);
+    await reconcileDeps(deps);
+    return mutationReceipt(result);
+  }
+  if (operation.action === 'move') {
+    const source = currentByReferenceDeps(deps, { id: operation.id });
+    if (source.id === undefined) throw conflict(`note ${operation.id} is unmanaged and cannot be moved`);
+    if (source.etag !== operation.expected_etag) {
+      throw conflict(`note ${operation.id} changed since the expected etag`);
+    }
+    const intent: LocalOperationIntent = {
+      tool: 'brain_review',
+      action: 'move',
+      project_id: null,
+      idempotency_key: operation.idempotency_key,
+      payload: operation,
+      preconditions: { id: operation.id, etag: operation.expected_etag, target_path: operation.target_path }
+    };
+    const plan: LocalOperationPlan = (identity) => {
+      if (identity.kind !== 'note') throw localInvalidInput('move requires a note identity');
+      return {
+        kind: 'note',
+        heads: [],
+        parents: [],
+        read_set: [
+          noteReadCondition({
+            id: source.id as string,
+            path: source.path,
+            revision_id: source.revision_id ?? source.hash,
+            etag: source.etag
+          }),
+          { kind: 'path', path: operation.target_path, expected: { kind: 'absent' } }
+        ],
+        effects: [{ kind: 'move', from_path: source.path, to_path: operation.target_path }]
+      };
+    };
+    const result = await deps.mutations.run(intent, plan);
+    await reconcileDeps(deps);
+    return mutationReceipt(result);
+  }
+  if (operation.action === 'adopt') {
+    const file = await deps.documents.readPath(operation.path);
+    if (file.etag !== operation.expected_etag) {
+      throw conflict(`path ${operation.path} changed since the expected etag`);
+    }
+    const parsed = parseDocument(file.raw, operation.path);
+    const intent: LocalOperationIntent = {
+      tool: 'brain_review',
+      action: 'adopt',
+      project_id: null,
+      idempotency_key: operation.idempotency_key,
+      payload: operation,
+      preconditions: { path: operation.path, etag: operation.expected_etag }
+    };
+    const plan: LocalOperationPlan = (identity) => {
+      if (identity.kind !== 'note') throw localInvalidInput('adopt requires a note identity');
+      const adopted = parsed.id === undefined ? { ...parsed, id: identity.note_id } : parsed;
+      return {
+        kind: 'note',
+        heads: [],
+        parents: [],
+        read_set: [
+          { kind: 'path', path: operation.path, expected: { kind: 'present', etag: operation.expected_etag } }
+        ],
+        effects: [
+          {
+            kind: 'write',
+            write: {
+              path: operation.path,
+              raw: renderDocument(adopted),
+              id: adopted.id as string,
+              revision_id: identity.revision_id,
+              parents: []
+            }
+          }
+        ]
+      };
+    };
+    const result = await deps.mutations.run(intent, plan);
+    await reconcileDeps(deps);
+    return mutationReceipt(result);
+  }
+  const source = currentByReferenceDeps(deps, { id: operation.id });
+  if (source.id === undefined) throw conflict(`note ${operation.id} is unmanaged`);
+  if (source.etag !== operation.expected_etag) {
+    throw conflict(`note ${operation.id} changed since the expected etag`);
+  }
+  const base = await readDocument(deps, source.path);
+  const intent: LocalOperationIntent = {
+    tool: 'brain_review',
+    action: operation.action,
+    project_id: null,
+    idempotency_key: operation.idempotency_key,
+    payload: operation,
+    preconditions: { id: operation.id, etag: operation.expected_etag }
+  } as LocalOperationIntent;
+  const plan: LocalOperationPlan = async (identity) => {
+    if (identity.kind !== 'note') throw localInvalidInput('review requires a note identity');
+    let document: CurrentDocument;
+    const readSet: LocalReadCondition[] = [
+      noteReadCondition({
+        id: source.id as string,
+        path: source.path,
+        revision_id: source.revision_id ?? source.hash,
+        etag: source.etag
+      })
+    ];
+    if (operation.action === 'approve') {
+      if (!approveEvidenceOk(base)) {
+        throw localInvalidInput('approval requires at least one non-hypothesis evidence item');
+      }
+      document = { ...base, status: 'active', updated: new Date().toISOString() };
+    } else if (operation.action === 'archive') {
+      document = { ...base, status: 'archived', updated: new Date().toISOString() };
+    } else if (operation.action === 'supersede') {
+      const replacement = deps.catalogue.getById(operation.replacement_id);
+      if (replacement === undefined) throw conflict('supersession requires an existing replacement');
+      if (replacement.status !== 'active') throw conflict('supersession requires an active replacement');
+      let cursor: string | undefined = operation.replacement_id;
+      const visited = new Set<string>([operation.id]);
+      while (cursor !== undefined) {
+        if (visited.has(cursor)) throw conflict('supersession would create a replacement cycle');
+        visited.add(cursor);
+        const heads = await deps.mutations.enumerateConflictHeads(cursor);
+        if (heads.length !== 1) {
+          throw conflict(`replacement ${cursor} has no unique durable current revision`);
+        }
+        const head = heads[0];
+        readSet.push(
+          noteReadCondition({
+            id: cursor,
+            path: head.path,
+            revision_id: head.revision_id,
+            etag: head.etag
+          })
+        );
+        const linkDocument = await readDocument(deps, head.path);
+        const next = linkDocument.properties.replacement_id;
+        cursor = typeof next === 'string' ? next : undefined;
+      }
+      document = {
+        ...base,
+        status: 'superseded',
+        updated: new Date().toISOString(),
+        properties: { ...base.properties, replacement_id: operation.replacement_id }
+      };
+    } else {
+      if (operation.action !== 'revise') throw localInvalidInput('unsupported review action');
+      document = preservedDocument(base, operation.note, 'candidate');
+    }
+    return {
+      kind: 'note',
+      heads: [],
+      parents: [],
+      read_set: readSet as unknown as import('../core/types.js').LocalReadSet,
+      effects: [
+        {
+          kind: 'write',
+          write: {
+            path: source.path,
+            raw: renderDocument(document),
+            id: source.id as string,
+            revision_id: identity.revision_id,
+            parents: []
+          }
+        }
+      ]
+    };
+  };
+  const result = await deps.mutations.run(intent, plan);
+  await reconcileDeps(deps);
+  return mutationReceipt(result);
 }

@@ -24,6 +24,14 @@ import {
 } from '../storage/legacy-project-adapter.js';
 import type { OperationRecord } from '../storage/journal.js';
 
+import type {
+  AuthenticatedContext as LocalContext,
+  LocalHandlerDeps,
+  LocalOperationIntent,
+  LocalOperationPlan
+} from '../core/types.js';
+import { recoveryRequired as localRecoveryRequired } from './local-support.js';
+
 const TOOL = 'brain_project_ensure';
 const WINDOW_MS = 60_000;
 
@@ -478,4 +486,114 @@ export async function recoverProjectOperation(
       reason: 'project_verification_inconclusive'
     };
   }
+}
+
+
+export async function projectEnsureLocal(
+  ctx: LocalContext,
+  input: ProjectEnsureRequest,
+  deps: LocalHandlerDeps
+): Promise<ProjectEnsureResult> {
+  const parsed = projectEnsureRequestSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new BrainError({ code: 'INVALID_INPUT', message: 'invalid project ensure request' });
+  }
+  const identity = normalizeRepositoryIdentity(parsed.data.remote_url);
+  const intent: LocalOperationIntent = {
+    tool: 'brain_project_ensure',
+    action: 'ensure',
+    project_id: null,
+    idempotency_key: parsed.data.idempotency_key,
+    payload: parsed.data,
+    preconditions: {}
+  };
+  const plan: LocalOperationPlan = (allocated) => {
+    if (allocated.kind !== 'project_ensure') {
+      throw localRecoveryRequired('project ensure requires a project-ensure identity');
+    }
+    const existing = deps.journal.getProjectByIdentity(identity);
+    if (existing !== undefined) {
+      if (existing.state !== 'ready') deps.journal.markProjectReady(existing.project.id);
+      const ready = deps.journal.getProjectById(existing.project.id) ?? existing;
+      return {
+        kind: 'project_ensure',
+        repository_identity: identity,
+        project_id: ready.project.id,
+        relative_root: ready.project.relative_root,
+        created: false,
+        read_set: [
+          {
+            kind: 'project',
+            repository_identity: identity,
+            expected: {
+              kind: 'present',
+              project_id: ready.project.id,
+              version: ready.updated_at
+            }
+          }
+        ]
+      };
+    }
+    const projectId = scopeCandidateForRepository(identity);
+    if (deps.journal.getProjectById(projectId) !== undefined) {
+      throw new BrainError({
+        code: 'CONFLICT',
+        message: `project ${projectId} is already bound to another repository`
+      });
+    }
+    const occupied = [
+      ...deps.journal.listProjects().map((project) => project.project.relative_root),
+      ...deps.config.scopes.map((scope) => scope.relative_root)
+    ];
+    const displayName = parsed.data.display_name ?? safeBasename(identity.split('/').at(-1) ?? identity);
+    const relativeRoot = allocateProjectRoot(displayName, occupied);
+    deps.journal.reserveProject({
+      repository_identity: identity,
+      project_id: projectId,
+      display_name: displayName,
+      relative_root: relativeRoot,
+      backend_project: projectId,
+      backend_relative_root: relativeRoot,
+      created_by_actor_id: ctx.actor.id,
+      creation_operation_id: allocated.operation_id
+    });
+    deps.journal.markProjectReady(projectId);
+    const ready = deps.journal.getProjectById(projectId);
+    if (ready === undefined) {
+      throw localRecoveryRequired('the reserved project could not be read back');
+    }
+    return {
+      kind: 'project_ensure',
+      repository_identity: identity,
+      project_id: projectId,
+      relative_root: ready.project.relative_root,
+      created: true,
+      read_set: [
+        {
+          kind: 'project',
+          repository_identity: identity,
+          expected: {
+            kind: 'present',
+            project_id: projectId,
+            version: ready.updated_at
+          }
+        }
+      ]
+    };
+  };
+  const result = await deps.mutations.run(intent, plan);
+  if (result.kind !== 'project_ensure') {
+    throw localRecoveryRequired('project ensure returned a non-project receipt');
+  }
+  return {
+    operation_id: result.operation_id,
+    repository_identity: result.repository_identity,
+    scope: result.project_id,
+    project_id: result.project_id,
+    relative_root: result.relative_root,
+    created: result.created,
+    backend_ready: false,
+    materialized: result.materialized,
+    warnings: result.warnings
+  };
 }
