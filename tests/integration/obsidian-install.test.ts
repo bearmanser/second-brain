@@ -6,10 +6,13 @@ import type { BrainConfig } from '../../src/config/schema.js';
 import type { AuthenticatedContext, LocalHandlerDeps } from '../../src/core/types.js';
 import { SYSTEM_ACTOR } from '../../src/core/types.js';
 import { runCli } from '../../src/cli.js';
+import { captureLocal } from '../../src/features/capture.js';
 import { projectEnsureLocal } from '../../src/features/project-ensure.js';
 import { buildLocalHandlerDeps, type LocalBrain } from '../../src/features/local-support.js';
 import { CurrentCatalogue, reconcileCurrentVault } from '../../src/notes/current-catalogue.js';
+import { parseDocument } from '../../src/notes/document-codec.js';
 import { installObsidianAssets } from '../../src/obsidian/install.js';
+import { projectHubPath, projectProperty } from '../../src/projects/hub.js';
 import { openDocumentStore, type DocumentStore } from '../../src/storage/document-store.js';
 import { Journal, LocalOperationJournal } from '../../src/storage/journal.js';
 import { openRevisionStore, type RevisionStore } from '../../src/storage/revision-store.js';
@@ -209,6 +212,58 @@ test('project ensure generates a readable project page that embeds the project b
     const source = ground.deps.catalogue.all().find((entry) => entry.path === pagePath);
     expect(source?.id).toBeUndefined();
     expect(source?.title).toBe('Læring prosjekt');
+  } finally {
+    await ground.dispose();
+  }
+});
+
+test('captured project notes use the canonical hub link that the project view compares', async () => {
+  const ground = await openGround();
+  try {
+    await installObsidianAssets({ vault: ground.vaultRoot, mode: 'create-only' });
+    const project = await projectEnsureLocal(
+      ctx(),
+      {
+        idempotency_key: randomUUID(),
+        remote_url: 'https://github.com/example/hub-link.git',
+        display_name: 'Læring prosjekt'
+      },
+      ground.deps
+    );
+    const relativeRoot = project.relative_root as string;
+    const capture = await captureLocal(
+      ctx(),
+      {
+        project: project.project_id,
+        idempotency_key: randomUUID(),
+        note: {
+          title: 'Hub link note',
+          tags: [],
+          content: { kind: 'note', summary: 'hub', body_markdown: '# Hub link note\n' },
+          evidence: [],
+          related_ids: []
+        }
+      },
+      ground.deps
+    );
+    const path = ground.deps.catalogue.getById(capture.id)?.path;
+    expect(path).toBeTruthy();
+    const document = parseDocument(
+      await readFile(join(ground.vaultRoot, path as string), 'utf8'),
+      path as string
+    );
+    const expectedProperty = projectProperty(relativeRoot);
+    expect(expectedProperty).toBe('[[Projects/Læring prosjekt/Læring prosjekt]]');
+    expect(document.project).toBe(expectedProperty);
+
+    const hubRelative = projectHubPath(relativeRoot);
+    expect(await existsIn(ground.vaultRoot, hubRelative)).toBe(true);
+    expect(expectedProperty.slice(2, -2)).toBe(
+      hubRelative.slice(0, hubRelative.length - '.md'.length)
+    );
+
+    const base = await readFile(join(ground.vaultRoot, 'Views/Project notes.base'), 'utf8');
+    expect(base).toContain('note.project == this.file.asLink()');
   } finally {
     await ground.dispose();
   }

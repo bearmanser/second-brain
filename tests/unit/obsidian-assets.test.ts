@@ -5,6 +5,7 @@ import { expect, test } from 'vitest';
 import { parse as parseYaml } from 'yaml';
 import { extractLinks } from '../../src/notes/links.js';
 import { projectIndexDocument, projectIndexPath } from '../../src/obsidian/project-index.js';
+import { projectHubPath, projectProperty } from '../../src/projects/hub.js';
 
 const ASSETS = fileURLToPath(new URL('../../src/obsidian/assets', import.meta.url));
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
@@ -236,4 +237,19 @@ test('project index paths preserve Unicode and avoid an opaque identifier fallba
   const colliding = { id: 'x', display_name: 'CON', relative_root: 'Projects/CON_' };
   expect(projectIndexPath(colliding)).not.toBe('Projects/CON_/CON.md');
   expect(colliding.relative_root).toBe('Projects/CON_');
+});
+
+test('project page basenames reserve the extension and stay within 100 bytes', () => {
+  const longName = 'Æ'.repeat(60);
+  const project = { id: 'long-name', display_name: longName, relative_root: `Projects/${longName}` };
+  const path = projectIndexPath(project);
+  const basename = path.slice(path.lastIndexOf('/') + 1);
+  expect(basename.endsWith('.md')).toBe(true);
+  expect(Buffer.byteLength(basename, 'utf8')).toBeLessThanOrEqual(100);
+  expect(Buffer.from(basename, 'utf8').toString('utf8')).toBe(basename);
+  expect(path).not.toMatch(UUID);
+  expect(path).toBe(projectHubPath(project.relative_root));
+  expect(projectIndexDocument(project, { today: '2026-09-24' })).toContain(
+    `project: "${projectProperty(project.relative_root)}"`
+  );
 });

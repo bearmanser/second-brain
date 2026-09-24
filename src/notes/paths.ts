@@ -91,6 +91,13 @@ export function safeBasename(title: string): string {
   return fittedStem(cleaned, BASENAME_MAX_BYTES) ?? 'Note';
 }
 
+export function safeNoteFilename(title: string): string {
+  const stem = safeBasename(title);
+  const maxStem = BASENAME_MAX_BYTES - NOTE_EXTENSION.length;
+  const fitted = fittedStem(stem, maxStem) ?? 'Note';
+  return `${fitted}${NOTE_EXTENSION}`;
+}
+
 function assertSafeDirectory(directory: string): string {
   if (typeof directory !== 'string' || directory.length === 0) {
     throw invalidInput('a vault directory must be a non-empty relative path');

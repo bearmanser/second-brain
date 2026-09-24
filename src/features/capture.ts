@@ -15,6 +15,7 @@ import type {
   StoredRevision
 } from '../core/types.js';
 import { decodeRevision, makeEtag } from '../notes/codec.js';
+import { projectProperty } from '../projects/hub.js';
 import { requiredProject } from '../projects/registry.js';
 import { assertNoCredentials } from '../security/redact.js';
 import { validateRelatedIds } from './related.js';
@@ -341,7 +342,7 @@ export async function captureLocal(
         ...(note.type === undefined ? {} : { type: note.type }),
         ...(note.source === undefined ? {} : { properties: { source: note.source } }),
         status: 'candidate',
-        ...(resolved === undefined ? {} : { project: `[[${resolved.relative_root}]]` }),
+        ...(resolved === undefined ? {} : { project: projectProperty(resolved.relative_root) }),
         tags: note.tags,
         created: now,
         updated: now

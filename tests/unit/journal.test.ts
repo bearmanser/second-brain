@@ -340,6 +340,28 @@ test('retains explicit operational-loss acknowledgement until real history begin
   journal.close();
 });
 
+test('a persisted project alone counts as durable operational history', () => {
+  const journal = Journal.open(':memory:');
+  try {
+    expect(journal.hasOperationalHistory()).toBe(false);
+    journal.acknowledgeOperationalLoss();
+    expect(journal.hasOperationalLossAcknowledgement()).toBe(true);
+    journal.reserveProject({
+      repository_identity: 'github.com/bearmanser/project-history',
+      project_id: 'project-history',
+      display_name: 'Project history',
+      relative_root: 'Projects/Project history',
+      created_by_actor_id: 'actor-history',
+      creation_operation_id: fixtureIds.idempotencyKey
+    });
+    expect(journal.hasOperationalHistory()).toBe(true);
+    expect(journal.hasOperationalLossAcknowledgement()).toBe(false);
+    expect(() => journal.acknowledgeOperationalLoss()).toThrow(/history exists/);
+  } finally {
+    journal.close();
+  }
+});
+
 test('uses injected deterministic providers and random UUID defaults', () => {
   const clock = new TestClock('2026-09-20T12:34:56.000Z');
   const journal = Journal.open(':memory:', { clock, ids: new SequenceIds('op') });

@@ -1,5 +1,6 @@
 import { lstatSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { projectHubPath, projectProperty } from '../projects/hub.js';
 
 export interface ProjectIndexInput {
   id: string;
@@ -15,8 +16,7 @@ export interface ProjectIndexOptions {
 export type ProjectIndexWrite = 'created' | 'unchanged' | 'conflict';
 
 export function projectIndexPath(project: ProjectIndexInput): string {
-  const stem = project.relative_root.split('/').filter((segment) => segment.length > 0).at(-1);
-  return `${project.relative_root}/${stem ?? 'Project'}.md`;
+  return projectHubPath(project.relative_root);
 }
 
 export function projectIndexDocument(
@@ -24,12 +24,11 @@ export function projectIndexDocument(
   options: ProjectIndexOptions = {}
 ): string {
   const today = options.today ?? new Date().toISOString().slice(0, 10);
-  const link = projectIndexPath(project).replace(/\.md$/, '');
   return [
     '---',
     'type: project',
     'status: active',
-    `project: "[[${link}]]"`,
+    `project: "${projectProperty(project.relative_root)}"`,
     `created: ${today}`,
     `updated: ${today}`,
     'aliases: []',

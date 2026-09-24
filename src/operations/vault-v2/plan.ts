@@ -12,6 +12,7 @@ import { extractLinks, isExternalTarget, type LinkReference } from '../../notes/
 import { resolveLink, type LinkCatalogue } from '../../notes/link-resolver.js';
 import { allocateNotePath, allocateProjectRoot, collisionKey } from '../../notes/paths.js';
 import { KIND_FOLDERS } from '../../notes/registry.js';
+import { projectHubPath, projectProperty } from '../../projects/hub.js';
 import { hasBrainMarker, readBoundedBytes } from '../../storage/vault.js';
 import { revisionLocation } from '../../storage/revision-store.js';
 import {
@@ -693,15 +694,7 @@ function blocker(
   return { kind, reason, ...extra };
 }
 
-export function projectHubPath(projectRoot: string): string {
-  const leaf = projectRoot.slice(projectRoot.lastIndexOf('/') + 1);
-  return `${projectRoot}/${leaf}.md`;
-}
-
-function projectProperty(projectRoot: string): string {
-  const leaf = projectRoot.slice(projectRoot.lastIndexOf('/') + 1);
-  return `[[${projectRoot}/${leaf}]]`;
-}
+export { projectHubPath };
 
 export function effectiveLifecycle(revision: StoredRevision): Lifecycle {
   const approval = revision.approval;
