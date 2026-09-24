@@ -5,7 +5,7 @@ import {
   RECALL_BUDGET_TOKENS_MIN,
   TOOL_RESULT_MAX_BYTES
 } from '../core/limits.js';
-import type { RecallResult } from '../core/types.js';
+import type { RecallMode, RecallResult } from '../core/types.js';
 import type { ResultDelivery } from '../config/schema.js';
 import { modelVisibleRepresentation, toolResultByteLength } from '../mcp/tools.js';
 
@@ -37,7 +37,7 @@ export function clampRecallBudget(value: number | undefined): number {
 
 export interface RecallMetadata {
   retrieval_id: string;
-  mode: 'hybrid' | 'text';
+  mode: RecallMode;
   partial: boolean;
   warnings: string[];
 }

@@ -16,6 +16,7 @@ import type {
   AuthenticatedContext,
   BackendHit,
   Head,
+  LocalHandlerDeps,
   NoteInput,
   NoteKind,
   ProjectFilter,
@@ -25,11 +26,24 @@ import type {
   SourceRef,
   StoredRevision
 } from '../core/types.js';
+import {
+  LEGACY_SHARED_CATEGORY,
+  normalizeRecallMode,
+  normalizeRecallScope
+} from '../contracts/compatibility.js';
 import { decodeRevision } from '../notes/codec.js';
 import { NOTE_REGISTRY } from '../notes/registry.js';
 import { projectFilter } from '../projects/registry.js';
 import { clampRecallBudget, packRecall } from '../retrieval/budget.js';
+import { GRAPH_NEIGHBOR_LIMIT, GRAPH_SEED_LIMIT } from '../retrieval/graph.js';
+import {
+  rerankCandidates,
+  RerankerUnavailableError,
+  selectFinalCandidates,
+  type RerankedCandidate
+} from '../retrieval/reranker.js';
 import { phaseKinds, rankEligible, type EligibleHit } from '../retrieval/rank.js';
+import { reconcileRetrievalDeps, sourceRefManaged } from './local-support.js';
 
 export const RECALL_WARNING_SEARCH_TRUNCATED = 'search_truncated';
 export const RECALL_WARNING_HIT_UNRESOLVED = 'hit_unresolved';
@@ -723,4 +737,226 @@ export async function recallTraced(
   deps: BrainDeps
 ): Promise<RecallTrace> {
   return runRecall(ctx, input, deps);
+}
+
+export const RECALL_WARNING_INDEX_LAG = 'index_lag';
+
+const LOCAL_CANDIDATE_LIMIT = 50;
+const LOCAL_RERANK_LIMIT = 30;
+
+function localRecallCancelled(): BrainError {
+  return new BrainError({ code: 'CANCELLED', message: 'the recall was cancelled' });
+}
+
+function localRecallInvalid(message: string): BrainError {
+  return new BrainError({ code: 'INVALID_INPUT', message });
+}
+
+function parseLocalRecall(input: RecallRequest): RecallRequest {
+  const parsed = recallRequestSchema.safeParse(input);
+  if (!parsed.success) {
+    const detail = parsed.error.issues
+      .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
+      .join('; ');
+    throw localRecallInvalid(`recall request is invalid: ${detail}`);
+  }
+  return parsed.data as RecallRequest;
+}
+
+function localStatuses(request: RecallRequest): string[] {
+  const statuses = ['active'];
+  if (request.include_candidates === true) statuses.push('candidate');
+  if (request.include_superseded === true) statuses.push('superseded');
+  if (request.include_archived === true) statuses.push('archived');
+  return statuses;
+}
+
+interface LocalGraphEdge {
+  source: string;
+  target: string;
+  relationship: string;
+}
+
+function graphEdgeReason(
+  edges: readonly LocalGraphEdge[],
+  neighbor: { document_key: string; relationship: string; direction: 'outgoing' | 'incoming' },
+  seeds: readonly string[]
+): string | undefined {
+  for (const seed of seeds) {
+    const match = edges.find((edge) => {
+      if (edge.relationship !== neighbor.relationship) return false;
+      return neighbor.direction === 'outgoing'
+        ? edge.source === seed && edge.target === neighbor.document_key
+        : edge.target === seed && edge.source === neighbor.document_key;
+    });
+    if (match !== undefined) return `graph_edge:${neighbor.direction}:${seed}`;
+  }
+  return undefined;
+}
+
+export async function recallLocal(
+  ctx: AuthenticatedContext,
+  input: RecallRequest,
+  deps: LocalHandlerDeps
+): Promise<RecallResult> {
+  if (ctx.signal.aborted) throw localRecallCancelled();
+  const request = parseLocalRecall(input);
+  const scope = normalizeRecallScope(request, {
+    canonicalId: (identifier) => deps.projects.canonicalId(identifier)
+  });
+  const modeInfo = normalizeRecallMode(request.mode);
+  const warnings = [...scope.warnings, ...modeInfo.warnings];
+  const projectId = scope.filter.mode === 'project' ? scope.filter.identifier : undefined;
+  const projectRoots: string[] = [];
+  if (projectId !== undefined) {
+    const resolved = deps.projects.resolve(projectId);
+    if (resolved !== undefined) projectRoots.push(resolved.relative_root);
+    if (scope.selected_shared) {
+      const shared = deps.projects.resolve(LEGACY_SHARED_CATEGORY);
+      if (shared !== undefined && shared.id !== projectId) projectRoots.push(shared.relative_root);
+    }
+  }
+  const limit = request.limit ?? RECALL_LIMIT_DEFAULT;
+  const types = request.kinds ?? [];
+  const statuses = localStatuses(request);
+
+  const reconciled = await reconcileRetrievalDeps(deps);
+  if (reconciled.index_failed || reconciled.pending_index > 0) {
+    if (!warnings.includes(RECALL_WARNING_INDEX_LAG)) warnings.push(RECALL_WARNING_INDEX_LAG);
+  }
+  if (ctx.signal.aborted) throw localRecallCancelled();
+
+  const filters = {
+    ...(types.length === 0 ? {} : { types }),
+    statuses,
+    ...(projectId === undefined ? {} : { project: projectId }),
+    ...(projectRoots.length === 0 ? {} : { project_roots: projectRoots })
+  };
+  const candidates = deps.index.candidates({
+    query: request.query,
+    limit: LOCAL_CANDIDATE_LIMIT,
+    ...filters
+  });
+
+  if (request.expand_graph === true) {
+    const seeds = [...new Set(candidates.slice(0, GRAPH_SEED_LIMIT).map((candidate) => candidate.document_key))];
+    const expansion = deps.index.expandGraph(seeds, { ...filters, query: request.query }, GRAPH_NEIGHBOR_LIMIT);
+    const knownChunks = new Set(candidates.map((candidate) => candidate.chunk_key));
+    const knownDocuments = new Set(candidates.map((candidate) => candidate.document_key));
+    for (const neighbor of expansion.neighbors) {
+      if (knownChunks.has(neighbor.chunk.chunk_key) || knownDocuments.has(neighbor.document_key)) continue;
+      const edgeReason = graphEdgeReason(expansion.edges, neighbor, seeds);
+      candidates.push({
+        ...neighbor.chunk,
+        lexical_rank: null,
+        candidate_position: 0,
+        reasons: [neighbor.reason, ...(edgeReason === undefined ? [] : [edgeReason])]
+      });
+      knownChunks.add(neighbor.chunk.chunk_key);
+      knownDocuments.add(neighbor.document_key);
+    }
+  }
+
+  let ordered: RerankedCandidate[] = candidates;
+  let executed = modeInfo.executed;
+  if (executed === 'reranked') {
+    if (deps.worker === undefined) {
+      if (request.allow_text_fallback === false) {
+        throw new BrainError({
+          code: 'EMBEDDINGS_UNAVAILABLE',
+          message: 'reranking is unavailable and lexical fallback is disabled'
+        });
+      }
+      executed = 'text';
+      warnings.push('reranker_unavailable:disabled');
+    } else if (candidates.length > 0) {
+      try {
+        const result = await rerankCandidates({
+          query: request.query,
+          candidates: candidates.slice(0, LOCAL_RERANK_LIMIT),
+          worker: deps.worker,
+          allowFallback: request.allow_text_fallback !== false,
+          signal: ctx.signal
+        });
+        ordered = result.items;
+        executed = result.mode;
+        warnings.push(...result.warnings);
+      } catch (error) {
+        if (error instanceof RerankerUnavailableError) {
+          throw new BrainError({
+            code: 'EMBEDDINGS_UNAVAILABLE',
+            message: 'reranking is unavailable and lexical fallback is disabled',
+            cause: error
+          });
+        }
+        throw error;
+      }
+    }
+  }
+  if (ctx.signal.aborted) throw localRecallCancelled();
+
+  const excluded = deps.documents.recallExclusions();
+  const affected = deps.mutations.pendingAffected();
+  for (const id of affected.ids) excluded.ids.add(id);
+  for (const path of affected.paths) excluded.paths.add(path);
+
+  const selected = selectFinalCandidates(ordered, {
+    maxItems: limit,
+    isEligible: (candidate) => {
+      if (excluded.paths.has(candidate.path) || excluded.ids.has(candidate.id ?? '')) return false;
+      const source = deps.catalogue.getByPath(candidate.path);
+      if (source === undefined) return false;
+      return statuses.includes(source.status);
+    },
+    currentHash: (candidate) => deps.catalogue.getByPath(candidate.path)?.hash
+  });
+
+  const items: (SourceRef & { excerpt: string; reasons: string[] })[] = [];
+  let staleExcluded = false;
+  for (const candidate of selected) {
+    if (excluded.paths.has(candidate.path) || excluded.ids.has(candidate.id ?? '')) continue;
+    const source = deps.catalogue.getByPath(candidate.path);
+    if (source === undefined || source.hash !== candidate.source_hash) {
+      staleExcluded = true;
+      continue;
+    }
+    let file: { raw: string; etag: string };
+    try {
+      file = await deps.documents.readPath(candidate.path);
+    } catch {
+      staleExcluded = true;
+      continue;
+    }
+    if (file.etag !== source.hash) {
+      staleExcluded = true;
+      continue;
+    }
+    const itemWarnings: string[] = [];
+    if (source.status === 'superseded' && request.include_superseded === true) itemWarnings.push('superseded');
+    if (source.status === 'archived' && request.include_archived === true) itemWarnings.push('archived');
+    items.push({
+      ...sourceRefManaged(deps, source, itemWarnings),
+      excerpt: candidate.text,
+      heading: candidate.heading,
+      start_line: candidate.line_from,
+      end_line: candidate.line_to,
+      reasons: [...candidate.reasons]
+    });
+  }
+  if (staleExcluded && !warnings.includes(RECALL_WARNING_STALE_HITS_EXCLUDED)) {
+    warnings.push(RECALL_WARNING_STALE_HITS_EXCLUDED);
+  }
+
+  const budgetLimit = clampRecallBudget(request.budget_tokens);
+  return packRecall(
+    items,
+    {
+      retrieval_id: deps.ids.next(),
+      mode: executed,
+      partial: staleExcluded,
+      warnings
+    },
+    budgetLimit,
+    deps.config.result_delivery
+  );
 }

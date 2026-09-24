@@ -1,14 +1,22 @@
+import { readFileSync } from 'node:fs';
 import { BrainError } from '../contracts/errors.js';
 import type { BrainConfig } from '../config/schema.js';
 import {
   reconcileCurrentVault,
   type CurrentCatalogue,
   type CurrentSource,
-  type CurrentVault
+  type CurrentVault,
+  type ReconcileCurrentVaultReport
 } from '../notes/current-catalogue.js';
 import { contentKindForType } from '../notes/document.js';
 import { indexReconciledDocuments } from '../notes/reconcile.js';
 import { LocalMutationCoordinator } from '../core/mutation.js';
+import {
+  finalizeStoredCursorV2,
+  reserveStoredCursorV2,
+  verifyStoredCursorV2,
+  type CursorPayloadV2
+} from '../retrieval/cursor.js';
 import type { DocumentStore } from '../storage/document-store.js';
 import { openRevisionStore, type RevisionStore } from '../storage/revision-store.js';
 import type { Journal, LocalOperationJournal } from '../storage/journal.js';
@@ -18,11 +26,15 @@ import type {
   Clock,
   IdSource,
   LocalHandlerDeps,
+  LocalMutationCoordinatorPort,
   LocalOperationReceipt,
+  LocalPendingAffected,
+  LocalPendingOperation,
   MutationReceipt,
   ProjectResolutionPort,
   ResolvedProject,
   SourceBoundCursorPort,
+  SourceCursorScope,
   SourceRef
 } from '../core/types.js';
 
@@ -115,6 +127,32 @@ export async function reconcileDeps(deps: LocalHandlerDeps): Promise<void> {
   indexReconciledDocuments({ catalogue: deps.catalogue, index: deps.index, report });
 }
 
+export async function reconcileCatalogueDeps(deps: LocalHandlerDeps): Promise<ReconcileCurrentVaultReport> {
+  return reconcileCurrentVault({ vault: deps.vault, catalogue: deps.catalogue });
+}
+
+export interface RetrievalReconcileReport {
+  index_failed: boolean;
+  pending_index: number;
+}
+
+export async function reconcileRetrievalDeps(deps: LocalHandlerDeps): Promise<RetrievalReconcileReport> {
+  const report = await reconcileCurrentVault({ vault: deps.vault, catalogue: deps.catalogue });
+  let indexFailed = false;
+  try {
+    indexReconciledDocuments({ catalogue: deps.catalogue, index: deps.index, report });
+  } catch {
+    indexFailed = true;
+  }
+  let pending = 0;
+  try {
+    pending = deps.documents.pendingIndexCount();
+  } catch {
+    pending = 0;
+  }
+  return { index_failed: indexFailed, pending_index: pending };
+}
+
 export function scopeForPathDeps(deps: LocalHandlerDeps, path: string): string {
   for (const project of deps.projects.list()) {
     if (path === project.relative_root || path.startsWith(`${project.relative_root}/`)) {
@@ -140,6 +178,14 @@ export function sourceRefForDeps(
     relative_path: source.path,
     warnings
   };
+}
+
+export function sourceRefManaged(
+  deps: LocalHandlerDeps,
+  source: CurrentSource,
+  warnings: string[] = []
+): SourceRef {
+  return sourceRefForDeps(deps, source, warnings);
 }
 
 export function validateRelatedIdsLocal(
@@ -291,17 +337,89 @@ function projectPort(brain: LocalBrain): ProjectResolutionPort {
   };
 }
 
-function cursorPort(): SourceBoundCursorPort {
-  const unavailable = (): never => {
-    throw recoveryRequired('the local read-cursor capability is not wired in this phase');
+const MIN_CURSOR_SECRET_BYTES = 32;
+
+function cursorPort(brain: LocalBrain): SourceBoundCursorPort {
+  let secret: Uint8Array | undefined;
+  const secretOf = (): Uint8Array => {
+    if (secret !== undefined) return secret;
+    const path = brain.config.cursor_secret_file;
+    if (path === undefined || path.length === 0) {
+      throw recoveryRequired(
+        'the read-cursor signing secret is not configured; set cursor_secret_file from BRAIN_CURSOR_SECRET'
+      );
+    }
+    let bytes: Buffer;
+    try {
+      bytes = readFileSync(path);
+    } catch (cause) {
+      throw recoveryRequired('the read-cursor signing secret cannot be read', cause);
+    }
+    if (bytes.length < MIN_CURSOR_SECRET_BYTES) {
+      throw recoveryRequired(
+        `the read-cursor signing secret must be at least ${MIN_CURSOR_SECRET_BYTES} bytes`
+      );
+    }
+    secret = new Uint8Array(bytes);
+    return secret;
   };
-  return { issue: unavailable, verify: unavailable };
+  const payloadFor = (
+    scope: SourceCursorScope,
+    offset: number,
+    expires_at: string
+  ): CursorPayloadV2 => ({
+    version: 2,
+    scope: scopeForPath(brain, scope.path),
+    id: scope.id,
+    revision_id: scope.revision_id,
+    raw_hash: scope.etag,
+    offset,
+    expires_at
+  });
+  return {
+    issue: (input) => {
+      const payload = payloadFor(input, input.offset, input.expires_at);
+      const reservation = reserveStoredCursorV2(payload, secretOf(), brain.journal);
+      return finalizeStoredCursorV2(reservation, payload, brain.journal);
+    },
+    verify: (cursor, scope) => {
+      const payload = verifyStoredCursorV2(cursor, secretOf(), brain.clock.now(), brain.journal);
+      if (payload.id !== scope.id) {
+        throw invalidInput('the read cursor does not belong to the requested note');
+      }
+      return {
+        offset: payload.offset,
+        id: payload.id,
+        revision_id: payload.revision_id,
+        raw_hash: payload.raw_hash
+      };
+    }
+  };
 }
 
 export interface LocalHandlerOverrides {
   operations?: LocalOperationJournal;
   revisions?: RevisionStore;
   mutations?: LocalHandlerDeps['mutations'];
+}
+
+function unavailableLocalMutations(): LocalMutationCoordinatorPort {
+  const unavailable = (): never => {
+    throw recoveryRequired('the local operation journal is not configured');
+  };
+  return {
+    pending: (): LocalPendingOperation[] => [],
+    pendingAffected: (): LocalPendingAffected => ({ ids: [], paths: [] }),
+    run: () => Promise.resolve().then(unavailable),
+    runLazy: () => Promise.resolve().then(unavailable),
+    status: () => undefined,
+    recover: () => Promise.resolve().then(unavailable),
+    enumerateConflictHeads: () => Promise.resolve().then(unavailable),
+    verifyConflictHeads: () => Promise.resolve().then(unavailable),
+    selectSurvivorPath: () => Promise.resolve().then(unavailable),
+    latestGeneratedNote: () => undefined,
+    runWithSharedKey: () => Promise.resolve().then(unavailable)
+  };
 }
 
 const sharedLocalDeps = new WeakMap<LocalBrain, Promise<LocalHandlerDeps>>();
@@ -319,14 +437,14 @@ export async function buildLocalHandlerDeps(
     catch (error) { sharedLocalDeps.delete(brain); throw error; }
   }
   const operations = overrides.operations ?? brain.operations;
-  if (operations === undefined) {
-    throw recoveryRequired('the local operation journal is not configured');
-  }
   const revisions =
-    overrides.revisions ?? (await openRevisionStore(brain.config.mounts.state));
+    overrides.revisions ??
+    (operations === undefined ? undefined : await openRevisionStore(brain.config.mounts.state));
   const mutations =
     overrides.mutations ??
-    new LocalMutationCoordinator({
+    (operations === undefined
+      ? unavailableLocalMutations()
+      : new LocalMutationCoordinator({
       operations,
       documents: brain.documents,
       catalogue: brain.catalogue,
@@ -340,7 +458,7 @@ export async function buildLocalHandlerDeps(
         reserveProject: (input) => brain.journal.reserveProject(input),
         markProjectReady: (id) => brain.journal.markProjectReady(id)
       }
-    });
+      }));
   return {
     config: brain.config,
     documents: brain.documents,
@@ -353,7 +471,7 @@ export async function buildLocalHandlerDeps(
     ids: brain.ids,
     mutations,
     projects: projectPort(brain),
-    cursors: cursorPort(),
+    cursors: cursorPort(brain),
     ...(brain.worker === undefined ? {} : { worker: brain.worker })
   };
 }

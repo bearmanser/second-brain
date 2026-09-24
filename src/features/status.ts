@@ -12,12 +12,14 @@ import {
   LIFECYCLES,
   NOTE_KINDS,
   type AuthenticatedContext,
+  type LocalHandlerDeps,
   type MutationReceipt,
   type ProjectEnsureResult,
   type ScopeConfig,
   type StatusRequest,
   type StatusResult
 } from '../core/types.js';
+import { mutationReceipt as localMutationReceipt, reconcileRetrievalDeps } from './local-support.js';
 import { projectFilter } from '../projects/registry.js';
 import { projectEnsureReceipt } from '../storage/legacy-project-adapter.js';
 import {
@@ -277,6 +279,119 @@ export async function status(
     if (record === undefined) throw notFound();
     const receipt = receiptFromRecord(record);
     if (receipt !== undefined) result.operation = receipt;
+  }
+
+  if (request.include_schemas === true) result.schemas = toolSchemas();
+
+  return result;
+}
+
+function statusCancelled(): BrainError {
+  return new BrainError({ code: 'CANCELLED', message: 'the caller cancelled the status request' });
+}
+
+function statusNotFound(): BrainError {
+  return new BrainError({ code: 'NOT_FOUND', message: 'the requested operation is not available' });
+}
+
+export async function statusLocal(
+  ctx: AuthenticatedContext,
+  input: StatusRequest,
+  deps: LocalHandlerDeps
+): Promise<StatusResult> {
+  if (ctx.signal.aborted) throw statusCancelled();
+  const request = parseRequest(input);
+  const identifier = request.project ?? request.scope;
+  const resolved = identifier === undefined ? undefined : deps.projects.resolve(identifier);
+  const selectedId = resolved?.id;
+
+  let indexFailed = false;
+  let pendingIndex = 0;
+  try {
+    const report = await reconcileRetrievalDeps(deps);
+    indexFailed = report.index_failed;
+    pendingIndex = report.pending_index;
+  } catch {
+    indexFailed = true;
+  }
+  if (ctx.signal.aborted) throw statusCancelled();
+
+  let documents: number | undefined;
+  try {
+    documents = deps.index.paths().length;
+  } catch {
+    documents = undefined;
+  }
+
+  const projects = deps.projects.list().filter((project) => selectedId === undefined || project.id === selectedId);
+  const pending = deps.mutations
+    .pending()
+    .filter((operation) => selectedId === undefined || operation.project_id === selectedId);
+  const workerHealth = deps.worker?.health();
+  const workerState = workerHealth === undefined ? 'disabled' : workerHealth.state;
+  const gateway = indexFailed ? 'degraded' : pending.length > 0 ? 'recovering' : 'ready';
+
+  const result: StatusResult = {
+    version: APPLICATION_VERSION,
+    protocol_version: '2',
+    schema_version: SCHEMA_VERSION,
+    protocol: 2,
+    scopes: projects.map((project) => ({ id: project.id })),
+    health: { gateway, backend: 'unavailable', embeddings: 'unknown' },
+    local: {
+      index: {
+        state: indexFailed ? 'unavailable' : 'ready',
+        ...(documents === undefined ? {} : { documents }),
+        pending_index: pendingIndex
+      },
+      worker:
+        workerHealth === undefined
+          ? { state: 'disabled' }
+          : {
+              state: workerHealth.state,
+              ...(workerHealth.model_fingerprint === undefined
+                ? {}
+                : { model_fingerprint: workerHealth.model_fingerprint })
+            }
+    },
+    features: {
+      reranking: workerState === 'ready',
+      text_search: true,
+      fallback: true
+    },
+    pending_operations: pending.length
+  };
+
+  if (projects.length > 0) {
+    result.projects = projects.map((project) => ({
+      scope: project.id,
+      state: project.state,
+      display_name: project.display_name,
+      relative_root: project.relative_root
+    }));
+  }
+
+  if (request.operation_id !== undefined) {
+    const status = deps.mutations.status(request.operation_id);
+    if (status === undefined) throw statusNotFound();
+    if (selectedId !== undefined && status.project_id !== selectedId) throw statusNotFound();
+    if (status.receipt?.kind === 'note') {
+      result.operation = localMutationReceipt(status.receipt);
+    } else if (status.receipt?.kind === 'project_ensure') {
+      result.operation = {
+        operation_id: status.receipt.operation_id,
+        repository_identity: status.receipt.repository_identity,
+        scope: status.receipt.project_id,
+        project_id: status.receipt.project_id,
+        relative_root: status.receipt.relative_root,
+        created: status.receipt.created,
+        backend_ready: false,
+        materialized: status.receipt.materialized,
+        warnings: status.receipt.warnings
+      };
+    } else if (status.receipt !== undefined) {
+      result.operation = status.receipt as unknown as StatusResult['operation'];
+    }
   }
 
   if (request.include_schemas === true) result.schemas = toolSchemas();

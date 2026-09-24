@@ -428,6 +428,7 @@ export interface DocumentStore {
   materializedPath(id: string, revisionId: string): string | undefined;
   getConsolidationOperationId(idempotencyKey: string): string | undefined;
   recallExclusions(): { paths: Set<string>; ids: Set<string> };
+  pendingIndexCount(): number;
   getDocumentReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
   getMoveReceipt(idempotencyKey: string): RenameReceipt | undefined;
   recover(): Promise<DocumentStoreRecoveryReport>;
@@ -821,6 +822,10 @@ class LocalDocumentStore implements DocumentStore {
       for (const edit of manifest.referenceEdits ?? []) paths.add(edit.path);
     }
     return { paths, ids };
+  }
+
+  pendingIndexCount(): number {
+    return this.journal.listIndex().length;
   }
 
   getDocumentReceipt(idempotencyKey: string): DocumentStorePutResult | undefined {

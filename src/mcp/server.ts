@@ -223,7 +223,8 @@ const statusOutputSchemaV2 = z.strictObject({
   health: z.strictObject({
     gateway: z.enum(['ready', 'recovering', 'degraded']),
     index: z.enum(['ready', 'unavailable']),
-    worker: z.enum(['ready', 'disabled', 'unavailable'])
+    worker: z.enum(['ready', 'disabled', 'unavailable']),
+    pending_index: z.number().optional()
   }),
   features: z.strictObject({
     reranking: z.boolean(), text_search: z.boolean(), fallback: z.boolean()
@@ -275,7 +276,10 @@ function v2PublicResult(tool: ToolName, value: unknown): unknown {
       health: {
         gateway: result.health.gateway,
         index: result.local.index.state,
-        worker: workerState === 'ready' || workerState === 'disabled' ? workerState : 'unavailable'
+        worker: workerState === 'ready' || workerState === 'disabled' ? workerState : 'unavailable',
+        ...(result.local.index.pending_index === undefined
+          ? {}
+          : { pending_index: result.local.index.pending_index })
       },
       features: result.features,
       pending_operations: result.pending_operations,

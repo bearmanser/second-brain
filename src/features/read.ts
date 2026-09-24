@@ -12,11 +12,22 @@ import type { BrainDeps } from '../core/mutation.js';
 import type {
   AuthenticatedContext,
   Head,
+  LocalHandlerDeps,
   ReadRequest,
   ReadResult,
   ScopeConfig,
+  SourceCursorPosition,
   SourceRef
 } from '../core/types.js';
+import type { CurrentSource } from '../notes/current-catalogue.js';
+import { projectParts } from '../retrieval/query.js';
+import {
+  conflict as localConflict,
+  invalidInput as localInvalidInput,
+  notFound as localNotFound,
+  reconcileCatalogueDeps,
+  sourceRefManaged
+} from './local-support.js';
 import { requiredProject } from '../projects/registry.js';
 import { countReferenceTokens } from '../retrieval/budget.js';
 import { modelVisibleRepresentation, toolResultByteLength } from '../mcp/tools.js';
@@ -364,4 +375,213 @@ export async function read(
   } finally {
     if (!finalized) deps.journal.deleteReadCursor(reservation.cursor_id);
   }
+}
+
+function localCancelled(): BrainError {
+  return new BrainError({ code: 'CANCELLED', message: 'the read was cancelled' });
+}
+
+function matchesProject(deps: LocalHandlerDeps, source: CurrentSource, relativeRoot: string | undefined, projectId: string | undefined): boolean {
+  if (projectId === undefined) return true;
+  if (source.id !== undefined && projectId !== undefined) {
+    const declared = source.project;
+    if (declared !== undefined) {
+      const parts = projectParts(declared);
+      if (parts.leaf === projectId || parts.norm === relativeRoot?.toLowerCase()) return true;
+    }
+  }
+  if (relativeRoot === undefined) return false;
+  const normalized = source.path.replace(/\\/g, '/');
+  const root = relativeRoot.replace(/\\/g, '/').replace(/\/+$/, '');
+  return normalized === root || normalized.startsWith(`${root}/`);
+}
+
+function conflictSourcesForPath(deps: LocalHandlerDeps, path: string): CurrentSource[] {
+  for (const id of deps.catalogue.conflictIds()) {
+    const sources = deps.catalogue.conflictsFor(id);
+    if (sources.some((source) => source.path === path)) return sources;
+  }
+  return [];
+}
+
+function conflictPaths(sources: readonly CurrentSource[]): string {
+  return sources
+    .map((source) => source.path)
+    .sort()
+    .join(', ');
+}
+
+function resolveCurrentSource(
+  deps: LocalHandlerDeps,
+  request: ReadRequest,
+  relativeRoot: string | undefined,
+  projectId: string | undefined
+): CurrentSource {
+  const all = deps.catalogue.all().filter((source) => matchesProject(deps, source, relativeRoot, projectId));
+  if (request.id !== undefined) {
+    const conflicts = deps.catalogue.conflictsFor(request.id);
+    if (conflicts.length > 0) {
+      throw localConflict(`note ${request.id} has conflicting sources: ${conflictPaths(conflicts)}`);
+    }
+    const found = all.find((source) => source.id === request.id);
+    if (found === undefined) throw localNotFound(`note ${request.id} was not found`);
+    return found;
+  }
+  if (request.path !== undefined) {
+    const conflicts = conflictSourcesForPath(deps, request.path);
+    if (conflicts.length > 0) {
+      throw localConflict(`note ${request.path} has conflicting sources: ${conflictPaths(conflicts)}`);
+    }
+    const found = all.find((source) => source.path === request.path);
+    if (found === undefined) throw localNotFound(`note ${request.path} was not found`);
+    return found;
+  }
+  const title = request.title as string;
+  const matches = all.filter((source) => source.title === title);
+  if (matches.length === 0) throw localNotFound(`note titled ${title} was not found`);
+  if (matches.length > 1) {
+    throw new BrainError({
+      code: 'AMBIGUOUS_REFERENCE',
+      message: `title ${title} matches multiple notes: ${matches
+        .map((source) => source.path)
+        .sort()
+        .join(', ')}`
+    });
+  }
+  const found = matches[0];
+  if (found.id !== undefined) {
+    const conflicts = deps.catalogue.conflictsFor(found.id);
+    if (conflicts.length > 0) {
+      throw localConflict(`note ${found.id} has conflicting sources: ${conflictPaths(conflicts)}`);
+    }
+  }
+  const pathConflicts = conflictSourcesForPath(deps, found.path);
+  if (pathConflicts.length > 0) {
+    throw localConflict(`note ${found.path} has conflicting sources: ${conflictPaths(pathConflicts)}`);
+  }
+  return found;
+}
+
+function historicalSource(
+  deps: LocalHandlerDeps,
+  request: ReadRequest,
+  relativeRoot: string | undefined,
+  projectId: string | undefined
+): CurrentSource | undefined {
+  const all = deps.catalogue.all().filter((source) => matchesProject(deps, source, relativeRoot, projectId));
+  const conflicts = request.id === undefined ? [] : deps.catalogue.conflictsFor(request.id);
+  return (
+    all.find((source) => source.id === request.id) ??
+    conflicts.find((source) => source.revision_id === request.revision_id) ??
+    all.find((source) => source.id === request.id && source.revision_id === request.revision_id) ??
+    conflicts[0]
+  );
+}
+
+export async function readLocal(
+  ctx: AuthenticatedContext,
+  input: ReadRequest,
+  deps: LocalHandlerDeps
+): Promise<ReadResult> {
+  if (ctx.signal.aborted) throw localCancelled();
+  const request = parseRequest(input);
+  const identifier = request.project ?? request.scope;
+  const resolved = identifier === undefined ? undefined : deps.projects.resolve(identifier);
+  await reconcileCatalogueDeps(deps);
+  if (ctx.signal.aborted) throw localCancelled();
+  const relativeRoot = resolved?.relative_root;
+  const projectId = resolved?.id;
+  const budget = clampReadBudget(request.budget_tokens);
+  const offsetFor = (
+    cursor: string | undefined,
+    scope: { id: string; path: string; revision_id: string; etag: string }
+  ): number => {
+    if (cursor === undefined) return 0;
+    const position = deps.cursors.verify(cursor, scope);
+    if (request.revision_id !== undefined && position.revision_id !== request.revision_id) {
+      throw localInvalidInput('the read cursor does not match the requested revision');
+    }
+    if (position.raw_hash !== scope.etag) {
+      throw localConflict('the note changed since the page cursor was issued; restart the read');
+    }
+    return position.offset;
+  };
+
+  if (request.revision_id !== undefined) {
+    const id = request.id as string;
+    const metadata = historicalSource(deps, request, relativeRoot, projectId);
+    let cursorOffset = 0;
+    let cursorPayload: SourceCursorPosition | undefined;
+    if (request.cursor !== undefined) {
+      cursorPayload = deps.cursors.verify(request.cursor, {
+        id,
+        path: metadata?.path ?? '',
+        revision_id: request.revision_id,
+        etag: ''
+      });
+      if (cursorPayload.revision_id !== request.revision_id) {
+        throw localInvalidInput('the read cursor does not match the requested revision');
+      }
+    }
+    const revision = await deps.documents.readRevision(id, request.revision_id);
+    if (cursorPayload !== undefined && cursorPayload.raw_hash !== revision.hash) {
+      throw localConflict('the note changed since the page cursor was issued; restart the read');
+    }
+    cursorOffset = cursorPayload?.offset ?? 0;
+    const scope = {
+      id,
+      path: metadata?.path ?? '',
+      revision_id: request.revision_id,
+      etag: revision.hash
+    };
+    const offset = cursorOffset;
+    const page = paginate(revision.raw, offset, budget);
+    const source: SourceRef =
+      metadata === undefined
+        ? {
+            id,
+            revision_id: request.revision_id,
+            scope: 'brain',
+            title: id,
+            kind: 'note',
+            status: 'candidate',
+            etag: revision.hash,
+            relative_path: '',
+            warnings: ['historical']
+          }
+        : {
+            ...sourceRefManaged(deps, metadata, ['historical']),
+            revision_id: request.revision_id,
+            etag: revision.hash
+          };
+    const result: ReadResult = { source, markdown: page.page };
+    if (page.nextOffset !== undefined) {
+      result.next_cursor = deps.cursors.issue({
+        ...scope,
+        offset: page.nextOffset,
+        expires_at: new Date(deps.clock.now().getTime() + CURSOR_TTL_MS).toISOString()
+      });
+    }
+    return result;
+  }
+
+  const source = resolveCurrentSource(deps, request, relativeRoot, projectId);
+  const file = await deps.documents.readPath(source.path);
+  const scope = {
+    id: source.id ?? source.path,
+    path: source.path,
+    revision_id: source.revision_id ?? file.etag,
+    etag: file.etag
+  };
+  const offset = offsetFor(request.cursor, scope);
+  const page = paginate(file.raw, offset, budget);
+  const result: ReadResult = { source: sourceRefManaged(deps, source), markdown: page.page };
+  if (page.nextOffset !== undefined) {
+    result.next_cursor = deps.cursors.issue({
+      ...scope,
+      offset: page.nextOffset,
+      expires_at: new Date(deps.clock.now().getTime() + CURSOR_TTL_MS).toISOString()
+    });
+  }
+  return result;
 }

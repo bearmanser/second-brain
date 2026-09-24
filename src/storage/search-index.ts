@@ -12,6 +12,7 @@ import { chunkDocument, type SearchChunk } from '../retrieval/chunker.js';
 import {
   clampCandidateLimit,
   documentMatchesFilters,
+  escapeLikePattern,
   literalMatch,
   normalizeStatuses,
   normalizeTypes,
@@ -459,10 +460,19 @@ class SearchIndexImpl implements SearchIndex {
   ): Candidate[] {
     const conditions: string[] = ['chunks_fts MATCH ?'];
     const parameters: unknown[] = [match];
-    if (filters.project !== undefined) {
-      const wanted = projectParts(filters.project);
-      conditions.push('(d.project_norm = ? OR d.project_leaf = ?)');
-      parameters.push(wanted.norm, wanted.leaf);
+    if (filters.project !== undefined || (filters.project_roots !== undefined && filters.project_roots.length > 0)) {
+      const clauses: string[] = [];
+      if (filters.project !== undefined) {
+        const wanted = projectParts(filters.project);
+        clauses.push('d.project_norm = ?', 'd.project_leaf = ?');
+        parameters.push(wanted.norm, wanted.leaf);
+      }
+      for (const root of filters.project_roots ?? []) {
+        const normalized = root.replace(/\\/g, '/').replace(/\/+$/, '');
+        clauses.push("d.path = ?", "d.path LIKE ? ESCAPE '\\'");
+        parameters.push(normalized, `${escapeLikePattern(normalized)}/%`);
+      }
+      conditions.push(`(${clauses.join(' OR ')})`);
     }
     if (filters.types !== undefined && filters.types.length > 0) {
       conditions.push(`d.type IN (${filters.types.map(() => '?').join(', ')})`);
@@ -555,8 +565,12 @@ class SearchIndexImpl implements SearchIndex {
       typeof input?.project === 'string' && input.project.trim().length > 0
         ? input.project
         : undefined;
+    const projectRoots = Array.isArray(input?.project_roots)
+      ? input.project_roots.filter((root): root is string => typeof root === 'string' && root.length > 0)
+      : [];
     const filters: CandidateFilters = {
       ...(project === undefined ? {} : { project }),
+      ...(projectRoots.length === 0 ? {} : { project_roots: projectRoots }),
       ...(types.length === 0 ? {} : { types }),
       ...(statuses.length === 0 ? {} : { statuses })
     };

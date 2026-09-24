@@ -271,7 +271,8 @@ const statusResultSchemaV2: Record<string, unknown> = {
       properties: {
         gateway: { type: 'string', enum: ['ready', 'recovering', 'degraded'] },
         index: { type: 'string', enum: ['ready', 'unavailable'] },
-        worker: { type: 'string', enum: ['ready', 'disabled', 'unavailable'] }
+        worker: { type: 'string', enum: ['ready', 'disabled', 'unavailable'] },
+        pending_index: { type: 'number' }
       }
     },
     features: {

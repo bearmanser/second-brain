@@ -144,6 +144,9 @@ export interface RecallRequest extends ProjectSelector {
   kinds?: NoteKind[];
   include_shared?: boolean;
   include_candidates?: boolean;
+  include_superseded?: boolean;
+  include_archived?: boolean;
+  expand_graph?: boolean;
   session_id?: string;
   mode?: RecallMode;
   allow_text_fallback?: boolean;
@@ -294,7 +297,7 @@ export interface StatusResult {
     embeddings: 'ready' | 'unavailable' | 'unknown';
   };
   local?: {
-    index: { state: 'ready' | 'unavailable'; documents?: number };
+    index: { state: 'ready' | 'unavailable'; documents?: number; pending_index?: number };
     worker: { state: string; model_fingerprint?: string };
   };
   features?: {
@@ -323,6 +326,7 @@ export interface StatusResultV2 {
     gateway: 'ready' | 'recovering' | 'degraded';
     index: 'ready' | 'unavailable';
     worker: 'ready' | 'disabled' | 'unavailable';
+    pending_index?: number;
   };
   features: {
     reranking: boolean;
@@ -606,7 +610,22 @@ export interface LocalRecoveryReport {
   blocking_operations: string[];
 }
 
+export interface LocalPendingOperation {
+  operation_id: string;
+  tool: string;
+  action: string;
+  project_id: string | null;
+  state: LocalOperationState;
+}
+
+export interface LocalPendingAffected {
+  ids: string[];
+  paths: string[];
+}
+
 export interface LocalMutationCoordinatorPort {
+  pending(): LocalPendingOperation[];
+  pendingAffected(): LocalPendingAffected;
   run(intent: LocalOperationIntent, plan: LocalOperationPlan): Promise<LocalOperationReceipt>;
   runLazy(intent: LocalOperationIntent, prepare: () => Promise<LocalOperationPlan>): Promise<LocalOperationReceipt>;
   status(operation_id: string): LocalOperationStatus | undefined;
@@ -641,6 +660,9 @@ export interface SourceCursorScope {
 
 export interface SourceCursorPosition {
   offset: number;
+  id: string;
+  revision_id: string;
+  raw_hash: string;
 }
 
 export interface SourceBoundCursorPort {

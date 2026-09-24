@@ -372,7 +372,7 @@ test('the published tool contract is pinned', () => {
         "output": "dc422311704e5104ae8b579055802d36215ab8fb8171c3ecf8d53b3c8c1f99d8",
       },
       {
-        "input": "eb9847690ed4c0878ad3043b40cbf6d3fd7b09a5ff455fc917465d359fcbcf1b",
+        "input": "8da9bb9a8dd136291ff3535f5ec632121fbd0ef3cd38ea80cabedabbc15cf79b",
         "name": "brain_recall",
         "output": "1bba962c7fe6f748ca285b4bd573dd3c64dd299b2d6470bce14dbff9055aa0a5",
       },
@@ -384,7 +384,7 @@ test('the published tool contract is pinned', () => {
       {
         "input": "b08c7c6e06ed73a354cdcd37ef9fc28a5d454f4e7a7394270bc295db8a285579",
         "name": "brain_status",
-        "output": "58ce0796103fe0f5764a9f4fe3e59ab4da7986005b92eae7be5e60c8b529c146",
+        "output": "0d51808afe512494a125cc12b40045a813442ba04aba7178776501e1e4c01dd5",
       },
     ]
   `);
@@ -405,10 +405,19 @@ test('representative tool schemas are pinned in full', () => {
           "minimum": 256,
           "type": "integer",
         },
+        "expand_graph": {
+          "type": "boolean",
+        },
+        "include_archived": {
+          "type": "boolean",
+        },
         "include_candidates": {
           "type": "boolean",
         },
         "include_shared": {
+          "type": "boolean",
+        },
+        "include_superseded": {
           "type": "boolean",
         },
         "kinds": {
@@ -528,6 +537,9 @@ test('representative tool schemas are pinned in full', () => {
                 "unavailable",
               ],
               "type": "string",
+            },
+            "pending_index": {
+              "type": "number",
             },
             "worker": {
               "enum": [

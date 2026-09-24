@@ -65,6 +65,8 @@ import type {
   LocalOperationPlan,
   LocalOperationReceipt,
   LocalOperationStatus,
+  LocalPendingAffected,
+  LocalPendingOperation,
   LocalPendingWrite,
   LocalPlannedOperation,
   LocalReadCondition,
@@ -1457,6 +1459,53 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
 
   constructor(deps: LocalMutationCoordinatorDeps) {
     this.deps = deps;
+  }
+
+  pending(): LocalPendingOperation[] {
+    return this.deps.operations.listIncomplete().map((record) => ({
+      operation_id: record.operation_id,
+      tool: record.tool,
+      action: record.action,
+      project_id: record.project_id,
+      state: record.state as LocalPendingOperation['state']
+    }));
+  }
+
+  pendingAffected(): LocalPendingAffected {
+    const ids = new Set<string>();
+    const paths = new Set<string>();
+    for (const record of this.deps.operations.listIncomplete()) {
+      if (record.plan_json === null) continue;
+      let plan: {
+        kind?: unknown;
+        heads?: { id?: unknown; path?: unknown }[];
+        effects?: { kind?: unknown; path?: unknown; write?: { path?: unknown }; from_path?: unknown; to_path?: unknown }[];
+        reference_edits?: { path?: unknown }[];
+      };
+      try {
+        plan = JSON.parse(record.plan_json) as typeof plan;
+      } catch (error) {
+        throw new BrainError({
+          code: 'RECOVERY_REQUIRED',
+          message: `pending operation ${record.operation_id} has an unreadable plan`,
+          cause: error
+        });
+      }
+      if (plan === null || plan.kind !== 'note') continue;
+      for (const head of plan.heads ?? []) {
+        if (typeof head.id === 'string') ids.add(head.id);
+        if (typeof head.path === 'string') paths.add(head.path);
+      }
+      for (const effect of plan.effects ?? []) {
+        for (const candidate of [effect.path, effect.write?.path, effect.from_path, effect.to_path]) {
+          if (typeof candidate === 'string') paths.add(candidate);
+        }
+      }
+      for (const edit of plan.reference_edits ?? []) {
+        if (typeof edit.path === 'string') paths.add(edit.path);
+      }
+    }
+    return { ids: [...ids], paths: [...paths] };
   }
 
   run(intent: LocalOperationIntent, plan: LocalOperationPlan): Promise<LocalOperationReceipt> {

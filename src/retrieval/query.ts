@@ -11,6 +11,7 @@ export interface Candidate extends SearchChunk {
 
 export interface CandidateFilters {
   project?: string;
+  project_roots?: readonly string[];
   types?: readonly string[];
   statuses?: readonly string[];
 }
@@ -89,8 +90,22 @@ export function projectParts(value: string): ProjectParts {
 export interface FilterableDocument {
   type: string;
   status: string;
+  path?: string;
   project_norm?: string | null;
   project_leaf?: string | null;
+}
+
+export function documentInProjectRoots(
+  path: string | undefined,
+  roots: readonly string[] | undefined
+): boolean {
+  if (roots === undefined || roots.length === 0) return false;
+  if (path === undefined) return false;
+  const normalized = path.replace(/\\/g, '/');
+  return roots.some((root) => {
+    const normalizedRoot = root.replace(/\\/g, '/').replace(/\/+$/, '');
+    return normalized === normalizedRoot || normalized.startsWith(`${normalizedRoot}/`);
+  });
 }
 
 export function documentMatchesFilters(
@@ -107,13 +122,22 @@ export function documentMatchesFilters(
   ) {
     return false;
   }
-  if (filters.project !== undefined) {
-    const wanted = projectParts(filters.project);
-    if (document.project_norm !== wanted.norm && document.project_leaf !== wanted.leaf) {
+  if (filters.project !== undefined || filters.project_roots !== undefined) {
+    const projectMatch =
+      filters.project !== undefined &&
+      (() => {
+        const wanted = projectParts(filters.project);
+        return document.project_norm === wanted.norm || document.project_leaf === wanted.leaf;
+      })();
+    if (!projectMatch && !documentInProjectRoots(document.path, filters.project_roots)) {
       return false;
     }
   }
   return true;
+}
+
+export function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, (character) => `\\${character}`);
 }
 
 export function clampCandidateLimit(limit: number): number {
