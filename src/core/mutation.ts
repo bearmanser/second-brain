@@ -1336,6 +1336,7 @@ export interface LocalDocumentExecutor {
   consolidate(input: DocumentStoreConsolidateInput): Promise<DocumentStorePutResult>;
   getConsolidationReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
   hasConsolidationManifest?(idempotencyKey: string): boolean;
+  hasDocumentActivity?(idempotencyKey: string): boolean;
   getConsolidationOperationId?(idempotencyKey: string): string | undefined;
   recover?(): Promise<{ recovered: string[]; pending: string[] }>;
   getDocumentReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
@@ -1773,6 +1774,8 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     }
     const specs = this.subordinateSpecs(plan);
     const expectedKeys = specs.map((spec) => `${record.idempotency_key}:${spec.key}`);
+    const hasManifest = plan.kind === 'note' && specs.length === 1 && specs[0].kind === 'consolidation' &&
+      this.deps.documents.hasConsolidationManifest?.(expectedKeys[0]) === true;
     let compatibleConsolidation = false;
     if (plan.kind === 'note' && specs.length === 1 && specs[0].kind === 'consolidation') {
       const former = plan.effects.map((effect, index) =>
@@ -1780,8 +1783,24 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
       former.push(`${record.idempotency_key}:consolidate:primary`,
         `${record.idempotency_key}:consolidate:manifest`);
       (plan.reference_edits ?? []).forEach((_edit, index) => former.push(`${record.idempotency_key}:ref:${index}`));
+      let beforeManifest = false;
+      if (!hasManifest && existing.length > 0 &&
+          this.deps.documents.hasDocumentActivity?.(record.idempotency_key) === false) {
+        let progress: LocalOperationProgress;
+        try { progress = JSON.parse(record.progress_json ?? '{}') as LocalOperationProgress; }
+        catch (error) { throw localRecovery('the pre-manifest operation progress is unreadable', error); }
+        if (progress === null || typeof progress !== 'object' || Array.isArray(progress) ||
+            progress.effects === null ||
+            (progress.effects !== undefined && (typeof progress.effects !== 'object' || Array.isArray(progress.effects))) ||
+            progress.renames === null ||
+            (progress.renames !== undefined && (typeof progress.renames !== 'object' || Array.isArray(progress.renames)))) {
+          throw localRecovery('the pre-manifest operation progress is malformed');
+        }
+        beforeManifest = Object.keys(progress.effects ?? {}).length === 0 &&
+          Object.keys(progress.renames ?? {}).length === 0;
+      }
       compatibleConsolidation = JSON.stringify(legacyKeys) === JSON.stringify(former) &&
-        this.deps.documents.hasConsolidationManifest?.(expectedKeys[0]) === true;
+        (hasManifest || beforeManifest);
       if (compatibleConsolidation) {
         const primary = plan.effects.find((effect) => effect.kind === 'write');
         const put = this.deps.documents.getDocumentReceipt(`${record.idempotency_key}:consolidate:primary`);
@@ -1821,7 +1840,8 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
         const consolidatedReceipt = this.deps.documents.getConsolidationReceipt(expectedKeys[0]);
         const primaryDocumentId = consolidatedReceipt?.operation_id ?? primaryReceipt?.operation_id;
         const primaryIndex = plan.kind === 'note' ? plan.effects.findIndex((effect) => effect.kind === 'write') : -1;
-        if (manifestId !== record.operation_id || existing.length > historical.length ||
+        if ((hasManifest ? manifestId !== record.operation_id : manifestId !== undefined) ||
+            existing.length > historical.length ||
             (consolidatedReceipt !== undefined && primaryReceipt !== undefined &&
               consolidatedReceipt.operation_id !== primaryReceipt.operation_id) ||
             this.deps.documents.getDocumentReceipt(expectedKeys[0]) !== undefined ||
@@ -2777,6 +2797,7 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
       indexed: result.indexed,
       warnings: []
     };
+    this.deps.operations.markSubordinate(record.operation_id, 0, 'complete');
     this.finalize(record, receipt, input.idempotencyKey);
     return receipt;
   }

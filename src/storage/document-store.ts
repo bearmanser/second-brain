@@ -424,6 +424,7 @@ export interface DocumentStore {
   consolidate(input: DocumentStoreConsolidateInput): Promise<DocumentStorePutResult>;
   getConsolidationReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
   hasConsolidationManifest(idempotencyKey: string): boolean;
+  hasDocumentActivity(idempotencyKey: string): boolean;
   getConsolidationOperationId(idempotencyKey: string): string | undefined;
   recallExclusions(): { paths: Set<string>; ids: Set<string> };
   getDocumentReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
@@ -784,6 +785,10 @@ class LocalDocumentStore implements DocumentStore {
 
   hasConsolidationManifest(idempotencyKey: string): boolean {
     return this.journal.findConsolidationByKey(idempotencyKey) !== undefined;
+  }
+
+  hasDocumentActivity(idempotencyKey: string): boolean {
+    return this.journal.hasOperationWithPrefix(`${idempotencyKey}:`);
   }
 
   getConsolidationOperationId(idempotencyKey: string): string | undefined {

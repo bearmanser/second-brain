@@ -2999,6 +2999,17 @@ export class LocalWriteJournal {
     return row === undefined ? undefined : toLocalWrite(row);
   }
 
+  hasOperationWithPrefix(prefix: string): boolean {
+    this.assertOpen();
+    for (const table of ['local_write_operations', 'local_move_operations', 'local_consolidations']) {
+      const row = this.database.prepare(
+        `SELECT 1 FROM ${table} WHERE substr(idempotency_key, 1, ?) = ? LIMIT 1`
+      ).get(prefix.length, prefix);
+      if (row !== undefined) return true;
+    }
+    return false;
+  }
+
   findById(operation_id: string): LocalWriteRecord | undefined {
     this.assertOpen();
     const row = this.database

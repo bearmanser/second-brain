@@ -22,7 +22,7 @@ import {
   type DocumentStore,
   type DocumentStoreFaults
 } from '../../src/storage/document-store.js';
-import { LocalOperationJournal } from '../../src/storage/journal.js';
+import { LocalOperationJournal, LocalWriteJournal } from '../../src/storage/journal.js';
 import { openRevisionStore, type RevisionStore } from '../../src/storage/revision-store.js';
 import { FileVault } from '../../src/storage/vault.js';
 import { vaultSandbox } from '../helpers/vault-sandbox.js';
@@ -912,6 +912,96 @@ test.each([
     expect((await ground.revisions.readRevision(id, b.revisionId)).raw).toBe(b.raw);
     expect((await ground.store.readPath('Knowledge/A.md')).raw).toBe(spec.resolutionRaw);
     expect((await ground.store.readPath('Knowledge/Reference.md')).raw).toBe(rewrittenRaw);
+  } finally { await ground.dispose(); }
+});
+
+test.each([
+  { stale: false, documentActivity: false, outcome: 'finalized' },
+  { stale: true, documentActivity: false, outcome: 'conflicted' },
+  { stale: false, documentActivity: true, outcome: 'recovery_required' }
+])('a pre-manifest legacy consolidation with old rows rechecks its read set and is $outcome', async ({ stale, documentActivity }) => {
+  const { ground, id, a, b } = await twoHeadGround();
+  try {
+    const key = randomUUID();
+    const revisionId = randomUUID();
+    const spec: ResolveSpec = { id, survivorPath: 'Knowledge/A.md', survivorEtag: a.hash,
+      removalPaths: [{ path: 'Knowledge/B.md', id, revisionId: b.revisionId, etag: b.hash }],
+      resolutionRaw: managed(id, 'planned resolution'), resolutionRevision: revisionId };
+    const heads = await ground.coordinator.enumerateConflictHeads(id);
+    const now = new Date().toISOString();
+    const operation = ground.operations.reserve({ operation_id: randomUUID(), idempotency_key: key,
+      tool: 'brain_review', action: 'resolve', project_id: null, payload_hash: 'a'.repeat(64),
+      payload_json: '{}', created_at: now, updated_at: now }).record;
+    const plan = await resolvePlan(spec)({ kind: 'note', operation_id: operation.operation_id,
+      timestamp: now, storage_operation_ids: [], note_id: id, revision_id: revisionId,
+      path: spec.survivorPath }, { sources: [], heads });
+    ground.operations.update(operation.operation_id, { plan_json: JSON.stringify(plan),
+      storage_key: JSON.stringify([`${key}:doc:0`, `${key}:doc:1`,
+        `${key}:consolidate:primary`, `${key}:consolidate:manifest`]),
+      progress_json: JSON.stringify({ preconditions_validated: true }), updated_at: now });
+    for (const [effect_index, kind, subordinateKey] of [
+      [0, 'write', `${key}:doc:0`],
+      [1, 'remove', `${key}:remove:1`],
+      [2, 'consolidation', `${key}:consolidate`]
+    ] as const) {
+      ground.operations.reserveSubordinate({ operation_id: operation.operation_id, effect_index,
+        kind, key: subordinateKey, created_at: now, updated_at: now });
+    }
+    expect(ground.store.hasConsolidationManifest(`${key}:consolidate`)).toBe(false);
+    if (documentActivity) {
+      const documentJournal = LocalWriteJournal.open(join(ground.sandbox.state, 'documents.sqlite'));
+      try {
+        documentJournal.reserve({ operation_id: randomUUID(), idempotency_key: `${key}:consolidate:primary`,
+          tool: 'brain_review', path: 'Knowledge/A.md', payload_hash: 'b'.repeat(64),
+          source: 'brain_review', expected_etag: a.hash, id, revision_id: revisionId,
+          preimage_hash: null, revision_hash: null, updated_at: now });
+      } finally { documentJournal.close(); }
+    }
+    const changed = managed(id, 'external head edit');
+    if (stale) await writeFile(join(ground.vaultRoot, 'Knowledge/B.md'), changed);
+    await ground.reopenStore();
+    expect(ground.store.hasConsolidationManifest(`${key}:consolidate`)).toBe(false);
+    const result = await ground.coordinator.recover();
+    if (documentActivity) {
+      expect(result.finalized).toBe(0);
+      expect(result.conflicted).toBe(0);
+      expect(result.blocking_operations).toContain(operation.operation_id);
+      expect(ground.operations.findByKey(key)).toMatchObject({ state: 'recovery_required', receipt_json: null });
+      expect(ground.store.hasConsolidationManifest(`${key}:consolidate`)).toBe(false);
+      expect(ground.operations.listSubordinates(operation.operation_id).map((row) => row.key)).toEqual([
+        `${key}:doc:0`, `${key}:remove:1`, `${key}:consolidate`
+      ]);
+      expect((await ground.store.readPath('Knowledge/A.md')).raw).toBe(a.raw);
+      expect((await ground.store.readPath('Knowledge/B.md')).raw).toBe(b.raw);
+      return;
+    }
+    if (stale) {
+      expect(result.conflicted).toBe(1);
+      expect(result.finalized).toBe(0);
+      expect(result.blocking_operations).toEqual([]);
+      expect(ground.operations.findByKey(key)).toMatchObject({ state: 'conflicted', receipt_json: null });
+      expect(ground.store.hasConsolidationManifest(`${key}:consolidate`)).toBe(false);
+      expect((await ground.store.readPath('Knowledge/A.md')).raw).toBe(a.raw);
+      expect((await ground.store.readPath('Knowledge/B.md')).raw).toBe(changed);
+      expect(ground.operations.listSubordinates(operation.operation_id).map((row) => row.key)).toEqual([
+        `${key}:consolidate`
+      ]);
+    } else {
+      expect(result.finalized).toBe(1);
+      expect(result.conflicted).toBe(0);
+      expect(result.blocking_operations).toEqual([]);
+      expect(ground.operations.findByKey(key)?.state).toBe('finalized');
+      expect(ground.coordinator.status(operation.operation_id)?.receipt).toMatchObject({
+        id, revision_id: revisionId, path: spec.survivorPath
+      });
+      expect(ground.store.hasConsolidationManifest(`${key}:consolidate`)).toBe(true);
+      expect((await ground.store.readPath('Knowledge/A.md')).raw).toBe(spec.resolutionRaw);
+      await expect(ground.store.readPath('Knowledge/B.md')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+      expect((await ground.revisions.readRevision(id, b.revisionId)).raw).toBe(b.raw);
+      expect(ground.operations.listSubordinates(operation.operation_id)).toMatchObject([
+        { effect_index: 0, kind: 'consolidation', key: `${key}:consolidate`, state: 'complete' }
+      ]);
+    }
   } finally { await ground.dispose(); }
 });
 
