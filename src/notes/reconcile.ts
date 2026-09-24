@@ -12,6 +12,7 @@ import {
   type SchemaVersionRegistry
 } from './codec.js';
 import type { ApprovalProvenance, ApprovalProvenanceInput } from './catalogue.js';
+import type { CurrentCatalogue, ReconcileCurrentVaultReport } from './current-catalogue.js';
 
 export {
   CURRENT_VAULT_DEBOUNCE_MS,
@@ -46,6 +47,45 @@ export type {
 
 export interface ReconcileOptions {
   detailed?: boolean;
+}
+
+export interface SearchIndexSink {
+  upsert(entry: {
+    path: string;
+    raw: string;
+    etag: string;
+    id?: string;
+    revision_id?: string;
+  }): void;
+  remove?(path: string): void;
+}
+
+export interface IndexReconciledDocumentsInput {
+  catalogue: Pick<CurrentCatalogue, 'rawFor' | 'getByPath'>;
+  index: SearchIndexSink;
+  report: ReconcileCurrentVaultReport;
+}
+
+export function indexReconciledDocuments(input: IndexReconciledDocumentsInput): void {
+  const { catalogue, index, report } = input;
+  for (const moved of report.moved) index.remove?.(moved.from);
+  const paths = new Set<string>();
+  for (const source of report.added) paths.add(source.path);
+  for (const change of report.changed) paths.add(change.path);
+  for (const moved of report.moved) paths.add(moved.to);
+  for (const path of paths) {
+    const raw = catalogue.rawFor(path);
+    const source = catalogue.getByPath(path);
+    if (raw === undefined || source === undefined) continue;
+    index.upsert({
+      path,
+      raw,
+      etag: source.etag,
+      ...(source.id === undefined ? {} : { id: source.id }),
+      ...(source.revision_id === undefined ? {} : { revision_id: source.revision_id })
+    });
+  }
+  for (const removed of report.removed) index.remove?.(removed.path);
 }
 
 export type { ReconcileFinding, ReconcileReport, ReconcileScopeReport } from '../core/types.js';

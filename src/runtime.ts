@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile } from 'node:fs/promises';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { createServer, type Server as HttpServer } from 'node:http';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import type { Request, Response } from 'express';
 import { assertTokenDigest } from './config/load.js';
@@ -41,12 +41,13 @@ import {
   type CurrentVaultObserver,
   type ReconcileCurrentVaultReport
 } from './notes/current-catalogue.js';
-import { JournalApprovalProvenance, reconcileVault } from './notes/reconcile.js';
+import { JournalApprovalProvenance, indexReconciledDocuments, reconcileVault } from './notes/reconcile.js';
 import { recoverPending } from './operations/recovery.js';
 import { ScopeRegistry } from './projects/scope-registry.js';
 import { BasicMemoryBackend } from './storage/basic-memory.js';
 import { Journal } from './storage/journal.js';
 import { openRevisionStore, type RevisionStore } from './storage/revision-store.js';
+import { openSearchIndex, type SearchIndex } from './storage/search-index.js';
 import { FileVault } from './storage/vault.js';
 import { InstanceLock, MutationCoordinator, type BrainDeps } from './core/mutation.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -271,6 +272,7 @@ class BrainRuntimeImpl implements BrainRuntime {
   private reconciling = false;
   private currentIndex: CurrentCatalogue | undefined;
   private currentObserver: CurrentVaultObserver | undefined;
+  private searchIndex: SearchIndex | undefined;
   private readonly readLimiter: ReadLimiter;
 
   constructor(config: BrainConfig, options: RuntimeOptions) {
@@ -609,13 +611,33 @@ class BrainRuntimeImpl implements BrainRuntime {
     }
     const current = CurrentCatalogue.open({ revisions, ids: this.ids });
     this.currentIndex = current;
+    let index: SearchIndex | undefined;
+    try {
+      const indexPath = join(this.config.mounts.state, 'index', 'search.sqlite');
+      mkdirSync(dirname(indexPath), { recursive: true });
+      index = openSearchIndex(indexPath);
+      this.searchIndex = index;
+    } catch (error) {
+      this.log(internalDiagnostic(error));
+    }
+    const syncIndex = (report: ReconcileCurrentVaultReport): void => {
+      if (index === undefined) return;
+      try {
+        indexReconciledDocuments({ catalogue: current, index, report });
+      } catch (error) {
+        this.log(internalDiagnostic(error));
+      }
+    };
     const observer = observeCurrentVault({
       root: this.config.mounts.vault,
       vault: vault as CurrentVault,
       catalogue: current,
       signal: this.shutdown.signal,
       interval_ms: this.config.limits.reconcile_interval_ms ?? RECONCILE_INTERVAL_MS,
-      onReconcile: (report) => this.logCurrentReconcile(report),
+      onReconcile: (report) => {
+        this.logCurrentReconcile(report);
+        syncIndex(report);
+      },
       onError: (error) => this.log(internalDiagnostic(error))
     });
     this.currentObserver = observer;
@@ -626,6 +648,7 @@ class BrainRuntimeImpl implements BrainRuntime {
         signal: this.shutdown.signal
       });
       this.logCurrentReconcile(report);
+      syncIndex(report);
     } catch (error) {
       if (!(isBrainError(error) && error.code === 'CANCELLED')) {
         this.log(internalDiagnostic(error));
@@ -731,6 +754,8 @@ class BrainRuntimeImpl implements BrainRuntime {
     this.currentObserver = undefined;
     this.currentIndex?.close();
     this.currentIndex = undefined;
+    this.searchIndex?.close();
+    this.searchIndex = undefined;
     await this.backend?.close().catch(() => undefined);
     this.backend = undefined;
     this.catalogue?.close();
