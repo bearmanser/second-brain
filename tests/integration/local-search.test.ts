@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { expect, test } from 'vitest';
 import { CurrentCatalogue, reconcileCurrentVault } from '../../src/notes/current-catalogue.js';
@@ -221,6 +221,115 @@ test('graph neighbour chunks prefer lexical relevance over the first section', (
     expect(ranked.neighbors[0].chunk.text).toContain('carburetor router details');
   } finally {
     index.close();
+  }
+});
+
+test('graph edges are returned only for selected neighbours', () => {
+  const index = openSearchIndex(':memory:');
+  try {
+    for (let i = 0; i < 12; i += 1) {
+      index.replaceDocument({
+        path: `Knowledge/Linked ${i}.md`,
+        raw: `# Linked ${i}\n\nbody ${i}\n`,
+        etag: `l${i}`
+      });
+    }
+    const links = Array.from({ length: 12 }, (_value, i) => `[[Knowledge/Linked ${i}]]`).join('\n');
+    index.replaceDocument({
+      path: 'Knowledge/Origin.md',
+      raw: `# Origin\n\norigin term\n\n${links}\n`,
+      etag: 'origin'
+    });
+    const zero = index.expandGraph(['Knowledge/Origin.md'], {}, 0);
+    expect(zero.neighbors).toHaveLength(0);
+    expect(zero.edges).toHaveLength(0);
+    const capped = index.expandGraph(['Knowledge/Origin.md'], {}, 10);
+    expect(capped.neighbors).toHaveLength(10);
+    expect(capped.edges).toHaveLength(10);
+    for (const edge of capped.edges) {
+      expect(capped.neighbors.map((neighbor) => neighbor.document_key)).toContain(edge.target);
+    }
+    const filtered = index.expandGraph(['Knowledge/Origin.md'], { statuses: ['archived'] }, 10);
+    expect(filtered.neighbors).toHaveLength(0);
+    expect(filtered.edges).toHaveLength(0);
+  } finally {
+    index.close();
+  }
+});
+
+test('adding an id to an existing path cleans up its former path keyed links', () => {
+  const index = openSearchIndex(':memory:');
+  try {
+    index.replaceDocument({
+      path: 'Knowledge/Note.md',
+      raw: '# Note\n\n[[Knowledge/Target]]\n',
+      etag: 'v1'
+    });
+    index.replaceDocument({ path: 'Knowledge/Target.md', raw: '# Target\n\ntarget body\n', etag: 't' });
+    expect(index.expandGraph(['Knowledge/Note.md'], {}, 10).neighbors.map((n) => n.path)).toContain(
+      'Knowledge/Target.md'
+    );
+    index.replaceDocument({
+      path: 'Knowledge/Note.md',
+      raw: frontmatterDocument('# Note\n\n[[Knowledge/Target]]\n', { id: MANAGED_ID }),
+      etag: 'v2'
+    });
+    expect(index.expandGraph(['Knowledge/Note.md'], {}, 10).neighbors).toHaveLength(0);
+    expect(
+      index.expandGraph([MANAGED_ID], {}, 10).neighbors.map((neighbor) => neighbor.path)
+    ).toContain('Knowledge/Target.md');
+  } finally {
+    index.close();
+  }
+});
+
+test('a frontmatter-only note is retrievable by its alias and title', () => {
+  const index = openSearchIndex(':memory:');
+  try {
+    index.replaceDocument({
+      path: 'Knowledge/Metadata only.md',
+      raw: '---\naliases:\n  - Legacy alias\n---\n',
+      etag: 'm'
+    });
+    const byAlias = index.candidates({ query: 'legacy alias', limit: 10 });
+    expect(byAlias).toHaveLength(1);
+    expect(byAlias[0].reasons).toContain('alias');
+    expect(byAlias[0].text).toBe('---\naliases:\n  - Legacy alias\n---\n');
+    const byTitle = index.candidates({ query: 'Metadata only', limit: 10 });
+    expect(byTitle).toHaveLength(1);
+    expect(byTitle[0].reasons).toContain('title');
+  } finally {
+    index.close();
+  }
+});
+
+test('a note deleted while the index is closed is pruned on restart', async () => {
+  const sandbox = await vaultSandbox();
+  const databasePath = join(sandbox.state, 'search.sqlite');
+  try {
+    await mkdir(join(sandbox.vault, 'Knowledge'), { recursive: true });
+    await writeFile(join(sandbox.vault, 'Knowledge', 'Gone.md'), '# Gone\n\nvanishing term\n');
+    const vault = new FileVault(sandbox.vault, []);
+    const firstCatalogue = CurrentCatalogue.open({});
+    const first = openSearchIndex(databasePath);
+    const firstReport = await reconcileCurrentVault({ vault, catalogue: firstCatalogue });
+    indexReconciledDocuments({ catalogue: firstCatalogue, index: first, report: firstReport });
+    expect(first.candidates({ query: 'vanishing', limit: 10 })).toHaveLength(1);
+    first.close();
+    firstCatalogue.close();
+
+    await rm(join(sandbox.vault, 'Knowledge', 'Gone.md'));
+
+    const secondCatalogue = CurrentCatalogue.open({});
+    const second = openSearchIndex(databasePath);
+    const secondReport = await reconcileCurrentVault({ vault, catalogue: secondCatalogue });
+    indexReconciledDocuments({ catalogue: secondCatalogue, index: second, report: secondReport });
+    expect(second.candidates({ query: 'vanishing', limit: 10 })).toHaveLength(0);
+    expect(second.paths()).toEqual([]);
+    second.close();
+    secondCatalogue.close();
+  } finally {
+    await sandbox.dispose();
   }
 });
 

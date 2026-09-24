@@ -138,6 +138,28 @@ function overlapBoundary(raw: string, start: number, end: number, maxTokens: num
   return best;
 }
 
+function fitOverlapStart(
+  raw: string,
+  minimum: number,
+  maximum: number,
+  end: number,
+  maxTokens: number
+): number {
+  let low = minimum;
+  let high = maximum;
+  let best = maximum;
+  while (low <= high) {
+    const middle = (low + high) >> 1;
+    if (countReferenceTokens(raw.slice(middle, end)) <= maxTokens) {
+      best = middle;
+      high = middle - 1;
+    } else {
+      low = middle + 1;
+    }
+  }
+  return best;
+}
+
 function splitOversized(raw: string, start: number, end: number): Array<[number, number]> {
   const parts: Array<[number, number]> = [];
   let cursor = start;
@@ -156,7 +178,7 @@ function splitOversized(raw: string, start: number, end: number): Array<[number,
     }
     let stop = best;
     if (stop < end) {
-      const newline = raw.lastIndexOf('\n', stop);
+      const newline = raw.lastIndexOf('\n', stop - 1);
       if (newline > cursor) stop = newline + 1;
     }
     if (stop <= cursor) stop = Math.min(cursor + 1, end);
@@ -245,12 +267,29 @@ export function chunkDocument(document: CurrentDocument, raw: string): SearchChu
   const sourceHash = sha256(raw);
   const offset = bodyOffset(raw, document.body);
   const body = raw.slice(offset);
-  if (body.length === 0) return [];
+  const references = extractLinks(raw);
+  const starts = lineStarts(raw);
+  const build = (start: number, end: number, heading: string | null): SearchChunk => ({
+    chunk_key: `${documentKey}#${start}-${end}`,
+    document_key: documentKey,
+    ...(document.id === undefined ? {} : { id: document.id }),
+    path: document.path,
+    title: document.title,
+    heading,
+    line_from: lineAt(starts, start),
+    line_to: lineAt(starts, Math.max(start, end - 1)),
+    start_offset: start,
+    end_offset: end,
+    text: raw.slice(start, end),
+    source_hash: sourceHash,
+    reference_tokens: referenceTokensIn(references, start, end)
+  });
+  if (body.trim().length === 0) {
+    return splitOversized(raw, 0, raw.length).map(([start, end]) => build(start, end, null));
+  }
   const sections = sectionsOf(bodyBlocks(body, offset), document.title);
   const segments: Segment[] = [];
   sections.forEach((section, index) => segmentSection(raw, section, index, segments));
-  const references = extractLinks(raw);
-  const starts = lineStarts(raw);
   const chunks: SearchChunk[] = [];
   for (let index = 0; index < segments.length; index += 1) {
     const segment = segments[index];
@@ -258,26 +297,17 @@ export function chunkDocument(document: CurrentDocument, raw: string): SearchChu
     if (index > 0 && segments[index - 1].section === segment.section) {
       const previous = segments[index - 1];
       const overlap = overlapBoundary(raw, previous.start, previous.end, CHUNK_OVERLAP_TOKENS);
-      if (overlap > previous.start && overlap < segment.end) start = overlap;
+      if (overlap > previous.start && overlap < segment.end) {
+        start =
+          countReferenceTokens(raw.slice(overlap, segment.end)) <= CHUNK_TARGET_TOKENS
+            ? overlap
+            : fitOverlapStart(raw, overlap, segment.start, segment.end, CHUNK_TARGET_TOKENS);
+      }
     }
     if (start >= segment.end) start = segment.start;
-    const text = raw.slice(start, segment.end);
-    if (text.length === 0) continue;
-    chunks.push({
-      chunk_key: `${documentKey}#${start}-${segment.end}`,
-      document_key: documentKey,
-      ...(document.id === undefined ? {} : { id: document.id }),
-      path: document.path,
-      title: document.title,
-      heading: segment.heading,
-      line_from: lineAt(starts, start),
-      line_to: lineAt(starts, Math.max(start, segment.end - 1)),
-      start_offset: start,
-      end_offset: segment.end,
-      text,
-      source_hash: sourceHash,
-      reference_tokens: referenceTokensIn(references, start, segment.end)
-    });
+    const chunk = build(start, segment.end, segment.heading);
+    if (chunk.text.length === 0) continue;
+    chunks.push(chunk);
   }
   return chunks;
 }

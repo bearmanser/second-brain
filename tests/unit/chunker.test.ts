@@ -93,3 +93,30 @@ test('reference tokens record the wikilinks inside each slice', () => {
   const withLinks = chunks.find((chunk) => chunk.text.includes('Knowledge/Answer'));
   expect(withLinks?.reference_tokens).toEqual(['Knowledge/Answer', 'Other#Part']);
 });
+
+test('two near-target paragraphs keep every chunk within the token target after overlap', () => {
+  const repeated = (word: string): string => {
+    let text = '';
+    while (countReferenceTokens(`${text}${word} `) <= 240) text += `${word} `;
+    return text.trim();
+  };
+  const raw = `# Head\n\n${repeated('alpha')}\n\n${repeated('bravo')}\n`;
+  const chunks = chunksFor(raw);
+  expect(chunks.length).toBeGreaterThanOrEqual(2);
+  for (const chunk of chunks) {
+    expect(countReferenceTokens(chunk.text)).toBeLessThanOrEqual(CHUNK_TARGET_TOKENS);
+    expect(chunk.text).toBe(raw.slice(chunk.start_offset, chunk.end_offset));
+  }
+  expect(chunks.some((chunk) => chunk.text.includes('bravo'))).toBe(true);
+});
+
+test('frontmatter-only notes produce a source-backed excerpt', () => {
+  const raw = '---\naliases:\n  - Legacy alias\n---\n';
+  const document = parseDocument(raw, 'Knowledge/Metadata only.md');
+  const chunks = chunkDocument(document, raw);
+  expect(chunks).toHaveLength(1);
+  expect(chunks[0].text).toBe(raw);
+  expect(chunks[0].text).toBe(raw.slice(chunks[0].start_offset, chunks[0].end_offset));
+  expect(chunks[0].reference_tokens).toEqual([]);
+  expect(chunks[0].heading).toBeNull();
+});

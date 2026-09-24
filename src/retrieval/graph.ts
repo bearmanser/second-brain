@@ -77,8 +77,10 @@ export function expandGraph(
   if (seeds.length === 0) return { neighbors: [], edges: [] };
   const maximum = Math.max(0, Math.min(Math.trunc(limit), GRAPH_NEIGHBOR_LIMIT));
   const seedSet = new Set(seeds);
-  const chosen = new Map<string, { relationship: string; direction: 'outgoing' | 'incoming' }>();
-  const edges: GraphEdge[] = [];
+  const chosen = new Map<
+    string,
+    { relationship: string; direction: 'outgoing' | 'incoming'; edge: GraphStoredEdge }
+  >();
   for (const edge of store.edgesTouching(seeds)) {
     const candidates: Array<{ self: string; other: string; direction: 'outgoing' | 'incoming' }> = [
       { self: edge.source, other: edge.target, direction: 'outgoing' },
@@ -87,16 +89,24 @@ export function expandGraph(
     for (const candidate of candidates) {
       if (!seedSet.has(candidate.self)) continue;
       if (seedSet.has(candidate.other)) continue;
-      edges.push(edge);
       const existing = chosen.get(candidate.other);
       if (existing === undefined) {
-        chosen.set(candidate.other, { relationship: edge.relationship, direction: candidate.direction });
+        chosen.set(candidate.other, {
+          relationship: edge.relationship,
+          direction: candidate.direction,
+          edge
+        });
       } else if (existing.relationship === 'link' && edge.relationship !== 'link') {
-        chosen.set(candidate.other, { relationship: edge.relationship, direction: candidate.direction });
+        chosen.set(candidate.other, {
+          relationship: edge.relationship,
+          direction: candidate.direction,
+          edge
+        });
       }
     }
   }
   const neighbors: GraphNeighbor[] = [];
+  const selectedEdges: GraphEdge[] = [];
   for (const [key, relation] of chosen) {
     if (neighbors.length >= maximum) break;
     const document = store.documentFor(key);
@@ -114,8 +124,9 @@ export function expandGraph(
       direction: relation.direction,
       chunk
     });
+    selectedEdges.push(relation.edge);
   }
-  return { neighbors, edges: dedupeEdges(edges) };
+  return { neighbors, edges: dedupeEdges(selectedEdges) };
 }
 
 export function createGraphExpander(

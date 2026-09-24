@@ -168,18 +168,29 @@ function removeDocumentRows(
   documentKey: string,
   path: string
 ): void {
+  const displaced = database
+    .prepare('SELECT document_key FROM documents WHERE document_key = ? OR path = ?')
+    .all(documentKey, path) as { document_key: string }[];
+  const keys = [...new Set<string>([documentKey, ...displaced.map((row) => row.document_key)])];
+  const placeholders = keys.map(() => '?').join(', ');
   const rows = database
-    .prepare('SELECT row_id FROM chunks WHERE document_key = ? OR path = ?')
-    .all(documentKey, path) as { row_id: number }[];
+    .prepare(`SELECT row_id FROM chunks WHERE document_key IN (${placeholders}) OR path = ?`)
+    .all(...keys, path) as { row_id: number }[];
   if (rows.length > 0) {
     const deleteFts = database.prepare('DELETE FROM chunks_fts WHERE rowid = ?');
     for (const row of rows) deleteFts.run(row.row_id);
   }
-  database.prepare('DELETE FROM chunks WHERE document_key = ? OR path = ?').run(documentKey, path);
-  database.prepare('DELETE FROM documents WHERE document_key = ? OR path = ?').run(documentKey, path);
-  database.prepare('DELETE FROM document_properties WHERE document_key = ?').run(documentKey);
-  database.prepare('DELETE FROM document_aliases WHERE document_key = ?').run(documentKey);
-  database.prepare('DELETE FROM document_links WHERE source_document_key = ?').run(documentKey);
+  database
+    .prepare(`DELETE FROM chunks WHERE document_key IN (${placeholders}) OR path = ?`)
+    .run(...keys, path);
+  database
+    .prepare(`DELETE FROM documents WHERE document_key IN (${placeholders}) OR path = ?`)
+    .run(...keys, path);
+  database.prepare(`DELETE FROM document_properties WHERE document_key IN (${placeholders})`).run(...keys);
+  database.prepare(`DELETE FROM document_aliases WHERE document_key IN (${placeholders})`).run(...keys);
+  database
+    .prepare(`DELETE FROM document_links WHERE source_document_key IN (${placeholders})`)
+    .run(...keys);
 }
 
 function mergeCandidates(
@@ -223,6 +234,7 @@ export interface SearchIndexEntry {
 export interface SearchIndex {
   replaceDocument(input: ReplaceDocumentInput): void;
   deletePath(path: string): void;
+  paths(): string[];
   candidates(input: CandidateQuery): Candidate[];
   expandGraph(seedKeys: readonly string[], filters: GraphFilters, limit: number): GraphExpansion;
   upsert(entry: SearchIndexEntry): void;
@@ -420,6 +432,14 @@ class SearchIndexImpl implements SearchIndex {
       removeDocumentRows(this.database, documentKey, path);
     });
     transaction.immediate();
+  }
+
+  paths(): string[] {
+    this.assertOpen();
+    const rows = this.database.prepare('SELECT path FROM documents ORDER BY path ASC').all() as {
+      path: string;
+    }[];
+    return rows.map((row) => row.path);
   }
 
   private lexicalCandidates(

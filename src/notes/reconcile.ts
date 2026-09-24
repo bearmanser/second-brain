@@ -58,10 +58,11 @@ export interface SearchIndexSink {
     revision_id?: string;
   }): void;
   remove?(path: string): void;
+  paths?(): string[];
 }
 
 export interface IndexReconciledDocumentsInput {
-  catalogue: Pick<CurrentCatalogue, 'rawFor' | 'getByPath'>;
+  catalogue: Pick<CurrentCatalogue, 'all' | 'rawFor' | 'getByPath'>;
   index: SearchIndexSink;
   report: ReconcileCurrentVaultReport;
 }
@@ -86,6 +87,12 @@ export function indexReconciledDocuments(input: IndexReconciledDocumentsInput): 
     });
   }
   for (const removed of report.removed) index.remove?.(removed.path);
+  if (typeof index.paths === 'function') {
+    const current = new Set(catalogue.all().map((source) => source.path));
+    for (const indexed of index.paths()) {
+      if (!current.has(indexed)) index.remove?.(indexed);
+    }
+  }
 }
 
 export type { ReconcileFinding, ReconcileReport, ReconcileScopeReport } from '../core/types.js';
