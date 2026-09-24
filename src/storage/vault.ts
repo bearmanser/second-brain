@@ -259,6 +259,27 @@ export class FileVault implements VaultPort {
     return this.inventory(scope);
   }
 
+  async listMarkdown(): Promise<string[]> {
+    const paths = await listVaultFilePaths(this.root);
+    return paths.filter((path) => path.toLowerCase().endsWith('.md'));
+  }
+
+  async readMarkdown(
+    relativePath: string
+  ): Promise<{ raw: string; raw_hash: string; relative_path: string }> {
+    const segments = vaultNoteSegments(relativePath);
+    const resolved = resolve(this.root, ...segments);
+    if (!isStrictlyInside(this.root, resolved)) {
+      throw forbidden('path is outside the vault root');
+    }
+    for (let attempt = 0; attempt < MAX_READ_ATTEMPTS; attempt += 1) {
+      await this.assertSegments(segments);
+      const outcome = await this.readOnce(segments, this.canonicalRoot);
+      if (outcome.kind === 'stable') return outcome.value;
+    }
+    throw unstable(`file ${segments.join('/')} changed or left the vault while it was being read`);
+  }
+
   private async inventory(scope: string): Promise<{ managed: string[]; unmanaged: string[] }> {
     const config = this.requireScope(scope);
     const canonicalScopeRoot = this.scopeRoots.get(config.id);

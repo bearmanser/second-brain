@@ -33,6 +33,14 @@ import { createHttpApp } from './mcp/http.js';
 import { createMcpServer, type BrainServices } from './mcp/server.js';
 import { internalDiagnostic } from './mcp/tools.js';
 import { RevisionCatalogue } from './notes/catalogue.js';
+import {
+  CurrentCatalogue,
+  observeCurrentVault,
+  reconcileCurrentVault,
+  type CurrentVault,
+  type CurrentVaultObserver,
+  type ReconcileCurrentVaultReport
+} from './notes/current-catalogue.js';
 import { JournalApprovalProvenance, reconcileVault } from './notes/reconcile.js';
 import { recoverPending } from './operations/recovery.js';
 import { ScopeRegistry } from './projects/scope-registry.js';
@@ -259,6 +267,8 @@ class BrainRuntimeImpl implements BrainRuntime {
   private pruneTimer: NodeJS.Timeout | undefined;
   private reconcileTimer: NodeJS.Timeout | undefined;
   private reconciling = false;
+  private currentCatalogue: CurrentCatalogue | undefined;
+  private currentObserver: CurrentVaultObserver | undefined;
   private readonly readLimiter: ReadLimiter;
 
   constructor(config: BrainConfig, options: RuntimeOptions) {
@@ -394,6 +404,7 @@ class BrainRuntimeImpl implements BrainRuntime {
         this.logRecovery(report);
       });
       await this.startupReconcile();
+      await this.startCurrentVault();
       await loadCursorSecret(this.config);
 
       const base = buildServices(deps, this.config.result_delivery, this.log);
@@ -578,6 +589,47 @@ class BrainRuntimeImpl implements BrainRuntime {
     this.logReconcile(report);
   }
 
+  private async startCurrentVault(): Promise<void> {
+    const vault = this.deps.vault as VaultPort & Partial<CurrentVault>;
+    if (typeof vault.listMarkdown !== 'function' || typeof vault.readMarkdown !== 'function') {
+      return;
+    }
+    const current = CurrentCatalogue.open();
+    this.currentCatalogue = current;
+    const observer = observeCurrentVault({
+      root: this.config.mounts.vault,
+      vault: vault as CurrentVault,
+      catalogue: current,
+      signal: this.shutdown.signal,
+      interval_ms: this.config.limits.reconcile_interval_ms ?? RECONCILE_INTERVAL_MS,
+      onReconcile: (report) => this.logCurrentReconcile(report),
+      onError: (error) => this.log(internalDiagnostic(error))
+    });
+    this.currentObserver = observer;
+    try {
+      const report = await reconcileCurrentVault({
+        vault: vault as CurrentVault,
+        catalogue: current,
+        signal: this.shutdown.signal
+      });
+      this.logCurrentReconcile(report);
+    } catch (error) {
+      if (!(isBrainError(error) && error.code === 'CANCELLED')) {
+        this.log(internalDiagnostic(error));
+      }
+    }
+  }
+
+  private logCurrentReconcile(report: ReconcileCurrentVaultReport): void {
+    this.log(
+      `current vault reconcile scanned ${report.scanned} files; ` +
+        `${report.added.length} added, ${report.changed.length} changed, ` +
+        `${report.moved.length} moved, ${report.removed.length} removed, ` +
+        `${report.malformed.length} malformed, ${report.duplicate_ids.length} duplicate_ids, ` +
+        `${report.unresolved_links.length} unresolved_links`
+    );
+  }
+
   private periodicReconcile(): void {
     if (this.reconciling || this.closing) return;
     this.reconciling = true;
@@ -662,6 +714,10 @@ class BrainRuntimeImpl implements BrainRuntime {
       this.reconcileTimer = undefined;
     }
     this.ready = false;
+    await this.currentObserver?.close().catch(() => undefined);
+    this.currentObserver = undefined;
+    this.currentCatalogue?.close();
+    this.currentCatalogue = undefined;
     await this.backend?.close().catch(() => undefined);
     this.backend = undefined;
     this.catalogue?.close();

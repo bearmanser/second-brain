@@ -255,6 +255,27 @@ function asLifecycle(value: string | null | undefined): Lifecycle {
   return (LIFECYCLES as readonly string[]).includes(value ?? '') ? (value as Lifecycle) : 'candidate';
 }
 
+export interface CatalogueReferenceTarget {
+  id?: string | null;
+  path: string;
+}
+
+export function selectCatalogueEntry<T extends CatalogueReferenceTarget>(
+  entries: readonly T[],
+  reference: { id?: string; path?: string }
+): T | undefined {
+  const id = reference.id;
+  if (id !== undefined) {
+    const match = entries.find((entry) => entry.id === id);
+    if (match !== undefined) return match;
+  }
+  const path = reference.path;
+  if (path !== undefined) {
+    return entries.find((entry) => entry.path === path);
+  }
+  return undefined;
+}
+
 export class RevisionCatalogue implements CataloguePort {
   private readonly database: Database.Database;
   private readonly vault: VaultPort;

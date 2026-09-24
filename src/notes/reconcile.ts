@@ -13,6 +13,37 @@ import {
 } from './codec.js';
 import type { ApprovalProvenance, ApprovalProvenanceInput } from './catalogue.js';
 
+export {
+  CURRENT_VAULT_DEBOUNCE_MS,
+  CURRENT_VAULT_RESCAN_INTERVAL_MS,
+  CurrentCatalogue,
+  matchCurrentIdentity,
+  observeCurrentVault,
+  readCurrentSource,
+  reconcileCurrentVault
+} from './current-catalogue.js';
+export type {
+  CurrentCatalogueOptions,
+  CurrentHistory,
+  CurrentIdentity,
+  CurrentIndexEntry,
+  CurrentIdentityMatch,
+  CurrentSource,
+  CurrentSourceLookup,
+  CurrentVault,
+  CurrentVaultChange,
+  CurrentVaultDuplicate,
+  CurrentVaultMalformed,
+  CurrentVaultMove,
+  CurrentVaultObserver,
+  CurrentVaultRemoval,
+  CurrentVaultUnresolvedLink,
+  ObserveCurrentVaultOptions,
+  ReadCurrentSourceInput,
+  ReconcileCurrentVaultInput,
+  ReconcileCurrentVaultReport
+} from './current-catalogue.js';
+
 export interface ReconcileOptions {
   detailed?: boolean;
 }
