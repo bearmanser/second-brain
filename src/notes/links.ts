@@ -170,7 +170,12 @@ function splitWikilinkInner(
   };
 }
 
-function findWikilinkClose(text: string, from: number): number {
+type WikilinkBoundary =
+  | { kind: 'close'; index: number }
+  | { kind: 'nested'; index: number }
+  | { kind: 'none' };
+
+function findWikilinkBoundary(text: string, from: number): WikilinkBoundary {
   let cursor = from;
   while (cursor < text.length) {
     const character = text[cursor];
@@ -178,10 +183,11 @@ function findWikilinkClose(text: string, from: number): number {
       cursor += 2;
       continue;
     }
-    if (character === ']' && text[cursor + 1] === ']') return cursor;
+    if (character === '[' && text[cursor + 1] === '[') return { kind: 'nested', index: cursor };
+    if (character === ']' && text[cursor + 1] === ']') return { kind: 'close', index: cursor };
     cursor += 1;
   }
-  return -1;
+  return { kind: 'none' };
 }
 
 function scanWikilinks(
@@ -203,11 +209,16 @@ function scanWikilinks(
       index = open + 1;
       continue;
     }
-    const close = findWikilinkClose(text, open + 2);
-    if (close === -1) {
+    const boundary = findWikilinkBoundary(text, open + 2);
+    if (boundary.kind === 'nested') {
+      index = boundary.index;
+      continue;
+    }
+    if (boundary.kind === 'none') {
       index = open + 1;
       continue;
     }
+    const close = boundary.index;
     const start = base + (bang ? open - 1 : open);
     const end = base + close + 2;
     if (!overlapsAny(excluded, start, end)) {

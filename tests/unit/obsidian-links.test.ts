@@ -146,3 +146,18 @@ test('keeps escaped brackets inside a wikilink and reports raw offsets', () => {
   expect(links.map((link) => link.target)).toEqual(['Notes[draft]']);
   expect(raw.slice(links[0].start, links[0].end)).toBe('[[Notes\\[draft\\]]]');
 });
+
+test('does not let an unfinished opener consume a later valid link', () => {
+  const raw = '[[unfinished [[Real]]\n';
+  const links = extractLinks(raw);
+  expect(links.map((link) => link.target)).toEqual(['Real']);
+  expect(raw.slice(links[0].start, links[0].end)).toBe('[[Real]]');
+});
+
+test('extracts ordinary adjacent complete wikilinks', () => {
+  const raw = '[[A]] and [[B]]\n';
+  const links = extractLinks(raw);
+  expect(links.map((link) => link.target)).toEqual(['A', 'B']);
+  expect(raw.slice(links[0].start, links[0].end)).toBe('[[A]]');
+  expect(raw.slice(links[1].start, links[1].end)).toBe('[[B]]');
+});
