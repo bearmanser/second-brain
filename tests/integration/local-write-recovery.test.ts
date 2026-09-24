@@ -488,6 +488,35 @@ test('a retry after a partially completed replacement resumes instead of conflic
   }
 });
 
+test('a quoted managed id survives interrupted replacement and same-key retry', async () => {
+  const s = await vaultSandbox();
+  let interrupt = true;
+  const id = '44b093c5-71db-4785-b9a5-bb8118304278';
+  const path = 'Inbox/Quoted retry.md';
+  const raw = `---\nid: '${id}'\ntype: note\nstatus: candidate\n---\n\n# Quoted retry\n`;
+  const store = await openDocumentStore({ vault: s.vault, state: s.state, faults: {
+    afterReplace() { if (interrupt) throw new Error('interrupted after replacement'); }
+  } });
+  try {
+    const input = { path, raw, expectedEtag: null, idempotencyKey: 'quoted-interrupted', source: 'test' };
+    await expect(store.put(input)).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    const before = await stat(join(s.vault, path));
+    interrupt = false;
+    const result = await store.put(input);
+    expect(result.id).toBe(id);
+    expect((await store.readPath(path)).raw).toBe(raw);
+    expect((await store.readPath(path)).revision_id).toBe(result.revision_id);
+    expect((await store.readRevision(id, result.revision_id)).raw).toBe(raw);
+    const after = await stat(join(s.vault, path));
+    expect(after.ino).toBe(before.ino);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+    expect(await revisionCount(s.state, id)).toBe(1);
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
 test('recovery does not catalogue a visible revision missing from durable history', async () => {
   const s = await vaultSandbox();
   const path = 'Inbox/Missing history.md';

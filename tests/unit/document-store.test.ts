@@ -559,6 +559,45 @@ test('a quoted foreign frontmatter id cannot pass historical identity verificati
   }
 });
 
+test('a quoted matching managed id is writable and historically readable', async () => {
+  const s = await vaultSandbox();
+  const store = await openDocumentStore(s);
+  const id = '44b093c5-71db-4785-b9a5-bb8118304278';
+  const path = 'Inbox/Quoted matching.md';
+  const raw = `---\nid: "${id}"\ntype: note\nstatus: candidate\n---\n\n# Quoted matching\n`;
+  try {
+    const result = await store.put({ path, raw, expectedEtag: null, idempotencyKey: 'quoted-matching', source: 'test' });
+    expect(result.id).toBe(id);
+    expect((await store.readPath(path)).raw).toBe(raw);
+    expect((await store.readPath(path)).revision_id).toBe(result.revision_id);
+    expect((await store.readRevision(id, result.revision_id)).raw).toBe(raw);
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
+test('an unsupported id representation fails before reserving a key that a corrected request can use', async () => {
+  const s = await vaultSandbox();
+  const store = await openDocumentStore(s);
+  const id = '44b093c5-71db-4785-b9a5-bb8118304278';
+  const path = 'Inbox/Unsupported id.md';
+  const idempotencyKey = 'unsupported-id-then-corrected';
+  try {
+    await expect(store.put({
+      path, raw: `---\nid: "${id}" # comment\ntype: note\n---\n\n# Unsupported\n`,
+      expectedEtag: null, idempotencyKey, source: 'test'
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+    const raw = `---\nid: "${id}"\ntype: note\n---\n\n# Supported\n`;
+    const result = await store.put({ path, raw, expectedEtag: null, idempotencyKey, source: 'test' });
+    expect(result.id).toBe(id);
+    expect((await store.readRevision(id, result.revision_id)).raw).toBe(raw);
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
 test('an oversized current note is rejected before hashing', async () => {
   const s = await vaultSandbox();
   const store = await openDocumentStore(s);

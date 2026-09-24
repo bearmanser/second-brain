@@ -9,7 +9,7 @@ import { readBoundedBytes } from './vault.js';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
-const FRONTMATTER_ID_PATTERN = /^id:[ \t]*([0-9a-fA-F-]{36})[ \t]*$/;
+const FRONTMATTER_ID_PATTERN = /^id:[ \t]*(?:"([0-9a-fA-F-]{36})"|'([0-9a-fA-F-]{36})'|([0-9a-fA-F-]{36}))[ \t]*$/;
 
 function invalidInput(message: string, cause?: unknown): BrainError {
   return new BrainError({ code: 'INVALID_INPUT', message, cause });
@@ -98,9 +98,13 @@ function readFrontmatterId(raw: string): string | undefined {
   if (close === -1) return undefined;
   for (const line of lines.slice(1, close)) {
     const match = FRONTMATTER_ID_PATTERN.exec(line);
-    if (match !== null) return match[1].toLowerCase();
+    if (match !== null) return (match[1] ?? match[2] ?? match[3])?.toLowerCase();
   }
   return undefined;
+}
+
+export function revisionHasId(raw: string, id: string): boolean {
+  return readFrontmatterId(raw) === id.toLowerCase();
 }
 
 async function assertSafeRoot(root: string): Promise<void> {
@@ -312,8 +316,7 @@ class FileRevisionStore implements RevisionStore {
     if (!HASH_PATTERN.test(recorded) || recorded !== hash) {
       throw recoveryRequired(`revision ${safeRevision} failed its recorded byte-integrity check`);
     }
-    const documentId = readFrontmatterId(raw);
-    if (documentId !== safeId.toLowerCase()) {
+    if (!revisionHasId(raw, safeId)) {
       throw recoveryRequired(`revision ${safeRevision} does not belong to logical id ${safeId}`);
     }
     return { id: safeId, revision_id: safeRevision, raw, hash, path };

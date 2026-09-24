@@ -9,7 +9,7 @@ import type { Clock, IdSource } from '../core/types.js';
 import { parseDocument, renderDocument } from '../notes/document-codec.js';
 import { collisionKey } from '../notes/paths.js';
 import { LocalWriteJournal, type LocalWriteRecord } from './journal.js';
-import { openRevisionStore, type RevisionStore } from './revision-store.js';
+import { openRevisionStore, revisionHasId, type RevisionStore } from './revision-store.js';
 import { listVaultFilePaths, readBoundedBytes, vaultNoteSegments } from './vault.js';
 
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
@@ -416,6 +416,9 @@ class LocalDocumentStore implements DocumentStore {
     const revisionId = record?.revision_id ?? this.ids.next();
     const document = parsed.id === undefined ? { ...parsed, id } : parsed;
     const rawToWrite = parsed.id === undefined ? renderDocument(document) : input.raw;
+    if (!revisionHasId(rawToWrite, id)) {
+      throw invalidInput('the managed note must have a readable frontmatter id matching its logical id');
+    }
     const revisionHash = sha256(rawToWrite);
     const preimageHash = record === undefined ? observed?.hash ?? null : record.preimage_hash;
     const hadReservation = record !== undefined;
