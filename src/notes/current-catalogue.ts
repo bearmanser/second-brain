@@ -447,6 +447,22 @@ export async function reconcileCurrentVault(
     )
     .map((item) => ({ id: item.document.id, path: item.path }));
 
+  interface PlannedUpsert {
+    path: string;
+    raw: string;
+    etag: string;
+    id?: string;
+    revision_id?: string;
+  }
+  interface PlannedMove extends PlannedUpsert {
+    from: string;
+    move_id: string;
+  }
+  interface PlannedChange extends PlannedUpsert {
+    previous_etag: string;
+    prior: CurrentSource;
+  }
+
   const movedFrom = new Set<string>();
   const moveDestinations = new Set<string>();
   const movesByTo = new Map<string, { id: string; from: string; to: string }>();
@@ -454,48 +470,36 @@ export async function reconcileCurrentVault(
     if ('to' in match) movesByTo.set(match.to, match);
   }
 
-  interface PendingMove {
-    match: { id: string; from: string; to: string };
-    item: ObservedDocument;
-    source: CurrentSource;
-  }
-  const pendingMoves: PendingMove[] = [];
+  const plannedMoves: PlannedMove[] = [];
   for (const item of observed) {
+    if (signal?.aborted) throw cancelled();
     const id = item.document.id;
     if (id !== undefined && duplicateIds.has(id)) continue;
     const move = movesByTo.get(item.path);
     if (move === undefined) continue;
     const source = previousByPath.get(move.from);
     if (source === undefined) continue;
-    pendingMoves.push({ match: move, item, source });
     moveDestinations.add(item.path);
-  }
-
-  const movePriorRaw = new Map<string, string | undefined>();
-  for (const pending of pendingMoves) {
-    movePriorRaw.set(pending.match.from, catalogue.rawFor(pending.match.from));
-    catalogue.remove(pending.match.from);
-    movedFrom.add(pending.match.from);
-  }
-
-  for (const pending of pendingMoves) {
-    if (signal?.aborted) throw cancelled();
-    const { match, item, source } = pending;
+    movedFrom.add(move.from);
     let revisionId = source.revision_id;
     if (source.id !== undefined && source.hash !== item.raw_hash) {
-      await catalogue.persistSnapshot(source.id, movePriorRaw.get(match.from));
+      await catalogue.persistSnapshot(source.id, catalogue.rawFor(move.from));
+      if (signal?.aborted) throw cancelled();
       revisionId = await catalogue.persistRevision(source.id, item.raw);
     }
-    catalogue.upsert({
+    plannedMoves.push({
+      from: move.from,
+      move_id: move.id,
       path: item.path,
       raw: item.raw,
       etag: item.raw_hash,
       ...(source.id === undefined ? {} : { id: source.id }),
       ...(revisionId === undefined ? {} : { revision_id: revisionId })
     });
-    report.moved.push({ id: match.id, from: match.from, to: item.path });
   }
 
+  const plannedAdds: PlannedUpsert[] = [];
+  const plannedChanges: PlannedChange[] = [];
   for (const item of observed) {
     if (signal?.aborted) throw cancelled();
     if (moveDestinations.has(item.path)) continue;
@@ -505,15 +509,13 @@ export async function reconcileCurrentVault(
     const prior = previousByPath.get(item.path);
     if (prior === undefined) {
       const revisionId = await catalogue.persistRevision(id, item.raw);
-      catalogue.upsert({
+      plannedAdds.push({
         path: item.path,
         raw: item.raw,
         etag: item.raw_hash,
         ...(id === undefined ? {} : { id }),
         ...(revisionId === undefined ? {} : { revision_id: revisionId })
       });
-      const added = catalogue.getByPath(item.path);
-      if (added !== undefined) report.added.push(added);
       continue;
     }
 
@@ -522,34 +524,76 @@ export async function reconcileCurrentVault(
     let revisionId: string | undefined;
     if (id !== undefined && id === prior.id) {
       await catalogue.persistSnapshot(id, catalogue.rawFor(prior.path));
+      if (signal?.aborted) throw cancelled();
       revisionId = await catalogue.persistRevision(id, item.raw);
     } else if (id !== undefined) {
       if (prior.id !== undefined) {
         await catalogue.persistSnapshot(prior.id, catalogue.rawFor(prior.path));
       }
+      if (signal?.aborted) throw cancelled();
       revisionId = await catalogue.persistRevision(id, item.raw);
     }
-    catalogue.recordHistory(prior);
-    catalogue.upsert({
+    plannedChanges.push({
+      prior,
+      previous_etag: prior.etag,
       path: item.path,
       raw: item.raw,
       etag: item.raw_hash,
       ...(id === undefined ? {} : { id }),
       ...(revisionId === undefined ? {} : { revision_id: revisionId })
     });
-    report.changed.push({
-      path: item.path,
-      ...(id === undefined ? {} : { id }),
-      previous_etag: prior.etag,
-      etag: item.raw_hash
-    });
   }
 
   const observedPaths = new Set(observed.map((item) => item.path));
+  const plannedRemovals: CurrentSource[] = [];
   for (const source of previous) {
     if (observedPaths.has(source.path)) continue;
     if (movedFrom.has(source.path)) continue;
     if (source.id !== undefined && duplicateIds.has(source.id)) continue;
+    plannedRemovals.push(source);
+  }
+
+  if (signal?.aborted) throw cancelled();
+
+  for (const move of plannedMoves) catalogue.remove(move.from);
+  for (const move of plannedMoves) {
+    catalogue.upsert({
+      path: move.path,
+      raw: move.raw,
+      etag: move.etag,
+      ...(move.id === undefined ? {} : { id: move.id }),
+      ...(move.revision_id === undefined ? {} : { revision_id: move.revision_id })
+    });
+    report.moved.push({ id: move.move_id, from: move.from, to: move.path });
+  }
+  for (const add of plannedAdds) {
+    catalogue.upsert({
+      path: add.path,
+      raw: add.raw,
+      etag: add.etag,
+      ...(add.id === undefined ? {} : { id: add.id }),
+      ...(add.revision_id === undefined ? {} : { revision_id: add.revision_id })
+    });
+    const added = catalogue.getByPath(add.path);
+    if (added !== undefined) report.added.push(added);
+  }
+  for (const change of plannedChanges) {
+    catalogue.recordHistory(change.prior);
+    catalogue.upsert({
+      path: change.path,
+      raw: change.raw,
+      etag: change.etag,
+      ...(change.id === undefined ? {} : { id: change.id }),
+      ...(change.revision_id === undefined ? {} : { revision_id: change.revision_id })
+    });
+    report.changed.push({
+      path: change.path,
+      ...(change.id === undefined ? {} : { id: change.id }),
+      previous_etag: change.previous_etag,
+      etag: change.etag
+    });
+  }
+  for (const source of plannedRemovals) {
     catalogue.remove(source.path);
     report.removed.push({
       path: source.path,

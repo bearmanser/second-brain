@@ -1,18 +1,31 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { lstat, mkdir, readFile, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { afterEach, expect, test } from 'vitest';
+import type { BrainConfig } from '../../src/config/schema.js';
+import { BrainError } from '../../src/contracts/errors.js';
+import {
+  INPUT_BODY_MAX_BYTES,
+  BACKEND_TIMEOUT_MS,
+  CONCURRENT_READS,
+  DYNAMIC_PROJECTS_MAX,
+  PROJECT_PROVISION_GLOBAL_PER_MINUTE,
+  RENDERED_NOTE_MAX_BYTES,
+  TOOL_RESULT_MAX_BYTES
+} from '../../src/core/limits.js';
 import {
   CurrentCatalogue,
   observeCurrentVault,
   readCurrentSource,
   reconcileCurrentVault
 } from '../../src/notes/current-catalogue.js';
+import { createRuntime, type BrainRuntime } from '../../src/runtime.js';
 import { openDocumentStore } from '../../src/storage/document-store.js';
 import { openRevisionStore, type RevisionStore } from '../../src/storage/revision-store.js';
 import { FileVault } from '../../src/storage/vault.js';
+import { scopeFixtures } from '../fixtures/principals.js';
 import { vaultSandbox } from '../helpers/vault-sandbox.js';
-import { startHttpHarness } from '../support/harness.js';
+import { FakeBackend } from '../support/fake-backend.js';
 
 interface Fixture {
   vault: string;
@@ -629,40 +642,190 @@ test('aborting the observer signal releases its watcher and timers', async () =>
   await expect(observer.reconcileNow()).resolves.toBeUndefined();
 });
 
+async function startRuntimeFixture(s: { vault: string; state: string }): Promise<BrainRuntime> {
+  const scopes = scopeFixtures.map((scope) => ({ ...scope }));
+  for (const scope of scopes) {
+    await mkdir(join(s.vault, scope.relative_root), { recursive: true });
+  }
+  const cursorSecretFile = join(s.state, 'cursor.key');
+  await writeFile(cursorSecretFile, randomBytes(48));
+  const config: BrainConfig = {
+    endpoint: 'http://127.0.0.1:7331/mcp',
+    backend_endpoint: 'http://127.0.0.1:1/mcp',
+    port: 0,
+    mounts: { vault: s.vault, state: s.state },
+    cursor_secret_file: cursorSecretFile,
+    scopes,
+    limits: {
+      input_body_max_bytes: INPUT_BODY_MAX_BYTES,
+      rendered_note_max_bytes: RENDERED_NOTE_MAX_BYTES,
+      tool_result_max_bytes: TOOL_RESULT_MAX_BYTES,
+      backend_timeout_ms: BACKEND_TIMEOUT_MS,
+      materialization_timeout_ms: 200,
+      reconcile_interval_ms: 30,
+      concurrent_reads: CONCURRENT_READS,
+      project_provision_global_per_minute: PROJECT_PROVISION_GLOBAL_PER_MINUTE,
+      dynamic_projects_max: DYNAMIC_PROJECTS_MAX
+    },
+    allowed_hosts: ['127.0.0.1', 'localhost'],
+    allowed_origins: [],
+    result_delivery: 'structured'
+  };
+  return createRuntime(config, {
+    backend: new FakeBackend({
+      root: s.vault,
+      projects: scopes.map((scope) => scope.backend_project)
+    }),
+    token_digest: createHash('sha256').update(randomBytes(32)).digest('hex'),
+    logger: () => undefined
+  });
+}
+
 test('the runtime retains durable history across a restart', async () => {
-  const h = await startHttpHarness({ reconcile_interval_ms: 30 });
+  const s = await vaultSandbox();
+  disposers.push(s.dispose);
   const id = randomUUID();
   const relative = 'Knowledge/Durable.md';
-  try {
-    await writeVault(h.config.mounts.vault, relative, managedNote(id, 'Durable', { body: '# Durable\n\nFirst.\n' }));
-    const catalogue = h.runtime.currentCatalogue;
-    expect(catalogue).toBeDefined();
-    const firstDeadline = Date.now() + 5000;
-    while (catalogue?.getById(id) === undefined && Date.now() < firstDeadline) await sleep(20);
-    const first = catalogue?.getById(id);
-    expect(first?.revision_id).toBeDefined();
+  const firstRaw = managedNote(id, 'Durable', { body: '# Durable\n\nFirst.\n' });
+  const secondRaw = managedNote(id, 'Durable', { body: '# Durable\n\nSecond.\n' });
 
-    await writeVault(h.config.mounts.vault, relative, managedNote(id, 'Durable', { body: '# Durable\n\nSecond.\n' }));
-    const secondDeadline = Date.now() + 5000;
+  const firstRuntime = await startRuntimeFixture(s);
+  let firstRevision: string | undefined;
+  let secondRevision: string | undefined;
+  try {
+    await writeVault(s.vault, relative, firstRaw);
+    const firstDeadline = Date.now() + 8000;
+    while (firstRuntime.currentCatalogue?.getById(id) === undefined && Date.now() < firstDeadline) {
+      await sleep(20);
+    }
+    firstRevision = firstRuntime.currentCatalogue?.getById(id)?.revision_id;
+    expect(firstRevision).toBeDefined();
+
+    await writeVault(s.vault, relative, secondRaw);
+    const secondDeadline = Date.now() + 8000;
     while (
-      catalogue?.getById(id)?.revision_id === first?.revision_id &&
+      firstRuntime.currentCatalogue?.getById(id)?.revision_id === firstRevision &&
       Date.now() < secondDeadline
     ) {
       await sleep(20);
     }
-    const second = catalogue?.getById(id);
-    expect(second?.revision_id).not.toBe(first?.revision_id);
-
-    await rm(join(h.config.mounts.vault, relative));
-    const removalDeadline = Date.now() + 5000;
-    while (catalogue?.getById(id) !== undefined && Date.now() < removalDeadline) await sleep(20);
-    expect(catalogue?.getById(id)).toBeUndefined();
-
-    const fresh = await openRevisionStore(h.config.mounts.state);
-    expect((await fresh.readRevision(id, first?.revision_id ?? '')).raw).toContain('First.');
-    expect((await fresh.readRevision(id, second?.revision_id ?? '')).raw).toContain('Second.');
-    await fresh.verifyPreimage(id, first?.hash ?? '');
+    secondRevision = firstRuntime.currentCatalogue?.getById(id)?.revision_id;
+    expect(secondRevision).toBeDefined();
+    expect(secondRevision).not.toBe(firstRevision);
   } finally {
-    await h.close();
+    await firstRuntime.close();
   }
+
+  const restarted = await startRuntimeFixture(s);
+  try {
+    const catalogue = restarted.currentCatalogue;
+    expect(catalogue).toBeDefined();
+    const deadline = Date.now() + 8000;
+    while (catalogue?.getById(id) === undefined && Date.now() < deadline) await sleep(20);
+    expect(catalogue?.getById(id)?.path).toBe(relative);
+
+    const revisions = catalogue?.revisions;
+    expect(revisions).toBeDefined();
+    expect((await revisions!.readRevision(id, firstRevision!)).raw).toContain('First.');
+    expect((await revisions!.readRevision(id, secondRevision!)).raw).toContain('Second.');
+    await revisions!.verifyPreimage(id, hash(firstRaw));
+  } finally {
+    await restarted.close();
+  }
+});
+
+function controlledStore(real: RevisionStore): {
+  store: RevisionStore;
+  fail: () => void;
+  abortOnSnapshot: (controller: AbortController) => void;
+} {
+  let failing = false;
+  let abortController: AbortController | undefined;
+  const failure = (): Promise<never> =>
+    Promise.reject(
+      new BrainError({ code: 'RECOVERY_REQUIRED', message: 'simulated history failure' })
+    );
+  return {
+    fail: () => {
+      failing = true;
+    },
+    abortOnSnapshot: (controller) => {
+      abortController = controller;
+    },
+    store: {
+      persistPreimage(id, raw) {
+        if (failing) return failure();
+        if (abortController !== undefined) abortController.abort();
+        return real.persistPreimage(id, raw);
+      },
+      verifyPreimage: (id, digest) => real.verifyPreimage(id, digest),
+      persistRevision(id, revisionId, raw) {
+        if (failing) return failure();
+        return real.persistRevision(id, revisionId, raw);
+      },
+      readRevision: (id, revisionId) => real.readRevision(id, revisionId),
+      hasRevision: (id, revisionId) => real.hasRevision(id, revisionId),
+      close: () => real.close()
+    }
+  };
+}
+
+async function controlledFixture(): Promise<{
+  s: { vault: string; state: string };
+  vault: FileVault;
+  catalogue: CurrentCatalogue;
+  control: ReturnType<typeof controlledStore>;
+}> {
+  const s = await vaultSandbox();
+  disposers.push(s.dispose);
+  const real = await openRevisionStore(s.state);
+  const control = controlledStore(real);
+  const catalogue = CurrentCatalogue.open({ revisions: control.store });
+  return { s, vault: new FileVault(s.vault, []), catalogue, control };
+}
+
+test('a failed move persistence leaves every live note in the catalogue', async () => {
+  const f = await controlledFixture();
+  const first = randomUUID();
+  const second = randomUUID();
+  await writeVault(f.s.vault, 'Knowledge/Source.md', managedNote(first, 'Source', { body: '# Source\n\nOld.\n' }));
+  await writeVault(f.s.vault, 'Knowledge/Keep.md', managedNote(second, 'Keep'));
+  await reconcileCurrentVault({ vault: f.vault, catalogue: f.catalogue });
+  expect(f.catalogue.getById(first)?.path).toBe('Knowledge/Source.md');
+
+  await writeVault(f.s.vault, 'Knowledge/Moved.md', managedNote(first, 'Source', { body: '# Source\n\nNew.\n' }));
+  await rm(join(f.s.vault, 'Knowledge/Source.md'));
+  f.control.fail();
+
+  await expect(
+    reconcileCurrentVault({ vault: f.vault, catalogue: f.catalogue })
+  ).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+
+  expect(f.catalogue.getById(first)?.path).toBe('Knowledge/Source.md');
+  expect(f.catalogue.getById(second)?.path).toBe('Knowledge/Keep.md');
+  expect(f.catalogue.getByPath('Knowledge/Moved.md')).toBeUndefined();
+  expect(f.catalogue.all()).toHaveLength(2);
+});
+
+test('aborting during a move leaves every live note in the catalogue', async () => {
+  const f = await controlledFixture();
+  const first = randomUUID();
+  const second = randomUUID();
+  await writeVault(f.s.vault, 'Knowledge/Source.md', managedNote(first, 'Source', { body: '# Source\n\nOld.\n' }));
+  await writeVault(f.s.vault, 'Knowledge/Keep.md', managedNote(second, 'Keep'));
+  await reconcileCurrentVault({ vault: f.vault, catalogue: f.catalogue });
+
+  await writeVault(f.s.vault, 'Knowledge/Moved.md', managedNote(first, 'Source', { body: '# Source\n\nNew.\n' }));
+  await rm(join(f.s.vault, 'Knowledge/Source.md'));
+  const controller = new AbortController();
+  f.control.abortOnSnapshot(controller);
+
+  await expect(
+    reconcileCurrentVault({ vault: f.vault, catalogue: f.catalogue, signal: controller.signal })
+  ).rejects.toMatchObject({ code: 'CANCELLED' });
+
+  expect(f.catalogue.getById(first)?.path).toBe('Knowledge/Source.md');
+  expect(f.catalogue.getById(second)?.path).toBe('Knowledge/Keep.md');
+  expect(f.catalogue.getByPath('Knowledge/Moved.md')).toBeUndefined();
+  expect(f.catalogue.all()).toHaveLength(2);
 });
