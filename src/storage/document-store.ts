@@ -333,7 +333,6 @@ export interface DocumentStorePutInput {
   source: string;
   revisionId?: string;
   parents?: readonly { revision_id: string; raw_hash: string }[];
-  allowDuplicateIdPaths?: readonly string[];
 }
 
 export interface DocumentStorePutResult {
@@ -413,6 +412,7 @@ interface ConsolidationProgress {
   references_done?: string[];
   removals?: Record<string, { staging: string; sha256: string; disposed: boolean }>;
   removals_done?: boolean;
+  removal_index_failed?: boolean;
 }
 
 export interface DocumentStore {
@@ -422,6 +422,7 @@ export interface DocumentStore {
   applyRename(plan: RenamePlan): Promise<RenameReceipt>;
   consolidate(input: DocumentStoreConsolidateInput): Promise<DocumentStorePutResult>;
   getConsolidationReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
+  hasConsolidationManifest(idempotencyKey: string): boolean;
   getDocumentReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
   getMoveReceipt(idempotencyKey: string): RenameReceipt | undefined;
   recover(): Promise<DocumentStoreRecoveryReport>;
@@ -446,7 +447,6 @@ function payloadHash(input: DocumentStorePutInput): string {
       source: input.source,
       revisionId: input.revisionId ?? null,
       parents: input.parents ?? null,
-      allowDuplicateIdPaths: input.allowDuplicateIdPaths ?? null
     })
   );
 }
@@ -542,7 +542,7 @@ class LocalDocumentStore implements DocumentStore {
     return this.withLock(() => this.putSerialized(input));
   }
 
-  private async putSerialized(input: DocumentStorePutInput): Promise<DocumentStorePutResult> {
+  private async putSerialized(input: DocumentStorePutInput, consolidationPaths: readonly string[] = []): Promise<DocumentStorePutResult> {
     this.assertOpen();
     const segments = vaultNoteSegments(input.path);
     if (typeof input.raw !== 'string') throw invalidInput('raw must be a string');
@@ -654,7 +654,7 @@ class LocalDocumentStore implements DocumentStore {
         }
       }
     }
-    const collision = await this.findIdCollision(id, input.path, input.allowDuplicateIdPaths);
+    const collision = await this.findIdCollision(id, input.path, consolidationPaths);
     if (collision !== undefined) {
       this.markConflict(record, timestamp);
       throw conflict(`logical id ${id} already exists at ${collision}`);
@@ -666,14 +666,12 @@ class LocalDocumentStore implements DocumentStore {
         await this.revisions.persistPreimage(id, observed.raw);
       }
       await this.revisions.persistRevision(id, revisionId, rawToWrite);
-      if (input.parents !== undefined) {
-        await this.ensureRevisionMetadata(
-          id,
-          revisionId,
-          input.parents,
-          parsed.created ?? timestamp
-        );
-      }
+      await this.ensureRevisionMetadata(
+        id,
+        revisionId,
+        input.parents ?? [],
+        parsed.created ?? timestamp
+      );
     } catch (error) {
       throw wrapIo('revision history could not be persisted', error);
     }
@@ -717,6 +715,7 @@ class LocalDocumentStore implements DocumentStore {
       throw conflict(`path ${input.path} diverged from the persisted revision after replacement`);
     }
     await this.verifyDurableHistory(record);
+    await this.revisions.bindCurrent(id, input.path, revisionId, after.hash);
     return this.finalize(record, after, id, revisionId, timestamp, true);
   }
 
@@ -780,6 +779,10 @@ class LocalDocumentStore implements DocumentStore {
     return undefined;
   }
 
+  hasConsolidationManifest(idempotencyKey: string): boolean {
+    return this.journal.findConsolidationByKey(idempotencyKey) !== undefined;
+  }
+
   getDocumentReceipt(idempotencyKey: string): DocumentStorePutResult | undefined {
     const record = this.journal.findByKey(idempotencyKey);
     if (record !== undefined && record.state === 'complete' && record.receipt_json !== null) {
@@ -824,7 +827,7 @@ class LocalDocumentStore implements DocumentStore {
     const input = JSON.parse(current.manifest_json) as DocumentStoreConsolidateInput;
     let progress = JSON.parse(current.progress_json) as ConsolidationProgress;
     const save = (state: LocalConsolidationState, extra?: Partial<ConsolidationProgress>): void => {
-      progress = { ...progress, ...(extra ?? {}) };
+      Object.assign(progress, extra ?? {});
       current = this.journal.updateConsolidation(current.operation_id, {
         progress_json: JSON.stringify(progress),
         state,
@@ -839,6 +842,36 @@ class LocalDocumentStore implements DocumentStore {
       });
       throw recoveryRequired(message, cause);
     };
+
+    const groups = new Map<string, DocumentStoreReferenceEdit>();
+    const initialHashes = new Map<string, string>();
+    for (const edit of input.referenceEdits) {
+      const previous = groups.get(edit.path);
+      if (previous === undefined) {
+        initialHashes.set(edit.path, edit.expected_etag);
+      } else if (edit.expected_etag !== sha256(previous.raw)) {
+        throw invalidInput(`reference edits for ${edit.path} must compose in byte order`);
+      }
+      if (previous?.managed !== undefined && edit.managed !== undefined &&
+          (previous.managed.id !== edit.managed.id || previous.managed.revision_id !== edit.managed.revision_id)) {
+        throw invalidInput(`reference edits for ${edit.path} have conflicting identities`);
+      }
+      groups.set(edit.path, edit);
+    }
+    const verifyReferences = async (afterInstallation: boolean): Promise<void> => {
+      for (const [path, edit] of groups) {
+        const observed = await readNoteFile(this.vaultRoot, vaultNoteSegments(path), { requireUtf8: false });
+        const expected = afterInstallation ? sha256(edit.raw) : initialHashes.get(path);
+        if (observed?.hash !== expected) {
+          if (afterInstallation || progress.primary === true || (progress.references_done?.length ?? 0) > 0) {
+            failRecovery(`reference edit target ${path} diverged from its recorded bytes`);
+          }
+          throw conflict(`reference edit target ${path} changed before the rewrite`);
+        }
+      }
+    };
+
+    if (progress.primary !== true) await verifyReferences(false);
 
     if (progress.history !== true) {
       try {
@@ -858,7 +891,7 @@ class LocalDocumentStore implements DocumentStore {
           input.parents,
           this.clock.now().toISOString()
         );
-        for (const edit of input.referenceEdits) {
+        for (const edit of groups.values()) {
           if (edit.managed !== undefined) {
             await this.revisions.persistRevision(edit.managed.id, edit.managed.revision_id, edit.raw);
             await this.revisions.persistRevisionMetadata({
@@ -883,6 +916,7 @@ class LocalDocumentStore implements DocumentStore {
 
     if (progress.primary !== true) {
       await this.runConsolidationFault('beforeSurvivor', 'the resolution document could not be installed');
+      await verifyReferences(false);
       await this.putSerialized({
         path: input.path,
         raw: input.raw,
@@ -890,31 +924,29 @@ class LocalDocumentStore implements DocumentStore {
         idempotencyKey: `${input.idempotencyKey}:primary`,
         source: input.source,
         revisionId: input.revisionId,
-        parents: input.parents,
-        allowDuplicateIdPaths: input.removals.map((removal) => removal.path)
-      });
+        parents: input.parents
+      }, input.removals.map((removal) => removal.path));
       save('primary_applied', { primary: true });
       await this.runConsolidationFault('afterSurvivor', 'the resolution document could not be recorded');
     }
 
     if (progress.references !== true) {
-      const groups = new Map<string, DocumentStoreReferenceEdit[]>();
-      for (const edit of input.referenceEdits) {
-        const list = groups.get(edit.path) ?? [];
-        list.push(edit);
-        groups.set(edit.path, list);
-      }
       const done = new Set(progress.references_done ?? []);
       let groupIndex = 0;
-      for (const [path, edits] of groups) {
+      for (const [path, finalEdit] of groups) {
         groupIndex += 1;
-        if (done.has(path)) continue;
+        if (done.has(path)) {
+          const observed = await readNoteFile(this.vaultRoot, vaultNoteSegments(path), { requireUtf8: false });
+          if (observed?.hash !== sha256(finalEdit.raw)) {
+            failRecovery(`completed reference edit ${path} diverged from its recorded bytes`);
+          }
+          continue;
+        }
         await this.runConsolidationFault(
           'beforeReferenceEdit',
           'the reference rewrite could not be applied',
           path
         );
-        const finalEdit = edits[edits.length - 1];
         const targetRaw = finalEdit.raw;
         const targetHash = sha256(targetRaw);
         const current = await readNoteFile(this.vaultRoot, vaultNoteSegments(path), {
@@ -924,10 +956,8 @@ class LocalDocumentStore implements DocumentStore {
           return failRecovery(`reference edit target ${path} is missing`);
         }
         if (current.hash !== targetHash) {
-          for (const edit of edits) {
-            if (edit.expected_etag !== current.hash) {
-              throw conflict(`reference edit target ${path} changed before the rewrite`);
-            }
+          if (initialHashes.get(path) !== current.hash) {
+            failRecovery(`reference edit target ${path} changed before the rewrite`);
           }
           if (finalEdit.managed !== undefined) {
             await this.putSerialized({
@@ -954,6 +984,8 @@ class LocalDocumentStore implements DocumentStore {
       save('references_applied', { references: true });
     }
 
+    await verifyReferences(true);
+
     const installed = await readNoteFile(this.vaultRoot, vaultNoteSegments(input.path));
     if (installed === undefined || installed.hash !== sha256(input.raw)) {
       return failRecovery('the resolution document diverged before absorbed files were removed');
@@ -964,6 +996,8 @@ class LocalDocumentStore implements DocumentStore {
       if (entry?.disposed === true) continue;
       await this.stageRemoval(removal, progress, save);
     }
+
+    await verifyReferences(true);
     if (progress.removals_done !== true) save('removals_applied', { removals_done: true });
 
     const finalPrimary = await readNoteFile(this.vaultRoot, vaultNoteSegments(input.path));
@@ -981,6 +1015,17 @@ class LocalDocumentStore implements DocumentStore {
 
     await this.runConsolidationFault('afterDocumentComplete', 'the consolidation did not verify');
     await this.runConsolidationFault('beforeReceipt', 'the consolidation receipt could not be written');
+    await verifyReferences(true);
+    const verifiedPrimary = await readNoteFile(this.vaultRoot, vaultNoteSegments(input.path));
+    if (verifiedPrimary?.hash !== sha256(input.raw) ||
+        parseDocument(verifiedPrimary.raw, input.path).id !== input.logicalId) {
+      return failRecovery('the resolution identity or bytes changed before the document receipt');
+    }
+    for (const removal of input.removals) {
+      if ((await readNoteFile(this.vaultRoot, vaultNoteSegments(removal.path))) !== undefined) {
+        return failRecovery(`absorbed path ${removal.path} reappeared before the document receipt`);
+      }
+    }
     const primaryRecord = this.journal.findByKey(`${input.idempotencyKey}:primary`);
     const stored = current.receipt_json;
     let receipt: DocumentStorePutResult;
@@ -997,6 +1042,7 @@ class LocalDocumentStore implements DocumentStore {
         indexed: false
       };
     }
+    if (progress.removal_index_failed === true) receipt = { ...receipt, indexed: false };
     this.journal.updateConsolidation(current.operation_id, {
       state: 'complete',
       receipt_json: JSON.stringify(receipt),
@@ -1015,6 +1061,17 @@ class LocalDocumentStore implements DocumentStore {
     const target = join(this.vaultRoot, ...segments);
     const staged = progress.removals?.[removal.path];
     if (staged !== undefined && staged.disposed !== true) {
+      const stagedBytes = await readNoteFile(this.vaultRoot, [
+        ...segments.slice(0, -1), staged.staging.slice(staged.staging.lastIndexOf('/') + 1), 'absorbed'
+      ], { requireUtf8: false });
+      if (stagedBytes === undefined) {
+        const original = await readNoteFile(this.vaultRoot, segments, { requireUtf8: false });
+        if (original?.hash !== staged.sha256 || original.hash !== removal.expected_etag) {
+          throw recoveryRequired(`prepared removal of ${removal.path} lost its expected bytes`);
+        }
+        await rename(target, join(staged.staging, 'absorbed'));
+        await syncDirectory(dirname(target));
+      }
       await this.finishRemoval(removal, progress, save);
       return;
     }
@@ -1033,7 +1090,8 @@ class LocalDocumentStore implements DocumentStore {
     } catch {
       observedId = undefined;
     }
-    if (observedId !== undefined && observedId !== removal.expected_id) {
+    if (observedId !== removal.expected_id ||
+        await this.revisions.currentBinding(removal.expected_id, removal.path, observed.hash) !== removal.expected_revision_id) {
       throw conflict(`absorbed path ${removal.path} no longer carries its expected identity`);
     }
     await this.runConsolidationFault(
@@ -1043,6 +1101,11 @@ class LocalDocumentStore implements DocumentStore {
     );
     const stagedDirectory = await mkdtemp(join(dirname(target), '.consolidate-stage-'));
     const stagedPath = join(stagedDirectory, 'absorbed');
+    progress.removals = {
+      ...(progress.removals ?? {}),
+      [removal.path]: { staging: stagedDirectory, sha256: observed.hash, disposed: false }
+    };
+    save('removals_applied');
     try {
       await rename(target, stagedPath);
       await syncDirectory(dirname(target));
@@ -1059,10 +1122,6 @@ class LocalDocumentStore implements DocumentStore {
     } catch (error) {
       throw recoveryRequired(`absorbed path ${removal.path} could not be staged`, error);
     }
-    progress.removals = {
-      ...(progress.removals ?? {}),
-      [removal.path]: { staging: stagedDirectory, sha256: observed.hash, disposed: false }
-    };
     await this.runConsolidationFault(
       'afterRemovalStage',
       'the staged absorbed file could not be verified',
@@ -1086,6 +1145,10 @@ class LocalDocumentStore implements DocumentStore {
     if (entry === undefined) {
       throw recoveryRequired(`removal of ${removal.path} has no recorded staging progress`);
     }
+    const original = await readNoteFile(this.vaultRoot, vaultNoteSegments(removal.path), { requireUtf8: false });
+    if (original !== undefined) {
+      throw recoveryRequired(`absorbed path ${removal.path} is still occupied during removal`);
+    }
     const stagedBytes = await readNoteFile(
       this.vaultRoot,
       [
@@ -1098,21 +1161,29 @@ class LocalDocumentStore implements DocumentStore {
     if (stagedBytes === undefined || stagedBytes.hash !== entry.sha256) {
       throw recoveryRequired(`staged absorbed bytes for ${removal.path} cannot be verified`);
     }
+    if (entry.sha256 !== removal.expected_etag ||
+        (await this.revisions.readRevision(removal.expected_id, removal.expected_revision_id)).hash !== entry.sha256) {
+      throw recoveryRequired(`staged absorbed identity for ${removal.path} cannot be verified`);
+    }
     await rm(join(entry.staging, 'absorbed'), { force: true });
     await rmdir(entry.staging).catch(() => undefined);
+    this.journal.enqueueIndex({ path: removal.path, revision_id: 'remove', raw_hash: entry.sha256,
+      enqueued_at: this.clock.now().toISOString() });
     progress.removals = {
       ...(progress.removals ?? {}),
       [removal.path]: { ...entry, disposed: true }
     };
     save('removals_applied');
     this.journal.deleteDocument(removal.path);
-    this.journal.dequeueIndex(removal.path);
     if (this.index !== undefined) {
       try {
-        this.index.remove?.(removal.path);
+        await this.index.remove?.(removal.path);
+        this.journal.dequeueIndex(removal.path);
       } catch {
-        undefined;
+        save('removals_applied', { removal_index_failed: true });
       }
+    } else {
+      save('removals_applied', { removal_index_failed: true });
     }
   }
 
@@ -1324,7 +1395,7 @@ class LocalDocumentStore implements DocumentStore {
     const revision_id =
       catalogue !== undefined && catalogue.raw_hash === observed.hash
         ? catalogue.revision_id
-        : undefined;
+        : id === undefined ? undefined : await this.revisions.currentBinding(id, path, observed.hash);
     return {
       raw: observed.raw,
       etag: observed.hash,
@@ -2234,6 +2305,7 @@ class LocalDocumentStore implements DocumentStore {
     this.assertOpen();
     const recovered = new Set<string>();
     const pending = new Set<string>();
+    const blockedIndexPaths = new Set<string>();
     for (const record of this.journal.listIncomplete()) {
       const outcome = await this.completeIncomplete(record);
       if (outcome === 'recovered') {
@@ -2243,12 +2315,6 @@ class LocalDocumentStore implements DocumentStore {
         pending.add(record.path);
       }
     }
-    const indexReport = await this.reconcileIndex();
-    for (const path of indexReport.recovered) {
-      recovered.add(path);
-      pending.delete(path);
-    }
-    for (const path of indexReport.pending) pending.add(path);
     for (const move of this.journal.listIncompleteMoves()) {
       const outcome = await this.resumeMove(move);
       if (outcome === 'recovered') {
@@ -2265,8 +2331,23 @@ class LocalDocumentStore implements DocumentStore {
         pending.delete(consolidation.logical_id);
       } catch {
         pending.add(consolidation.logical_id);
+        try {
+          const manifest = JSON.parse(consolidation.manifest_json) as DocumentStoreConsolidateInput;
+          blockedIndexPaths.add(manifest.path);
+          for (const head of manifest.heads) blockedIndexPaths.add(head.path);
+          for (const edit of manifest.referenceEdits) blockedIndexPaths.add(edit.path);
+        } catch {
+          pending.add(consolidation.operation_id);
+          for (const row of this.journal.listIndex()) blockedIndexPaths.add(row.path);
+        }
       }
     }
+    const indexReport = await this.reconcileIndex(blockedIndexPaths);
+    for (const path of indexReport.recovered) {
+      recovered.add(path);
+      pending.delete(path);
+    }
+    for (const path of indexReport.pending) pending.add(path);
     return { recovered: [...recovered], pending: [...pending] };
   }
 
@@ -2318,10 +2399,26 @@ class LocalDocumentStore implements DocumentStore {
     return receipt.indexed ? 'recovered' : 'pending';
   }
 
-  private async reconcileIndex(): Promise<DocumentStoreRecoveryReport> {
+  private async reconcileIndex(blockedPaths: ReadonlySet<string> = new Set()): Promise<DocumentStoreRecoveryReport> {
     const recovered: string[] = [];
     const pending: string[] = [];
     for (const row of this.journal.listIndex()) {
+      if (blockedPaths.has(row.path)) {
+        pending.push(row.path);
+        continue;
+      }
+      if (row.revision_id === 'remove') {
+        const absent = await readNoteFile(this.vaultRoot, vaultNoteSegments(row.path));
+        if (absent !== undefined || this.index === undefined || this.index.remove === undefined) {
+          pending.push(row.path);
+          continue;
+        }
+        try { await this.index.remove(row.path); }
+        catch { pending.push(row.path); continue; }
+        this.journal.dequeueIndex(row.path);
+        recovered.push(row.path);
+        continue;
+      }
       let segments: string[];
       try {
         segments = vaultNoteSegments(row.path);

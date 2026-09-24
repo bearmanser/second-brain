@@ -768,6 +768,8 @@ function controlledStore(real: RevisionStore): {
       persistRevisionMetadata: (metadata) => real.persistRevisionMetadata(metadata),
       readRevisionMetadata: (id, revisionId) => real.readRevisionMetadata(id, revisionId),
       findRevisionByHash: (id, hash) => real.findRevisionByHash(id, hash),
+      bindCurrent: (id, path, revisionId, hash) => real.bindCurrent(id, path, revisionId, hash),
+      currentBinding: (id, path, hash) => real.currentBinding(id, path, hash),
       close: () => real.close()
     }
   };

@@ -3457,6 +3457,14 @@ const LOCAL_OPERATION_SCHEMA = [
      created_at TEXT NOT NULL,
      updated_at TEXT NOT NULL,
      PRIMARY KEY (operation_id, effect_index)
+    )`,
+  `CREATE TABLE IF NOT EXISTS local_feedback_effects (
+     operation_id TEXT PRIMARY KEY,
+     feedback_id TEXT NOT NULL UNIQUE,
+     id TEXT NOT NULL,
+     revision_id TEXT NOT NULL,
+     verdict TEXT NOT NULL,
+     reason TEXT NOT NULL
    )`
 ];
 
@@ -3572,7 +3580,8 @@ export class LocalOperationJournal {
   }
 
   reserve(
-    input: LocalOperationReservation & { created_at: string; updated_at: string }
+    input: Omit<LocalOperationReservation, 'operation_id'> & { operation_id?: string; created_at: string; updated_at: string },
+    allocateId?: () => string
   ): LocalOperationReservationResult {
     this.assertOpen();
     const reconcile = (): LocalOperationReservationResult | undefined => {
@@ -3589,6 +3598,8 @@ export class LocalOperationJournal {
     const run = this.database.transaction((): LocalOperationReservationResult => {
       const existing = reconcile();
       if (existing !== undefined) return existing;
+      const operationId = input.operation_id ?? allocateId?.();
+      if (operationId === undefined) throw recoveryRequired('a local operation identity is required');
       try {
         this.database
           .prepare(
@@ -3599,7 +3610,7 @@ export class LocalOperationJournal {
              ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'pending', NULL, NULL, ?, ?)`
           )
           .run(
-            input.operation_id,
+            operationId,
             input.idempotency_key,
             input.tool,
             input.action,
@@ -3614,13 +3625,37 @@ export class LocalOperationJournal {
         if (raced !== undefined) return raced;
         throw error;
       }
-      const stored = this.findById(input.operation_id);
+      const stored = this.findById(operationId);
       if (stored === undefined) {
-        throw recoveryRequired(`local operation ${input.operation_id} was not persisted`);
+        throw recoveryRequired(`local operation ${operationId} was not persisted`);
       }
       return { kind: 'new', record: stored };
     });
     return run.immediate();
+  }
+
+  recordFeedback(input: { operation_id: string; feedback_id: string; id: string;
+    revision_id: string; verdict: string; reason: string }): void {
+    this.assertOpen();
+    const existing = this.getFeedbackEffect(input.operation_id);
+    if (existing !== undefined) {
+      if (JSON.stringify(existing) !== JSON.stringify(input)) {
+        throw recoveryRequired('the durable feedback effect disagrees with its plan');
+      }
+      return;
+    }
+    this.database.prepare(`INSERT INTO local_feedback_effects
+      (operation_id, feedback_id, id, revision_id, verdict, reason) VALUES (?, ?, ?, ?, ?, ?)`).run(
+      input.operation_id, input.feedback_id, input.id, input.revision_id, input.verdict, input.reason
+    );
+  }
+
+  getFeedbackEffect(operationId: string): { operation_id: string; feedback_id: string; id: string;
+    revision_id: string; verdict: string; reason: string } | undefined {
+    this.assertOpen();
+    return this.database.prepare('SELECT * FROM local_feedback_effects WHERE operation_id = ?').get(operationId) as
+      { operation_id: string; feedback_id: string; id: string; revision_id: string;
+        verdict: string; reason: string } | undefined;
   }
 
   reserveSubordinate(
@@ -3683,12 +3718,16 @@ export class LocalOperationJournal {
     document_operation_id: string
   ): void {
     this.assertOpen();
-    this.database
+    const result = this.database
       .prepare(
         `UPDATE local_subordinate_operations SET document_operation_id = ?, updated_at = ?
-         WHERE operation_id = ? AND effect_index = ?`
+         WHERE operation_id = ? AND effect_index = ?
+           AND (document_operation_id IS NULL OR document_operation_id = ?)`
       )
-      .run(document_operation_id, new Date().toISOString(), operation_id, effect_index);
+      .run(document_operation_id, new Date().toISOString(), operation_id, effect_index, document_operation_id);
+    if (result.changes !== 1) {
+      throw recoveryRequired(`subordinate effect ${effect_index} has conflicting document-operation linkage`);
+    }
   }
 
   findSubordinateByKey(key: string): LocalSubordinateRecord | undefined {

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { link, lstat, mkdir, open, readdir, rm } from 'node:fs/promises';
+import { link, lstat, mkdir, open, readdir, rename, rm } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { BrainError, isBrainError } from '../contracts/errors.js';
@@ -79,6 +79,8 @@ export interface RevisionStore {
   persistRevisionMetadata(metadata: RevisionMetadata): Promise<void>;
   readRevisionMetadata(id: string, revisionId: string): Promise<RevisionMetadata>;
   findRevisionByHash(id: string, hash: string): Promise<string | undefined>;
+  bindCurrent(id: string, path: string, revisionId: string, hash: string): Promise<void>;
+  currentBinding(id: string, path: string, hash: string): Promise<string | undefined>;
   close(): void;
 }
 
@@ -143,7 +145,13 @@ async function ensureDirectoryChain(root: string, parts: string[]): Promise<stri
       try {
         await mkdir(current, { mode: 0o700 });
       } catch (cause) {
-        throw recoveryRequired(`state directory ${current} cannot be created`, cause);
+        if (!hasErrno(cause, 'EEXIST')) {
+          throw recoveryRequired(`state directory ${current} cannot be created`, cause);
+        }
+        const concurrent = await lstat(current);
+        if (concurrent.isSymbolicLink() || !concurrent.isDirectory()) {
+          throw recoveryRequired(`state directory ${current} is not a safe directory`);
+        }
       }
       continue;
     }
@@ -278,6 +286,49 @@ class FileRevisionStore implements RevisionStore {
 
   constructor(state: string) {
     this.state = state;
+  }
+
+  private async bindingPath(id: string, path: string): Promise<{ directory: string; file: string }> {
+    const directory = await ensureDirectoryChain(this.state, ['history', requireUuid(id, 'id'), 'bindings']);
+    return { directory, file: join(directory, `${sha256(path)}.json`) };
+  }
+
+  async bindCurrent(id: string, path: string, revisionId: string, hash: string): Promise<void> {
+    const bytes = await this.readRevision(id, revisionId);
+    if (bytes.hash !== hash) throw recoveryRequired(`binding ${path} does not match its revision bytes`);
+    const { directory, file } = await this.bindingPath(id, path);
+    const temp = join(directory, `.${randomUUID()}.tmp`);
+    const payload = JSON.stringify({ id, path, revision_id: revisionId, hash });
+    const handle = await open(temp, 'wx', 0o600);
+    try {
+      await handle.writeFile(payload, 'utf8');
+      await handle.sync();
+    } finally { await handle.close(); }
+    try {
+      await rename(temp, file);
+      await syncDirectory(directory);
+    } finally { await rm(temp, { force: true }).catch(() => undefined); }
+  }
+
+  async currentBinding(id: string, path: string, hash: string): Promise<string | undefined> {
+    const { file } = await this.bindingPath(id, path);
+    let bytes: Buffer;
+    try { bytes = await readBoundedFile(file, `current binding ${path}`); }
+    catch (error) {
+      if (isBrainError(error) && error.code === 'NOT_FOUND') return undefined;
+      throw error;
+    }
+    let binding: { id?: unknown; path?: unknown; hash?: unknown; revision_id?: unknown };
+    try { binding = JSON.parse(bytes.toString('utf8')) as typeof binding; }
+    catch (error) { throw recoveryRequired(`current binding ${path} is malformed`, error); }
+    if (binding.id !== id || binding.path !== path || typeof binding.hash !== 'string' ||
+        typeof binding.revision_id !== 'string' || !UUID_PATTERN.test(binding.revision_id)) {
+      throw recoveryRequired(`current binding ${path} has contradictory identity`);
+    }
+    if (binding.hash !== hash) return undefined;
+    const revision = await this.readRevision(id, binding.revision_id);
+    if (revision.hash !== hash) throw recoveryRequired(`current binding ${path} has contradictory bytes`);
+    return binding.revision_id;
   }
 
   async persistPreimage(id: string, raw: string): Promise<StoredPreimageBytes> {

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, symlink, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, symlink, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { expect, test } from 'vitest';
 import { LocalMutationCoordinator } from '../../src/core/mutation.js';
@@ -7,6 +7,8 @@ import type {
   LocalDocumentEffect,
   LocalOperationIntent,
   LocalOperationPlan,
+  LocalPlannedOperation,
+  LocalReadSet,
   LocalOperationReceipt,
   LocalReferenceEdit
 } from '../../src/core/types.js';
@@ -52,7 +54,7 @@ async function openGround(
   index?: DocumentIndex
 ): Promise<Ground> {
   const sandbox = await vaultSandbox();
-  const revisions = await openRevisionStore(sandbox.state);
+  let revisions = await openRevisionStore(sandbox.state);
   const makeStore = (): Promise<DocumentStore> =>
     openDocumentStore({
       vault: sandbox.vault,
@@ -62,12 +64,12 @@ async function openGround(
     });
   const store = await makeStore();
   const vault = new FileVault(sandbox.vault, []);
-  const catalogue = CurrentCatalogue.open({ revisions, ids });
+  let catalogue = CurrentCatalogue.open({ revisions, ids });
   const refresh = async (): Promise<void> => {
     await reconcileCurrentVault({ vault, catalogue });
   };
   await refresh();
-  const operations = LocalOperationJournal.open(join(sandbox.state, 'operations.sqlite'));
+  let operations = LocalOperationJournal.open(join(sandbox.state, 'operations.sqlite'));
   const ground: Ground = {
     sandbox,
     vaultRoot: sandbox.vault,
@@ -79,6 +81,15 @@ async function openGround(
     refresh,
     reopenStore: async (faults) => {
       await ground.store.close();
+      operations.close();
+      catalogue.close();
+      revisions.close();
+      revisions = await openRevisionStore(sandbox.state);
+      catalogue = CurrentCatalogue.open({ revisions, ids });
+      operations = LocalOperationJournal.open(join(sandbox.state, 'operations.sqlite'));
+      ground.revisions = revisions;
+      ground.catalogue = catalogue;
+      ground.operations = operations;
       ground.store = await openDocumentStore({
         vault: sandbox.vault,
         state: sandbox.state,
@@ -96,6 +107,7 @@ async function openGround(
       }
       await ground.store.close();
       catalogue.close();
+      revisions.close();
       await sandbox.dispose();
     }
   };
@@ -144,6 +156,7 @@ async function writeManaged(
   const absolute = join(ground.vaultRoot, path);
   await mkdir(dirname(absolute), { recursive: true });
   await writeFile(absolute, raw);
+  await ground.revisions.bindCurrent(id, path, seeded.revisionId, seeded.hash);
   return seeded;
 }
 
@@ -230,17 +243,17 @@ function resolvePlan(spec: ResolveSpec): LocalOperationPlan {
         {
           kind: 'path',
           path: spec.survivorPath,
-          expected: { kind: 'present', etag: spec.survivorEtag, id: spec.id }
+          expected: { kind: 'present', etag: spec.survivorEtag, id: spec.id, revision_id: observed.heads.find((head) => head.path === spec.survivorPath)?.revision_id }
         },
         ...spec.removalPaths.map(
           (removal): import('../../src/core/types.js').LocalReadCondition => ({
             kind: 'path',
             path: removal.path,
-            expected: { kind: 'present', etag: removal.etag, id: removal.id }
+            expected: { kind: 'present', etag: removal.etag, id: removal.id, revision_id: removal.revisionId }
           })
         ),
         ...(spec.referenceEdits ?? [])
-          .filter((edit) => edit.managed === undefined)
+          .filter((edit, index, all) => edit.managed === undefined && all.findIndex((other) => other.path === edit.path) === index)
           .map(
             (edit): import('../../src/core/types.js').LocalReadCondition => ({
               kind: 'path',
@@ -333,7 +346,7 @@ test('consolidation applies managed and unmanaged reference edits with durable p
           managed: { id: managedId, revision_id: refRevision, parents: [] }
         },
         { path: 'Knowledge/Plain.md', expected_etag: sha256(plainRaw), raw: '# Plain\n\nintermediate\n' },
-        { path: 'Knowledge/Plain.md', expected_etag: sha256(plainRaw), raw: plainEditRaw }
+        { path: 'Knowledge/Plain.md', expected_etag: sha256('# Plain\n\nintermediate\n'), raw: plainEditRaw }
       ]
     };
     const heads = await ground.coordinator.enumerateConflictHeads(id);
@@ -423,6 +436,115 @@ test('a stale reference edit fails closed before any current file changes', asyn
   }
 });
 
+test('resolution read set must bind each head revision to its own path and cannot borrow another path etag', async () => {
+  const { ground, id, a, b } = await twoHeadGround();
+  try {
+    const expected = (await ground.coordinator.enumerateConflictHeads(id)).map(({ revision_id, etag }) => ({ revision_id, etag }));
+    const spec: ResolveSpec = { id, survivorPath: 'Knowledge/A.md', survivorEtag: a.hash,
+      removalPaths: [{ path: 'Knowledge/B.md', id, revisionId: b.revisionId, etag: b.hash }],
+      resolutionRaw: managed(id, 'resolved'), resolutionRevision: randomUUID() };
+    const key = randomUUID();
+    await expect(ground.coordinator.run(resolveIntent(key, id, expected), async (identity, observed) => {
+      const planned = await resolvePlan(spec)(identity, observed) as Extract<LocalPlannedOperation, { kind: 'note' }>;
+      return { ...planned, read_set: planned.read_set.map((condition) => condition.kind === 'path' && condition.path === 'Knowledge/B.md'
+        ? { ...condition, expected: { kind: 'present' as const, id, etag: b.hash, revision_id: a.revisionId } }
+        : condition) as unknown as LocalReadSet };
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+    expect((await ground.store.readPath('Knowledge/A.md')).raw).toBe(a.raw);
+    expect((await ground.store.readPath('Knowledge/B.md')).raw).toBe(b.raw);
+  } finally { await ground.dispose(); }
+});
+
+test('a backlink changed between history persistence and installation leaves every current byte intact', async () => {
+  const { ground, id, a, b } = await twoHeadGround();
+  try {
+    const path = 'Knowledge/Plain.md';
+    const original = '# Plain\n\nold\n';
+    const human = '# Plain\n\nhuman edit\n';
+    await writeFile(join(ground.vaultRoot, path), original);
+    await ground.refresh();
+    await ground.store.close();
+    ground.store = await openDocumentStore({ vault: ground.vaultRoot, state: ground.sandbox.state, faults: {
+      consolidation: { afterHistory: async () => { await writeFile(join(ground.vaultRoot, path), human); } }
+    } });
+    ground.coordinator = makeCoordinator(ground);
+    const expected = (await ground.coordinator.enumerateConflictHeads(id)).map(({ revision_id, etag }) => ({ revision_id, etag }));
+    await expect(ground.coordinator.run(resolveIntent(randomUUID(), id, expected), resolvePlan({
+      id, survivorPath: 'Knowledge/A.md', survivorEtag: a.hash,
+      removalPaths: [{ path: 'Knowledge/B.md', id, revisionId: b.revisionId, etag: b.hash }],
+      resolutionRaw: managed(id, 'resolved'), resolutionRevision: randomUUID(),
+      referenceEdits: [{ path, expected_etag: sha256(original), raw: '# Plain\n\nrewritten\n' }]
+    }))).rejects.toMatchObject({ code: expect.stringMatching(/CONFLICT|RECOVERY_REQUIRED/) });
+    expect((await ground.store.readPath('Knowledge/A.md')).raw).toBe(a.raw);
+    expect((await ground.store.readPath('Knowledge/B.md')).raw).toBe(b.raw);
+    expect((await ground.store.readPath(path)).raw).toBe(human);
+  } finally { await ground.dispose(); }
+});
+
+test('a completed backlink changed while a removal remains staged blocks completion without losing detached bytes', async () => {
+  const { ground, id, a, b } = await twoHeadGround();
+  try {
+    const path = 'Knowledge/Plain.md';
+    const original = '# Plain\n\nold\n';
+    const rewritten = '# Plain\n\nrewritten\n';
+    const human = '# Plain\n\nhuman edit\n';
+    await writeFile(join(ground.vaultRoot, path), original);
+    await ground.refresh();
+    await ground.store.close();
+    ground.store = await openDocumentStore({ vault: ground.vaultRoot, state: ground.sandbox.state, faults: {
+      consolidation: { afterRemovalStage: async () => { await writeFile(join(ground.vaultRoot, path), human); throw new Error('interrupted'); } }
+    } });
+    ground.coordinator = makeCoordinator(ground);
+    const expected = (await ground.coordinator.enumerateConflictHeads(id)).map(({ revision_id, etag }) => ({ revision_id, etag }));
+    const key = randomUUID();
+    await expect(ground.coordinator.run(resolveIntent(key, id, expected), resolvePlan({
+      id, survivorPath: 'Knowledge/A.md', survivorEtag: a.hash,
+      removalPaths: [{ path: 'Knowledge/B.md', id, revisionId: b.revisionId, etag: b.hash }],
+      resolutionRaw: managed(id, 'resolved'), resolutionRevision: randomUUID(),
+      referenceEdits: [{ path, expected_etag: sha256(original), raw: rewritten }]
+    }))).rejects.toBeDefined();
+    const stages = (await readdir(join(ground.vaultRoot, 'Knowledge'))).filter((entry) => entry.startsWith('.consolidate-stage-'));
+    expect(stages).toHaveLength(1);
+    expect(await readFile(join(ground.vaultRoot, 'Knowledge', stages[0], 'absorbed'), 'utf8')).toBe(b.raw);
+    await ground.reopenStore();
+    const report = await ground.coordinator.recover();
+    expect(report.blocking_operations).toContain(ground.operations.findByKey(key)?.operation_id);
+    expect(ground.operations.findByKey(key)?.receipt_json).toBeNull();
+    expect((await ground.store.readPath(path)).raw).toBe(human);
+    expect(await readFile(join(ground.vaultRoot, 'Knowledge', stages[0], 'absorbed'), 'utf8')).toBe(b.raw);
+  } finally { await ground.dispose(); }
+});
+
+test('a backlink changed at the document-completion boundary never produces a successful receipt', async () => {
+  const { ground, id, a, b } = await twoHeadGround();
+  try {
+    const path = 'Knowledge/Plain.md';
+    const original = '# Plain\n\nold\n';
+    const human = '# Plain\n\nhuman after final verification\n';
+    await writeFile(join(ground.vaultRoot, path), original);
+    await ground.refresh();
+    await ground.store.close();
+    ground.store = await openDocumentStore({ vault: ground.vaultRoot, state: ground.sandbox.state, faults: {
+      consolidation: { afterDocumentComplete: async () => { await writeFile(join(ground.vaultRoot, path), human); } }
+    } });
+    ground.coordinator = makeCoordinator(ground);
+    const key = randomUUID();
+    const expected = (await ground.coordinator.enumerateConflictHeads(id)).map(({ revision_id, etag }) => ({ revision_id, etag }));
+    await expect(ground.coordinator.run(resolveIntent(key, id, expected), resolvePlan({
+      id, survivorPath: 'Knowledge/A.md', survivorEtag: a.hash,
+      removalPaths: [{ path: 'Knowledge/B.md', id, revisionId: b.revisionId, etag: b.hash }],
+      resolutionRaw: managed(id, 'resolved'), resolutionRevision: randomUUID(),
+      referenceEdits: [{ path, expected_etag: sha256(original), raw: '# Plain\n\nrewritten\n' }]
+    }))).rejects.toBeDefined();
+    await ground.reopenStore();
+    const report = await ground.coordinator.recover();
+    expect(report.blocking_operations).toContain(ground.operations.findByKey(key)?.operation_id);
+    expect(ground.operations.findByKey(key)?.receipt_json).toBeNull();
+    expect((await ground.store.readPath(path)).raw).toBe(human);
+    expect((await ground.revisions.readRevision(id, b.revisionId)).raw).toBe(b.raw);
+  } finally { await ground.dispose(); }
+});
+
 test('an unexpected survivor change after installation is reported as recovery work', async () => {
   const { ground, id, a, b } = await twoHeadGround();
   try {
@@ -458,9 +580,77 @@ test('an unexpected survivor change after installation is reported as recovery w
     ).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
     expect((await ground.store.readPath('Knowledge/A.md')).raw).toContain('human edit');
     expect((await ground.store.readPath('Knowledge/B.md')).raw).toContain('branch B');
+    await ground.reopenStore();
+    const recovery = await ground.coordinator.recover();
+    expect(recovery.blocking_operations).toContain(ground.operations.findByKey(key)?.operation_id);
+    expect((await ground.store.readPath('Knowledge/A.md')).raw).toBe(managed(id, 'human edit'));
+    expect((await ground.store.readPath('Knowledge/B.md')).raw).toBe(b.raw);
   } finally {
     await ground.dispose();
   }
+});
+
+test('a human-edited absorbed head after survivor installation survives restart and blocks completion', async () => {
+  const { ground, id, a, b } = await twoHeadGround();
+  try {
+    const human = managed(id, 'human changed absorbed head');
+    const key = randomUUID();
+    await ground.store.close();
+    ground.store = await openDocumentStore({ vault: ground.vaultRoot, state: ground.sandbox.state, faults: {
+      consolidation: { afterSurvivor: async () => { await writeFile(join(ground.vaultRoot, 'Knowledge/B.md'), human); } }
+    } });
+    ground.coordinator = makeCoordinator(ground);
+    const expected = (await ground.coordinator.enumerateConflictHeads(id)).map(({ revision_id, etag }) => ({ revision_id, etag }));
+    await expect(ground.coordinator.run(resolveIntent(key, id, expected), resolvePlan({
+      id, survivorPath: 'Knowledge/A.md', survivorEtag: a.hash,
+      removalPaths: [{ path: 'Knowledge/B.md', id, revisionId: b.revisionId, etag: b.hash }],
+      resolutionRaw: managed(id, 'resolved'), resolutionRevision: randomUUID()
+    }))).rejects.toBeDefined();
+    await ground.reopenStore();
+    const report = await ground.coordinator.recover();
+    expect(report.blocking_operations).toContain(ground.operations.findByKey(key)?.operation_id);
+    expect(ground.operations.findByKey(key)?.receipt_json).toBeNull();
+    expect((await ground.store.readPath('Knowledge/B.md')).raw).toBe(human);
+    expect((await ground.store.readPath('Knowledge/A.md')).raw).toBe(managed(id, 'resolved'));
+    expect((await ground.revisions.readRevision(id, b.revisionId)).raw).toBe(b.raw);
+  } finally { await ground.dispose(); }
+});
+
+test('an incomplete consolidation excludes its intermediate survivor path from another local mutation', async () => {
+  const { ground, id, a, b } = await twoHeadGround();
+  try {
+    const key = randomUUID();
+    await ground.store.close();
+    ground.store = await openDocumentStore({ vault: ground.vaultRoot, state: ground.sandbox.state, faults: {
+      consolidation: { afterSurvivor: () => { throw new Error('interrupted after survivor'); } }
+    } });
+    ground.coordinator = makeCoordinator(ground);
+    const expected = (await ground.coordinator.enumerateConflictHeads(id)).map(({ revision_id, etag }) => ({ revision_id, etag }));
+    await expect(ground.coordinator.run(resolveIntent(key, id, expected), resolvePlan({
+      id, survivorPath: 'Knowledge/A.md', survivorEtag: a.hash,
+      removalPaths: [{ path: 'Knowledge/B.md', id, revisionId: b.revisionId, etag: b.hash }],
+      resolutionRaw: managed(id, 'resolved'), resolutionRevision: randomUUID()
+    }))).rejects.toBeDefined();
+    const intermediate = (await ground.store.readPath('Knowledge/A.md')).raw;
+    expect(intermediate).toBe(managed(id, 'resolved'));
+    expect((await ground.store.readPath('Knowledge/B.md')).raw).toBe(b.raw);
+    const competingKey = randomUUID();
+    const competing: LocalOperationIntent = {
+      tool: 'brain_capture', action: 'capture', project_id: null, idempotency_key: competingKey,
+      payload: { idempotency_key: competingKey, note: { title: 'competing', tags: [],
+        content: { kind: 'note', summary: 'competing', body_markdown: '# competing' }, evidence: [], related_ids: [] } },
+      preconditions: {}
+    };
+    await expect(ground.coordinator.run(competing, (identity) => {
+      if (identity.kind !== 'note') throw new Error('missing identity');
+      return { kind: 'note', heads: [], parents: [], read_set: [
+        { kind: 'path', path: 'Knowledge/A.md', expected: { kind: 'present', etag: sha256(intermediate), id } }
+      ], effects: [{ kind: 'write', write: { path: 'Knowledge/A.md', id,
+        revision_id: identity.revision_id, raw: managed(id, 'competing'), parents: [] } }] };
+    })).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect((await ground.store.readPath('Knowledge/A.md')).raw).toBe(intermediate);
+    expect((await ground.store.readPath('Knowledge/B.md')).raw).toBe(b.raw);
+  } finally { await ground.dispose(); }
 });
 
 test('a recreated absorbed path keeps the operation recovery-blocking', async () => {
@@ -517,6 +707,8 @@ test('a symlink substituted at the absorbed path discards no bytes', async () =>
     const heads = await ground.coordinator.enumerateConflictHeads(id);
     const expected = heads.map((head) => ({ revision_id: head.revision_id, etag: head.etag }));
     let armed = true;
+    const protectedRaw = '# protected target\n\nuntouched\n';
+    await writeFile(join(ground.vaultRoot, 'Knowledge/Protected.md'), protectedRaw);
     await ground.store.close();
     ground.store = await openDocumentStore({
       vault: ground.vaultRoot,
@@ -527,7 +719,7 @@ test('a symlink substituted at the absorbed path discards no bytes', async () =>
             if (!armed) return;
             armed = false;
             await unlink(join(ground.vaultRoot, 'Knowledge/B.md'));
-            await symlink('Knowledge/A.md', join(ground.vaultRoot, 'Knowledge/B.md'));
+            await symlink('Protected.md', join(ground.vaultRoot, 'Knowledge/B.md'));
           }
         }
       }
@@ -537,6 +729,8 @@ test('a symlink substituted at the absorbed path discards no bytes', async () =>
       ground.coordinator.run(resolveIntent(key, id, expected), resolvePlan(spec))
     ).rejects.toMatchObject({ code: expect.stringMatching(/FORBIDDEN|RECOVERY_REQUIRED|CONFLICT/) });
     expect((await ground.store.readPath('Knowledge/A.md')).raw).toContain('resolved');
+    expect(await readFile(join(ground.vaultRoot, 'Knowledge/Protected.md'), 'utf8')).toBe(protectedRaw);
+    expect((await ground.revisions.readRevision(id, b.revisionId)).raw).toBe(b.raw);
   } finally {
     await ground.dispose();
   }
@@ -580,7 +774,7 @@ test('a three-head fork consolidates with all parents and history retained', asy
     await expect(ground.store.readPath('Knowledge/B.md')).rejects.toMatchObject({ code: 'NOT_FOUND' });
     await expect(ground.store.readPath('Knowledge/C.md')).rejects.toMatchObject({ code: 'NOT_FOUND' });
     for (const seeded of [a, b, c]) {
-      expect(await ground.revisions.hasRevision(id, seeded.revisionId)).toBe(true);
+      expect((await ground.revisions.readRevision(id, seeded.revisionId)).raw).toBe(seeded.raw);
     }
     const metadata = await ground.revisions.readRevisionMetadata(id, newRevision);
     expect(metadata.parents.map((entry) => entry.revision_id).sort()).toEqual(
@@ -647,20 +841,21 @@ test('fault injection at persisted boundaries yields documented recovery without
         }
       });
       ground.coordinator = makeCoordinator(ground);
-      await ground.coordinator
-        .run(resolveIntent(key, id, expected), resolvePlan(spec))
-        .catch(() => undefined);
+       await expect(ground.coordinator.run(resolveIntent(key, id, expected), resolvePlan(spec))).rejects.toBeDefined();
 
-      await ground.reopenStore();
-      const report = await ground.coordinator.recover();
-      expect(report.inspected).toBeGreaterThanOrEqual(0);
+       await ground.reopenStore();
+       const report = await ground.coordinator.recover();
+       expect(report.finalized, boundary).toBe(1);
+       expect(report.blocking_operations).toEqual([]);
+       expect(ground.operations.findByKey(key)?.state).toBe('finalized');
 
-      expect(await ground.revisions.hasRevision(id, a.revisionId)).toBe(true);
-      expect(await ground.revisions.hasRevision(id, b.revisionId)).toBe(true);
-      const aRaw = (await ground.store.readPath('Knowledge/A.md')).raw;
-      expect([managed(id, 'resolved'), a.raw]).toContain(aRaw);
-      const bRead = await ground.store.readPath('Knowledge/B.md').catch(() => undefined);
-      if (bRead !== undefined) expect(bRead.raw).toBe(b.raw);
+       expect((await ground.revisions.readRevision(id, a.revisionId)).raw).toBe(a.raw);
+       expect((await ground.revisions.readRevision(id, b.revisionId)).raw).toBe(b.raw);
+       const aRaw = (await ground.store.readPath('Knowledge/A.md')).raw;
+       expect(aRaw).toBe(spec.resolutionRaw);
+       await expect(ground.store.readPath('Knowledge/B.md')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+       expect((await ground.store.readPath('Knowledge/Note.md')).raw).toBe('# Note\n\nrewritten\n');
+       expect((await readdir(join(ground.vaultRoot, 'Knowledge'))).filter((entry) => entry.startsWith('.consolidate-stage-'))).toEqual([]);
     } finally {
       await ground.dispose();
     }
@@ -725,6 +920,42 @@ test('an index failure at consolidation still yields durable success and a rebui
   } finally {
     await ground.dispose();
   }
+});
+
+test('failed removal from an existing index remains pending until durable retry removes the absorbed source', async () => {
+  const index = openSearchIndex(':memory:');
+  let failRemoval = true;
+  const adapter: DocumentIndex = {
+    upsert: (entry) => index.upsert(entry),
+    remove: (path) => { if (failRemoval) throw new Error('removal unavailable'); index.remove(path); }
+  };
+  const ground = await openGround(undefined, adapter);
+  try {
+    const id = randomUUID();
+    const root = await seedRevisionOnly(ground, id, managed(id, 'root'));
+    await ground.revisions.persistRevisionMetadata({ id, revision_id: root.revisionId, parents: [], created_at: new Date().toISOString() });
+    const parents = [{ revision_id: root.revisionId, raw_hash: root.hash }];
+    const a = await writeManaged(ground, id, 'Knowledge/A.md', managed(id, 'a'), parents);
+    const b = await writeManaged(ground, id, 'Knowledge/B.md', managed(id, 'b'), parents);
+    index.upsert({ path: 'Knowledge/B.md', raw: b.raw, etag: b.hash, id, revision_id: b.revisionId });
+    expect(index.paths()).toContain('Knowledge/B.md');
+    await ground.refresh();
+    const expected = (await ground.coordinator.enumerateConflictHeads(id)).map(({ revision_id, etag }) => ({ revision_id, etag }));
+    const receipt = await ground.coordinator.run(resolveIntent(randomUUID(), id, expected), resolvePlan({
+      id, survivorPath: 'Knowledge/A.md', survivorEtag: a.hash,
+      removalPaths: [{ path: 'Knowledge/B.md', id, revisionId: b.revisionId, etag: b.hash }],
+      resolutionRaw: managed(id, 'resolved'), resolutionRevision: randomUUID()
+    }));
+    expect(receipt).toMatchObject({ kind: 'note', indexed: false });
+    const unresolved = await ground.store.recover();
+    expect(unresolved.pending).toContain('Knowledge/B.md');
+    failRemoval = false;
+    const recovered = await ground.store.recover();
+    expect(recovered.recovered).toContain('Knowledge/B.md');
+    expect(index.paths()).not.toContain('Knowledge/B.md');
+    expect(index.candidates({ query: 'branch', limit: 10 }).some((hit) => hit.path === 'Knowledge/B.md')).toBe(false);
+    expect((await ground.store.readPath('Knowledge/A.md')).raw).toBe(managed(id, 'resolved'));
+  } finally { await ground.dispose(); index.close(); }
 });
 
 test('subordinate operation records are persisted, linked, and stable across a two-coordinator race', async () => {
@@ -811,4 +1042,24 @@ test('subordinate operation records are persisted, linked, and stable across a t
   } finally {
     await sandbox.dispose();
   }
+});
+
+test('transactional reservation collision does not consume a second operation identity', async () => {
+  const sandbox = await vaultSandbox();
+  const first = LocalOperationJournal.open(join(sandbox.state, 'operations.sqlite'));
+  const second = LocalOperationJournal.open(join(sandbox.state, 'operations.sqlite'));
+  try {
+    let allocations = 0;
+    const key = randomUUID();
+    const now = new Date().toISOString();
+    const input = { idempotency_key: key, tool: 'brain_capture', action: 'capture',
+      project_id: null, payload_hash: 'a'.repeat(64), payload_json: '{}', created_at: now, updated_at: now };
+    const allocate = () => { allocations += 1; return randomUUID(); };
+    const reserved = first.reserve(input, allocate);
+    const collided = second.reserve(input, allocate);
+    expect(reserved.kind).toBe('new');
+    expect(collided.kind).toBe('replay');
+    expect(collided.record.operation_id).toBe(reserved.record.operation_id);
+    expect(allocations).toBe(1);
+  } finally { first.close(); second.close(); await sandbox.dispose(); }
 });

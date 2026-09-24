@@ -311,13 +311,14 @@ export class CurrentCatalogue {
     await this.revisions.persistPreimage(id, raw);
   }
 
-  async persistRevision(id: string | undefined, raw: string): Promise<string | undefined> {
+  async persistRevision(id: string | undefined, path: string, raw: string): Promise<string | undefined> {
     if (id === undefined || this.revisions === undefined) return undefined;
     const hash = createHash('sha256').update(raw, 'utf8').digest('hex');
-    const existing = await this.revisions.findRevisionByHash(id, hash);
+    const existing = await this.revisions.currentBinding(id, path, hash);
     if (existing !== undefined) return existing;
     const revisionId = this.idSource.next();
     await this.revisions.persistRevision(id, revisionId, raw);
+    await this.revisions.bindCurrent(id, path, revisionId, hash);
     return revisionId;
   }
 
@@ -481,11 +482,12 @@ export async function reconcileCurrentVault(
     const pathList = [...new Set([...beforePaths, ...afterPaths])].sort();
     duplicateIds.set(id, pathList);
     report.duplicate_ids.push({ id, paths: pathList });
+    const conflictSources = await Promise.all(observed
+        .filter((item) => item.document.id === id)
+        .map(async (item) => ({ item, revision_id: await catalogue.revisions?.currentBinding(id, item.path, item.raw_hash) })));
     catalogue.recordConflict(
       id,
-      observed
-        .filter((item) => item.document.id === id)
-        .map((item) => ({
+      conflictSources.map(({ item, revision_id }) => ({
           path: item.path,
           hash: item.raw_hash,
           etag: item.raw_hash,
@@ -496,6 +498,7 @@ export async function reconcileCurrentVault(
           tags: [...item.document.tags],
           observed_at: new Date().toISOString(),
           id,
+          ...(revision_id === undefined ? {} : { revision_id }),
           ...(item.document.project === undefined ? {} : { project: item.document.project })
         }))
     );
@@ -550,7 +553,7 @@ export async function reconcileCurrentVault(
     if (source.id !== undefined && source.hash !== item.raw_hash) {
       await catalogue.persistSnapshot(source.id, catalogue.rawFor(move.from));
       if (signal?.aborted) throw cancelled();
-      revisionId = await catalogue.persistRevision(source.id, item.raw);
+       revisionId = await catalogue.persistRevision(source.id, item.path, item.raw);
     }
     plannedMoves.push({
       from: move.from,
@@ -573,7 +576,7 @@ export async function reconcileCurrentVault(
 
     const prior = previousByPath.get(item.path);
     if (prior === undefined) {
-      const revisionId = await catalogue.persistRevision(id, item.raw);
+      const revisionId = await catalogue.persistRevision(id, item.path, item.raw);
       plannedAdds.push({
         path: item.path,
         raw: item.raw,
@@ -597,13 +600,13 @@ export async function reconcileCurrentVault(
     if (id !== undefined && id === prior.id) {
       await catalogue.persistSnapshot(id, catalogue.rawFor(prior.path));
       if (signal?.aborted) throw cancelled();
-      revisionId = await catalogue.persistRevision(id, item.raw);
+      revisionId = await catalogue.persistRevision(id, item.path, item.raw);
     } else if (id !== undefined) {
       if (prior.id !== undefined) {
         await catalogue.persistSnapshot(prior.id, catalogue.rawFor(prior.path));
       }
       if (signal?.aborted) throw cancelled();
-      revisionId = await catalogue.persistRevision(id, item.raw);
+      revisionId = await catalogue.persistRevision(id, item.path, item.raw);
     }
     plannedChanges.push({
       prior,

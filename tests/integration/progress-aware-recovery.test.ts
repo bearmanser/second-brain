@@ -10,6 +10,7 @@ import type {
   LocalPlannedOperation
 } from '../../src/core/types.js';
 import { CurrentCatalogue, reconcileCurrentVault } from '../../src/notes/current-catalogue.js';
+import { collectRenameSnapshots, planRename } from '../../src/notes/rename.js';
 import { openDocumentStore, type DocumentStore } from '../../src/storage/document-store.js';
 import { LocalOperationJournal } from '../../src/storage/journal.js';
 import { openRevisionStore, type RevisionStore } from '../../src/storage/revision-store.js';
@@ -108,7 +109,8 @@ async function reserveOperation(
   ground: Ground,
   key: string,
   plan: LocalPlannedOperation,
-  progress?: unknown
+  progress?: unknown,
+  request?: { hash: string; json: string }
 ): Promise<string> {
   const now = clock.now().toISOString();
   const record = ground.operations.reserve({
@@ -117,8 +119,8 @@ async function reserveOperation(
     tool: 'brain_capture',
     action: 'capture',
     project_id: null,
-    payload_hash: 'a'.repeat(64),
-    payload_json: '{}',
+    payload_hash: request?.hash ?? 'a'.repeat(64),
+    payload_json: request?.json ?? '{}',
     created_at: now,
     updated_at: now
   }).record;
@@ -223,6 +225,54 @@ test('a completed effect later edited by a human is recovery-required and preser
   } finally {
     await ground.dispose();
   }
+});
+
+test('a document-complete first effect edited while a second effect is unfinished blocks finalization', async () => {
+  const ground = await openGround();
+  try {
+    const key = randomUUID();
+    const firstId = randomUUID();
+    const secondId = randomUUID();
+    const firstRevision = randomUUID();
+    const plan = writePlan([
+      { path: 'Inbox/One.md', noteId: firstId, revisionId: firstRevision },
+      { path: 'Inbox/Two.md', noteId: secondId, revisionId: randomUUID() }
+    ]);
+    const first = await ground.store.put({ path: 'Inbox/One.md', raw: managed(firstId, 'own output'),
+      expectedEtag: null, idempotencyKey: `${key}:doc:0`, source: 'brain_capture', revisionId: firstRevision, parents: [] });
+    const operationId = await reserveOperation(ground, key, plan, { preconditions_validated: true, effects: {
+      '0': { path: 'Inbox/One.md', etag: first.etag, id: first.id, revision_id: first.revision_id, document_complete: true }
+    } });
+    const human = managed(firstId, 'human edit');
+    await writeFile(join(ground.vaultRoot, 'Inbox/One.md'), human);
+    const report = await ground.coordinator.recover();
+    expect(report.blocking_operations).toContain(operationId);
+    expect(ground.coordinator.status(operationId)?.receipt).toBeUndefined();
+    expect((await ground.store.readPath('Inbox/One.md')).raw).toBe(human);
+    await expect(ground.store.readPath('Inbox/Two.md')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  } finally { await ground.dispose(); }
+});
+
+test('an unfinished effect sharing a completed path is not hidden by applied-path accounting', async () => {
+  const ground = await openGround();
+  try {
+    const key = randomUUID();
+    const id = randomUUID();
+    const plan = writePlan([
+      { path: 'Inbox/Shared.md', noteId: id, revisionId: randomUUID() },
+      { path: 'Inbox/Shared.md', noteId: id, revisionId: randomUUID() }
+    ]);
+    const first = await ground.store.put({ path: 'Inbox/Shared.md', raw: managed(id, 'first output'),
+      expectedEtag: null, idempotencyKey: `${key}:doc:0`, source: 'brain_capture' });
+    const operationId = await reserveOperation(ground, key, plan, { preconditions_validated: true, effects: {
+      '0': { path: 'Inbox/Shared.md', etag: first.etag, id: first.id, revision_id: first.revision_id, document_complete: true }
+    } });
+    const report = await ground.coordinator.recover();
+    expect(report.blocking_operations).toContain(operationId);
+    expect(ground.coordinator.status(operationId)?.receipt).toBeUndefined();
+    expect((await ground.store.readPath('Inbox/Shared.md')).raw).toBe(managed(id, 'first output'));
+    expect(ground.store.getDocumentReceipt(`${key}:doc:1`)).toBeUndefined();
+  } finally { await ground.dispose(); }
 });
 
 test('a durably completed document operation finalizes despite a later edit', async () => {
@@ -336,7 +386,7 @@ test('an ambiguous legacy storage-key record reports recovery required', async (
     ground.operations.update(receipt.operation_id, {
       state: 'pending',
       receipt_json: null,
-      storage_key: JSON.stringify([`${key}:doc:0`, `${key}:doc:1`]),
+      storage_key: JSON.stringify([`${key}:doc:1`]),
       updated_at: clock.now().toISOString()
     });
     await expect(
@@ -345,4 +395,89 @@ test('an ambiguous legacy storage-key record reports recovery required', async (
   } finally {
     await ground.dispose();
   }
+});
+
+test('a legacy key matching two distinct document operations cannot be rebound even with a correct-length key array', async () => {
+  const ground = await openGround();
+  try {
+    const key = randomUUID();
+    const receipt = await ground.coordinator.run(captureIntent(key), capturePlan('Inbox/Legacy.md'));
+    const original = (await ground.store.readPath('Inbox/Legacy.md')).raw;
+    const duplicateKey = `${key}:doc:0`;
+    await ground.store.applyRename(planRename({ from: 'Inbox/Legacy.md', to: 'Inbox/Moved.md',
+      files: await collectRenameSnapshots(ground.vaultRoot), idempotency_key: duplicateKey }));
+    expect(ground.store.getDocumentReceipt(duplicateKey)?.operation_id).toBeTruthy();
+    expect(ground.store.getMoveReceipt(duplicateKey)?.operation_id).toBeTruthy();
+    ground.operations.deleteSubordinates(receipt.operation_id);
+    ground.operations.update(receipt.operation_id, { state: 'pending', receipt_json: null,
+      storage_key: JSON.stringify([duplicateKey]), updated_at: clock.now().toISOString() });
+    await expect(ground.coordinator.run(captureIntent(key), capturePlan('Inbox/Legacy.md')))
+      .rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect((await ground.store.readPath('Inbox/Moved.md')).raw).toBe(original);
+    expect(ground.operations.listSubordinates(receipt.operation_id)).toEqual([]);
+  } finally { await ground.dispose(); }
+});
+
+test('a pending same-key replay reclassifies changed untouched preconditions before executing', async () => {
+  const ground = await openGround();
+  try {
+    const key = randomUUID();
+    const plan = writePlan([{ path: 'Inbox/One.md', noteId: randomUUID(), revisionId: randomUUID() }]);
+    const intent = captureIntent(key);
+    const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical) :
+      value !== null && typeof value === 'object' ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([field, item]) => [field, canonical(item)])) : value;
+    const payloadJson = JSON.stringify(canonical({ action: intent.action, payload: intent.payload, tool: intent.tool }));
+    const operationId = await reserveOperation(ground, key, plan, { preconditions_validated: false },
+      { json: payloadJson, hash: createHash('sha256').update(payloadJson).digest('hex') });
+    await mkdir(join(ground.vaultRoot, 'Inbox'), { recursive: true });
+    const human = managed(randomUUID(), 'human');
+    await writeFile(join(ground.vaultRoot, 'Inbox/One.md'), human);
+    await expect(ground.coordinator.run(intent, capturePlan('Inbox/One.md'))).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(ground.coordinator.status(operationId)?.receipt).toBeUndefined();
+    expect((await ground.store.readPath('Inbox/One.md')).raw).toBe(human);
+  } finally { await ground.dispose(); }
+});
+
+test('a subordinate document-operation link cannot be silently rebound to a different operation', async () => {
+  const ground = await openGround();
+  try {
+    const key = randomUUID();
+    const receipt = await ground.coordinator.run(captureIntent(key), capturePlan('Inbox/Legacy.md'));
+    const row = ground.operations.listSubordinates(receipt.operation_id)[0];
+    expect(row.document_operation_id).toBeTruthy();
+    await expect(() => ground.operations.setSubordinateDocumentOperation(receipt.operation_id, 0, randomUUID()))
+      .toThrowError(/conflicting document-operation linkage/);
+    expect(ground.operations.listSubordinates(receipt.operation_id)[0].document_operation_id).toBe(row.document_operation_id);
+  } finally { await ground.dispose(); }
+});
+
+test('a feedback receipt is true only after the exact verdict and reason are durably recorded', async () => {
+  const ground = await openGround();
+  try {
+    const key = randomUUID();
+    const id = randomUUID();
+    const revision = randomUUID();
+    const raw = managed(id, 'feedback target');
+    await ground.store.put({ path: 'Inbox/Feedback.md', raw, expectedEtag: null,
+      idempotencyKey: `${key}:seed`, source: 'test_seed', revisionId: revision, parents: [] });
+    const now = clock.now().toISOString();
+    const record = ground.operations.reserve({ operation_id: randomUUID(), idempotency_key: key,
+      tool: 'brain_feedback', action: 'feedback', project_id: null, payload_hash: 'a'.repeat(64), payload_json: '{}',
+      created_at: now, updated_at: now }).record;
+    const plan = { kind: 'feedback', id, revision_id: revision, feedback_id: randomUUID(), verdict: 'useful', reason: 'verified',
+      read_set: [{ kind: 'note', id, expected: { kind: 'present', path: 'Inbox/Feedback.md', revision_id: revision,
+        etag: createHash('sha256').update(raw).digest('hex') } }] };
+    ground.operations.update(record.operation_id, { plan_json: JSON.stringify(plan),
+      storage_key: JSON.stringify([`${key}:feedback`]), progress_json: JSON.stringify({ preconditions_validated: true }), updated_at: now });
+    const report = await ground.coordinator.recover();
+    expect(report.finalized).toBe(1);
+    expect(ground.coordinator.status(record.operation_id)?.receipt).toMatchObject({ recorded: true, feedback_id: plan.feedback_id });
+    expect(ground.operations.getFeedbackEffect(record.operation_id)).toEqual({
+      operation_id: record.operation_id, feedback_id: plan.feedback_id, id,
+      revision_id: revision, verdict: 'useful', reason: 'verified'
+    });
+    ground.operations.close();
+    ground.operations = LocalOperationJournal.open(join(ground.sandbox.state, 'operations.sqlite'));
+    expect(ground.operations.getFeedbackEffect(record.operation_id)?.reason).toBe('verified');
+  } finally { await ground.dispose(); }
 });

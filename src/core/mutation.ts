@@ -48,6 +48,8 @@ import type {
 } from '../storage/document-store.js';
 import type { LocalOperationJournal, LocalOperationRecord } from '../storage/journal.js';
 import type { RevisionStore } from '../storage/revision-store.js';
+import { scanVaultFilePaths } from '../storage/vault.js';
+import { parseDocument } from '../notes/document-codec.js';
 import { collectRenameSnapshots, planRename, type RenamePlan, type RenameReceipt } from '../notes/rename.js';
 import { allocateNotePath, safeBasename } from '../notes/paths.js';
 import type {
@@ -1333,6 +1335,8 @@ export interface LocalDocumentExecutor {
   applyRename(plan: RenamePlan): Promise<RenameReceipt>;
   consolidate(input: DocumentStoreConsolidateInput): Promise<DocumentStorePutResult>;
   getConsolidationReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
+  hasConsolidationManifest?(idempotencyKey: string): boolean;
+  recover?(): Promise<{ recovered: string[]; pending: string[] }>;
   getDocumentReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
   getMoveReceipt(idempotencyKey: string): RenameReceipt | undefined;
 }
@@ -1526,7 +1530,6 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     if (existing !== undefined) return this.replay(intent, existing, request.hash);
     const now = this.now();
     const reserved = this.deps.operations.reserve({
-      operation_id: this.deps.ids.next(),
       idempotency_key: intent.idempotency_key,
       tool: intent.tool,
       action: intent.action,
@@ -1535,7 +1538,7 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
       payload_json: request.json,
       created_at: now,
       updated_at: now
-    });
+    }, () => this.deps.ids.next());
     if (reserved.kind === 'replay') return this.replay(intent, reserved.record, request.hash);
     const record = reserved.record;
     const observed = await this.observe(intent);
@@ -1548,6 +1551,7 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
       storage_key: JSON.stringify(this.storageKeys(record.idempotency_key, planned)),
       updated_at: this.now()
     });
+    this.assertNoPendingOverlap(record, planned);
     await this.persistObservedHeads(planned, observed);
     try {
       await this.recheckPlan(planned);
@@ -1595,7 +1599,46 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     }
     const plan = JSON.parse(record.plan_json) as LocalPlannedOperation;
     this.bindLegacySubordinates(record, plan);
-    return this.executePlan(record, plan);
+    await this.recoverOperation(record, plan);
+    const finalized = this.deps.operations.findById(record.operation_id);
+    if (finalized?.receipt_json === null || finalized?.receipt_json === undefined) {
+      throw localRecovery(`operation ${record.operation_id} did not produce a durable receipt`);
+    }
+    return JSON.parse(finalized.receipt_json) as LocalOperationReceipt;
+  }
+
+  private assertNoPendingOverlap(record: LocalOperationRecord, plan: LocalPlannedOperation): void {
+    const plannedPaths = new Set<string>();
+    const plannedIds = new Set<string>();
+    if (plan.kind === 'note') {
+      for (const head of plan.heads) { plannedIds.add(head.id); plannedPaths.add(head.path); }
+      for (const effect of plan.effects) {
+        if (effect.kind === 'move') { plannedPaths.add(effect.from_path); plannedPaths.add(effect.to_path); }
+        else plannedPaths.add(effect.kind === 'write' || effect.kind === 'adopt' ? effect.write.path : effect.path);
+      }
+      for (const edit of plan.reference_edits ?? []) plannedPaths.add(edit.path);
+    }
+    for (const condition of plan.read_set) {
+      if (condition.kind === 'path') plannedPaths.add(condition.path);
+      else if (condition.kind === 'note') {
+        plannedIds.add(condition.id);
+        if (condition.expected.kind === 'present') plannedPaths.add(condition.expected.path);
+      } else if (condition.kind === 'heads') plannedIds.add(condition.id);
+    }
+    for (const pending of this.deps.operations.listIncomplete()) {
+      if (pending.operation_id === record.operation_id || pending.plan_json === null) continue;
+      let other: LocalPlannedOperation;
+      try { other = JSON.parse(pending.plan_json) as LocalPlannedOperation; }
+      catch { throw localRecovery(`pending operation ${pending.operation_id} has unreadable affected paths`); }
+      if (other.kind !== 'note') continue;
+      if (other.heads.some((head) => plannedIds.has(head.id) || plannedPaths.has(head.path)) ||
+          other.effects.some((effect) => effect.kind === 'move'
+            ? plannedPaths.has(effect.from_path) || plannedPaths.has(effect.to_path)
+            : plannedPaths.has(effect.kind === 'write' || effect.kind === 'adopt' ? effect.write.path : effect.path)) ||
+          (other.reference_edits ?? []).some((edit) => plannedPaths.has(edit.path))) {
+        throw localRecovery(`pending operation ${pending.operation_id} blocks an overlapping mutation`);
+      }
+    }
   }
 
   private async observe(intent: LocalOperationIntent): Promise<LocalObservedState> {
@@ -1674,18 +1717,17 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
   private subordinateSpecs(plan: LocalPlannedOperation): { kind: string; key: string }[] {
     if (plan.kind === 'project_ensure') return [{ kind: 'project_ensure', key: 'project' }];
     if (plan.kind === 'feedback') return [{ kind: 'feedback', key: 'feedback' }];
+    if (plan.effects.some((effect) => effect.kind === 'remove')) {
+      return [{ kind: 'consolidation', key: 'consolidate' }];
+    }
     const specs: { kind: string; key: string }[] = [];
     plan.effects.forEach((effect, index) => {
       if (effect.kind === 'move') specs.push({ kind: 'move', key: `move:${index}` });
-      else if (effect.kind === 'remove') specs.push({ kind: 'remove', key: `remove:${index}` });
       else specs.push({ kind: effect.kind, key: `doc:${index}` });
+      if (effect.kind === 'move' && effect.write !== undefined) {
+        specs.push({ kind: 'write', key: `doc:${index + 1000}` });
+      }
     });
-    if (plan.effects.some((effect) => effect.kind === 'remove')) {
-      specs.push({ kind: 'consolidation', key: 'consolidate' });
-    }
-    (plan.reference_edits ?? []).forEach((_edit, index) =>
-      specs.push({ kind: 'reference_edit', key: `ref:${index}` })
-    );
     return specs;
   }
 
@@ -1695,8 +1737,10 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
   ): void {
     const existing = this.deps.operations.listSubordinates(record.operation_id);
     this.subordinateSpecs(plan).forEach((spec, index) => {
+      const effectIndex = spec.key.startsWith('doc:') && Number(spec.key.slice(4)) >= 1000
+        ? Number(spec.key.slice(4)) : index;
       const key = `${record.idempotency_key}:${spec.key}`;
-      const held = existing.find((entry) => entry.effect_index === index);
+      const held = existing.find((entry) => entry.effect_index === effectIndex);
       if (held !== undefined) {
         if (held.key !== key) {
           throw localRecovery('the persisted subordinate linkage changed for this operation');
@@ -1705,7 +1749,7 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
       }
       this.deps.operations.reserveSubordinate({
         operation_id: record.operation_id,
-        effect_index: index,
+        effect_index: effectIndex,
         kind: spec.kind,
         key,
         created_at: record.created_at,
@@ -1716,7 +1760,6 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
 
   private bindLegacySubordinates(record: LocalOperationRecord, plan: LocalPlannedOperation): void {
     const existing = this.deps.operations.listSubordinates(record.operation_id);
-    if (existing.length > 0) return;
     if (record.storage_key === null) return;
     let legacyKeys: unknown;
     try {
@@ -1729,12 +1772,23 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     }
     const specs = this.subordinateSpecs(plan);
     const expectedKeys = specs.map((spec) => `${record.idempotency_key}:${spec.key}`);
-    if (legacyKeys.length !== expectedKeys.length) {
+    if (JSON.stringify(legacyKeys) !== JSON.stringify(expectedKeys)) {
       throw localRecovery(
         'the legacy subordinate linkage does not match this plan and cannot be rebound safely'
       );
     }
+    if (existing.length > 0) {
+      if (existing.length !== expectedKeys.length || expectedKeys.some((key, index) =>
+        existing.find((row) => row.key === key)?.effect_index !== (
+          specs[index].key.startsWith('doc:') && Number(specs[index].key.slice(4)) >= 1000
+            ? Number(specs[index].key.slice(4)) : index))) {
+        throw localRecovery('the persisted subordinate rows disagree with the stored key array');
+      }
+      return;
+    }
     specs.forEach((spec, index) => {
+      const effectIndex = spec.key.startsWith('doc:') && Number(spec.key.slice(4)) >= 1000
+        ? Number(spec.key.slice(4)) : index;
       const key = expectedKeys[index];
       const candidates: string[] = [];
       const document = this.deps.documents.getDocumentReceipt(key);
@@ -1751,7 +1805,7 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
       }
       this.deps.operations.reserveSubordinate({
         operation_id: record.operation_id,
-        effect_index: index,
+        effect_index: effectIndex,
         kind: spec.kind,
         key,
         created_at: record.created_at,
@@ -1760,7 +1814,7 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
       if (unique.length === 1) {
         this.deps.operations.setSubordinateDocumentOperation(
           record.operation_id,
-          index,
+          effectIndex,
           unique[0]
         );
       }
@@ -1772,23 +1826,14 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     plan: LocalPlannedOperation
   ): void {
     this.subordinateSpecs(plan).forEach((_spec, index) => {
-      this.deps.operations.markSubordinate(record.operation_id, index, 'complete');
+      const effectIndex = _spec.key.startsWith('doc:') && Number(_spec.key.slice(4)) >= 1000
+        ? Number(_spec.key.slice(4)) : index;
+      this.deps.operations.markSubordinate(record.operation_id, effectIndex, 'complete');
     });
   }
 
   private storageKeys(key: string, plan: LocalPlannedOperation): string[] {
-    if (plan.kind === 'project_ensure') return [`${key}:project`];
-    if (plan.kind === 'feedback') return [`${key}:feedback`];
-    const keys: string[] = [];
-    plan.effects.forEach((effect, index) => {
-      if (effect.kind === 'move') keys.push(`${key}:move:${index}`);
-      else keys.push(`${key}:doc:${index}`);
-    });
-    if (plan.effects.some((effect) => effect.kind === 'remove')) {
-      keys.push(`${key}:consolidate:primary`, `${key}:consolidate:manifest`);
-    }
-    (plan.reference_edits ?? []).forEach((_edit, index) => keys.push(`${key}:ref:${index}`));
-    return keys;
+    return this.subordinateSpecs(plan).map((spec) => `${key}:${spec.key}`);
   }
 
   private bindPlanToIntent(intent: LocalOperationIntent, plan: LocalPlannedOperation): void {
@@ -1810,14 +1855,25 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
         }
       }
     }
+    if (intent.action === 'supersede') {
+      const replacementId = intent.payload.replacement_id;
+      if (!plan.read_set.some((condition) => condition.kind === 'note' &&
+          condition.id === replacementId && condition.expected.kind === 'present' &&
+          condition.expected.revision_id.length > 0 && condition.expected.etag.length > 0)) {
+        throw localInvalid('the supersede plan must bind its replacement identity and revision');
+      }
+    }
     if (preconditions.etag !== undefined) {
+      const expectedPath = preconditions.path;
       const bound = plan.read_set.some(
         (condition) =>
           (condition.kind === 'note' &&
             condition.expected.kind === 'present' &&
+            (expectedPath === undefined || condition.expected.path === expectedPath) &&
             condition.expected.etag === preconditions.etag) ||
           (condition.kind === 'path' &&
             condition.expected.kind === 'present' &&
+            (expectedPath === undefined || condition.path === expectedPath) &&
             condition.expected.etag === preconditions.etag)
       );
       if (!bound) {
@@ -1850,7 +1906,8 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
             throw localInvalid(`the read set does not cover adoption target ${effect.path}`);
           }
         } else if (effect.kind === 'move') {
-          if (!coversPath(effect.from_path) || !coversPath(effect.to_path)) {
+          if (!coversPath(effect.from_path) || !coversPath(effect.to_path) ||
+              (effect.write !== undefined && !coversPath(effect.write.path))) {
             throw localInvalid(
               `the read set does not cover the move ${effect.from_path} -> ${effect.to_path}`
             );
@@ -1861,17 +1918,27 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
           }
         }
       }
+      const priorEdit = new Map<string, string>();
       for (const edit of plan.reference_edits ?? []) {
-        if (!coversPath(edit.path)) {
+        const prior = priorEdit.get(edit.path);
+        if (prior !== undefined && createHash('sha256').update(prior).digest('hex') !== edit.expected_etag) {
+          throw localInvalid(`reference edits for ${edit.path} do not compose`);
+        }
+        if (prior === undefined && !readSet.some((condition) =>
+          (condition.kind === 'path' && condition.path === edit.path && condition.expected.kind === 'present' && condition.expected.etag === edit.expected_etag) ||
+          (condition.kind === 'note' && condition.expected.kind === 'present' && condition.expected.path === edit.path && condition.expected.etag === edit.expected_etag))) {
           throw localInvalid(`the read set does not cover reference edit ${edit.path}`);
         }
+        priorEdit.set(edit.path, edit.raw);
         if (edit.managed !== undefined) {
           const bound = readSet.some(
             (condition) =>
               condition.kind === 'note' &&
               condition.id === edit.managed?.id &&
               condition.expected.kind === 'present' &&
-              condition.expected.path === edit.path
+              condition.expected.path === edit.path &&
+              condition.expected.etag === (prior === undefined ? edit.expected_etag :
+                (plan.reference_edits ?? []).find((item) => item.path === edit.path)?.expected_etag)
           );
           if (!bound) {
             throw localInvalid(`the read set does not bind managed reference edit ${edit.path}`);
@@ -1892,6 +1959,13 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
           throw localInvalid('the heads condition must equal the verified conflict heads');
         }
         for (const head of plan.heads) {
+          if (!readSet.some((condition) =>
+            (condition.kind === 'path' && condition.path === head.path && condition.expected.kind === 'present' &&
+              condition.expected.id === head.id && condition.expected.revision_id === head.revision_id && condition.expected.etag === head.etag) ||
+            (condition.kind === 'note' && condition.id === head.id && condition.expected.kind === 'present' &&
+              condition.expected.path === head.path && condition.expected.revision_id === head.revision_id && condition.expected.etag === head.etag))) {
+            throw localInvalid(`the read set does not bind conflict head ${head.path}`);
+          }
           if (
             !expectedHeads.some(
               (expected) =>
@@ -1940,7 +2014,7 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
 
   private async recheckPlan(
     plan: LocalPlannedOperation,
-    options: { skipPaths?: ReadonlySet<string>; skipHeads?: boolean } = {}
+    options: { skipPaths?: ReadonlySet<string>; appliedEffects?: Readonly<Record<string, EffectPostcondition>> } = {}
   ): Promise<void> {
     for (const condition of plan.read_set) {
       if (condition.kind === 'path') {
@@ -1980,7 +2054,27 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
         continue;
       }
       if (condition.kind === 'heads') {
-        if (options.skipHeads === true) continue;
+        if (options.appliedEffects !== undefined && plan.kind === 'note') {
+          const expectedPaths = new Set(plan.heads.map((head) => head.path));
+          for (const [index, effect] of plan.effects.entries()) {
+            if (options.appliedEffects[String(index)] === undefined) continue;
+            if (effect.kind === 'move') {
+              expectedPaths.delete(effect.from_path);
+              expectedPaths.add(effect.to_path);
+            } else if (effect.kind === 'remove') expectedPaths.delete(effect.path);
+          }
+          const current = await this.resolveConflictHeads(condition.id);
+          if (current.length !== expectedPaths.size || current.some((head) => !expectedPaths.has(head.path))) {
+            throw localConflict('the current head set diverged after partial application');
+          }
+          for (const head of plan.heads) {
+            if (options.skipPaths?.has(head.path)) continue;
+            if (!current.some((item) => item.path === head.path && item.revision_id === head.revision_id && item.etag === head.etag)) {
+              throw localConflict(`unfinished conflict head ${head.path} changed`);
+            }
+          }
+          continue;
+        }
         await this.verifyConflictHeads(condition.id, condition.expected_heads);
         continue;
       }
@@ -2007,42 +2101,28 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     return this.resolveConflictHeads(id);
   }
 
-  private observedEntries(id: string): LocalObservedCatalogueEntry[] {
-    const byPath = new Map<string, LocalObservedCatalogueEntry>();
-    for (const entry of this.deps.catalogue.all()) {
-      if (entry.id === id) byPath.set(entry.path, entry);
-    }
-    for (const entry of this.deps.catalogue.conflictsFor?.(id) ?? []) {
-      byPath.set(entry.path, entry);
-    }
-    return [...byPath.values()].sort((left, right) =>
-      left.path < right.path ? -1 : left.path > right.path ? 1 : 0
-    );
-  }
-
   private async resolveConflictHeads(id: string): Promise<LocalConflictHead[]> {
+    const scan = await scanVaultFilePaths(this.deps.vaultRoot);
+    if (!scan.complete) throw localRecovery('the current vault scan is incomplete');
     const heads: LocalConflictHead[] = [];
-    for (const entry of this.observedEntries(id)) {
-      let revisionId = entry.revision_id;
-      if (revisionId === undefined && this.deps.revisions !== undefined) {
-        revisionId = await this.deps.revisions.findRevisionByHash(id, entry.hash);
-      }
+    for (const path of scan.paths.filter((path) => path.endsWith('.md'))) {
+      const entry = await this.readPathOrUndefined(path);
+      if (entry === undefined || parseDocument(entry.raw, path).id !== id) continue;
+      const revisionId = await this.deps.revisions?.currentBinding(id, path, entry.etag);
       let parents: readonly { revision_id: string; raw_hash: string }[] = [];
-      if (
-        this.deps.revisions !== undefined &&
-        revisionId !== undefined &&
-        REVISION_UUID_PATTERN.test(revisionId)
-      ) {
-        try {
-          parents = (await this.deps.revisions.readRevisionMetadata(id, revisionId)).parents;
-        } catch {
-          parents = [];
+      if (revisionId !== undefined) {
+        try { parents = (await this.deps.revisions?.readRevisionMetadata(id, revisionId))?.parents ?? []; }
+        catch (error) {
+          if (isBrainError(error) && error.code === 'NOT_FOUND') {
+            parents = [];
+          }
+          throw error;
         }
       }
       heads.push({
         id,
-        path: entry.path,
-        revision_id: revisionId ?? entry.hash,
+        path,
+        revision_id: revisionId ?? '',
         etag: entry.etag,
         parents
       });
@@ -2183,6 +2263,19 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     record: LocalOperationRecord,
     plan: LocalPlannedOperation
   ): Promise<void> {
+    this.bindLegacySubordinates(record, plan);
+    if (plan.kind === 'note' && plan.effects.some((effect) => effect.kind === 'remove') &&
+        this.deps.documents.hasConsolidationManifest?.(`${record.idempotency_key}:consolidate`)) {
+      if (!this.preconditionsValidated(this.liveRecord(record))) {
+        throw localRecovery('the in-flight consolidation has no validated-preconditions boundary');
+      }
+      await this.deps.documents.recover?.();
+      if (this.deps.documents.getConsolidationReceipt(`${record.idempotency_key}:consolidate`) === undefined) {
+        throw localRecovery('the in-flight consolidation has not verified its final document and references');
+      }
+      await this.executeConsolidation(record, plan);
+      return;
+    }
     if (plan.kind === 'note' && !plan.effects.some((effect) => effect.kind === 'remove')) {
       for (const [index, effect] of plan.effects.entries()) {
         if (this.recordedEffect(record, index) !== undefined) continue;
@@ -2224,6 +2317,11 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     }
     const applied = Object.keys(this.readProgress(this.liveRecord(record)).effects ?? {}).length;
     if (applied === 0) {
+      if (plan.kind === 'note' && plan.effects.some((effect) => effect.kind === 'move') &&
+          Object.keys(this.readProgress(this.liveRecord(record)).renames ?? {}).length > 0) {
+        await this.executePlan(record, plan);
+        return;
+      }
       try {
         await this.recheckPlan(plan);
       } catch (error) {
@@ -2235,7 +2333,20 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
         }
         throw error;
       }
+      if (!this.preconditionsValidated(this.liveRecord(record))) {
+        const progress = this.readProgress(this.liveRecord(record));
+        this.deps.operations.update(record.operation_id, {
+          progress_json: JSON.stringify({ ...progress, preconditions_validated: true }),
+          updated_at: this.now()
+        });
+      }
     } else {
+      if (!this.preconditionsValidated(this.liveRecord(record)) &&
+          !Object.values(this.readProgress(this.liveRecord(record)).effects ?? {}).every(
+            (effect) => effect.document_complete === true
+          )) {
+        throw localRecovery('an applied effect has no durable validated-preconditions boundary');
+      }
       await this.verifyPartial(record, plan);
     }
     await this.executePlan(record, plan);
@@ -2246,8 +2357,10 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     plan: LocalPlannedOperation
   ): Promise<void> {
     const effects = this.readProgress(this.liveRecord(record)).effects ?? {};
+    const allComplete = plan.kind === 'note' && plan.effects.length > 0 &&
+      plan.effects.every((_effect, index) => effects[String(index)]?.document_complete === true);
     for (const [index, postcondition] of Object.entries(effects)) {
-      if (postcondition.document_complete === true) continue;
+      if (allComplete && postcondition.document_complete === true) continue;
       const current = await this.readPathOrUndefined(postcondition.path);
       if (
         current === undefined ||
@@ -2262,7 +2375,7 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     try {
       await this.recheckPlan(plan, {
         skipPaths: this.appliedSkipPaths(record, plan),
-        skipHeads: true
+        appliedEffects: effects
       });
     } catch (error) {
       if (isBrainError(error) && error.code === 'CONFLICT') {
@@ -2279,6 +2392,12 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     record: LocalOperationRecord,
     plan: LocalPlannedOperation
   ): Promise<LocalOperationReceipt> {
+    const effects = this.readProgress(this.liveRecord(record)).effects ?? {};
+    const completedDocument = plan.kind === 'note' && plan.effects.length > 0 &&
+      plan.effects.every((_effect, index) => effects[String(index)]?.document_complete === true);
+    if (!this.preconditionsValidated(this.liveRecord(record)) && !completedDocument) {
+      throw localRecovery('the plan cannot execute without a durable validated-preconditions boundary');
+    }
     let last: DocumentStorePutResult | undefined;
     let moveReceipt: RenameReceipt | undefined;
     if (plan.kind === 'note') {
@@ -2301,16 +2420,13 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
             }
           }
           if (effect.kind === 'move') {
-            moveReceipt = {
-              operation_id: record.operation_id,
-              from: effect.from_path,
-              to: recorded.path,
-              moved: true,
-              edited: [],
-              indexed: [],
-              moved_indexed: false,
-              verified: true
-            };
+            moveReceipt = this.deps.documents.getMoveReceipt(`${record.idempotency_key}:move:${index}`);
+            if (moveReceipt === undefined) {
+              throw localRecovery(`move ${index} has no verified document receipt`);
+            }
+            if (effect.write !== undefined) {
+              last = await this.applyOptionalMoveWrite(record, effect, plan, index);
+            }
           } else {
             last = {
               id: recorded.id ?? '',
@@ -2347,15 +2463,7 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
         }
         this.linkSubordinate(record, index, moveReceipt.operation_id);
         if (effect.write !== undefined) {
-          const put = await this.putEffect(record, effect.write, plan, index + 1000);
-          last = put;
-          this.recordEffect(record, index + 1000, {
-            path: put.path,
-            etag: put.etag,
-            id: put.id,
-            revision_id: put.revision_id
-          });
-          this.linkSubordinate(record, index + 1000, put.operation_id);
+          last = await this.applyOptionalMoveWrite(record, effect, plan, index);
         }
       }
     }
@@ -2375,11 +2483,21 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
       return receipt;
     }
     if (plan.kind === 'feedback') {
-      const receipt: LocalOperationReceipt = {
-        kind: 'feedback',
+      this.deps.operations.recordFeedback({
         operation_id: record.operation_id,
         feedback_id: plan.feedback_id,
-        recorded: true
+        id: plan.id,
+        revision_id: plan.revision_id,
+        verdict: plan.verdict,
+        reason: plan.reason
+      });
+      const durable = this.deps.operations.getFeedbackEffect(record.operation_id);
+      if (durable?.feedback_id !== plan.feedback_id || durable.id !== plan.id ||
+          durable.revision_id !== plan.revision_id || durable.verdict !== plan.verdict || durable.reason !== plan.reason) {
+        throw localRecovery('the feedback effect was not durably verified');
+      }
+      const receipt: LocalOperationReceipt = {
+        kind: 'feedback', operation_id: record.operation_id, feedback_id: plan.feedback_id, recorded: true
       };
       this.finalize(record, receipt, storageKey);
       return receipt;
@@ -2410,6 +2528,9 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     record: LocalOperationRecord,
     plan: Extract<LocalPlannedOperation, { kind: 'note' }>
   ): Promise<LocalOperationReceipt> {
+    if (!this.preconditionsValidated(this.liveRecord(record))) {
+      throw localRecovery('the consolidation has no validated-preconditions boundary');
+    }
     if (record.tool !== 'brain_review' || record.action !== 'resolve') {
       throw localInvalid('remove effects are only legal inside a resolve consolidation');
     }
@@ -2438,6 +2559,9 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
       throw localInvalid('a consolidation requires exactly one primary resolution write');
     }
     const primary = writes[0].write;
+    if (primary.id !== heads[0]?.id || JSON.stringify(primary.parents) !== JSON.stringify(plan.parents)) {
+      throw localInvalid('the resolution write must retain the verified identity and all parents');
+    }
     const headPaths = new Set(heads.map((head) => head.path));
     if (!headPaths.has(primary.path)) {
       throw localInvalid('the resolution write must target a verified head path');
@@ -2545,16 +2669,38 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     record: LocalOperationRecord,
     write: LocalPendingWrite,
     plan: LocalPlannedOperation,
-    index: number
+    index: number,
+    movedEtag?: string
   ): Promise<DocumentStorePutResult> {
-    const expectedEtag = this.expectedEtagFor(write.path, plan.read_set);
+    const expectedEtag = movedEtag ?? this.expectedEtagFor(write.path, plan.read_set);
     return this.deps.documents.put({
       path: write.path,
       raw: write.raw,
       expectedEtag,
       idempotencyKey: `${record.idempotency_key}:doc:${index}`,
-      source: record.tool
+      source: record.tool,
+      revisionId: write.revision_id,
+      parents: write.parents
     });
+  }
+
+  private async applyOptionalMoveWrite(
+    record: LocalOperationRecord,
+    effect: Extract<LocalDocumentEffect, { kind: 'move' }>,
+    plan: LocalPlannedOperation,
+    index: number
+  ): Promise<DocumentStorePutResult> {
+    if (effect.write === undefined) throw localInvalid('a move write is required');
+    const stored = this.deps.documents.getDocumentReceipt(`${record.idempotency_key}:doc:${index + 1000}`);
+    if (stored !== undefined) return stored;
+    const destination = await this.readPathOrUndefined(effect.to_path);
+    const put = await this.putEffect(record, effect.write, plan, index + 1000,
+      effect.write.path === effect.to_path ? destination?.etag : undefined);
+    this.recordEffect(record, index + 1000, {
+      path: put.path, etag: put.etag, id: put.id, revision_id: put.revision_id
+    });
+    this.linkSubordinate(record, index + 1000, put.operation_id);
+    return put;
   }
 
   private async moveEffect(
@@ -2631,6 +2777,17 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
       } else skip.add(effect.path);
     }
     for (const effect of Object.values(effects)) skip.add(effect.path);
+    if (plan.kind === 'note') {
+      for (const [index, effect] of plan.effects.entries()) {
+        if (effects[String(index)] !== undefined) continue;
+        if (effect.kind === 'write' || effect.kind === 'adopt') skip.delete(effect.write.path);
+        else if (effect.kind === 'move') {
+          skip.delete(effect.from_path);
+          skip.delete(effect.to_path);
+          if (effect.write !== undefined) skip.delete(effect.write.path);
+        } else skip.delete(effect.path);
+      }
+    }
     return skip;
   }
 
@@ -2640,15 +2797,11 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     documentOperationId: string | undefined
   ): void {
     if (documentOperationId === undefined) return;
-    try {
-      this.deps.operations.setSubordinateDocumentOperation(
-        record.operation_id,
-        index,
-        documentOperationId
-      );
-    } catch {
-      undefined;
-    }
+    this.deps.operations.setSubordinateDocumentOperation(
+      record.operation_id,
+      index,
+      documentOperationId
+    );
   }
 
   private storedRename(record: LocalOperationRecord, index: number): RenamePlan | undefined {

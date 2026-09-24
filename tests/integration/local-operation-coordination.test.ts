@@ -175,6 +175,11 @@ test('a repeated identical request returns the original operation across restart
     >;
     expect(first.kind).toBe('note');
     await brain.refresh();
+    const planned = JSON.parse(brain.operations.findByKey(key)?.plan_json ?? '{}') as { effects: [{ write: { revision_id: string; parents: unknown[] } }] };
+    expect(first.revision_id).toBe(planned.effects[0].write.revision_id);
+    expect((await brain.revisions.readRevision(first.id, first.revision_id)).raw).toBe((await brain.store.readPath(first.path)).raw);
+    expect((await brain.revisions.readRevisionMetadata(first.id, first.revision_id)).parents).toEqual(planned.effects[0].write.parents);
+    expect(brain.catalogue.getByPath(first.path)?.revision_id).toBe(first.revision_id);
 
     await writeFile(join(brain.vaultRoot, 'Inbox/One.md'), managed(first.id, 'edited marker'));
     await brain.refresh();
@@ -235,6 +240,35 @@ test('a reused key with a different payload or tool is an idempotency conflict',
   }
 });
 
+test('a supersede plan cannot omit the replacement note identity and version from its read set', async () => {
+  const brain = await openBrain();
+  try {
+    const sourceId = randomUUID();
+    const replacementId = randomUUID();
+    const sourceRaw = managed(sourceId, 'source');
+    const replacementRaw = managed(replacementId, 'replacement');
+    const source = await brain.store.put({ path: 'Inbox/Source.md', raw: sourceRaw,
+      expectedEtag: null, idempotencyKey: randomUUID(), source: 'seed' });
+    await brain.store.put({ path: 'Inbox/Replacement.md', raw: replacementRaw,
+      expectedEtag: null, idempotencyKey: randomUUID(), source: 'seed' });
+    const key = randomUUID();
+    const intent: LocalOperationIntent = { tool: 'brain_review', action: 'supersede', project_id: null, idempotency_key: key,
+      payload: { action: 'supersede', idempotency_key: key, id: sourceId, expected_etag: source.etag,
+        replacement_id: replacementId, rationale: 'replacement' },
+      preconditions: { id: sourceId, etag: source.etag } };
+    await expect(brain.coordinator.run(intent, (identity) => {
+      if (identity.kind !== 'note') throw new Error('missing identity');
+      return { kind: 'note', heads: [], parents: [], read_set: [
+        { kind: 'note', id: sourceId, expected: { kind: 'present', path: source.path,
+          revision_id: source.revision_id, etag: source.etag } }
+      ], effects: [{ kind: 'write', write: { path: source.path, raw: managed(sourceId, 'superseded'),
+        id: sourceId, revision_id: identity.revision_id, parents: [{ revision_id: source.revision_id, raw_hash: source.etag }] } }] };
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+    expect((await brain.store.readPath(source.path)).raw).toBe(sourceRaw);
+    expect((await brain.store.readPath('Inbox/Replacement.md')).raw).toBe(replacementRaw);
+  } finally { await brain.dispose(); }
+});
+
 test('recovery finalizes a storage-complete operation whose receipt was never written', async () => {
   const brain = await openBrain();
   try {
@@ -273,6 +307,7 @@ test('recovery finalizes a storage-complete operation whose receipt was never wr
     };
     brain.operations.update(record.operation_id, {
       plan_json: JSON.stringify(plan),
+      storage_key: JSON.stringify([`${key}:doc:0`]),
       updated_at: now
     });
     await brain.store.put({
@@ -280,7 +315,9 @@ test('recovery finalizes a storage-complete operation whose receipt was never wr
       raw: managed(noteId, 'recovered marker'),
       expectedEtag: null,
       idempotencyKey: `${key}:doc:0`,
-      source: 'brain_capture'
+      source: 'brain_capture',
+      revisionId,
+      parents: []
     });
 
     const report = await brain.coordinator.recover();
