@@ -224,6 +224,51 @@ test('sqlite snapshots include committed WAL content', async () => {
   }
 });
 
+test('text search, reads, and safe writes work after a restore without model artifacts', async () => {
+  const s = await vaultSandbox();
+  try {
+    const notes = await writeNoteSet(s.vault, s.state);
+    seedJournal(s.state);
+    const destination = join(dirname(s.vault), 'backup-no-models');
+    await takeLocalBackup({ vault: s.vault, state: s.state, destination });
+    const vault = join(dirname(s.vault), 'no-models-vault');
+    const state = join(dirname(s.vault), 'no-models-state');
+    await restoreLocalBackup({ backupRoot: destination, vault, state });
+    expect(existsSync(join(state, 'models'))).toBe(false);
+
+    const rebuilt = await rebuildLocalIndex({ vault, state });
+    expect(rebuilt.status).toBe('rebuilt');
+    if (rebuilt.status === 'rebuilt') {
+      const index = openSearchIndex(rebuilt.index_path);
+      try {
+        expect(index.candidates({ query: 'alpha', limit: 10 }).length).toBeGreaterThan(0);
+      } finally {
+        index.close();
+      }
+    }
+
+    const store = await openDocumentStore({ vault, state });
+    try {
+      const read = await store.readPath('Knowledge/Alpha.md');
+      expect(read.raw).toContain('alpha two');
+      const write = await store.put({
+        path: 'Knowledge/Delta.md',
+        raw: '# Delta\n\ndelta term\n',
+        expectedEtag: null,
+        idempotencyKey: randomUUID(),
+        source: 'test'
+      });
+      expect(write.revision_id).toBeTruthy();
+      expect((await store.readPath('Knowledge/Delta.md')).raw).toContain('delta term');
+    } finally {
+      await store.close();
+      expect(notes.first.id).toBeTruthy();
+    }
+  } finally {
+    await s.dispose();
+  }
+});
+
 test('token and cursor secrets are a separate protected category and never enter the vault', async () => {
   const s = await vaultSandbox();
   try {

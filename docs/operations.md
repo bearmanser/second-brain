@@ -190,6 +190,11 @@ copy of the local V2 state:
 - **secrets** — only with `--secret`; stored under `secrets/`, marked
   `sensitive: true`, and never copied into the `vault/` tree.
 
+A backup that excludes model binaries cannot promise an immediate offline Laya
+start after a restore; the model must be re-downloaded through the explicit
+setup path. Text search (via `rebuild-index`), current reads, and safe writes
+still work after durable-state verification without any model artifacts.
+
 `--vault-only` is an explicit, distinct export that contains only current note
 content. Import it with `local-restore --vault-only`; the CLI prints that
 history and receipts are absent, and `verify-local-backup` never reports a
