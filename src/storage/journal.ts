@@ -2530,6 +2530,15 @@ export type LocalMoveReservationResult =
   | { kind: 'new'; record: LocalMoveRecord }
   | { kind: 'replay'; record: LocalMoveRecord };
 
+export interface LocalMoveStepRecord {
+  operation_id: string;
+  ordinal: number;
+  from_path: string;
+  to_path: string;
+  state: 'pending' | 'complete';
+  updated_at: string;
+}
+
 interface LocalWriteRow {
   operation_id: string;
   idempotency_key: string;
@@ -2585,6 +2594,15 @@ interface LocalMoveFileRow {
   new_hash: string | null;
   new_raw: string | null;
   preimage_raw: string;
+  state: string;
+  updated_at: string;
+}
+
+interface LocalMoveStepRow {
+  operation_id: string;
+  ordinal: number;
+  from_path: string;
+  to_path: string;
   state: string;
   updated_at: string;
 }
@@ -2707,6 +2725,22 @@ function toLocalMoveFile(row: LocalMoveFileRow): LocalMoveFileRecord {
   };
 }
 
+function requireLocalMoveStepState(value: string): 'pending' | 'complete' {
+  if (value === 'pending' || value === 'complete') return value;
+  throw recoveryRequired('a local move step has an unknown stored state');
+}
+
+function toLocalMoveStep(row: LocalMoveStepRow): LocalMoveStepRecord {
+  return {
+    operation_id: row.operation_id,
+    ordinal: row.ordinal,
+    from_path: row.from_path,
+    to_path: row.to_path,
+    state: requireLocalMoveStepState(row.state),
+    updated_at: row.updated_at
+  };
+}
+
 const LOCAL_WRITE_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS local_write_operations (
      operation_id TEXT PRIMARY KEY,
@@ -2762,6 +2796,15 @@ const LOCAL_WRITE_SCHEMA = [
      state TEXT NOT NULL,
      updated_at TEXT NOT NULL,
      PRIMARY KEY (operation_id, path, role)
+   )`,
+  `CREATE TABLE IF NOT EXISTS local_move_steps (
+     operation_id TEXT NOT NULL,
+     ordinal INTEGER NOT NULL,
+     from_path TEXT NOT NULL,
+     to_path TEXT NOT NULL,
+     state TEXT NOT NULL,
+     updated_at TEXT NOT NULL,
+     PRIMARY KEY (operation_id, ordinal)
    )`
 ];
 
@@ -2964,7 +3007,9 @@ export class LocalWriteJournal {
   }
 
   reserveMove(
-    input: LocalMoveReservation & { created_at: string; updated_at: string }
+    input: LocalMoveReservation & { created_at: string; updated_at: string },
+    files: readonly LocalMoveFileRecord[],
+    steps: readonly Omit<LocalMoveStepRecord, 'operation_id'>[]
   ): LocalMoveReservationResult {
     this.assertOpen();
     const existing = this.findMoveByKey(input.idempotency_key);
@@ -2977,14 +3022,19 @@ export class LocalWriteJournal {
       }
       return { kind: 'replay', record: existing };
     }
-    this.database
-      .prepare(
-        `INSERT INTO local_move_operations (
-           operation_id, idempotency_key, from_path, to_path, payload_hash, manifest_json,
-           state, receipt_json, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, 'prepared', NULL, ?, ?)`
-      )
-      .run(
+    const insertMove = this.database.prepare(
+      `INSERT INTO local_move_operations (
+         operation_id, idempotency_key, from_path, to_path, payload_hash, manifest_json,
+         state, receipt_json, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, 'prepared', NULL, ?, ?)`
+    );
+    const insertStep = this.database.prepare(
+      `INSERT INTO local_move_steps (
+         operation_id, ordinal, from_path, to_path, state, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?)`
+    );
+    const run = this.database.transaction((): void => {
+      insertMove.run(
         input.operation_id,
         input.idempotency_key,
         input.from_path,
@@ -2994,6 +3044,19 @@ export class LocalWriteJournal {
         input.created_at,
         input.updated_at
       );
+      for (const file of files) this.insertMoveFile(file);
+      for (const step of steps) {
+        insertStep.run(
+          input.operation_id,
+          step.ordinal,
+          step.from_path,
+          step.to_path,
+          step.state,
+          step.updated_at
+        );
+      }
+    });
+    run.immediate();
     const stored = this.findMoveById(input.operation_id);
     if (stored === undefined) throw recoveryRequired(`local move ${input.operation_id} was not persisted`);
     return { kind: 'new', record: stored };
@@ -3094,6 +3157,32 @@ export class LocalWriteJournal {
       )
       .all(operation_id) as LocalMoveFileRow[];
     return rows.map(toLocalMoveFile);
+  }
+
+  updateMoveStep(
+    operation_id: string,
+    ordinal: number,
+    state: 'pending' | 'complete',
+    updated_at: string
+  ): void {
+    this.assertOpen();
+    const result = this.database
+      .prepare(
+        `UPDATE local_move_steps SET state = ?, updated_at = ?
+         WHERE operation_id = ? AND ordinal = ?`
+      )
+      .run(state, updated_at, operation_id, ordinal);
+    if (result.changes !== 1) {
+      throw recoveryRequired(`local move step ${ordinal} could not be updated`);
+    }
+  }
+
+  listMoveSteps(operation_id: string): LocalMoveStepRecord[] {
+    this.assertOpen();
+    const rows = this.database
+      .prepare('SELECT * FROM local_move_steps WHERE operation_id = ? ORDER BY ordinal ASC')
+      .all(operation_id) as LocalMoveStepRow[];
+    return rows.map(toLocalMoveStep);
   }
 
   close(): void {

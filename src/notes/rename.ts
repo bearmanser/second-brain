@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import { lstat, readdir, readFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
 import { isMap, isScalar, isSeq, parseDocument as parseYamlDocument } from 'yaml';
 import { BrainError } from '../contracts/errors.js';
 import { RENDERED_NOTE_MAX_BYTES } from '../core/limits.js';
@@ -72,8 +74,8 @@ function invalidInput(message: string): BrainError {
   return new BrainError({ code: 'INVALID_INPUT', message });
 }
 
-function sha256(raw: string): string {
-  return createHash('sha256').update(raw, 'utf8').digest('hex');
+function sha256(raw: string | Buffer): string {
+  return createHash('sha256').update(raw).digest('hex');
 }
 
 export function renameSegments(relativePath: string): string[] {
@@ -297,6 +299,15 @@ function planCanvas(
   return { raw: raw.endsWith('\n') ? `${serialized}\n` : serialized, unresolved };
 }
 
+function loneReference(value: string): boolean {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return false;
+  const references = extractLinks(trimmed);
+  if (references.length !== 1) return false;
+  const reference = references[0];
+  return reference.start === 0 && reference.end === trimmed.length;
+}
+
 function planBase(
   raw: string,
   sourcePath: string,
@@ -316,6 +327,7 @@ function planBase(
     return { raw, unresolved: [{ path: sourcePath, target: from, reason: 'unsupported' }] };
   }
   const fromStem = stripNoteExtension(from);
+  const replacements: Replacement[] = [];
   const visitScalar = (node: unknown): void => {
     if (isSeq(node)) {
       for (const item of node.items) visitScalar(item);
@@ -327,23 +339,37 @@ function planBase(
     }
     if (!isScalar(node) || typeof node.value !== 'string') return;
     const value = node.value;
-    const planned = planText(value, sourcePath, from, to, catalogue, post);
-    if (planned.raw !== value) {
-      node.value = planned.raw;
+    const range = node.range;
+    if (range === null || range === undefined) return;
+    const source = raw.slice(range[0], range[1]);
+    if (loneReference(value)) {
+      const planned = planText(source, sourcePath, from, to, catalogue, post).raw;
+      if (planned !== source) replacements.push({ start: range[0], end: range[1], text: planned });
       return;
     }
     if (value.trim() === from || value.trim() === fromStem) {
-      node.value = value.replace(from, to);
+      const replaced = source.replace(from, to);
+      if (replaced !== source) replacements.push({ start: range[0], end: range[1], text: replaced });
       return;
     }
     if (value.includes(from) || value.includes(fromStem)) {
       unresolved.push({ path: sourcePath, target: from, reason: 'unsupported' });
       return;
     }
-    unresolved.push(...planned.unresolved);
+    for (const reference of extractLinks(value)) {
+      const outcome = resolveLink(reference, sourcePath, catalogue);
+      if (outcome.state === 'ambiguous' || outcome.state === 'unresolved') {
+        unresolved.push({
+          path: sourcePath,
+          target: reference.target,
+          reason: outcome.state,
+          ...(outcome.state === 'ambiguous' ? { paths: outcome.paths } : {})
+        });
+      }
+    }
   };
   if (isMap(document.contents)) visitScalar(document.contents);
-  return { raw: document.toString(), unresolved };
+  return { raw: applyReplacements(raw, replacements), unresolved };
 }
 
 function planObsidian(raw: string, sourcePath: string, from: string, catalogue: LinkCatalogue): RenameUnresolved[] {
@@ -484,4 +510,48 @@ export function planRename(input: RenamePlanInput): RenamePlan {
     conflicts,
     idempotency_key: input.idempotency_key ?? `rename:${from}->${to}`
   };
+}
+
+export async function collectRenameSnapshots(root: string): Promise<RenameFileSnapshot[]> {
+  const rootPath = resolve(root);
+  const results: RenameFileSnapshot[] = [];
+  const walk = async (directory: string, prefix: string): Promise<void> => {
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    entries.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+    for (const entry of entries) {
+      if (entry.name === '.git') continue;
+      const absolute = join(directory, entry.name);
+      const relativePath = prefix.length === 0 ? entry.name : `${prefix}/${entry.name}`;
+      let info;
+      try {
+        info = await lstat(absolute);
+      } catch {
+        continue;
+      }
+      if (info.isSymbolicLink()) continue;
+      if (info.isDirectory()) {
+        if (entry.name.startsWith('.') && entry.name !== '.obsidian') continue;
+        await walk(absolute, relativePath);
+        continue;
+      }
+      if (!info.isFile()) continue;
+      let buffer: Buffer;
+      try {
+        buffer = await readFile(absolute);
+      } catch {
+        continue;
+      }
+      const raw = buffer.toString('utf8');
+      const text = Buffer.from(raw, 'utf8').equals(buffer);
+      results.push({ path: relativePath, raw: text ? raw : '', hash: sha256(buffer) });
+    }
+  };
+  await walk(rootPath, '');
+  results.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
+  return results;
 }

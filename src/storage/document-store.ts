@@ -21,6 +21,7 @@ import { listVaultFilePaths, readBoundedBytes, vaultNoteSegments } from './vault
 
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const IDEMPOTENCY_KEY_MAX_LENGTH = 256;
+const MOVE_MAX_BYTES = 8 * 1024 * 1024;
 
 const systemClock: Clock = { now: () => new Date() };
 const systemIds: IdSource = { next: () => randomUUID() };
@@ -141,8 +142,11 @@ async function syncDirectory(directory: string): Promise<void> {
 
 async function readNoteFile(
   root: string,
-  segments: string[]
-): Promise<{ raw: string; hash: string } | undefined> {
+  segments: string[],
+  options: { maxBytes?: number; requireUtf8?: boolean } = {}
+): Promise<{ raw: string; hash: string; text: boolean } | undefined> {
+  const maxBytes = options.maxBytes ?? RENDERED_NOTE_MAX_BYTES;
+  const requireUtf8 = options.requireUtf8 ?? true;
   let current = root;
   for (let index = 0; index < segments.length - 1; index += 1) {
     current = join(current, segments[index]);
@@ -170,9 +174,9 @@ async function readNoteFile(
     throw forbidden(`path ${segments.join('/')} is a symbolic link`);
   }
   if (!info.isFile()) throw forbidden(`path ${segments.join('/')} is not a regular file`);
-  if (info.size > RENDERED_NOTE_MAX_BYTES) {
+  if (info.size > maxBytes) {
     throw limitExceeded(
-      `file ${segments.join('/')} is ${info.size} bytes and exceeds the ${RENDERED_NOTE_MAX_BYTES} byte limit`
+      `file ${segments.join('/')} is ${info.size} bytes and exceeds the ${maxBytes} byte limit`
     );
   }
   let handle: FileHandle | undefined;
@@ -186,19 +190,20 @@ async function readNoteFile(
   }
   let buffer: Buffer;
   try {
-    const bounded = await readBoundedBytes(handle, RENDERED_NOTE_MAX_BYTES);
+    const bounded = await readBoundedBytes(handle, maxBytes);
     if (bounded.kind === 'overflow') {
-      throw limitExceeded(`file ${segments.join('/')} exceeds the ${RENDERED_NOTE_MAX_BYTES} byte limit`);
+      throw limitExceeded(`file ${segments.join('/')} exceeds the ${maxBytes} byte limit`);
     }
     buffer = bounded.buffer;
   } finally {
     await handle.close();
   }
   const raw = buffer.toString('utf8');
-  if (!Buffer.from(raw, 'utf8').equals(buffer)) {
+  const text = Buffer.from(raw, 'utf8').equals(buffer);
+  if (requireUtf8 && !text) {
     throw invalidInput(`file ${segments.join('/')} is not valid UTF-8`);
   }
-  return { raw, hash: sha256(buffer) };
+  return { raw, hash: sha256(buffer), text };
 }
 
 async function ensureWriteChain(root: string, segments: string[]): Promise<void> {
@@ -283,7 +288,10 @@ export interface RenameFaults {
   afterReserve?(): void | Promise<void>;
   afterManifest?(): void | Promise<void>;
   afterValidate?(): void | Promise<void>;
+  beforeMoveStep?(ordinal: string): void | Promise<void>;
+  afterMoveStep?(ordinal: string): void | Promise<void>;
   afterMove?(): void | Promise<void>;
+  beforeEditReplace?(path: string): void | Promise<void>;
   afterEdit?(path: string): void | Promise<void>;
   afterRecords?(): void | Promise<void>;
 }
@@ -836,56 +844,40 @@ class LocalDocumentStore implements DocumentStore {
 
     if (record === undefined) {
       const timestamp = this.clock.now().toISOString();
-      const reserved = this.journal.reserveMove({
-        operation_id: this.ids.next(),
-        idempotency_key: key,
-        from_path: plan.from,
-        to_path: plan.to,
-        payload_hash: payloadHash,
-        manifest_json: JSON.stringify({
-          from: plan.from,
-          to: plan.to,
-          source_hash: plan.source_hash,
-          moves: plan.moves,
-          edits: edits.map((edit) => ({ path: edit.path, expected_hash: edit.expected_hash }))
-        }),
-        created_at: timestamp,
-        updated_at: timestamp
+      const source = await readNoteFile(this.vaultRoot, renameSegments(plan.from), {
+        maxBytes: MOVE_MAX_BYTES,
+        requireUtf8: false
       });
-      record = reserved.record;
-      await this.runRenameFault('afterReserve', 'the move could not be reserved');
-      const source = await readNoteFile(this.vaultRoot, renameSegments(plan.from));
       if (source === undefined) {
-        this.markMoveConflict(record.operation_id);
         throw conflict(`move source ${plan.from} does not exist`);
       }
       if (source.hash !== plan.source_hash) {
-        this.markMoveConflict(record.operation_id);
         throw conflict(`move source ${plan.from} changed before the move`);
       }
-      this.journal.insertMoveFile({
-        operation_id: record.operation_id,
-        path: plan.from,
-        role: 'source',
-        expected_hash: plan.source_hash,
-        new_hash: null,
-        new_raw: null,
-        preimage_raw: source.raw,
-        state: 'pending',
-        updated_at: timestamp
-      });
+      const operationId = this.ids.next();
+      const fileRecords: LocalMoveFileRecord[] = [
+        {
+          operation_id: operationId,
+          path: plan.from,
+          role: 'source',
+          expected_hash: plan.source_hash,
+          new_hash: null,
+          new_raw: null,
+          preimage_raw: source.text ? source.raw : '',
+          state: 'pending',
+          updated_at: timestamp
+        }
+      ];
       for (const edit of edits) {
         const existing = await readNoteFile(this.vaultRoot, renameSegments(edit.path));
         if (existing === undefined) {
-          this.markMoveConflict(record.operation_id);
           throw conflict(`move edit target ${edit.path} does not exist`);
         }
         if (existing.hash !== edit.expected_hash) {
-          this.markMoveConflict(record.operation_id);
           throw conflict(`file ${edit.path} changed before the move`);
         }
-        this.journal.insertMoveFile({
-          operation_id: record.operation_id,
+        fileRecords.push({
+          operation_id: operationId,
           path: edit.path,
           role: 'edit',
           expected_hash: edit.expected_hash,
@@ -896,6 +888,35 @@ class LocalDocumentStore implements DocumentStore {
           updated_at: timestamp
         });
       }
+      const stepRecords = plan.moves.map((step, ordinal) => ({
+        ordinal,
+        from_path: step.from,
+        to_path: step.to,
+        state: 'pending' as const,
+        updated_at: timestamp
+      }));
+      const reserved = this.journal.reserveMove(
+        {
+          operation_id: operationId,
+          idempotency_key: key,
+          from_path: plan.from,
+          to_path: plan.to,
+          payload_hash: payloadHash,
+          manifest_json: JSON.stringify({
+            from: plan.from,
+            to: plan.to,
+            source_hash: plan.source_hash,
+            moves: plan.moves,
+            edits: edits.map((edit) => ({ path: edit.path, expected_hash: edit.expected_hash }))
+          }),
+          created_at: timestamp,
+          updated_at: timestamp
+        },
+        fileRecords,
+        stepRecords
+      );
+      record = reserved.record;
+      await this.runRenameFault('afterReserve', 'the move could not be reserved');
       record = this.journal.updateMove(record.operation_id, {
         state: 'manifest_persisted',
         updated_at: this.clock.now().toISOString()
@@ -908,33 +929,44 @@ class LocalDocumentStore implements DocumentStore {
   private async runMove(record: LocalMoveRecord): Promise<RenameReceipt> {
     const manifest = parseMoveManifest(record.manifest_json);
     const files = this.journal.listMoveFiles(record.operation_id);
+    const steps = this.journal.listMoveSteps(record.operation_id);
     const sourceRow = files.find((file) => file.role === 'source');
     const editRows = files.filter((file) => file.role === 'edit');
-    if (sourceRow === undefined) {
+    if (sourceRow === undefined || files.length !== 1 + manifest.edits.length) {
       this.markMoveConflict(record.operation_id);
-      throw conflict(`move ${record.operation_id} has no source row`);
+      throw conflict(`move ${record.operation_id} has an incomplete manifest`);
     }
-    const fromSegments = renameSegments(manifest.from);
-    const toSegments = renameSegments(manifest.to);
+    if (steps.length !== manifest.moves.length) {
+      this.markMoveConflict(record.operation_id);
+      throw conflict(`move ${record.operation_id} has incomplete move steps`);
+    }
+    const editForSource = editRows.find((edit) => edit.path === manifest.from);
+    const sourceFinalHash = editForSource?.new_hash ?? sourceRow.expected_hash;
     try {
-      const fromRead = await readNoteFile(this.vaultRoot, fromSegments);
-      const toRead = await readNoteFile(this.vaultRoot, toSegments);
-      const sourceFinalHash =
-        editRows.find((edit) => edit.path === manifest.from)?.new_hash ?? sourceRow.expected_hash;
-      const sourceMoved =
-        fromRead === undefined &&
-        toRead !== undefined &&
-        (toRead.hash === sourceRow.expected_hash || toRead.hash === sourceFinalHash);
+      const location = await this.locateMoveSource(manifest, steps, sourceRow.expected_hash);
+      let startPath: string;
+      if (location.kind === 'duplicate') {
+        startPath = await this.deduplicateMoveSource(
+          location.paths,
+          steps,
+          record.operation_id
+        );
+      } else if (location.kind === 'occupied') {
+        this.markMoveConflict(record.operation_id);
+        throw conflict(`move target ${location.path} is occupied`);
+      } else if (location.kind === 'missing') {
+        this.markMoveConflict(record.operation_id);
+        throw conflict(`move source ${manifest.from} is missing`);
+      } else {
+        startPath = location.path;
+      }
 
+      const sourceAtFinal = startPath === manifest.to;
       for (const edit of editRows) {
         if (edit.state === 'applied') continue;
         const actualPath =
-          edit.path === manifest.from
-            ? sourceMoved
-              ? manifest.to
-              : manifest.from
-            : edit.path;
-        const observed = await readNoteFile(this.vaultRoot, renameSegments(actualPath));
+          edit.path === manifest.from ? (sourceAtFinal ? manifest.to : manifest.from) : edit.path;
+        const observed = await this.readMoveBytes(actualPath);
         if (
           observed === undefined ||
           (observed.hash !== edit.expected_hash && observed.hash !== edit.new_hash)
@@ -944,57 +976,83 @@ class LocalDocumentStore implements DocumentStore {
         }
       }
 
-      if (!sourceMoved) {
-        if (fromRead === undefined || fromRead.hash !== sourceRow.expected_hash) {
-          this.markMoveConflict(record.operation_id);
-          throw conflict(`move source ${manifest.from} changed during the move`);
-        }
-        const occupied = await listVaultFilePaths(this.vaultRoot);
-        const targetKey = collisionKey(manifest.to);
-        const reservedTargets = new Set(manifest.moves.map((step) => step.to));
-        for (const path of occupied) {
-          if (path === manifest.from) continue;
-          if (collisionKey(path) === targetKey || reservedTargets.has(path)) {
-            this.markMoveConflict(record.operation_id);
-            throw conflict(`move target ${path} is occupied`);
-          }
-        }
-      }
-
       this.journal.updateMove(record.operation_id, {
         state: 'validated',
         updated_at: this.clock.now().toISOString()
       });
       await this.runRenameFault('afterValidate', 'the move could not be validated');
 
-      if (!sourceMoved) {
-        for (const step of manifest.moves) {
-          const stepFrom = renameSegments(step.from);
-          const stepTo = renameSegments(step.to);
-          const current = await readNoteFile(this.vaultRoot, stepFrom);
-          if (current === undefined) {
-            const already = await readNoteFile(this.vaultRoot, stepTo);
-            if (already !== undefined && already.hash === sourceRow.expected_hash) continue;
-            this.markMoveConflict(record.operation_id);
-            throw conflict(`move step source ${step.from} does not exist`);
+      let current = startPath;
+      for (const step of steps) {
+        const fromSeg = renameSegments(step.from_path);
+        const toSeg = renameSegments(step.to_path);
+        const atFrom = await this.readMoveBytes(step.from_path);
+        const atTo = await this.readMoveBytes(step.to_path);
+        const toHasSource = atTo !== undefined && atTo.hash === sourceRow.expected_hash;
+        const fromHasSource = atFrom !== undefined && atFrom.hash === sourceRow.expected_hash;
+        if (toHasSource) {
+          if (fromHasSource) {
+            const same = await this.sameVaultInode(step.from_path, step.to_path);
+            if (!same) {
+              this.markMoveConflict(record.operation_id);
+              throw conflict(`move step ${step.from_path} duplicated with different bytes`);
+            }
+            await rm(join(this.vaultRoot, ...fromSeg));
+            await syncDirectory(dirname(join(this.vaultRoot, ...fromSeg)));
           }
-          if (current.hash !== sourceRow.expected_hash) {
-            this.markMoveConflict(record.operation_id);
-            throw conflict(`move step source ${step.from} changed`);
+          if (step.state !== 'complete') {
+            this.journal.updateMoveStep(
+              record.operation_id,
+              step.ordinal,
+              'complete',
+              this.clock.now().toISOString()
+            );
           }
-          const destination = await readNoteFile(this.vaultRoot, stepTo);
-          if (destination !== undefined) {
-            this.markMoveConflict(record.operation_id);
-            throw conflict(`move step target ${step.to} is occupied`);
-          }
-          await ensureWriteChain(this.vaultRoot, stepTo);
-          try {
-            await rename(join(this.vaultRoot, ...stepFrom), join(this.vaultRoot, ...stepTo));
-            await syncDirectory(dirname(join(this.vaultRoot, ...stepTo)));
-          } catch (error) {
-            throw wrapIo('the note file could not be moved', error);
-          }
+          current = step.to_path;
+          continue;
         }
+        if (atTo !== undefined) {
+          this.markMoveConflict(record.operation_id);
+          throw conflict(`move target ${step.to_path} is occupied`);
+        }
+        if (!fromHasSource) {
+          this.markMoveConflict(record.operation_id);
+          throw conflict(`move step source ${step.from_path} changed or is missing`);
+        }
+        await ensureWriteChain(this.vaultRoot, toSeg);
+        await this.runRenameFault(
+          'beforeMoveStep',
+          'the move step could not start',
+          String(step.ordinal)
+        );
+        try {
+          await link(join(this.vaultRoot, ...fromSeg), join(this.vaultRoot, ...toSeg));
+        } catch (error) {
+          if (hasErrno(error, 'EEXIST')) {
+            this.markMoveConflict(record.operation_id);
+            throw conflict(`move target ${step.to_path} was occupied concurrently`);
+          }
+          throw wrapIo('the note file could not be moved', error);
+        }
+        await syncDirectory(dirname(join(this.vaultRoot, ...toSeg)));
+        await rm(join(this.vaultRoot, ...fromSeg));
+        await syncDirectory(dirname(join(this.vaultRoot, ...fromSeg)));
+        this.journal.updateMoveStep(
+          record.operation_id,
+          step.ordinal,
+          'complete',
+          this.clock.now().toISOString()
+        );
+        await this.runRenameFault(
+          'afterMoveStep',
+          'the move step could not be recorded',
+          String(step.ordinal)
+        );
+        current = step.to_path;
+      }
+      if (current !== manifest.to) {
+        this.markMoveConflict(record.operation_id);
+        throw conflict('the move did not reach its destination');
       }
 
       this.journal.updateMove(record.operation_id, {
@@ -1007,7 +1065,7 @@ class LocalDocumentStore implements DocumentStore {
         if (edit.state === 'applied') continue;
         const actualPath = edit.path === manifest.from ? manifest.to : edit.path;
         const segments = renameSegments(actualPath);
-        const observed = await readNoteFile(this.vaultRoot, segments);
+        const observed = await this.readMoveBytes(actualPath);
         if (observed !== undefined && observed.hash === edit.new_hash) {
           this.journal.updateMoveFile(
             record.operation_id,
@@ -1026,23 +1084,7 @@ class LocalDocumentStore implements DocumentStore {
           this.markMoveConflict(record.operation_id);
           throw conflict(`move edit ${edit.path} has no replacement bytes`);
         }
-        const target = join(this.vaultRoot, ...segments);
-        const leaf = segments[segments.length - 1];
-        const tempPath = await writeTemporary(target, leaf, edit.new_raw);
-        try {
-          const recheck = await readNoteFile(this.vaultRoot, segments);
-          if ((recheck?.hash ?? null) !== edit.expected_hash) {
-            this.markMoveConflict(record.operation_id);
-            throw conflict(`file ${actualPath} changed immediately before the rewrite`);
-          }
-          await rename(tempPath, target);
-          await syncDirectory(dirname(target));
-        } catch (error) {
-          await rm(tempPath, { force: true }).catch(() => undefined);
-          throw wrapIo('a rewritten reference file could not be replaced', error);
-        } finally {
-          await rm(tempPath, { force: true }).catch(() => undefined);
-        }
+        await this.replaceMoveEdit(record.operation_id, actualPath, segments, edit);
         this.journal.updateMoveFile(
           record.operation_id,
           edit.path,
@@ -1064,6 +1106,20 @@ class LocalDocumentStore implements DocumentStore {
         updated_at: this.clock.now().toISOString()
       });
       await this.runRenameFault('afterRecords', 'the move records could not be updated');
+
+      const finalSource = await this.readMoveBytes(manifest.to);
+      if (finalSource === undefined || finalSource.hash !== sourceFinalHash) {
+        this.markMoveConflict(record.operation_id);
+        throw conflict('the moved note diverged from its expected bytes');
+      }
+      for (const edit of editRows) {
+        const actualPath = edit.path === manifest.from ? manifest.to : edit.path;
+        const currentEdit = await this.readMoveBytes(actualPath);
+        if (currentEdit === undefined || currentEdit.hash !== edit.new_hash) {
+          this.markMoveConflict(record.operation_id);
+          throw conflict(`file ${actualPath} diverged after the rewrite`);
+        }
+      }
 
       const verified = await this.verifyMove(manifest, files);
       if (!verified) {
@@ -1100,19 +1156,24 @@ class LocalDocumentStore implements DocumentStore {
     const indexed: string[] = [];
     const prior = this.journal.findDocumentByPath(manifest.from);
     this.journal.deleteDocument(manifest.from);
-    const finalSource = await readNoteFile(this.vaultRoot, renameSegments(manifest.to));
+    const finalSource = await this.readMoveText(manifest.to);
     if (finalSource !== undefined && prior !== undefined) {
+      let revisionId = prior.revision_id;
+      if (finalSource.hash !== prior.raw_hash) {
+        revisionId = this.ids.next();
+        await this.revisions.persistRevision(prior.id, revisionId, finalSource.raw);
+      }
       this.journal.recordDocument({
         path: manifest.to,
         id: prior.id,
-        revision_id: prior.revision_id,
+        revision_id: revisionId,
         raw_hash: finalSource.hash,
         etag: finalSource.hash,
         updated_at: timestamp
       });
       this.journal.enqueueIndex({
         path: manifest.to,
-        revision_id: prior.revision_id,
+        revision_id: revisionId,
         raw_hash: finalSource.hash,
         enqueued_at: timestamp
       });
@@ -1124,7 +1185,7 @@ class LocalDocumentStore implements DocumentStore {
             raw: finalSource.raw,
             etag: finalSource.hash,
             id: prior.id,
-            revision_id: prior.revision_id
+            revision_id: revisionId
           });
           indexed.push(manifest.to);
         } catch {
@@ -1138,30 +1199,70 @@ class LocalDocumentStore implements DocumentStore {
     }
     for (const edit of editRows) {
       if (edit.path === manifest.from) continue;
-      const observed = await readNoteFile(this.vaultRoot, renameSegments(edit.path));
+      const observed = await this.readMoveText(edit.path);
       if (observed === undefined) continue;
-      const document = this.journal.findDocumentByPath(edit.path);
+      const revisionId = await this.persistEditedDocument(
+        edit.path,
+        observed.raw,
+        observed.hash,
+        timestamp
+      );
       this.journal.enqueueIndex({
         path: edit.path,
-        revision_id: document?.revision_id ?? observed.hash,
+        revision_id: revisionId ?? observed.hash,
         raw_hash: observed.hash,
         enqueued_at: timestamp
       });
-      if (this.index !== undefined && document !== undefined) {
-        try {
-          await this.index.upsert({
-            path: edit.path,
-            raw: observed.raw,
-            etag: observed.hash,
-            id: document.id,
-            revision_id: document.revision_id
-          });
-          indexed.push(edit.path);
-        } catch {
+      if (this.index !== undefined && revisionId !== undefined) {
+        const document = this.journal.findDocumentByPath(edit.path);
+        if (document !== undefined) {
+          try {
+            await this.index.upsert({
+              path: edit.path,
+              raw: observed.raw,
+              etag: observed.hash,
+              id: document.id,
+              revision_id: revisionId
+            });
+            indexed.push(edit.path);
+          } catch {
+          }
         }
       }
     }
     return indexed;
+  }
+
+  private async persistEditedDocument(
+    path: string,
+    raw: string,
+    hash: string,
+    timestamp: string
+  ): Promise<string | undefined> {
+    const existing = this.journal.findDocumentByPath(path);
+    let id = existing?.id;
+    if (id === undefined) {
+      try {
+        id = parseDocument(raw, path).id;
+      } catch {
+        id = undefined;
+      }
+    }
+    if (id === undefined) return undefined;
+    if (existing !== undefined && existing.raw_hash === hash) return existing.revision_id;
+    const elsewhere = this.journal.findDocumentById(id);
+    if (elsewhere !== undefined && elsewhere.path !== path) return undefined;
+    const revisionId = this.ids.next();
+    await this.revisions.persistRevision(id, revisionId, raw);
+    this.journal.recordDocument({
+      path,
+      id,
+      revision_id: revisionId,
+      raw_hash: hash,
+      etag: hash,
+      updated_at: timestamp
+    });
+    return revisionId;
   }
 
   private async verifyMove(
@@ -1183,12 +1284,7 @@ class LocalDocumentStore implements DocumentStore {
     }
     for (const path of paths) {
       if (affected.has(path) || path === manifest.to) continue;
-      let observed: { raw: string; hash: string } | undefined;
-      try {
-        observed = await readNoteFile(this.vaultRoot, renameSegments(path));
-      } catch {
-        continue;
-      }
+      const observed = await this.readMoveBytes(path);
       if (observed === undefined) continue;
       snapshots.push({ path, raw: observed.raw, hash: observed.hash });
     }
@@ -1202,13 +1298,165 @@ class LocalDocumentStore implements DocumentStore {
     const observedEdits = new Map<string, string>();
     for (const file of files) {
       if (file.role !== 'edit' || file.new_raw === null) continue;
-      observedEdits.set(file.path, file.new_raw);
+      const actualPath = file.path === manifest.from ? manifest.to : file.path;
+      const observed = await this.readMoveText(actualPath);
+      if (observed === undefined) return false;
+      observedEdits.set(file.path, observed.raw);
     }
     if (expected.size !== observedEdits.size) return false;
     for (const [path, raw] of observedEdits) {
       if (expected.get(path) !== raw) return false;
     }
     return true;
+  }
+
+  private async readMoveBytes(
+    path: string
+  ): Promise<{ raw: string; hash: string; text: boolean } | undefined> {
+    let segments: string[];
+    try {
+      segments = renameSegments(path);
+    } catch {
+      return undefined;
+    }
+    try {
+      return await readNoteFile(this.vaultRoot, segments, {
+        maxBytes: MOVE_MAX_BYTES,
+        requireUtf8: false
+      });
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async readMoveText(path: string): Promise<{ raw: string; hash: string } | undefined> {
+    const observed = await this.readMoveBytes(path);
+    if (observed === undefined || !observed.text) return undefined;
+    return { raw: observed.raw, hash: observed.hash };
+  }
+
+  private async sameVaultInode(left: string, right: string): Promise<boolean> {
+    try {
+      const [a, b] = await Promise.all([
+        lstat(join(this.vaultRoot, ...renameSegments(left))),
+        lstat(join(this.vaultRoot, ...renameSegments(right)))
+      ]);
+      return a.isFile() && b.isFile() && a.dev === b.dev && a.ino === b.ino;
+    } catch {
+      return false;
+    }
+  }
+
+  private async locateMoveSource(
+    manifest: MoveManifest,
+    steps: readonly { from_path: string; to_path: string }[],
+    expectedHash: string
+  ): Promise<
+    | { kind: 'at'; path: string }
+    | { kind: 'duplicate'; paths: string[] }
+    | { kind: 'occupied'; path: string }
+    | { kind: 'missing' }
+  > {
+    const candidates: string[] = [];
+    if (steps.length > 0) candidates.push(steps[0].from_path);
+    for (const step of steps) candidates.push(step.to_path);
+    const present: { path: string; hash: string }[] = [];
+    for (const candidate of candidates) {
+      const observed = await this.readMoveBytes(candidate);
+      if (observed !== undefined) present.push({ path: candidate, hash: observed.hash });
+    }
+    const matching = present.filter((entry) => entry.hash === expectedHash);
+    if (matching.length === 0) {
+      const final = present.find((entry) => entry.path === manifest.to);
+      if (final !== undefined) return { kind: 'occupied', path: final.path };
+      return { kind: 'missing' };
+    }
+    if (matching.length > 1) return { kind: 'duplicate', paths: matching.map((entry) => entry.path) };
+    return { kind: 'at', path: matching[0].path };
+  }
+
+  private async deduplicateMoveSource(
+    paths: readonly string[],
+    steps: readonly { from_path: string; to_path: string }[],
+    operation_id: string
+  ): Promise<string> {
+    const ordered = [...steps.map((step) => step.from_path), ...steps.map((step) => step.to_path)];
+    const sorted = [...paths].sort((left, right) => ordered.indexOf(left) - ordered.indexOf(right));
+    const keep = sorted[sorted.length - 1];
+    const keepInfo = await lstat(join(this.vaultRoot, ...renameSegments(keep)));
+    for (const other of sorted.slice(0, -1)) {
+      const otherInfo = await lstat(join(this.vaultRoot, ...renameSegments(other)));
+      if (otherInfo.dev !== keepInfo.dev || otherInfo.ino !== keepInfo.ino) {
+        this.markMoveConflict(operation_id);
+        throw conflict(`move source ${other} diverged from ${keep}`);
+      }
+      const segments = renameSegments(other);
+      await rm(join(this.vaultRoot, ...segments));
+      await syncDirectory(dirname(join(this.vaultRoot, ...segments)));
+    }
+    return keep;
+  }
+
+  private async replaceMoveEdit(
+    operation_id: string,
+    actualPath: string,
+    segments: string[],
+    edit: LocalMoveFileRecord
+  ): Promise<void> {
+    const target = join(this.vaultRoot, ...segments);
+    const leaf = segments[segments.length - 1];
+    const replacement = edit.new_raw as string;
+    const tempPath = await writeTemporary(target, leaf, replacement);
+    let backup: string | undefined;
+    let rollbackFailed = false;
+    try {
+      await this.runRenameFault(
+        'beforeEditReplace',
+        'the reference rewrite could not be committed',
+        actualPath
+      );
+      backup = `${target}.move-backup-${this.ids.next()}`;
+      try {
+        await link(target, backup);
+      } catch (error) {
+        if (hasErrno(error, 'ENOENT')) {
+          this.markMoveConflict(operation_id);
+          throw conflict(`file ${actualPath} disappeared before the rewrite`);
+        }
+        throw wrapIo('the reference rewrite could not be pinned', error);
+      }
+      const backupLeaf = backup.slice(backup.lastIndexOf('/') + 1);
+      const backupSegments = [...segments.slice(0, -1), backupLeaf];
+      const pinned = await readNoteFile(this.vaultRoot, backupSegments, { requireUtf8: false });
+      if (pinned === undefined || pinned.hash !== edit.expected_hash) {
+        this.markMoveConflict(operation_id);
+        throw conflict(`file ${actualPath} changed immediately before the rewrite`);
+      }
+      const [targetInfo, backupInfo] = await Promise.all([lstat(target), lstat(backup)]);
+      if (targetInfo.dev !== backupInfo.dev || targetInfo.ino !== backupInfo.ino) {
+        this.markMoveConflict(operation_id);
+        throw conflict(`file ${actualPath} was replaced immediately before the rewrite`);
+      }
+      await rename(tempPath, target);
+      await syncDirectory(dirname(target));
+      const after = await readNoteFile(this.vaultRoot, segments, { requireUtf8: false });
+      if (after === undefined || after.hash !== edit.new_hash) {
+        try {
+          await rename(backup, target);
+          backup = undefined;
+        } catch (error) {
+          rollbackFailed = true;
+          throw wrapIo('the reference rewrite could not be rolled back', error);
+        }
+        this.markMoveConflict(operation_id);
+        throw conflict(`file ${actualPath} diverged during the rewrite`);
+      }
+    } finally {
+      await rm(tempPath, { force: true }).catch(() => undefined);
+      if (backup !== undefined && !rollbackFailed) {
+        await rm(backup, { force: true }).catch(() => undefined);
+      }
+    }
   }
 
   private markMoveConflict(operation_id: string): void {

@@ -1,22 +1,28 @@
 import { createHash } from 'node:crypto';
-import { readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import Database from 'better-sqlite3';
 import { expect, test } from 'vitest';
-import { planRename, type RenameFileSnapshot, type RenamePlan } from '../../src/notes/rename.js';
-import { openDocumentStore, type DocumentStore } from '../../src/storage/document-store.js';
+import {
+  collectRenameSnapshots,
+  planRename,
+  type RenameFileSnapshot,
+  type RenamePlan
+} from '../../src/notes/rename.js';
+import { openDocumentStore } from '../../src/storage/document-store.js';
 import { listVaultFilePaths } from '../../src/storage/vault.js';
 import { vaultSandbox } from '../helpers/vault-sandbox.js';
 
-function sha256(raw: string): string {
-  return createHash('sha256').update(raw, 'utf8').digest('hex');
+function sha256(raw: string | Buffer): string {
+  return createHash('sha256').update(raw).digest('hex');
 }
 
 async function snapshots(vault: string): Promise<RenameFileSnapshot[]> {
   const paths = await listVaultFilePaths(vault);
   const files: RenameFileSnapshot[] = [];
   for (const path of paths) {
-    const raw = await readFile(join(vault, path), 'utf8');
-    files.push({ path, raw, hash: sha256(raw) });
+    const buffer = await readFile(join(vault, path));
+    files.push({ path, raw: buffer.toString('utf8'), hash: sha256(buffer) });
   }
   return files;
 }
@@ -234,6 +240,10 @@ test('a move rebases a relative link inside the moved note itself', async () => 
     const moved = await store.readPath('Archive/Laya.md');
     expect(moved.id).toBe(created.id);
     expect(moved.raw).toContain('[Other](../Knowledge/Other.md)');
+    expect(moved.revision_id).toBeDefined();
+    expect(moved.revision_id).not.toBe(created.revision_id);
+    const rewritten = await store.readRevision(created.id, moved.revision_id as string);
+    expect(rewritten.raw).toContain('[Other](../Knowledge/Other.md)');
     await expect(store.readPath('Knowledge/Sub/Laya.md')).rejects.toMatchObject({ code: 'NOT_FOUND' });
   } finally {
     await store.close();
@@ -277,6 +287,305 @@ test('a move is refused when the plan already carries conflicts', async () => {
     });
     expect(plan.conflicts.length).toBeGreaterThan(0);
     await expect(store.applyRename(plan)).rejects.toMatchObject({ code: 'CONFLICT' });
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
+test('a target created between the check and the move is never overwritten', async () => {
+  const s = await vaultSandbox();
+  let injected = false;
+  const store = await openDocumentStore({
+    ...s,
+    faults: {
+      rename: {
+        beforeMoveStep: async () => {
+          if (injected) return;
+          injected = true;
+          await writeFile(join(s.vault, 'Personal/Laya.md'), '# Human arrived\n');
+        }
+      }
+    }
+  });
+  try {
+    await store.put({
+      path: 'Knowledge/Laya.md',
+      raw: '# Laya\n',
+      expectedEtag: null,
+      idempotencyKey: 'race-create',
+      source: 'test'
+    });
+    await writeFile(join(s.vault, 'Home.md'), '[[Knowledge/Laya]]\n');
+    const plan = await planMove(s.vault, 'Knowledge/Laya.md', 'Personal/Laya.md', 'move-race');
+    await expect(store.applyRename(plan)).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(await readFile(join(s.vault, 'Personal/Laya.md'), 'utf8')).toBe('# Human arrived\n');
+    expect((await store.readPath('Knowledge/Laya.md')).raw).toContain('# Laya');
+    expect(await readFile(join(s.vault, 'Home.md'), 'utf8')).toBe('[[Knowledge/Laya]]\n');
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
+test('a backlink changed during the rewrite keeps the human bytes', async () => {
+  const s = await vaultSandbox();
+  let injected = false;
+  const store = await openDocumentStore({
+    ...s,
+    faults: {
+      rename: {
+        beforeEditReplace: async (path) => {
+          if (injected || path !== 'Home.md') return;
+          injected = true;
+          await writeFile(join(s.vault, 'Home.md'), 'human [[Knowledge/Laya]]\n');
+        }
+      }
+    }
+  });
+  try {
+    await store.put({
+      path: 'Knowledge/Laya.md',
+      raw: '# Laya\n',
+      expectedEtag: null,
+      idempotencyKey: 'clobber-create',
+      source: 'test'
+    });
+    await writeFile(join(s.vault, 'Home.md'), '[[Knowledge/Laya]]\n');
+    const plan = await planMove(s.vault, 'Knowledge/Laya.md', 'Personal/Laya.md', 'move-clobber');
+    await expect(store.applyRename(plan)).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(await readFile(join(s.vault, 'Home.md'), 'utf8')).toBe('human [[Knowledge/Laya]]\n');
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
+test('a case-only rename interrupted after its temporary step recovers', async () => {
+  const s = await vaultSandbox();
+  let failed = false;
+  const first = await openDocumentStore({
+    ...s,
+    faults: {
+      rename: {
+        afterMoveStep: (ordinal) => {
+          if (failed || ordinal !== '0') return;
+          failed = true;
+          throw new Error('injected temporary step fault');
+        }
+      }
+    }
+  });
+  let id = '';
+  let revisionId = '';
+  try {
+    const created = await first.put({
+      path: 'Knowledge/Laya.md',
+      raw: '# Laya\n',
+      expectedEtag: null,
+      idempotencyKey: 'case-resume-create',
+      source: 'test'
+    });
+    id = created.id;
+    revisionId = created.revision_id;
+    await writeFile(join(s.vault, 'Home.md'), '[[Knowledge/Laya]]\n');
+    const plan = await planMove(s.vault, 'Knowledge/Laya.md', 'Knowledge/laya.md', 'move-case-resume');
+    await expect(first.applyRename(plan)).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    await expect(first.readPath('Knowledge/Laya.md')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    await expect(first.readPath('Knowledge/laya.md')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  } finally {
+    await first.close();
+  }
+  const second = await openDocumentStore(s);
+  try {
+    const moved = await second.readPath('Knowledge/laya.md');
+    expect(moved.id).toBe(id);
+    expect(moved.revision_id).toBe(revisionId);
+    expect(await readFile(join(s.vault, 'Home.md'), 'utf8')).toBe('[[Knowledge/laya]]\n');
+    await expect(second.readPath('Knowledge/Laya.md')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  } finally {
+    await second.close();
+    await s.dispose();
+  }
+});
+
+test('a divergent backlink prevents a verified receipt', async () => {
+  const s = await vaultSandbox();
+  let mutated = false;
+  const store = await openDocumentStore({
+    ...s,
+    faults: {
+      rename: {
+        afterRecords: async () => {
+          if (mutated) return;
+          mutated = true;
+          await writeFile(join(s.vault, 'Home.md'), 'human [[Personal/Laya]] edit\n');
+        }
+      }
+    }
+  });
+  try {
+    await store.put({
+      path: 'Knowledge/Laya.md',
+      raw: '# Laya\n',
+      expectedEtag: null,
+      idempotencyKey: 'verify-create',
+      source: 'test'
+    });
+    await writeFile(join(s.vault, 'Home.md'), '[[Knowledge/Laya]]\n');
+    const plan = await planMove(s.vault, 'Knowledge/Laya.md', 'Personal/Laya.md', 'move-verify');
+    await expect(store.applyRename(plan)).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(await readFile(join(s.vault, 'Home.md'), 'utf8')).toBe('human [[Personal/Laya]] edit\n');
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
+test('an incomplete multi-file reservation is rejected instead of partially applied', async () => {
+  const s = await vaultSandbox();
+  const first = await openDocumentStore({
+    ...s,
+    faults: {
+      rename: {
+        afterReserve: () => {
+          throw new Error('injected reservation fault');
+        }
+      }
+    }
+  });
+  try {
+    await first.put({
+      path: 'Knowledge/Laya.md',
+      raw: '# Laya\n',
+      expectedEtag: null,
+      idempotencyKey: 'partial-create',
+      source: 'test'
+    });
+    await writeFile(join(s.vault, 'Home1.md'), 'one [[Knowledge/Laya]]\n');
+    await writeFile(join(s.vault, 'Home2.md'), 'two [[Knowledge/Laya]]\n');
+    const plan = await planMove(s.vault, 'Knowledge/Laya.md', 'Personal/Laya.md', 'move-partial');
+    await expect(first.applyRename(plan)).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+  } finally {
+    await first.close();
+  }
+  const database = new Database(join(s.state, 'documents.sqlite'));
+  database.prepare("DELETE FROM local_move_files WHERE role = 'edit' AND path = 'Home2.md'").run();
+  database.close();
+  const second = await openDocumentStore(s);
+  try {
+    expect((await second.readPath('Knowledge/Laya.md')).raw).toContain('# Laya');
+    await expect(second.readPath('Personal/Laya.md')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(await readFile(join(s.vault, 'Home1.md'), 'utf8')).toBe('one [[Knowledge/Laya]]\n');
+    expect(await readFile(join(s.vault, 'Home2.md'), 'utf8')).toBe('two [[Knowledge/Laya]]\n');
+  } finally {
+    await second.close();
+    await s.dispose();
+  }
+});
+
+test('a binary attachment move preserves bytes and rewrites embeds', async () => {
+  const s = await vaultSandbox();
+  const store = await openDocumentStore(s);
+  try {
+    await mkdir(join(s.vault, 'Attachments'), { recursive: true });
+    const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0xff, 0xfe]);
+    await writeFile(join(s.vault, 'Attachments/diagram.png'), bytes);
+    await writeFile(join(s.vault, 'Home.md'), '![[Attachments/diagram.png]]\n');
+    const files = await snapshots(s.vault);
+    const plan = planRename({
+      from: 'Attachments/diagram.png',
+      to: 'Attachments/diagram final.png',
+      files,
+      idempotency_key: 'move-binary'
+    });
+    await store.applyRename(plan);
+    expect(await readFile(join(s.vault, 'Attachments/diagram final.png'))).toEqual(bytes);
+    await expect(readFile(join(s.vault, 'Attachments/diagram.png'))).rejects.toMatchObject({
+      code: 'ENOENT'
+    });
+    expect(await readFile(join(s.vault, 'Home.md'), 'utf8')).toBe(
+      '![[Attachments/diagram final.png]]\n'
+    );
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
+test('a managed backlink gets a durable revision after a rewrite', async () => {
+  const s = await vaultSandbox();
+  const store = await openDocumentStore(s);
+  try {
+    await store.put({
+      path: 'Knowledge/Laya.md',
+      raw: '# Laya\n',
+      expectedEtag: null,
+      idempotencyKey: 'revision-source',
+      source: 'test'
+    });
+    const home = await store.put({
+      path: 'Inbox/Home.md',
+      raw: '# Home\n\n[[Knowledge/Laya]]\n',
+      expectedEtag: null,
+      idempotencyKey: 'revision-home',
+      source: 'test'
+    });
+    const plan = await planMove(
+      s.vault,
+      'Knowledge/Laya.md',
+      'Knowledge/Laya classifier.md',
+      'move-revision'
+    );
+    await store.applyRename(plan);
+    const after = await store.readPath('Inbox/Home.md');
+    expect(after.id).toBe(home.id);
+    expect(after.revision_id).toBeDefined();
+    expect(after.revision_id).not.toBe(home.revision_id);
+    const rewritten = await store.readRevision(home.id, after.revision_id as string);
+    expect(rewritten.raw).toContain('[[Knowledge/Laya classifier]]');
+    const original = await store.readRevision(home.id, home.revision_id);
+    expect(original.raw).toContain('[[Knowledge/Laya]]');
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
+test('planning includes obsidian bookmarks read-only', async () => {
+  const s = await vaultSandbox();
+  const store = await openDocumentStore(s);
+  try {
+    await store.put({
+      path: 'Knowledge/Laya.md',
+      raw: '# Laya\n',
+      expectedEtag: null,
+      idempotencyKey: 'obsidian-create',
+      source: 'test'
+    });
+    await mkdir(join(s.vault, '.obsidian'), { recursive: true });
+    const bookmarks = `${JSON.stringify(
+      { items: [{ type: 'file', path: 'Knowledge/Laya.md', title: 'Laya' }] },
+      null,
+      2
+    )}\n`;
+    await writeFile(join(s.vault, '.obsidian/bookmarks.json'), bookmarks);
+    await writeFile(join(s.vault, 'Home.md'), '[[Knowledge/Laya]]\n');
+    const files = await collectRenameSnapshots(s.vault);
+    const plan = planRename({
+      from: 'Knowledge/Laya.md',
+      to: 'Knowledge/Laya classifier.md',
+      files,
+      idempotency_key: 'move-obsidian'
+    });
+    expect(plan.edits.find(edit => edit.path === '.obsidian/bookmarks.json')).toBeUndefined();
+    expect(
+      plan.unresolved.some(
+        entry => entry.path === '.obsidian/bookmarks.json' && entry.reason === 'manual'
+      )
+    ).toBe(true);
+    await store.applyRename(plan);
+    expect(await readFile(join(s.vault, '.obsidian/bookmarks.json'), 'utf8')).toBe(bookmarks);
   } finally {
     await store.close();
     await s.dispose();

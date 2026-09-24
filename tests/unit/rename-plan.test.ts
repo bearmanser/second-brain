@@ -173,6 +173,37 @@ test('a base rewrites a supported link but reports an unsupported formula', () =
   expect(plan.unresolved.some(entry => entry.path === 'Views/Laya.base')).toBe(true);
 });
 
+test('a base formula that embeds a resolvable link is reported, not rewritten', () => {
+  const baseRaw = [
+    '# keep this comment',
+    'formulas:',
+    '  linked: \'file.hasLink("[[Knowledge/Laya]]")\'',
+    'related: "[[Knowledge/Laya]]"',
+    ''
+  ].join('\n');
+  const files = [snapshot('Views/Laya.base', baseRaw), snapshot('Knowledge/Laya.md', '# Laya\n')];
+  const plan = planRename({ from: 'Knowledge/Laya.md', to: 'Knowledge/Laya classifier.md', files });
+  const edited = plan.edits.find(x => x.path === 'Views/Laya.base');
+  expect(edited).toBeDefined();
+  expect(edited!.raw).toContain('file.hasLink("[[Knowledge/Laya]]")');
+  expect(edited!.raw).toContain('# keep this comment');
+  expect(edited!.raw).toContain('related: "[[Knowledge/Laya classifier]]"');
+  expect(plan.unresolved.some(entry => entry.path === 'Views/Laya.base')).toBe(true);
+});
+
+test('a base with no supported reference is left byte-for-byte untouched', () => {
+  const baseRaw = [
+    'filters:',
+    '  and:',
+    '    - \'file.path == "Knowledge/Laya.md"\'',
+    ''
+  ].join('\n');
+  const files = [snapshot('Views/Laya.base', baseRaw), snapshot('Knowledge/Laya.md', '# Laya\n')];
+  const plan = planRename({ from: 'Knowledge/Laya.md', to: 'Knowledge/Laya classifier.md', files });
+  expect(plan.edits.find(x => x.path === 'Views/Laya.base')).toBeUndefined();
+  expect(plan.unresolved.some(entry => entry.path === 'Views/Laya.base')).toBe(true);
+});
+
 test('obsidian configuration is reported for manual attention and never edited', () => {
   const bookmarks = `${JSON.stringify(
     { items: [{ type: 'file', path: 'Knowledge/Laya.md', title: 'Laya' }] },
