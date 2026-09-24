@@ -15,7 +15,7 @@
     "test:integration": "vitest run tests/integration --exclude tests/integration/laya-local.test.ts",
     "test:laya": "vitest run tests/integration/laya-local.test.ts",
     "test:e2e": "vitest run tests/e2e",
-    "eval:retrieval": "tsx tests/eval/run.mts --mode retrieval",
+    "eval:retrieval": "tsx tests/eval/run.mts",
     "probe": "tsx scripts/probe-compatibility.mts"
   },
   "dependencies": {

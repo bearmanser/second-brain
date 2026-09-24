@@ -30,6 +30,16 @@ import {
   type RetrievalOutcomeV2
 } from '../core/types.js';
 import { containsCredentials } from '../security/redact.js';
+import {
+  DEFAULT_RUBRIC_VERSION,
+  RETRIEVAL_LABEL_SOURCES,
+  RETRIEVAL_LABEL_VALUES,
+  defaultApproved,
+  type RetrievalLabelEntry,
+  type RetrievalLabelInput,
+  type RetrievalLabelSource,
+  type RetrievalLabelValue
+} from '../retrieval/feedback-export.js';
 import { assertProjectIdentifier } from '../projects/registry.js';
 
 export const OPERATION_STATES = [
@@ -224,6 +234,13 @@ export interface RetrievalEventV2 {
   partial: boolean;
   duration_ms: number;
   created_at: string;
+  trace_version: number;
+  fallback_reason?: string;
+  candidate_positions?: number[];
+  query_id?: string;
+  question_id?: string;
+  question_version?: string;
+  model_fingerprint?: string;
 }
 
 export interface FeedbackWrite {
@@ -263,6 +280,34 @@ interface RetrievalRow {
   partial: number;
   duration_ms: number;
   filter_json: string | null;
+  created_at: string;
+  trace_version: number;
+  fallback_reason: string | null;
+  candidate_positions_json: string | null;
+  query_id: string | null;
+  question_id: string | null;
+  question_version: string | null;
+  model_fingerprint: string | null;
+}
+
+interface RetrievalLabelRow {
+  label_id: string;
+  trace_id: string;
+  source_type: string;
+  query_id: string;
+  question_id: string | null;
+  question_version: string | null;
+  model_fingerprint: string | null;
+  logical_id: string | null;
+  path: string | null;
+  revision_id: string | null;
+  source_hash: string;
+  candidate_position: number | null;
+  label: number;
+  rubric_version: string;
+  evidence_ref: string | null;
+  approved: number;
+  voided_at: string | null;
   created_at: string;
 }
 
@@ -643,6 +688,17 @@ function toRetrievalV2(row: RetrievalRow): RetrievalEventV2 {
   if (!(RETRIEVAL_OUTCOMES_V2 as readonly string[]).includes(row.outcome)) {
     throw recoveryRequired(`retrieval ${row.retrieval_id} has an unknown outcome`);
   }
+  let candidatePositions: number[] | undefined;
+  if (row.candidate_positions_json !== null) {
+    try {
+      const parsed = JSON.parse(row.candidate_positions_json) as unknown;
+      if (Array.isArray(parsed) && parsed.every((value) => Number.isSafeInteger(value) && value >= 0)) {
+        candidatePositions = parsed as number[];
+      }
+    } catch {
+      candidatePositions = undefined;
+    }
+  }
   return {
     retrieval_id: row.retrieval_id,
     actor_id: row.principal_id,
@@ -657,7 +713,14 @@ function toRetrievalV2(row: RetrievalRow): RetrievalEventV2 {
     outcome: row.outcome as RetrievalOutcomeV2,
     partial: row.partial === 1,
     duration_ms: row.duration_ms,
-    created_at: row.created_at
+    created_at: row.created_at,
+    trace_version: row.trace_version ?? 1,
+    ...(row.fallback_reason === null ? {} : { fallback_reason: row.fallback_reason }),
+    ...(candidatePositions === undefined ? {} : { candidate_positions: candidatePositions }),
+    ...(row.query_id === null ? {} : { query_id: row.query_id }),
+    ...(row.question_id === null ? {} : { question_id: row.question_id }),
+    ...(row.question_version === null ? {} : { question_version: row.question_version }),
+    ...(row.model_fingerprint === null ? {} : { model_fingerprint: row.model_fingerprint })
   };
 }
 
@@ -715,6 +778,37 @@ function normalizeRetrievalV2(
     input.created_at === undefined
       ? defaultTimestamp
       : requireTimestamp(input.created_at, 'created_at');
+  const trace_version =
+    input.trace_version === undefined ? 1 : requireFiniteCount(input.trace_version, 'trace_version');
+  const fallback_reason =
+    input.fallback_reason === undefined
+      ? undefined
+      : requireBoundedText(input.fallback_reason, 'fallback_reason', 128);
+  const query_id =
+    input.query_id === undefined ? undefined : requireBoundedText(input.query_id, 'query_id', 128);
+  const question_id =
+    input.question_id === undefined
+      ? undefined
+      : requireBoundedText(input.question_id, 'question_id', 128);
+  const question_version =
+    input.question_version === undefined
+      ? undefined
+      : requireBoundedText(input.question_version, 'question_version', 128);
+  const model_fingerprint =
+    input.model_fingerprint === undefined
+      ? undefined
+      : requireBoundedText(input.model_fingerprint, 'model_fingerprint', 128);
+  let candidate_positions: number[] | undefined;
+  if (input.candidate_positions !== undefined) {
+    if (
+      !Array.isArray(input.candidate_positions) ||
+      input.candidate_positions.length > RECALL_LIMIT_MAX ||
+      !input.candidate_positions.every((value) => Number.isSafeInteger(value) && value >= 0)
+    ) {
+      throw invalidInput('candidate_positions must be a bounded array of non-negative integers');
+    }
+    candidate_positions = [...input.candidate_positions];
+  }
   return {
     retrieval_id,
     actor_id,
@@ -729,7 +823,14 @@ function normalizeRetrievalV2(
     outcome: input.outcome,
     partial: input.partial,
     duration_ms,
-    created_at
+    created_at,
+    trace_version,
+    ...(fallback_reason === undefined ? {} : { fallback_reason }),
+    ...(candidate_positions === undefined ? {} : { candidate_positions }),
+    ...(query_id === undefined ? {} : { query_id }),
+    ...(question_id === undefined ? {} : { question_id }),
+    ...(question_version === undefined ? {} : { question_version }),
+    ...(model_fingerprint === undefined ? {} : { model_fingerprint })
   };
 }
 
@@ -747,6 +848,98 @@ function toFeedback(row: FeedbackRow): FeedbackEntry {
     reason: row.reason,
     ...(row.warning === null ? {} : { warning: row.warning }),
     created_at: row.created_at
+  };
+}
+
+function toRetrievalLabel(row: RetrievalLabelRow): RetrievalLabelEntry {
+  return {
+    label_id: row.label_id,
+    trace_id: row.trace_id,
+    source_type: row.source_type as RetrievalLabelSource,
+    query_id: row.query_id,
+    ...(row.question_id === null ? {} : { question_id: row.question_id }),
+    ...(row.question_version === null ? {} : { question_version: row.question_version }),
+    ...(row.model_fingerprint === null ? {} : { model_fingerprint: row.model_fingerprint }),
+    ...(row.logical_id === null ? {} : { logical_id: row.logical_id }),
+    ...(row.path === null ? {} : { path: row.path }),
+    ...(row.revision_id === null ? {} : { revision_id: row.revision_id }),
+    source_hash: row.source_hash,
+    ...(row.candidate_position === null ? {} : { candidate_position: row.candidate_position }),
+    label: row.label as RetrievalLabelValue,
+    rubric_version: row.rubric_version,
+    ...(row.evidence_ref === null ? {} : { evidence_ref: row.evidence_ref }),
+    approved: row.approved === 1,
+    voided_at: row.voided_at,
+    created_at: row.created_at
+  };
+}
+
+function normalizeRetrievalLabel(
+  input: RetrievalLabelInput,
+  generatedId: string,
+  defaultTimestamp: string
+): RetrievalLabelEntry {
+  if (input === null || typeof input !== 'object') {
+    throw invalidInput('retrieval label metadata must be an object');
+  }
+  const label_id =
+    input.label_id === undefined
+      ? generatedId
+      : requireBoundedText(input.label_id, 'label_id', 128);
+  const trace_id = requireBoundedText(input.trace_id, 'trace_id', 128);
+  if (!(RETRIEVAL_LABEL_SOURCES as readonly string[]).includes(input.source_type)) {
+    throw invalidInput(`unknown retrieval label source ${String(input.source_type)}`);
+  }
+  const source_type = input.source_type;
+  const query_id = requireBoundedText(input.query_id, 'query_id', 128);
+  if (
+    typeof input.source_hash !== 'string' ||
+    !/^[a-f0-9]{64}$/i.test(input.source_hash)
+  ) {
+    throw invalidInput('source_hash must be a 64 character hexadecimal digest');
+  }
+  if (!(RETRIEVAL_LABEL_VALUES as readonly number[]).includes(input.label)) {
+    throw invalidInput(`unknown retrieval label value ${String(input.label)}`);
+  }
+  const rubric_version =
+    input.rubric_version === undefined
+      ? DEFAULT_RUBRIC_VERSION
+      : requireBoundedText(input.rubric_version, 'rubric_version', 128);
+  const approved = source_type === 'agent_proposed' ? false : input.approved ?? true;
+  return {
+    label_id,
+    trace_id,
+    source_type,
+    query_id,
+    ...(input.question_id === undefined
+      ? {}
+      : { question_id: requireBoundedText(input.question_id, 'question_id', 128) }),
+    ...(input.question_version === undefined
+      ? {}
+      : { question_version: requireBoundedText(input.question_version, 'question_version', 128) }),
+    ...(input.model_fingerprint === undefined
+      ? {}
+      : { model_fingerprint: requireBoundedText(input.model_fingerprint, 'model_fingerprint', 128) }),
+    ...(input.logical_id === undefined
+      ? {}
+      : { logical_id: requireBoundedText(input.logical_id, 'logical_id', 128) }),
+    ...(input.path === undefined ? {} : { path: requireBoundedText(input.path, 'path', 1024) }),
+    ...(input.revision_id === undefined
+      ? {}
+      : { revision_id: requireBoundedText(input.revision_id, 'revision_id', 128) }),
+    source_hash: input.source_hash.toLowerCase(),
+    ...(input.candidate_position === undefined
+      ? {}
+      : { candidate_position: requireFiniteCount(input.candidate_position, 'candidate_position') }),
+    label: input.label,
+    rubric_version,
+    ...(input.evidence_ref === undefined
+      ? {}
+      : { evidence_ref: requireBoundedText(input.evidence_ref, 'evidence_ref', 512) }),
+    approved,
+    voided_at: input.voided_at === undefined ? null : requireTimestamp(input.voided_at, 'voided_at'),
+    created_at:
+      input.created_at === undefined ? defaultTimestamp : requireTimestamp(input.created_at, 'created_at')
   };
 }
 
@@ -798,6 +991,16 @@ function requireActorId(value: unknown, field: string): string {
   if (value === SYSTEM_ACTOR.id) return value;
   if (typeof value !== 'string' || !uuidSchema.safeParse(value).success) {
     throw invalidInput(`${field} must be a legacy UUID or the system actor`);
+  }
+  return value;
+}
+
+function requireBoundedText(value: unknown, field: string, max: number): string {
+  if (typeof value !== 'string' || value.trim().length === 0 || value.length > max) {
+    throw invalidInput(`${field} must be a bounded non-empty string`);
+  }
+  if (containsCredentials(value)) {
+    throw invalidInput(`${field} rejected because it contains an obvious credential`);
   }
   return value;
 }
@@ -2004,8 +2207,9 @@ export class Journal {
           `INSERT INTO retrieval_events (
             retrieval_id, principal_id, scope, scope_ids_json, returned_ids_json,
             item_count, token_used, token_limit, mode, outcome, partial, duration_ms,
-            filter_json, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            filter_json, created_at, trace_version, fallback_reason, candidate_positions_json,
+            query_id, question_id, question_version, model_fingerprint
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           record.retrieval_id,
@@ -2021,7 +2225,16 @@ export class Journal {
           record.partial ? 1 : 0,
           record.duration_ms,
           JSON.stringify(record.filter),
-          record.created_at
+          record.created_at,
+          record.trace_version,
+          record.fallback_reason ?? null,
+          record.candidate_positions === undefined
+            ? null
+            : JSON.stringify(record.candidate_positions),
+          record.query_id ?? null,
+          record.question_id ?? null,
+          record.question_version ?? null,
+          record.model_fingerprint ?? null
         );
       return record;
     });
@@ -2043,6 +2256,77 @@ export class Journal {
       .prepare('DELETE FROM retrieval_events WHERE created_at < ?')
       .run(cutoff);
     return result.changes;
+  }
+
+  recordRetrievalLabel(input: RetrievalLabelInput): RetrievalLabelEntry {
+    this.assertOpen();
+    const normalized = normalizeRetrievalLabel(input, this.ids.next(), this.timestamp());
+    const run = this.database.transaction((): RetrievalLabelEntry => {
+      const existing = this.selectRetrievalLabel(normalized.label_id);
+      if (existing !== undefined) return existing;
+      this.database
+        .prepare(
+          `INSERT INTO retrieval_labels (
+            label_id, trace_id, source_type, query_id, question_id, question_version,
+            model_fingerprint, logical_id, path, revision_id, source_hash, candidate_position,
+            label, rubric_version, evidence_ref, approved, voided_at, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          normalized.label_id,
+          normalized.trace_id,
+          normalized.source_type,
+          normalized.query_id,
+          normalized.question_id ?? null,
+          normalized.question_version ?? null,
+          normalized.model_fingerprint ?? null,
+          normalized.logical_id ?? null,
+          normalized.path ?? null,
+          normalized.revision_id ?? null,
+          normalized.source_hash,
+          normalized.candidate_position ?? null,
+          normalized.label,
+          normalized.rubric_version ?? DEFAULT_RUBRIC_VERSION,
+          normalized.evidence_ref ?? null,
+          normalized.approved ? 1 : 0,
+          normalized.voided_at ?? null,
+          normalized.created_at
+        );
+      const stored = this.selectRetrievalLabel(normalized.label_id);
+      if (stored === undefined) {
+        throw recoveryRequired(`retrieval label ${normalized.label_id} was not persisted`);
+      }
+      return stored;
+    });
+    return run.immediate();
+  }
+
+  getRetrievalLabel(label_id: string): RetrievalLabelEntry | undefined {
+    this.assertOpen();
+    return this.selectRetrievalLabel(label_id);
+  }
+
+  listRetrievalLabels(): RetrievalLabelEntry[] {
+    this.assertOpen();
+    const rows = this.database
+      .prepare('SELECT * FROM retrieval_labels ORDER BY created_at ASC, label_id ASC')
+      .all() as RetrievalLabelRow[];
+    return rows.map(toRetrievalLabel);
+  }
+
+  voidRetrievalLabel(label_id: string, voided_at: string = this.timestamp()): number {
+    this.assertOpen();
+    const result = this.database
+      .prepare('UPDATE retrieval_labels SET voided_at = ? WHERE label_id = ? AND voided_at IS NULL')
+      .run(voided_at, label_id);
+    return result.changes;
+  }
+
+  private selectRetrievalLabel(label_id: string): RetrievalLabelEntry | undefined {
+    const row = this.database
+      .prepare('SELECT * FROM retrieval_labels WHERE label_id = ?')
+      .get(label_id) as RetrievalLabelRow | undefined;
+    return row === undefined ? undefined : toRetrievalLabel(row);
   }
 
   replayFeedback(input: FeedbackWrite): FeedbackWriteResult | undefined {

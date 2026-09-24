@@ -374,3 +374,148 @@ external chat-model budget was approved. The evaluator now supports two
 distinct real temporary Git repository remotes and records whether ensure was
 called before recall, but that unexecuted client behavior is not reported as
 green.
+
+## Task 16 local retrieval evaluation, labels, and export
+
+Recorded on the execution host on 2026-09-24.
+
+### Evaluator flags
+
+The package script no longer hard-codes a mode:
+
+```json
+"eval:retrieval": "tsx tests/eval/run.mts"
+```
+
+`tests/eval/run.mts` keeps a documented default retrieval action and accepts
+explicit flags:
+
+| Flag | Meaning |
+|---|---|
+| `--backend <local\|basic-memory-docker\|lexical-fixture>` | Which retrieval backend to drive |
+| `--mode <text\|reranked\|graph\|lexical>` | Retrieval mode for the local dataset path (`text` is the default) |
+| `--mode <retrieval\|agent\|instruction>` | Legacy evaluator action, still accepted |
+| `--dataset <path>` | Frozen JSONL dataset for the local offline path |
+| `--out <path>` | Result file (defaults under `tests/eval/results/`) |
+
+`parseEvaluationArgs` is unit tested for the two local dataset commands and the
+default action. The legacy `--mode retrieval`, `--mode instruction`, and
+`--mode agent` actions are unchanged.
+
+### Frozen set and metrics
+
+`tests/eval/fixtures/local-retrieval/dataset.jsonl` is a synthetic, committed
+set of 119 queries across eleven slices (English, Norwegian, code terms,
+decision reasons, procedures, synonyms without lexical overlap, ambiguous
+titles, outdated decisions, no-answer, instructions embedded in notes, and a
+graph-expansion slice). `README.md` records the rubric and
+`source-hashes.json` the `sha256` of every synthetic note body. The run-time
+set belongs outside the repository at
+`/var/lib/second-brain/evaluations/retrieval.jsonl`.
+
+Metric semantics implemented in `src/retrieval/evaluation.ts`:
+
+- Candidate Recall@50 over the pre-Laya lexical/exact-match pool.
+- Graph-expanded recall reported separately with its bound (10 neighbours).
+- Deduplication by logical note id (or path for unmanaged notes) happens before
+  scoring, so a repeated id counts once.
+- Recall treats label `1` and `2` as relevant; `null` when no relevant note
+  exists, never a fabricated `0` or `1`.
+- nDCG@10 with gain `2 ** label - 1` and discount `log2(rank + 1)`; `null`
+  when no positive label exists.
+- The count of unjudged candidates is reported; an unjudged candidate is not a
+  negative.
+- No-answer false-positive behaviour is counted separately.
+- MRR is computed only for queries with a direct answer; latency p50/p95 and
+  the fallback rate are reported per run.
+
+`summary` output for the committed fixture (offline, no chat model):
+
+| Metric | Value |
+|---|---|
+| Queries | 119 |
+| Measurable recall queries | 107 |
+| Candidate recall@50 | 0.9252 |
+| Graph recall@10 (bound 10) | 0.0748 |
+| nDCG@10 | 0.9252 |
+| MRR | 0.9159 |
+| Unjudged candidates | 0 |
+| No-answer queries / false positives | 12 / 12 |
+| Latency p50 / p95 | 10 ms / 15 ms |
+
+These are synthetic-fixture numbers. The graph slice is deliberately reachable
+only through bounded expansion, so it lowers candidate recall while producing a
+non-zero graph recall; that is an illustration of why the two pools are
+reported separately, not a performance claim.
+
+### Explicit labels and export
+
+The journal migration `010-retrieval-trace-labels.sql` adds trace-versioning
+columns to `retrieval_events` (`trace_version`, `fallback_reason`,
+`candidate_positions_json`, `query_id`, `question_id`, `question_version`,
+`model_fingerprint`) and a durable `retrieval_labels` table. A label records
+the trace id, query id, source type, question/model identifiers, logical id,
+revision id, source `sha256`, candidate position, the graded value, the rubric
+version, an approval flag, and a `voided_at` tombstone. Raw query text is never
+written to the journal; it stays in the local dataset.
+
+`src/retrieval/feedback-export.ts`:
+
+- Only labels with `approved = 1` and `voided_at IS NULL` are exported.
+  `agent_proposed` labels are never approved, so an agent's "I used this note"
+  event cannot become a gold label.
+- A current-version judgment whose `source_hash` (or `revision_id`) does not
+  match the live source is rejected (`StaleLabelError`).
+- Unjudged candidates are counted, never written out as `label: 0`.
+- Train/dev/test assignment groups labels by query family and source
+  note/revision family; a connected group that cannot be split without leakage
+  is kept together and the limitation is recorded in the manifest.
+- A voided/corrected judgment is excluded from every later export.
+- The manifest records the dataset id and `sha256`, rubric version, split seed,
+  model fingerprints, question versions, counts, and limitations, and is
+  hashed; identical inputs produce an identical `manifest_hash`.
+
+The default export contains identifiers, hashes, labels, and the manifest only.
+`--include-text` adds `query_text` and `note_text`, resolved from the local
+dataset by `query_id` and `source_hash`; without a readable dataset the
+`--include-text` invocation fails rather than silently emitting hashes.
+
+### Offline fine-tuning path (not implemented in this release)
+
+The intended later path is: collect only `human_reviewed` labels an operator
+explicitly approved, keep the held-out split unchanged, run an offline
+fine-tuning job against the local Laya checkpoint, and re-run the same frozen
+held-out gate before any promotion. This release ships **no** automatic training
+job, no weights download, no model promotion, and no live learning. Accepting an
+export is not authorization to upload private note text or labels to any hosted
+service.
+
+### Commands run
+
+| Command | Status | Result |
+|---|---|---|
+| `npx vitest run tests/unit/retrieval-metrics.test.ts tests/unit/feedback-export.test.ts` | RUN | 25 tests passed |
+| `npm run verify` | RUN | typecheck + 691 tests + build passed |
+| `npm run test:integration` | RUN | 636 tests passed |
+| `npx tsx tests/eval/run.mts --backend local --mode text --dataset tests/eval/fixtures/local-retrieval/dataset.jsonl` | RUN | metrics in the table above |
+| `npx tsx tests/eval/run.mts --backend local --mode reranked --dataset tests/eval/fixtures/local-retrieval/dataset.jsonl` | RUN (fixture only) | identical offline metrics; no Laya worker |
+| `npm run eval:retrieval -- --backend local --mode text --dataset /var/lib/second-brain/evaluations/retrieval.jsonl` | **NOT RUN** | `/var/lib/second-brain/evaluations/retrieval.jsonl` does not exist on this host |
+| `npm run eval:retrieval -- --backend local --mode reranked --dataset /var/lib/second-brain/evaluations/retrieval.jsonl` | **NOT RUN** | dataset absent and no prepared Laya model artifacts under `/var/lib/second-brain/models`; the worker is disabled by default |
+| `node dist/cli.js feedback export --output /var/lib/second-brain/evaluations/laya-training.jsonl --include-text --split-seed 20260923` | **NOT RUN** | `/var/lib/second-brain/journal.db` and the local dataset do not exist on this host; parsing and the export logic are unit tested |
+
+The two local dataset jobs above exercise the metric/export pipeline with the
+committed fixture. They are **not** evidence for any real Laya reranking claim:
+the reranked label is a mode label, and no model artifacts were loaded.
+
+### Conservative decisions
+
+- Migration `010` adds columns to `retrieval_events` instead of rewriting the
+  table, so already-applied migrations 001–009 are untouched.
+- `agent_proposed` labels are stored but never approved; syntactic or behavioral
+  agent use is evidence to review, not a gold label.
+- `--include-text` fails closed when the dataset is unreadable rather than
+  exporting hashes under a text-including manifest.
+- Only `human_reviewed` and frozen `synthetic` labels default to approved; the
+  frozen set is committed and synthetic, and the manifest records source types so
+  a downstream consumer can exclude synthetic rows from a fine-tuning run.
+

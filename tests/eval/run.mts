@@ -24,6 +24,10 @@ import {
 import { runAgentPilot } from './agent.mjs';
 import { runInstructionProbe } from './instruction.mjs';
 import {
+  summariseLocalRetrieval,
+  type LocalEvaluationQuery
+} from '../../src/retrieval/evaluation.js';
+import {
   EVAL_CLIENT_NAME,
   EVAL_CLIENT_VERSION,
   REPO_ROOT,
@@ -288,26 +292,128 @@ export function formatRetrievalSummary(output: RetrievalRunOutput): string {
   return `${lines.join('\n')}\n`;
 }
 
+export const RETRIEVAL_ACTIONS = ['retrieval', 'agent', 'instruction'] as const;
+
+export interface EvaluationInvocation {
+  action: 'retrieval' | 'agent' | 'instruction';
+  mode: string | undefined;
+  backend: string | undefined;
+  dataset: string | undefined;
+}
+
+export function parseEvaluationArgs(argv: readonly string[]): EvaluationInvocation {
+  const args = parseArgs([...argv]);
+  const requested = args.get('mode');
+  const action: EvaluationInvocation['action'] =
+    requested === 'agent' || requested === 'instruction' ? requested : 'retrieval';
+  const mode =
+    action === 'retrieval' && requested !== undefined && requested !== 'retrieval'
+      ? requested
+      : undefined;
+  return { action, mode, backend: args.get('backend'), dataset: args.get('dataset') };
+}
+
+export interface LocalDatasetRunOutput {
+  run_id: string;
+  mode: string;
+  backend: 'local';
+  dataset: string;
+  dataset_sha256: string;
+  metrics: ReturnType<typeof summariseLocalRetrieval>;
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
+}
+
+function labelMap(value: unknown): Map<string, 0 | 1 | 2> {
+  const labels = new Map<string, 0 | 1 | 2>();
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return labels;
+  for (const [id, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (raw === 0 || raw === 1 || raw === 2) labels.set(id, raw);
+  }
+  return labels;
+}
+
+export async function readLocalDataset(path: string): Promise<LocalEvaluationQuery[]> {
+  const raw = await readFile(path, 'utf8');
+  const queries: LocalEvaluationQuery[] = [];
+  for (const [index, line] of raw.split('\n').entries()) {
+    if (line.trim().length === 0) continue;
+    const parsed = JSON.parse(line) as Record<string, unknown>;
+    queries.push({
+      query_id: typeof parsed.query_id === 'string' ? parsed.query_id : String(index),
+      ...(typeof parsed.query === 'string' ? { query: parsed.query } : {}),
+      ...(typeof parsed.slice === 'string' ? { slice: parsed.slice } : {}),
+      candidates: stringList(parsed.candidates),
+      ...(parsed.graph_candidates === undefined
+        ? {}
+        : { graph_candidates: stringList(parsed.graph_candidates) }),
+      labels: labelMap(parsed.labels),
+      ...(typeof parsed.direct_answer === 'string' ? { direct_answer: parsed.direct_answer } : {}),
+      ...(parsed.no_answer === true ? { no_answer: true } : {}),
+      ...(parsed.fallback === true ? { fallback: true } : {}),
+      ...(typeof parsed.latency_ms === 'number' ? { latency_ms: parsed.latency_ms } : {})
+    });
+  }
+  return queries;
+}
+
+async function runLocalDatasetEvaluation(
+  args: Map<string, string>,
+  mode: string
+): Promise<{ output: LocalDatasetRunOutput; failed: boolean }> {
+  const datasetPath = args.get('dataset');
+  if (datasetPath === undefined) throw new Error('--dataset is required for --backend local');
+  const raw = await readFile(datasetPath);
+  const queries = await readLocalDataset(datasetPath);
+  const output: LocalDatasetRunOutput = {
+    run_id: `local-${new Date().toISOString()}-${randomUUID().slice(0, 8)}`,
+    mode,
+    backend: 'local',
+    dataset: datasetPath,
+    dataset_sha256: createHash('sha256').update(raw).digest('hex'),
+    metrics: summariseLocalRetrieval(queries)
+  };
+  const outPath = args.get('out') ?? join(REPO_ROOT, 'tests/eval/results', `local-${mode}.json`);
+  await writeJson(outPath, output);
+  return { output, failed: false };
+}
+
+function formatLocalDatasetSummary(output: LocalDatasetRunOutput): string {
+  const metrics = output.metrics;
+  return [
+    `run ${output.run_id}`,
+    `backend local; mode ${output.mode}; dataset ${output.dataset} (${output.dataset_sha256.slice(0, 12)})`,
+    `queries ${metrics.queries}; measurable recall ${metrics.measurable_recall}`,
+    `candidate recall@50 ${String(metrics.candidate_recall_at_50)}; graph recall@${metrics.graph_recall_bound} ${String(metrics.graph_recall_at_50)}`,
+    `nDCG@10 ${String(metrics.ndcg_at_10)}; MRR ${String(metrics.mrr)}; unjudged ${metrics.unjudged_candidates}`,
+    `no-answer queries ${metrics.no_answer_queries}; no-answer false positives ${metrics.no_answer_false_positives}`,
+    `fallback rate ${metrics.fallback_rate}; p50 ${String(metrics.latency_p50_ms)} ms; p95 ${String(metrics.latency_p95_ms)} ms`
+  ].join('\n');
+}
+
 export async function main(argv: string[]): Promise<number> {
+  const invocation = parseEvaluationArgs(argv);
   const args = parseArgs(argv);
-  const mode = args.get('mode') ?? 'retrieval';
-  if (mode === 'retrieval') {
+  if (invocation.action === 'retrieval') {
+    if (invocation.backend === 'local' || invocation.dataset !== undefined) {
+      const { output } = await runLocalDatasetEvaluation(args, invocation.mode ?? 'text');
+      process.stdout.write(`${formatLocalDatasetSummary(output)}\n`);
+      return 0;
+    }
     const { output, failed } = await runRetrieval(args, null);
     process.stdout.write(formatRetrievalSummary(output));
     return failed ? 1 : 0;
   }
-  if (mode === 'agent') {
+  if (invocation.action === 'agent') {
     const result = await runAgentPilot(args);
     process.stdout.write(`${result.summary}\n`);
     return result.failed ? 1 : 0;
   }
-  if (mode === 'instruction') {
-    const result = await runInstructionProbe(args);
-    process.stdout.write(`${result.summary}\n`);
-    return result.failed ? 1 : 0;
-  }
-  process.stderr.write(`unknown mode: ${mode}\n`);
-  return 2;
+  const result = await runInstructionProbe(args);
+  process.stdout.write(`${result.summary}\n`);
+  return result.failed ? 1 : 0;
 }
 
 if (isEntryPoint(import.meta.url)) {

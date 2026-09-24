@@ -908,6 +908,13 @@ export interface RetrievalEventInputV2 {
   partial: boolean;
   duration_ms: number;
   created_at?: string;
+  trace_version?: number;
+  fallback_reason?: string;
+  candidate_positions?: number[];
+  query_id?: string;
+  question_id?: string;
+  question_version?: string;
+  model_fingerprint?: string;
 }
 
 export type NoteContentV1 = NoteContent;

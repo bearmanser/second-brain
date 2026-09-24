@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -36,6 +36,7 @@ import { buildInspectionReport, renderInspectionReport } from './operations/vaul
 import { rollbackVaultMigration } from './operations/vault-v2/rollback.js';
 import { verifyVaultMigration } from './operations/vault-v2/verify.js';
 import { ScopeRegistry } from './projects/scope-registry.js';
+import { exportLabeledRetrieval, type LabelTextLookup } from './retrieval/feedback-export.js';
 import { generateBearerToken } from './security/authenticate.js';
 import { BasicMemoryBackend } from './storage/basic-memory.js';
 import { Journal } from './storage/journal.js';
@@ -54,7 +55,8 @@ export type CliCommand =
   | 'verify-backup'
   | 'auth'
   | 'vault-v2'
-  | 'obsidian';
+  | 'obsidian'
+  | 'feedback';
 
 export const CLI_COMMANDS: readonly CliCommand[] = [
   'serve',
@@ -69,7 +71,8 @@ export const CLI_COMMANDS: readonly CliCommand[] = [
   'verify-backup',
   'auth',
   'vault-v2',
-  'obsidian'
+  'obsidian',
+  'feedback'
 ];
 
 export interface ParsedArguments {
@@ -83,7 +86,7 @@ const systemIds: IdSource = { next: () => randomUUID() };
 
 const USAGE = [
   'usage: node dist/cli.js <command> [options]',
-  'commands: serve | setup | health | recover | recover-state | rebuild-catalogue | backup-manifest | validate-archive | validate-store-links | verify-backup | auth | vault-v2 | obsidian'
+  'commands: serve | setup | health | recover | recover-state | rebuild-catalogue | backup-manifest | validate-archive | validate-store-links | verify-backup | auth | vault-v2 | obsidian | feedback'
 ].join('\n');
 
 function invalidInput(message: string): BrainError {
@@ -575,6 +578,97 @@ async function runObsidian(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Pro
   return 0;
 }
 
+interface EvaluationDataset {
+  dataset_id: string;
+  sha256: string;
+  lookup: LabelTextLookup;
+}
+
+async function loadEvaluationDataset(path: string): Promise<EvaluationDataset> {
+  let raw: string;
+  try {
+    raw = await readFile(path, 'utf8');
+  } catch {
+    throw invalidInput(`evaluation dataset cannot be read: ${path}`);
+  }
+  const queryText = new Map<string, string>();
+  const noteText = new Map<string, string>();
+  for (const line of raw.split('\n')) {
+    if (line.trim().length === 0) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      throw invalidInput(`evaluation dataset is not valid JSONL: ${path}`);
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+    const record = parsed as Record<string, unknown>;
+    if (typeof record.query_id === 'string' && typeof record.query === 'string') {
+      queryText.set(record.query_id, record.query);
+    }
+    if (Array.isArray(record.notes)) {
+      for (const note of record.notes) {
+        if (note === null || typeof note !== 'object') continue;
+        const entry = note as Record<string, unknown>;
+        if (typeof entry.source_hash === 'string' && typeof entry.text === 'string') {
+          noteText.set(entry.source_hash, entry.text);
+        }
+      }
+    }
+  }
+  return {
+    dataset_id: path,
+    sha256: createHash('sha256').update(raw).digest('hex'),
+    lookup: {
+      queryText: (query_id) => queryText.get(query_id),
+      noteText: (source_hash) => noteText.get(source_hash)
+    }
+  };
+}
+
+async function runFeedback(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promise<number> {
+  const subcommand = parsed.positionals[0];
+  if (subcommand !== 'export') throw invalidInput(`feedback requires the export subcommand\n${USAGE}`);
+  const output = flagString(parsed.flags, 'output');
+  if (output === undefined) throw invalidInput('feedback export requires --output');
+  const splitSeed = flagNumber(parsed.flags, 'split-seed');
+  if (splitSeed === undefined) throw invalidInput('feedback export requires --split-seed');
+  const includeText = flagBoolean(parsed.flags, 'include-text');
+  const config = resolveConfig(env);
+  const datasetPath =
+    flagString(parsed.flags, 'dataset') ??
+    join(config.mounts.state, 'evaluations', 'retrieval.jsonl');
+  const lock = InstanceLock.acquire(config.mounts.state);
+  let journal: Journal | undefined;
+  try {
+    journal = Journal.open(join(config.mounts.state, 'journal.db'), { requireExisting: true });
+    let dataset: EvaluationDataset | undefined;
+    try {
+      dataset = await loadEvaluationDataset(datasetPath);
+    } catch (error) {
+      if (includeText) throw error;
+    }
+    const result = await exportLabeledRetrieval({
+      output,
+      includeText,
+      splitSeed,
+      labels: journal.listRetrievalLabels(),
+      ...(dataset === undefined
+        ? {}
+        : { datasetId: dataset.dataset_id, datasetSha256: dataset.sha256, textLookup: dataset.lookup })
+    });
+    process.stdout.write(
+      `feedback export: ${result.counts.exported} labels exported ` +
+        `(${result.counts.excluded_not_approved} not approved, ${result.counts.excluded_voided} voided, ` +
+        `${result.counts.unjudged} unjudged); manifest ${result.manifest.manifest_hash}\n`
+    );
+    return 0;
+  } finally {
+    journal?.close();
+    lock.release();
+  }
+}
+
 export async function runCli(
   argv: readonly string[],
   env: NodeJS.ProcessEnv = process.env
@@ -611,6 +705,8 @@ export async function runCli(
       return runVaultV2(parsed, env);
     case 'obsidian':
       return runObsidian(parsed, env);
+    case 'feedback':
+      return runFeedback(parsed, env);
   }
 }
 

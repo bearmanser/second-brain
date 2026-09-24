@@ -140,6 +140,11 @@ async function loadCursorSecret(config: BrainConfig): Promise<Uint8Array> {
   return new Uint8Array(bytes);
 }
 
+function fallbackReasonOf(result: RecallResult): string | undefined {
+  const warning = result.warnings.find((entry) => entry.startsWith('reranker_unavailable:'));
+  return warning === undefined ? undefined : warning.slice('reranker_unavailable:'.length);
+}
+
 function localRecallEvent(
   local: LocalHandlerDeps,
   ctx: AuthenticatedContext,
@@ -149,17 +154,17 @@ function localRecallEvent(
   log: (line: string) => void
 ): RecallResult {
   try {
-    local.journal.recordRetrievalV2(
-      retrievalEventFromRecall(ctx, result, {
-        filter:
-          request.project === undefined && request.scope === undefined
-            ? { mode: 'all' }
-            : { mode: 'project', identifier: (request.project ?? request.scope) as string },
-        searched_project_ids: [],
-        primary_project_id: null,
-        duration_ms: Math.max(0, Date.now() - started)
-      })
-    );
+    const event = retrievalEventFromRecall(ctx, result, {
+      filter:
+        request.project === undefined && request.scope === undefined
+          ? { mode: 'all' }
+          : { mode: 'project', identifier: (request.project ?? request.scope) as string },
+      searched_project_ids: [],
+      primary_project_id: null,
+      duration_ms: Math.max(0, Date.now() - started)
+    });
+    const fallback = fallbackReasonOf(result);
+    local.journal.recordRetrievalV2(fallback === undefined ? event : { ...event, fallback_reason: fallback });
   } catch (error) {
     log(internalDiagnostic(error));
   }
@@ -211,13 +216,15 @@ function buildLegacyServices(
       const traced = await recallTraced(ctx, request, deps);
       const result = traced.result;
       try {
+        const event = retrievalEventFromRecall(ctx, result, {
+          filter: traced.filter,
+          searched_project_ids: traced.searched_project_ids,
+          primary_project_id: traced.primary_project_id,
+          duration_ms: Math.max(0, Date.now() - started)
+        });
+        const fallback = fallbackReasonOf(result);
         deps.journal.recordRetrievalV2(
-          retrievalEventFromRecall(ctx, result, {
-            filter: traced.filter,
-            searched_project_ids: traced.searched_project_ids,
-            primary_project_id: traced.primary_project_id,
-            duration_ms: Math.max(0, Date.now() - started)
-          })
+          fallback === undefined ? event : { ...event, fallback_reason: fallback }
         );
       } catch (error) {
         log(internalDiagnostic(error));
