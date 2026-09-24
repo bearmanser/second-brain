@@ -211,6 +211,18 @@ const feedbackResultSchema: Record<string, unknown> = {
   }
 };
 
+const feedbackReceiptSchema: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['kind', 'operation_id', 'feedback_id', 'recorded'],
+  properties: {
+    kind: { type: 'string', const: 'feedback' },
+    operation_id: UUID,
+    feedback_id: UUID,
+    recorded: { type: 'boolean', const: true }
+  }
+};
+
 const projectEnsureResultSchemaV2: Record<string, unknown> = {
   type: 'object',
   additionalProperties: false,
@@ -287,7 +299,7 @@ const statusResultSchemaV2: Record<string, unknown> = {
         }
       }
     },
-    operation: { oneOf: [mutationReceiptSchema, projectEnsureResultSchemaV2] },
+    operation: { oneOf: [mutationReceiptSchema, projectEnsureResultSchemaV2, feedbackReceiptSchema] },
     schemas: { type: 'object' }
   }
 };

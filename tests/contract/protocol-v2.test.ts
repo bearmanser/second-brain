@@ -10,6 +10,7 @@ import {
 } from '../../src/contracts/protocol.js';
 import { notePathSchema, noteInputSchemaV2 } from '../../src/contracts/content.js';
 import { RECALL_MODES } from '../../src/core/types.js';
+import { vaultNoteSegments } from '../../src/storage/vault.js';
 
 const ID = '44b093c5-71db-4785-b9a5-bb8118304278';
 const ETAG = 'a'.repeat(64);
@@ -226,11 +227,32 @@ test('read, move, and adopt never silently change the identity of a supplied pat
         expect(typeof parsed === 'string' ? parsed : parsed.path ?? parsed.operation?.path ?? parsed.operation?.target_path).toBe(path);
       }
     }
-    if (path.startsWith(' ') || path.endsWith(' ')) {
+    if (path.endsWith(' ')) {
+      expect(() => vaultNoteSegments(path)).toThrow();
       expect(accepted.success).toBe(false);
       expect(read.success).toBe(false);
       expect(move.success).toBe(false);
       expect(adopt.success).toBe(false);
+    } else {
+      expect(vaultNoteSegments(path).join('/')).toBe(path);
+      expect(accepted.success).toBe(true);
+      expect(read.success).toBe(true);
+      expect(move.success).toBe(true);
+      expect(adopt.success).toBe(true);
     }
   }
+});
+
+test('a leading-space vault segment is an exact, distinct read, move and adopt identity', () => {
+  const path = ' Knowledge/Laya.md';
+  expect(vaultNoteSegments(path)).toEqual([' Knowledge', 'Laya.md']);
+  expect(notePathSchema.parse(path)).toBe(path);
+  expect(readRequestSchema.parse({ path }).path).toBe(path);
+  expect(reviewRequestSchemaV2.parse({
+    operation: { action: 'move', idempotency_key: ID, id: ID, target_path: path, expected_etag: ETAG, rationale: 'relocate' }
+  }).operation).toMatchObject({ target_path: path });
+  expect(reviewRequestSchemaV2.parse({
+    operation: { action: 'adopt', idempotency_key: ID, path, expected_etag: ETAG, rationale: 'adopt' }
+  }).operation).toMatchObject({ path });
+  expect(notePathSchema.parse('Knowledge/Laya.md')).not.toBe(path);
 });

@@ -330,7 +330,7 @@ export interface StatusResultV2 {
     fallback: boolean;
   };
   pending_operations: number;
-  operation?: MutationReceipt | ProjectEnsureResultV2;
+  operation?: MutationReceipt | ProjectEnsureResultV2 | Extract<LocalOperationReceipt, { kind: 'feedback' }>;
   schemas?: Record<string, unknown>;
 }
 
@@ -459,6 +459,32 @@ export interface LocalObservedState {
   heads: readonly LocalConflictHead[];
 }
 
+export type LocalReadCondition =
+  | {
+      kind: 'path';
+      path: string;
+      expected:
+        | { kind: 'absent' }
+        | { kind: 'present'; etag: string; id?: string; revision_id?: string };
+    }
+  | {
+      kind: 'note';
+      id: string;
+      expected:
+        | { kind: 'absent' }
+        | { kind: 'present'; path: string; revision_id: string; etag: string };
+    }
+  | { kind: 'heads'; id: string; expected_heads: readonly LocalExpectedHead[] }
+  | {
+      kind: 'project';
+      repository_identity: string;
+      expected:
+        | { kind: 'absent' }
+        | { kind: 'present'; project_id: string; version: string };
+    };
+
+export type LocalReadSet = readonly [LocalReadCondition, ...LocalReadCondition[]];
+
 export interface LocalPendingWrite {
   path: string;
   raw: string;
@@ -475,12 +501,14 @@ export type LocalDocumentEffect =
 export type LocalPlannedOperation =
   | {
       kind: 'note';
+      read_set: LocalReadSet;
       heads: readonly LocalConflictHead[];
       parents: readonly LocalRevisionParent[];
       effects: readonly LocalDocumentEffect[];
     }
   | {
       kind: 'project_ensure';
+      read_set: LocalReadSet;
       repository_identity: string;
       project_id: string;
       relative_root: string;
@@ -488,6 +516,7 @@ export type LocalPlannedOperation =
     }
   | {
       kind: 'feedback';
+      read_set: LocalReadSet;
       feedback_id: string;
       id: string;
       revision_id: string;

@@ -7,6 +7,7 @@ import type {
   LocalOperationIntent,
   LocalOperationPlan,
   LocalOperationReceipt,
+  LocalReadCondition,
   LocalObservedState,
   LocalPlannedOperation,
   ProjectResolutionPort,
@@ -92,6 +93,7 @@ test('the note plan can retain all conflict heads and parents and express safe m
   const write = { path: identity.path, raw: 'resolved', id: identity.note_id, revision_id: identity.revision_id, parents: PARENTS };
   const plan: LocalOperationPlan = async (_identity, state) => ({
     kind: 'note', heads: state.heads, parents: PARENTS,
+    read_set: [{ kind: 'heads', id: fixtureIds.note, expected_heads: HEADS }],
     effects: [
       { kind: 'move', from_path: state.sources[0].path, to_path: identity.path, write },
       { kind: 'adopt', path: 'Knowledge/Human.md', write: { ...write, path: 'Knowledge/Human.md' } },
@@ -101,6 +103,7 @@ test('the note plan can retain all conflict heads and parents and express safe m
   const result: LocalPlannedOperation = await plan(identity, observed);
   expect(result).toEqual({
     kind: 'note', heads: observed.heads, parents: PARENTS,
+    read_set: [{ kind: 'heads', id: fixtureIds.note, expected_heads: HEADS }],
     effects: [
       { kind: 'move', from_path: 'Knowledge/Original.md', to_path: 'Knowledge/Moved.md', write },
       { kind: 'adopt', path: 'Knowledge/Human.md', write: { ...write, path: 'Knowledge/Human.md' } },
@@ -124,11 +127,13 @@ test('project ensure and feedback intents plan durable receipts without fabricat
   const feedbackIdentity: LocalAllocatedIdentity = { kind: 'feedback', operation_id: KEY, feedback_id: fixtureIds.replacement, timestamp: '2026-09-23T00:00:00Z', storage_operation_ids: [] };
   const ensurePlan: LocalOperationPlan = async () => ({
     kind: 'project_ensure', repository_identity: 'github.com/example/repo', project_id: 'repo',
-    relative_root: 'Projects/Repo', created: true
+    relative_root: 'Projects/Repo', created: true,
+    read_set: [{ kind: 'project', repository_identity: 'github.com/example/repo', expected: { kind: 'absent' } }]
   });
   const feedbackPlan: LocalOperationPlan = async () => ({
     kind: 'feedback', feedback_id: feedbackIdentity.feedback_id,
-    id: fixtureIds.note, revision_id: fixtureIds.revision, verdict: 'useful', reason: 'verified'
+    id: fixtureIds.note, revision_id: fixtureIds.revision, verdict: 'useful', reason: 'verified',
+    read_set: [{ kind: 'note', id: fixtureIds.note, expected: { kind: 'present', path: 'Knowledge/Original.md', revision_id: fixtureIds.revision, etag: HASH } }]
   });
   expect(ensureIntent.action).toBe('ensure');
   expect(feedbackIntent.action).toBe('record');
@@ -140,6 +145,85 @@ test('project ensure and feedback intents plan durable receipts without fabricat
   };
   const feedbackReceipt: LocalOperationReceipt = { kind: 'feedback', operation_id: KEY, feedback_id: fixtureIds.replacement, recorded: true };
   expect([ensureReceipt.kind, feedbackReceipt.kind]).toEqual(['project_ensure', 'feedback']);
+});
+
+test('a move plan persists source version and destination vacancy or destination version', async () => {
+  const target = { kind: 'note', id: fixtureIds.note,
+    expected: { kind: 'present', path: 'Knowledge/Original.md', revision_id: fixtureIds.revision, etag: HASH }
+  } as const satisfies LocalReadCondition;
+  const destination = { kind: 'path', path: 'Knowledge/Moved.md', expected: { kind: 'absent' } } as const satisfies LocalReadCondition;
+  const occupiedDestination = { kind: 'path', path: 'Knowledge/Moved.md',
+    expected: { kind: 'present', etag: OTHER_HASH, id: fixtureIds.replacement }
+  } as const satisfies LocalReadCondition;
+  const identity: LocalAllocatedIdentity = {
+    kind: 'note', operation_id: KEY, timestamp: '2026-09-23T00:00:00Z', storage_operation_ids: [],
+    note_id: fixtureIds.note, revision_id: fixtureIds.revision, path: 'Knowledge/Moved.md'
+  };
+  const observed: LocalObservedState = { sources: [], heads: [] };
+  const planFor = (destinationCondition: LocalReadCondition): LocalOperationPlan => async () => ({
+    kind: 'note', heads: [], parents: [], effects: [{ kind: 'move', from_path: 'Knowledge/Original.md', to_path: 'Knowledge/Moved.md' }],
+    read_set: [target, destinationCondition]
+  });
+  const vacant = await planFor(destination)(identity, observed);
+  const occupied = await planFor(occupiedDestination)(identity, observed);
+  expect(vacant.read_set).toEqual([
+    { kind: 'note', id: fixtureIds.note, expected: { kind: 'present', path: 'Knowledge/Original.md', revision_id: fixtureIds.revision, etag: HASH } },
+    { kind: 'path', path: 'Knowledge/Moved.md', expected: { kind: 'absent' } }
+  ]);
+  expect(occupied.read_set).toEqual([
+    { kind: 'note', id: fixtureIds.note, expected: { kind: 'present', path: 'Knowledge/Original.md', revision_id: fixtureIds.revision, etag: HASH } },
+    { kind: 'path', path: 'Knowledge/Moved.md', expected: { kind: 'present', etag: OTHER_HASH, id: fixtureIds.replacement } }
+  ]);
+});
+
+test('revise, adopt, supersede and resolve plans retain every dependency in the persisted read set', async () => {
+  const identity: LocalAllocatedIdentity = {
+    kind: 'note', operation_id: KEY, timestamp: '2026-09-23T00:00:00Z', storage_operation_ids: [],
+    note_id: fixtureIds.note, revision_id: KEY, path: 'Knowledge/Original.md'
+  };
+  const observed: LocalObservedState = {
+    sources: [],
+    heads: [
+      { id: fixtureIds.note, path: 'Knowledge/Original.md', ...HEADS[0], parents: [] },
+      { id: fixtureIds.note, path: 'Knowledge/Fork.md', ...HEADS[1], parents: [{ revision_id: fixtureIds.revision, raw_hash: HASH }] }
+    ]
+  };
+  const target = { kind: 'note', id: fixtureIds.note,
+    expected: { kind: 'present', path: 'Knowledge/Original.md', revision_id: fixtureIds.revision, etag: HASH }
+  } as const satisfies LocalReadCondition;
+  const readSets: Record<'revise' | 'adopt' | 'supersede' | 'resolve', readonly [LocalReadCondition, ...LocalReadCondition[]]> = {
+    revise: [target],
+    adopt: [{ kind: 'path', path: 'Knowledge/Human.md', expected: { kind: 'present', etag: HASH } }],
+    supersede: [
+      target,
+      { kind: 'note', id: fixtureIds.replacement, expected: { kind: 'present', path: 'Knowledge/Replacement.md', revision_id: fixtureIds.replacement, etag: OTHER_HASH } },
+      { kind: 'note', id: KEY, expected: { kind: 'present', path: 'Knowledge/Chain.md', revision_id: KEY, etag: 'c'.repeat(64) } }
+    ],
+    resolve: [{ kind: 'heads', id: fixtureIds.note, expected_heads: HEADS }]
+  };
+  const planFor = (read_set: readonly [LocalReadCondition, ...LocalReadCondition[]]): LocalOperationPlan => async () => ({
+    kind: 'note', heads: [], parents: [], effects: [], read_set
+  });
+  const resolvePlan: LocalOperationPlan = async (_identity, state) => ({
+    kind: 'note', heads: state.heads, parents: PARENTS, effects: [], read_set: readSets.resolve
+  });
+  const revise = await planFor(readSets.revise)(identity, observed);
+  const adopt = await planFor(readSets.adopt)(identity, observed);
+  const supersede = await planFor(readSets.supersede)(identity, observed);
+  const resolve = await resolvePlan(identity, observed);
+  expect(revise.read_set).toEqual([
+    { kind: 'note', id: fixtureIds.note, expected: { kind: 'present', path: 'Knowledge/Original.md', revision_id: fixtureIds.revision, etag: HASH } }
+  ]);
+  expect(adopt.read_set).toEqual([
+    { kind: 'path', path: 'Knowledge/Human.md', expected: { kind: 'present', etag: HASH } }
+  ]);
+  expect(supersede.read_set).toEqual([
+    { kind: 'note', id: fixtureIds.note, expected: { kind: 'present', path: 'Knowledge/Original.md', revision_id: fixtureIds.revision, etag: HASH } },
+    { kind: 'note', id: fixtureIds.replacement, expected: { kind: 'present', path: 'Knowledge/Replacement.md', revision_id: fixtureIds.replacement, etag: OTHER_HASH } },
+    { kind: 'note', id: KEY, expected: { kind: 'present', path: 'Knowledge/Chain.md', revision_id: KEY, etag: 'c'.repeat(64) } }
+  ]);
+  expect(resolve.read_set).toEqual([{ kind: 'heads', id: fixtureIds.note, expected_heads: HEADS }]);
+  expect(resolve).toMatchObject({ heads: observed.heads, parents: PARENTS });
 });
 
 test('local handler dependencies expose the frozen capabilities', () => {

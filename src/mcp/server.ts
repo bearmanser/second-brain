@@ -202,6 +202,13 @@ const projectEnsureOutputSchemaV2 = z.strictObject({
   warnings: stringListOutputSchema
 });
 
+const feedbackReceiptOutputSchemaV2 = z.strictObject({
+  kind: z.literal('feedback'),
+  operation_id: uuidOutputSchema,
+  feedback_id: uuidOutputSchema,
+  recorded: z.literal(true)
+});
+
 const statusOutputSchemaV2 = z.strictObject({
   version: z.string(),
   protocol_version: z.string(),
@@ -222,7 +229,7 @@ const statusOutputSchemaV2 = z.strictObject({
     reranking: z.boolean(), text_search: z.boolean(), fallback: z.boolean()
   }),
   pending_operations: z.number(),
-  operation: z.union([mutationReceiptOutputSchema, projectEnsureOutputSchemaV2]).optional(),
+  operation: z.union([mutationReceiptOutputSchema, projectEnsureOutputSchemaV2, feedbackReceiptOutputSchemaV2]).optional(),
   schemas: z.record(z.string(), z.unknown()).optional()
 });
 

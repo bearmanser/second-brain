@@ -2,6 +2,9 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { expect, test } from 'vitest';
 import { z } from 'zod';
+import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { BrainError, BRAIN_ERROR_CODES } from '../../src/contracts/errors.js';
 import { brainConfigSchema } from '../../src/config/schema.js';
 import {
@@ -28,7 +31,9 @@ import type {
   StatusResultV2,
   ProjectEnsureResultV2
 } from '../../src/core/types.js';
+import type { LocalOperationReceipt } from '../../src/core/types.js';
 import { SYSTEM_ACTOR } from '../../src/core/types.js';
+import { createMcpServer } from '../../src/mcp/server.js';
 import { capture } from '../../src/features/capture.js';
 import { status } from '../../src/features/status.js';
 import { buildInstructions } from '../../src/mcp/instructions.js';
@@ -195,6 +200,50 @@ test('published V2 project ensure and status schemas exclude backend flags', () 
   expect(legacyStatus.properties.health.required).toContain('backend');
 });
 
+test('a V2 status lookup publishes and registers the coordinator feedback receipt shape', async () => {
+  const receipt: Extract<LocalOperationReceipt, { kind: 'feedback' }> = {
+    kind: 'feedback', operation_id: fixtureIds.idempotencyKey,
+    feedback_id: fixtureIds.revision, recorded: true
+  };
+  const statusWithFeedback: StatusResultV2 = { ...statusSample, operation: receipt };
+  const schema = byName().brain_status.outputSchema;
+  const validator = new AjvJsonSchemaValidator().getValidator(schema);
+  expect(validator(statusWithFeedback).valid).toBe(true);
+  expect(validator({ ...statusWithFeedback, operation: { ...receipt, feedback_id: undefined } }).valid).toBe(false);
+  expect(validator({ ...statusWithFeedback, operation: { ...receipt, backend_ready: true } }).valid).toBe(false);
+
+  const server = createMcpServer({
+    contract_version: 2,
+    status: async () => ({
+      version: statusWithFeedback.version, protocol_version: statusWithFeedback.protocol_version,
+      schema_version: 1, protocol: 2,
+      scopes: [{ id: 'repo' }],
+      health: { gateway: 'ready', backend: 'unavailable', embeddings: 'unknown' },
+      local: { index: { state: 'ready' }, worker: { state: 'disabled' } },
+      features: statusWithFeedback.features,
+      pending_operations: 0,
+      operation: receipt
+    } as unknown as StatusResult),
+    capture: async () => { throw new Error('not called'); },
+    review: async () => { throw new Error('not called'); },
+    recall: async () => { throw new Error('not called'); },
+    read: async () => { throw new Error('not called'); },
+    feedback: async () => { throw new Error('not called'); },
+    projectEnsure: async () => { throw new Error('not called'); }
+  }, { actor: SYSTEM_ACTOR, request_id: key(5), signal: new AbortController().signal });
+  const client = new Client({ name: 'feedback-receipt-contract', version: '1' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const response = await client.callTool({ name: 'brain_status', arguments: { operation_id: receipt.operation_id } });
+    expect(response.structuredContent).toMatchObject({ operation: receipt });
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
 test('exposes only the seven controlled Brain tools', () => {
   expect(toolDefinitions.map((item) => item.name).sort()).toEqual([
     'brain_capture',
@@ -335,7 +384,7 @@ test('the published tool contract is pinned', () => {
       {
         "input": "b08c7c6e06ed73a354cdcd37ef9fc28a5d454f4e7a7394270bc295db8a285579",
         "name": "brain_status",
-        "output": "ed9670d6925720a0c6e36fbb49b1833ae5880f0a7f9ac473207513435441e46d",
+        "output": "58ce0796103fe0f5764a9f4fe3e59ab4da7986005b92eae7be5e60c8b529c146",
       },
     ]
   `);
@@ -664,6 +713,34 @@ test('representative tool schemas are pinned in full', () => {
                 "created",
                 "materialized",
                 "warnings",
+              ],
+              "type": "object",
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "feedback_id": {
+                  "format": "uuid",
+                  "type": "string",
+                },
+                "kind": {
+                  "const": "feedback",
+                  "type": "string",
+                },
+                "operation_id": {
+                  "format": "uuid",
+                  "type": "string",
+                },
+                "recorded": {
+                  "const": true,
+                  "type": "boolean",
+                },
+              },
+              "required": [
+                "kind",
+                "operation_id",
+                "feedback_id",
+                "recorded",
               ],
               "type": "object",
             },
