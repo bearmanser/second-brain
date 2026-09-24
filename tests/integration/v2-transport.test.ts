@@ -1,10 +1,9 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { request as httpRequest, type IncomingHttpHeaders } from 'node:http';
 import { expect, test } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { LATEST_PROTOCOL_VERSION } from '@modelcontextprotocol/sdk/types.js';
-import { createHash } from 'node:crypto';
 import { INPUT_BODY_MAX_BYTES } from '../../src/core/limits.js';
 import { TOOL_NAMES } from '../../src/mcp/tools.js';
 import { startLocalHttpHarness, type LocalHttpHarness } from '../support/harness.js';

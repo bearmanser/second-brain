@@ -197,6 +197,63 @@ test('runtime startup recovers a crashed local write before serving reads', asyn
   }
 });
 
+test('runtime status reports durable index lag after a write and clears it once indexing recovers', async () => {
+  const h = await startLocalHttpHarness();
+  const client = await h.connect(h.token, 'runtime-index-lag');
+  const deps = h.runtime.localDeps;
+  if (deps === undefined) throw new Error('the local handler deps are missing');
+  const originalUpsert = deps.index.upsert.bind(deps.index);
+  deps.index.upsert = (): void => {
+    throw new Error('index unavailable');
+  };
+  try {
+    const captured = (await client.callTool({
+      name: 'brain_capture',
+      arguments: { idempotency_key: randomUUID(), note: note('Index lag note', 'runtime index lag marker') }
+    })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
+    expect(captured.isError).toBeFalsy();
+    expect(captured.structuredContent).toMatchObject({
+      outcome: 'stored',
+      materialized: true,
+      indexed: false
+    });
+
+    const lagging = (await client.callTool({ name: 'brain_status', arguments: {} })) as {
+      structuredContent?: Record<string, unknown>;
+    };
+    const laggingHealth = lagging.structuredContent?.health as
+      | { index?: string; pending_index?: number }
+      | undefined;
+    expect(laggingHealth?.index).toBe('unavailable');
+    expect(laggingHealth?.pending_index).toBeGreaterThanOrEqual(1);
+    expect(deps.documents.pendingIndexCount()).toBeGreaterThanOrEqual(1);
+
+    const receipt = (await client.callTool({
+      name: 'brain_status',
+      arguments: { operation_id: captured.structuredContent?.operation_id }
+    })) as { structuredContent?: Record<string, unknown> };
+    expect(receipt.structuredContent?.operation).toMatchObject({ indexed: false });
+
+    deps.index.upsert = originalUpsert;
+    const recovered = await deps.documents.recover();
+    expect(recovered.pending).toEqual([]);
+
+    const cleared = (await client.callTool({ name: 'brain_status', arguments: {} })) as {
+      structuredContent?: Record<string, unknown>;
+    };
+    const clearedHealth = cleared.structuredContent?.health as
+      | { index?: string; pending_index?: number }
+      | undefined;
+    expect(clearedHealth?.index).toBe('ready');
+    expect(clearedHealth?.pending_index).toBe(0);
+    expect(deps.documents.pendingIndexCount()).toBe(0);
+  } finally {
+    deps.index.upsert = originalUpsert;
+    await client.close().catch(() => undefined);
+    await h.close();
+  }
+});
+
 test('the configured shared read-concurrency limit bounds V2 memory reads', async () => {
   const worker = new FakeWorker(async (candidates) => {
     await new Promise((resolve) => setTimeout(resolve, 40));
