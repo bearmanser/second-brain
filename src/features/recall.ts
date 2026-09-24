@@ -641,7 +641,45 @@ async function runRecall(
 
   const ranked = rankEligible([...best.values()], request.phase ?? 'general');
   const limit = resolveLimit(request.limit);
-  const items = ranked.slice(0, limit).map((hit) => toItem(hit, mode, deps));
+  const finalized: EligibleHit[] = [];
+  for (const hit of ranked) {
+    if (finalized.length >= limit) break;
+    let current: Head;
+    try {
+      current = await deps.catalogue.get(hit.head.source.scope, hit.head.revision.id);
+    } catch {
+      staleExcluded = true;
+      continue;
+    }
+    const scope = deps.scopeRegistry.get(hit.head.source.scope);
+    if (scope === undefined) {
+      staleExcluded = true;
+      continue;
+    }
+    if (current.state !== 'ready' && current.state !== 'manual_unreviewed') {
+      staleExcluded = true;
+      continue;
+    }
+    const decision = evaluateHit(scope, current, request, kinds, now);
+    if (!decision.included) {
+      staleExcluded = true;
+      continue;
+    }
+    if (
+      current.raw_hash !== hit.head.raw_hash ||
+      current.revision.revision_id !== hit.head.revision.revision_id ||
+      current.revision.id !== hit.head.revision.id ||
+      current.source.relative_path !== hit.head.source.relative_path
+    ) {
+      staleExcluded = true;
+      continue;
+    }
+    finalized.push(hit);
+  }
+  if (staleExcluded && !warnings.includes(RECALL_WARNING_STALE_HITS_EXCLUDED)) {
+    warnings.push(RECALL_WARNING_STALE_HITS_EXCLUDED);
+  }
+  const items = finalized.map((hit) => toItem(hit, mode, deps));
   const budget = clampRecallBudget(request.budget_tokens);
 
   const result = packRecall(

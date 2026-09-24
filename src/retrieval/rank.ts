@@ -7,6 +7,54 @@ export interface EligibleHit {
   reasons: string[];
 }
 
+export const DEFAULT_MAX_CANDIDATES_PER_NOTE = 2;
+
+export interface OrderableCandidate {
+  chunk_key: string;
+  document_key: string;
+  candidate_position: number;
+  line_from: number;
+  line_to: number;
+  relevance_score?: number;
+}
+
+export function rankCandidateChunks<T extends OrderableCandidate>(candidates: readonly T[]): T[] {
+  const scored = candidates.filter(
+    (candidate) => typeof candidate.relevance_score === 'number' && Number.isFinite(candidate.relevance_score)
+  );
+  const unscored = candidates.filter(
+    (candidate) => typeof candidate.relevance_score !== 'number' || !Number.isFinite(candidate.relevance_score)
+  );
+  scored.sort(
+    (left, right) =>
+      (right.relevance_score as number) - (left.relevance_score as number) ||
+      left.candidate_position - right.candidate_position
+  );
+  return [...scored, ...unscored];
+}
+
+export function selectDistinctCandidateChunks<T extends OrderableCandidate>(
+  candidates: readonly T[],
+  maxPerNote: number = DEFAULT_MAX_CANDIDATES_PER_NOTE
+): T[] {
+  const limit = Number.isFinite(maxPerNote) ? Math.max(0, Math.trunc(maxPerNote)) : candidates.length;
+  const keptByNote = new Map<string, Array<{ chunk_key: string; line_from: number; line_to: number }>>();
+  const selected: T[] = [];
+  for (const candidate of candidates) {
+    const kept = keptByNote.get(candidate.document_key) ?? [];
+    if (kept.some((entry) => entry.chunk_key === candidate.chunk_key)) continue;
+    if (kept.length >= limit) continue;
+    const overlaps = kept.some(
+      (entry) => candidate.line_from <= entry.line_to && entry.line_from <= candidate.line_to
+    );
+    if (overlaps) continue;
+    kept.push({ chunk_key: candidate.chunk_key, line_from: candidate.line_from, line_to: candidate.line_to });
+    keptByNote.set(candidate.document_key, kept);
+    selected.push(candidate);
+  }
+  return selected;
+}
+
 const PHASE_KINDS: Partial<Record<Phase, readonly NoteKind[]>> = {
   debugging: ['lesson', 'playbook'],
   planning: ['decision'],
