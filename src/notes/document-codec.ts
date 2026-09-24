@@ -549,6 +549,7 @@ export function documentFromNote(note: NoteInput, meta: DocumentMetadata): Curre
 
 interface GeneratedSkeleton {
   sections: SectionBlock[];
+  codeLines: Set<number>;
 }
 
 interface SectionBlock {
@@ -569,17 +570,90 @@ function sectionBlocks(infos: LineInfo[]): SectionBlock[] {
   return blocks;
 }
 
-function contentCounts(block: SectionBlock): Map<string, number> {
+function codeLines(source: string): Set<number> {
+  const starts = lineStarts(source.split('\n'));
+  const lines = new Set<number>();
+  for (const [start, end] of collectCodeRanges(topLevelNodes(source))) {
+    const first = lineIndexAt(start, starts);
+    const last = lineIndexAt(end - 1, starts);
+    for (let index = first; index <= last; index += 1) lines.add(index);
+  }
+  return lines;
+}
+
+interface ContentToken {
+  text: string;
+  lines: number[];
+}
+
+function contentTokens(block: SectionBlock, fenced: Set<number>): ContentToken[] {
+  const tokens: ContentToken[] = [];
+  for (let index = 1; index < block.lines.length; index += 1) {
+    const line = block.start + index;
+    if (fenced.has(line)) {
+      const lines: number[] = [];
+      const texts: string[] = [];
+      while (index < block.lines.length && fenced.has(block.start + index)) {
+        lines.push(block.start + index);
+        texts.push(block.lines[index].text);
+        index += 1;
+      }
+      tokens.push({ text: texts.join('\n'), lines });
+      index -= 1;
+    } else if (block.lines[index].text.trim().length > 0) {
+      tokens.push({ text: block.lines[index].text, lines: [line] });
+    }
+  }
+  return tokens;
+}
+
+function contentCounts(tokens: ContentToken[]): Map<string, number> {
   const counts = new Map<string, number>();
-  for (const info of block.lines.slice(1)) {
-    if (info.text.trim().length === 0) continue;
-    counts.set(info.text, (counts.get(info.text) ?? 0) + 1);
+  for (const token of tokens) {
+    counts.set(token.text, (counts.get(token.text) ?? 0) + 1);
   }
   return counts;
 }
 
 function generatedSkeleton(previous: NoteInput): GeneratedSkeleton {
-  return { sections: sectionBlocks(analyzeSource(renderNoteBody(previous))).filter((block) => block.title !== undefined) };
+  const body = renderNoteBody(previous);
+  return {
+    sections: sectionBlocks(analyzeSource(body)).filter((block) => block.title !== undefined),
+    codeLines: codeLines(body)
+  };
+}
+
+function overlapCount(expected: Map<string, number>, present: Map<string, number>): number {
+  let overlap = 0;
+  for (const [text, count] of expected) overlap += Math.min(count, present.get(text) ?? 0);
+  return overlap;
+}
+
+function alignedLines(expected: ContentToken[], present: ContentToken[]): Set<number> {
+  const lengths: number[][] = Array.from({ length: expected.length + 1 }, () =>
+    Array<number>(present.length + 1).fill(0));
+  for (let i = expected.length - 1; i >= 0; i -= 1) {
+    for (let j = present.length - 1; j >= 0; j -= 1) {
+      lengths[i][j] = expected[i].text === present[j].text
+        ? 1 + lengths[i + 1][j + 1]
+        : Math.max(lengths[i + 1][j], lengths[i][j + 1]);
+    }
+  }
+  const removed = new Set<number>();
+  let i = 0;
+  let j = 0;
+  while (i < expected.length && j < present.length) {
+    if (expected[i].text === present[j].text) {
+      for (const line of present[j].lines) removed.add(line);
+      i += 1;
+      j += 1;
+    } else if (lengths[i + 1][j] > lengths[i][j + 1]) {
+      i += 1;
+    } else {
+      j += 1;
+    }
+  }
+  return removed;
 }
 
 function subtractGenerated(
@@ -588,28 +662,42 @@ function subtractGenerated(
 ): { general: string[]; sections: Record<string, string[]> } {
   const skeleton = generatedSkeleton(previous);
   const blocks = sectionBlocks(analyzeSource(body));
-  const generated = new Map<number, Map<string, number>>();
+  const fenced = codeLines(body);
+  const tokens = blocks.map((block) => contentTokens(block, fenced));
+  const counts = tokens.map(contentCounts);
+  const generated = new Map<number, Set<number>>();
   let lastMatched = -1;
-  for (const section of skeleton.sections) {
-    const expected = contentCounts(section);
+  for (let position = 0; position < skeleton.sections.length; position += 1) {
+    const section = skeleton.sections[position];
+    const expectedTokens = contentTokens(section, skeleton.codeLines);
+    const expected = contentCounts(expectedTokens);
+    const next = skeleton.sections[position + 1];
+    let nextBound = blocks.length;
+    if (next !== undefined) {
+      const nextExpected = contentCounts(contentTokens(next, skeleton.codeLines));
+      for (let index = lastMatched + 1; index < blocks.length; index += 1) {
+        if (blocks[index].title === next.title && overlapCount(nextExpected, counts[index]) > 0) {
+          nextBound = index;
+          break;
+        }
+      }
+    }
     let chosen = -1;
     let bestOverlap = -1;
     let bestDistance = Infinity;
-    for (let index = lastMatched + 1; index < blocks.length; index += 1) {
+    for (let index = lastMatched + 1; index < nextBound; index += 1) {
       const candidate = blocks[index];
       if (candidate.title !== section.title) continue;
-      const present = contentCounts(candidate);
-      let overlap = 0;
-      for (const [text, count] of expected) overlap += Math.min(count, present.get(text) ?? 0);
+      const overlap = overlapCount(expected, counts[index]);
       const distance = Math.abs(candidate.start - section.start);
-      if (distance < bestDistance || (distance === bestDistance && overlap > bestOverlap)) {
+      if (overlap > bestOverlap || (overlap === bestOverlap && distance < bestDistance)) {
         chosen = index;
         bestOverlap = overlap;
         bestDistance = distance;
       }
     }
     if (chosen < 0) continue;
-    generated.set(chosen, expected);
+    generated.set(chosen, alignedLines(expectedTokens, tokens[chosen]));
     lastMatched = chosen;
   }
   const generalLines: string[] = [];
@@ -617,8 +705,8 @@ function subtractGenerated(
   let headingRemoved = false;
   for (let index = 0; index < blocks.length; index += 1) {
     const block = blocks[index];
-    const counts = generated.get(index);
-    if (counts === undefined) {
+    const removed = generated.get(index);
+    if (removed === undefined) {
       for (const info of block.lines) {
         if (info.headingDepth === 1 && !headingRemoved) {
           headingRemoved = true;
@@ -631,12 +719,9 @@ function subtractGenerated(
     const title = block.title;
     if (title === undefined) continue;
     const remaining = sectionLines.get(title) ?? [];
-    for (const info of block.lines.slice(1)) {
-      const count = counts.get(info.text) ?? 0;
-      if (info.text.trim().length > 0 && count > 0) {
-        counts.set(info.text, count - 1);
-        continue;
-      }
+    for (let line = 1; line < block.lines.length; line += 1) {
+      const info = block.lines[line];
+      if (removed.has(block.start + line)) continue;
       remaining.push(info.text);
     }
     sectionLines.set(title, remaining);

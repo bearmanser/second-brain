@@ -386,3 +386,27 @@ git diff --check                                 → clean
 ```
 
 No files outside the Task 4 source, unit test, and report were changed; no product-code comments or persistent fixtures were added.
+
+## Fix Round 5
+
+**Commit subject:** `fix: align generated sections and fenced content by origin` (new commit after `8760383`).
+
+Items fixed: **Regression C and Regression D**. Item 2 remains unchanged and verified.
+
+- **Regression C:** For each previous generated section, select the matching base section by its generated body content before using position as a tie-breaker. A later generated heading with the old generated content is therefore selected instead of an immediately preceding human heading with a different body. Bound selection by the next generated section's content anchor so a later human same-name section does not capture the old managed heading when its generated text was edited.
+- **Regression D:** Align previous generated content with the selected base section using ordered LCS matches rather than consuming first occurrences of matching text. Markdown code blocks are atomic tokens: a human `ts` fence with overlapping code does not match the previously generated fence unless the entire block matches. Only the aligned base lines are subtracted; unmatched human fence delimiters and both human code lines remain together.
+
+New tests first failed against `8760383` (both regressions), then passed after the fix. Existing assertions were not weakened.
+
+Verification (Node 24.15.0 via `/tmp/opencode/node-v24.15.0-linux-x64/bin`):
+
+```
+npx vitest run tests/unit/document-codec.test.ts  → 49 passed (49)
+npm run typecheck                              → clean
+npm run verify                                 → typecheck clean, 418 unit/contract tests passed (26 files), build succeeded
+npm run test:integration                       → 358 passed (17 files)
+npm test                                       → timed out after 360 seconds without a final summary (no pass claim)
+git diff --check                               → clean
+```
+
+Only the Task 4 source, unit test, and report were changed. No product-code comments or persistent fixtures were added.

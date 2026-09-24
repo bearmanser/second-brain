@@ -810,6 +810,26 @@ test('a revision preserves a human section with the same heading as a generated 
   expect(revised.body.match(/^## Context$/gm)).toHaveLength(2);
 });
 
+test('a human Context heading immediately before the generated Context survives revision', () => {
+  const previous: NoteInput = {
+    title: 'Managed decision', tags: [], related_ids: [], evidence: [],
+    content: { kind: 'decision', context: 'Generated context.', decision: 'D.', rationale: 'R.' }
+  };
+  const base = documentFromNote(previous, { path: 'Managed decision.md' });
+  const human = '## Context\n\nHuman-only context.\n\n';
+  const edited = parseDocument(renderDocument({
+    ...base, body: base.body.replace('## Context\n\nGenerated context.', `${human}## Context\n\nGenerated context.`)
+  }), base.path);
+  const revised = reviseDocument(edited, {
+    ...previous,
+    content: { kind: 'decision', context: 'Updated context.', decision: 'D2.', rationale: 'R2.' }
+  }, { previous });
+  expect(revised.body).toContain(human.trimEnd());
+  expect(revised.body).toContain('Updated context.');
+  expect(revised.body).not.toContain('Generated context.');
+  expect(revised.body.match(/^## Context$/gm)).toHaveLength(2);
+});
+
 test('a revision removes generated fenced field content but keeps human fenced code', () => {
   const previous: NoteInput = {
     title: 'Managed decision', tags: [], related_ids: [], evidence: [],
@@ -833,6 +853,31 @@ test('a revision removes generated fenced field content but keeps human fenced c
   expect(revised.body).not.toContain('const old = true;');
   expect(revised.body).not.toContain('```ts');
   expect(revised.body).toContain(humanCode);
+});
+
+test('a human ts fence overlapping an old generated ts fence remains intact', () => {
+  const previous: NoteInput = {
+    title: 'Managed decision', tags: [], related_ids: [], evidence: [],
+    content: {
+      kind: 'decision', context: 'Old context.\n\n```ts\nconst shared = true;\nconst generated = true;\n```',
+      decision: 'D.', rationale: 'R.'
+    }
+  };
+  const base = documentFromNote(previous, { path: 'Managed decision.md' });
+  const humanCode = '```ts\nconst shared = true;\nconst human = true;\n```';
+  const edited = parseDocument(renderDocument({
+    ...base, body: base.body.replace('```ts\nconst shared = true;\nconst generated = true;\n```',
+      `${humanCode}\n\n\`\`\`ts\nconst shared = true;\nconst generated = true;\n\`\`\``)
+  }), base.path);
+  const revised = reviseDocument(edited, {
+    ...previous,
+    content: { kind: 'decision', context: 'New context.', decision: 'D2.', rationale: 'R2.' }
+  }, { previous });
+  expect(revised.body).toContain(humanCode);
+  expect(revised.body).not.toContain('Old context.');
+  expect(revised.body).not.toContain('const generated = true;');
+  expect(revised.body.match(/^```ts$/gm)).toHaveLength(1);
+  expect(revised.body).toContain('New context.');
 });
 
 test('a revision replaces the generated Related section without duplicating it', () => {
