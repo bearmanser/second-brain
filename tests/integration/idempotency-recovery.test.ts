@@ -65,11 +65,11 @@ test('startup submits a unique planned project but never writes an ambiguous pla
     const reopened = await createRuntime(h.config, { backend, token_digest: h.runtime.tokenDigest });
     try {
       expect(reopened.ready).toBe(true);
-      expect(reopened.deps.journal.isKeyBlocked(KEY)).toBe(true);
-      expect(reopened.deps.journal.getProjectById('unique-control')?.state).toBe('ready');
+      expect(reopened.deps!.journal.isKeyBlocked(KEY)).toBe(true);
+      expect(reopened.deps!.journal.getProjectById('unique-control')?.state).toBe('ready');
       expect(ensureCalls).toEqual(['unique-control']);
-      expect(reopened.deps.journal.getProjectById('ambiguous-first')).toBeUndefined();
-      expect(reopened.deps.journal.getProjectById('ambiguous-second')).toBeUndefined();
+      expect(reopened.deps!.journal.getProjectById('ambiguous-first')).toBeUndefined();
+      expect(reopened.deps!.journal.getProjectById('ambiguous-second')).toBeUndefined();
       expect(backend.create_calls).toHaveLength(0);
     } finally {
       await reopened.close();

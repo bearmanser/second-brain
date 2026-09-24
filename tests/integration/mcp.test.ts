@@ -526,7 +526,7 @@ test('recall records a content-free retrieval event', async () => {
     });
     expect(recalled.isError).toBeFalsy();
     const retrievalId = record(recalled.structuredContent).retrieval_id as string;
-    const event = h.runtime.deps.journal.getRetrieval(retrievalId);
+    const event = h.runtime.deps!.journal.getRetrieval(retrievalId);
     expect(event).toBeDefined();
     expect(event?.principal_id).toBe(SYSTEM_ACTOR.id);
     expect(event?.scope_ids).toContain('freellmapi');
@@ -619,7 +619,7 @@ test('a write blocked past the drain deadline keeps the lock until it completes'
   const reopened = await createRuntime(h.config, { backend: replacementBackend, token_digest: h.runtime.tokenDigest });
   try {
     expect(reopened.ready).toBe(true);
-    const candidates = await reopened.deps.catalogue.list('freellmapi', 'candidate');
+    const candidates = await reopened.deps!.catalogue.list('freellmapi', 'candidate');
     expect(candidates.items.some((item) => item.title === lessonFixture.title)).toBe(true);
   } finally {
     await reopened.close();
@@ -707,9 +707,9 @@ test('startup quarantines one broken dynamic scope while unrelated scopes remain
   const reopened = await createRuntime(h.config, { backend, token_digest: h.runtime.tokenDigest });
   try {
     expect(reopened.ready).toBe(true);
-    expect(reopened.deps.scopeRegistry.isUsable(scope)).toBe(false);
-    expect(reopened.deps.scopeRegistry.isUsable('shared')).toBe(true);
-    expect(reopened.deps.journal.getProjectById(scope)).toMatchObject({
+    expect(reopened.deps!.scopeRegistry.isUsable(scope)).toBe(false);
+    expect(reopened.deps!.scopeRegistry.isUsable('shared')).toBe(true);
+    expect(reopened.deps!.journal.getProjectById(scope)).toMatchObject({
       state: 'recovery_required',
       provisioning: { failure_stage: 'startup_verification' }
     });
@@ -745,11 +745,11 @@ test('startup quarantines a missing project binding without blocking another pro
     const reopened = await createRuntime(h.config, { backend, token_digest: h.runtime.tokenDigest });
     try {
       expect(reopened.ready).toBe(true);
-      expect(reopened.deps.scopeRegistry.all().map((item) => item.id)).toContain('shared');
-      expect(reopened.deps.scopeRegistry.all().map((item) => item.id)).not.toContain(scope);
-      expect(reopened.deps.journal.getProjectById(scope)?.state).toBe('recovery_required');
-      expect(() => reopened.deps.scopeRegistry.require(scope)).toThrow(/RECOVERY_REQUIRED/);
-      expect(reopened.deps.scopeRegistry.require('shared').id).toBe('shared');
+      expect(reopened.deps!.scopeRegistry.all().map((item) => item.id)).toContain('shared');
+      expect(reopened.deps!.scopeRegistry.all().map((item) => item.id)).not.toContain(scope);
+      expect(reopened.deps!.journal.getProjectById(scope)?.state).toBe('recovery_required');
+      expect(() => reopened.deps!.scopeRegistry.require(scope)).toThrow(/RECOVERY_REQUIRED/);
+      expect(reopened.deps!.scopeRegistry.require('shared').id).toBe('shared');
       const context = {
         actor: SYSTEM_ACTOR, request_id: randomUUID(), signal: new AbortController().signal
       };
@@ -802,7 +802,7 @@ test('runtime features use independent project ID, name, vault root and backend 
   try {
     const runtime = await createRuntime(h.config, { backend, token_digest: h.runtime.tokenDigest });
     try {
-      expect(runtime.deps.journal.getProjectById('stable-four')?.project).toMatchObject({
+      expect(runtime.deps!.journal.getProjectById('stable-four')?.project).toMatchObject({
         id: 'stable-four', display_name: 'Human Facing Name', relative_root: 'Knowledge/Four'
       });
       const recalled = await runtime.services.recall(
@@ -813,8 +813,8 @@ test('runtime features use independent project ID, name, vault root and backend 
       expect(recalled.items).toEqual([]);
       expect(searched).toEqual(['storage-four']);
       expect(verified).toContainEqual(['storage-four', '/app/data/BackendData/Four']);
-      expect(runtime.deps.scopeRegistry.require('stable-four').relative_root).toBe('Knowledge/Four');
-      expect(runtime.deps.scopeRegistry.require('stable-four').backend_project).toBe('storage-four');
+      expect(runtime.deps!.scopeRegistry.require('stable-four').relative_root).toBe('Knowledge/Four');
+      expect(runtime.deps!.scopeRegistry.require('stable-four').backend_project).toBe('storage-four');
     } finally {
       await runtime.close();
     }

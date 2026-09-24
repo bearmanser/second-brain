@@ -16,7 +16,8 @@ import { captureLocal } from '../../src/features/capture.js';
 import { reviewLocal } from '../../src/features/review.js';
 import { feedbackLocal } from '../../src/features/feedback.js';
 import { projectEnsureLocal } from '../../src/features/project-ensure.js';
-import { localRead, localStatus } from '../../src/features/local-brain.js';
+import { readLocal } from '../../src/features/read.js';
+import { statusLocal } from '../../src/features/status.js';
 import { buildLocalHandlerDeps, type LocalBrain } from '../../src/features/local-support.js';
 import { openDocumentStore, type DocumentStore } from '../../src/storage/document-store.js';
 import { Journal, LocalOperationJournal } from '../../src/storage/journal.js';
@@ -315,7 +316,7 @@ test('capture, approve, revise, move and adopt replay stably and reject differen
     ).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
 
     await refresh(ground);
-    const status = await localStatus(c, { operation_id: first.operation_id }, ground.brain);
+    const status = await statusLocal(c, { operation_id: first.operation_id }, ground.deps);
     expect(status.operation?.operation_id).toBe(first.operation_id);
 
     const moveKey = randomUUID();
@@ -380,7 +381,7 @@ test('project ensure is durable, idempotent, and replays its original receipt', 
       ground.deps
     );
     expect(first.created).toBe(true);
-    expect((await localStatus(c, { operation_id: first.operation_id }, ground.brain)).operation?.operation_id)
+    expect((await statusLocal(c, { operation_id: first.operation_id }, ground.deps)).operation?.operation_id)
       .toBe(first.operation_id);
     await restartGround(ground);
     const replay = await projectEnsureLocal(
@@ -607,7 +608,7 @@ test('resolve uses the accepted consolidation and preserves branches for history
     expect(ground.catalogue.getById(referringId)?.revision_id).not.toBe(referringRevision);
     await refresh(ground);
     expect(ground.catalogue.getById(id)?.status).toBe('candidate');
-    const historical = await localRead(c, { id, revision_id: aRev }, ground.brain);
+    const historical = await readLocal(c, { id, revision_id: aRev }, ground.deps);
     expect(historical.markdown).toContain('branch A');
     const feedback = await feedbackLocal(
       c,
@@ -985,14 +986,14 @@ test('project-filtered status finds its own ensure operation across replay and r
     const ensured = await projectEnsureLocal(c, request, ground.deps);
     expect(ground.operations.findById(ensured.operation_id)?.project_id).toBe(ensured.project_id);
     for (const selector of [{ project: ensured.project_id }, { scope: ensured.project_id }, { project: ensured.repository_identity }]) {
-      expect((await localStatus(c, { ...selector, operation_id: ensured.operation_id }, ground.brain)).operation)
+      expect((await statusLocal(c, { ...selector, operation_id: ensured.operation_id }, ground.deps)).operation)
         .toMatchObject({ operation_id: ensured.operation_id, project_id: ensured.project_id, created: true });
     }
     expect(await projectEnsureLocal(c, request, ground.deps)).toEqual(ensured);
     await restartGround(ground);
-    expect((await localStatus(c, { project: ensured.project_id, operation_id: ensured.operation_id }, ground.brain)).operation)
+    expect((await statusLocal(c, { project: ensured.project_id, operation_id: ensured.operation_id }, ground.deps)).operation)
       .toMatchObject({ operation_id: ensured.operation_id, created: true });
-    await expect(localStatus(c, { project: 'shared', operation_id: ensured.operation_id }, ground.brain))
+    await expect(statusLocal(c, { project: 'shared', operation_id: ensured.operation_id }, ground.deps))
       .rejects.toMatchObject({ code: 'NOT_FOUND' });
 
     const identity = normalizeRepositoryIdentity('https://github.com/example/legacy-status.git');
@@ -1011,7 +1012,7 @@ test('project-filtered status finds its own ensure operation across replay and r
     await restartGround(ground);
     await ground.deps.mutations.recover();
     expect(ground.operations.findById(legacyOperation)?.payload_hash).toBe('e'.repeat(64));
-    expect((await localStatus(c, { project: legacyProject, operation_id: legacyOperation }, ground.brain)).operation)
+    expect((await statusLocal(c, { project: legacyProject, operation_id: legacyOperation }, ground.deps)).operation)
       .toMatchObject({ operation_id: legacyOperation, project_id: legacyProject });
   } finally { await ground.dispose(); }
 });

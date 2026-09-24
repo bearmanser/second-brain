@@ -505,8 +505,8 @@ test('an approval fingerprint without authenticated journal provenance is untrus
       renderRevision(revision, scope),
       'utf8'
     );
-    await h.runtime.deps.catalogue.reconcile(SCOPE);
-    const head = await h.runtime.deps.catalogue.get(SCOPE, revision.id);
+    await h.runtime.deps!.catalogue.reconcile(SCOPE);
+    const head = await h.runtime.deps!.catalogue.get(SCOPE, revision.id);
     expect(head.state).toBe('manual_unreviewed');
     expect(head.source.status).toBe('candidate');
   } finally {

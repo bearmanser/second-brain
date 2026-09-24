@@ -49,6 +49,7 @@ import {
   type VaultPort
 } from '../../src/core/types.js';
 import type { BrainServices } from '../../src/mcp/server.js';
+import type { RerankWorker } from '../../src/retrieval/reranker.js';
 import { ScopeRegistry } from '../../src/projects/scope-registry.js';
 import {
   buildManifest,
@@ -566,7 +567,7 @@ export async function startLegacyHttpHarness(options: HttpHarnessOptions = {}): 
     runtime,
     backend,
     recordedToolCalls: () => calls.map((call) => ({ ...call })),
-    auditedEvents: () => runtime.deps.journal.listAudit(),
+    auditedEvents: () => runtime.deps!.journal.listAudit(),
     loggedDiagnostics: () => [...diagnostics],
     connect: async (token: string, name = 'brain-http-test') => {
       const client = new Client({ name, version: '1.0.0' });
@@ -586,6 +587,8 @@ export async function startLegacyHttpHarness(options: HttpHarnessOptions = {}): 
 
 export interface LocalHttpHarness {
   url: string;
+  origin: string;
+  port: number;
   token: string;
   config: BrainConfig;
   runtime: BrainRuntime;
@@ -593,8 +596,18 @@ export interface LocalHttpHarness {
   close(): Promise<void>;
 }
 
+export interface LocalHttpHarnessOptions {
+  token?: string;
+  result_delivery?: ResultDelivery;
+  allowed_hosts?: string[];
+  allowed_origins?: string[];
+  concurrent_reads?: number;
+  reconcile_interval_ms?: number;
+  worker?: RerankWorker;
+}
+
 export async function startLocalHttpHarness(
-  options: { token?: string } = {}
+  options: LocalHttpHarnessOptions = {}
 ): Promise<LocalHttpHarness> {
   const root = await mkdtemp(join(tmpdir(), 'brain-local-http-'));
   const vaultRoot = join(root, 'vault');
@@ -620,21 +633,24 @@ export async function startLocalHttpHarness(
       tool_result_max_bytes: TOOL_RESULT_MAX_BYTES,
       backend_timeout_ms: BACKEND_TIMEOUT_MS,
       materialization_timeout_ms: MATERIALIZATION_TIMEOUT_MS,
-      reconcile_interval_ms: RECONCILE_INTERVAL_MS,
-      concurrent_reads: CONCURRENT_READS,
+      reconcile_interval_ms: options.reconcile_interval_ms ?? RECONCILE_INTERVAL_MS,
+      concurrent_reads: options.concurrent_reads ?? CONCURRENT_READS,
       project_provision_global_per_minute: PROJECT_PROVISION_GLOBAL_PER_MINUTE,
       dynamic_projects_max: DYNAMIC_PROJECTS_MAX
     },
-    allowed_hosts: ['127.0.0.1', 'localhost'],
-    allowed_origins: [],
-    result_delivery: 'structured'
+    allowed_hosts: options.allowed_hosts ?? ['127.0.0.1', 'localhost'],
+    allowed_origins: options.allowed_origins ?? [],
+    result_delivery: options.result_delivery ?? 'structured'
   };
   const runtime = await createRuntime(config, {
     token_digest: tokenDigest(token),
-    logger: () => undefined
+    logger: () => undefined,
+    ...(options.worker === undefined ? {} : { local: { worker: options.worker } })
   });
   return {
     url: runtime.url,
+    origin: `http://127.0.0.1:${runtime.port}`,
+    port: runtime.port,
     token,
     config,
     runtime,

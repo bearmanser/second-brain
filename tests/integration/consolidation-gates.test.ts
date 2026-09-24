@@ -14,7 +14,8 @@ import type {
 } from '../../src/core/types.js';
 import { CurrentCatalogue, reconcileCurrentVault } from '../../src/notes/current-catalogue.js';
 import { openSearchIndex } from '../../src/storage/search-index.js';
-import { localRecall, type LocalBrain } from '../../src/features/local-brain.js';
+import { recallLocal } from '../../src/features/recall.js';
+import { buildLocalHandlerDeps, type LocalBrain } from '../../src/features/local-support.js';
 import { reviewerContext } from '../fixtures/principals.js';
 import {
   openDocumentStore,
@@ -1057,7 +1058,7 @@ test('V2 recall excludes a matching intermediate survivor while consolidation is
     const brain = { config: { scopes: [] }, clock, ids, documents: ground.store,
       catalogue: ground.catalogue, index, journal: { listProjects: () => [] }, vault: new FileVault(ground.vaultRoot, []),
       vaultRoot: ground.vaultRoot } as unknown as LocalBrain;
-    const found = await localRecall(reviewerContext, { query: 'intermediate', include_candidates: true }, brain);
+    const found = await recallLocal(reviewerContext, { query: 'intermediate', include_candidates: true }, await buildLocalHandlerDeps(brain));
     expect(found.items).toEqual([]);
   } finally { index.close(); await ground.dispose(); }
 });
@@ -1293,8 +1294,8 @@ test('failed removal from an existing index remains pending until durable retry 
     const brain = { config: { scopes: [] }, clock, ids, documents: ground.store,
       catalogue: ground.catalogue, index, journal: { listProjects: () => [] },
       vault: new FileVault(ground.vaultRoot, []), vaultRoot: ground.vaultRoot } as unknown as LocalBrain;
-    const pendingRecall = await localRecall(reviewerContext,
-      { query: 'reused removal retry marker', include_candidates: true }, brain);
+    const pendingRecall = await recallLocal(reviewerContext,
+      { query: 'reused removal retry marker', include_candidates: true }, await buildLocalHandlerDeps(brain));
     expect(pendingRecall.items.some((item) => item.relative_path === 'Knowledge/B.md')).toBe(false);
     expect(ground.catalogue.getByPath('Knowledge/B.md')?.hash).toBe(matchingHit!.source_hash);
     expect((await ground.store.readPath('Knowledge/B.md')).raw).toBe(reusedRaw);

@@ -14,6 +14,7 @@ import type {
   CataloguePort,
   Clock,
   IdSource,
+  LocalHandlerDeps,
   MutationReceipt,
   ProjectEnsureResult,
   ReadResult,
@@ -22,13 +23,13 @@ import type {
   VaultPort
 } from './core/types.js';
 import { RECONCILE_INTERVAL_MS } from './core/limits.js';
-import { capture } from './features/capture.js';
-import { feedback, retrievalEventFromRecall } from './features/feedback.js';
-import { ensureProject } from './features/project-ensure.js';
-import { read } from './features/read.js';
-import { recallTraced } from './features/recall.js';
-import { review } from './features/review.js';
-import { status } from './features/status.js';
+import { capture, captureLocal } from './features/capture.js';
+import { feedback, feedbackLocal, retrievalEventFromRecall } from './features/feedback.js';
+import { ensureProject, projectEnsureLocal } from './features/project-ensure.js';
+import { read, readLocal } from './features/read.js';
+import { recallLocal, recallTraced } from './features/recall.js';
+import { review, reviewLocal } from './features/review.js';
+import { status, statusLocal } from './features/status.js';
 import { createHttpApp } from './mcp/http.js';
 import { createMcpServer, type BrainServices } from './mcp/server.js';
 import { internalDiagnostic } from './mcp/tools.js';
@@ -44,24 +45,17 @@ import {
 import { JournalApprovalProvenance, indexReconciledDocuments, reconcileVault } from './notes/reconcile.js';
 import { recoverPending } from './operations/recovery.js';
 import { ScopeRegistry } from './projects/scope-registry.js';
-import { BasicMemoryBackend } from './storage/basic-memory.js';
 import { Journal, LocalOperationJournal } from './storage/journal.js';
 import { openRevisionStore, type RevisionStore } from './storage/revision-store.js';
 import { openSearchIndex, type SearchIndex } from './storage/search-index.js';
 import { FileVault } from './storage/vault.js';
-import { openDocumentStore, type DocumentIndex } from './storage/document-store.js';
-import type { RerankWorker } from './retrieval/reranker.js';
 import {
-  localCapture,
-  localFeedback,
-  localProjectEnsure,
-  localRead,
-  localRecall,
-  localReview,
-  localStatus,
-  type LocalBrain
-} from './features/local-brain.js';
-import { buildLocalHandlerDeps } from './features/local-support.js';
+  openDocumentStore,
+  type DocumentIndex,
+  type DocumentIndexEntry
+} from './storage/document-store.js';
+import type { RerankWorker } from './retrieval/reranker.js';
+import { buildLocalHandlerDeps, type LocalBrain } from './features/local-support.js';
 import { InstanceLock, MutationCoordinator, type BrainDeps } from './core/mutation.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
@@ -75,14 +69,15 @@ export interface RuntimeOptions {
   clock?: Clock;
   ids?: IdSource;
   logger?: (line: string) => void;
-  wrapServices?: (services: BrainServices, deps: BrainDeps) => BrainServices;
+  wrapServices?: (services: BrainServices, deps: BrainDeps | undefined) => BrainServices;
   token_digest: string;
   local?: { worker?: RerankWorker };
 }
 
 export interface BrainRuntime {
   readonly config: BrainConfig;
-  readonly deps: BrainDeps;
+  readonly deps: BrainDeps | undefined;
+  readonly localDeps: LocalHandlerDeps | undefined;
   readonly services: BrainServices;
   readonly tokenDigest: string;
   readonly port: number;
@@ -109,49 +104,19 @@ const systemIds: IdSource = { next: () => randomUUID() };
 
 const silentLogger = (): void => undefined;
 
-class LocalOnlyBackend implements BackendPort {
-  async connect(): Promise<void> {
-    return;
-  }
-
-  async probe(): Promise<{ server_version: string; tools: string[] }> {
-    return { server_version: 'local', tools: [] };
-  }
-
-  registerScope(): void {
-    return;
-  }
-
-  async verifyProject(): Promise<boolean> {
-    return true;
-  }
-
-  async ensureProject(): Promise<{ created: boolean }> {
-    return { created: false };
-  }
-
-  async create(): Promise<{ permalink: string; relative_path?: string }> {
-    throw new BrainError({
-      code: 'BACKEND_UNAVAILABLE',
-      message: 'the local document store owns writes'
-    });
-  }
-
-  async search(): Promise<{ hits: never[]; has_more: boolean }> {
-    return { hits: [], has_more: false };
-  }
-
-  async isIndexed(): Promise<boolean> {
-    return true;
-  }
-
-  async close(): Promise<void> {
-    return;
-  }
-}
-
 function recoveryRequired(message: string, cause?: unknown): BrainError {
   return new BrainError({ code: 'RECOVERY_REQUIRED', message, cause });
+}
+
+function documentIndexAdapter(index: SearchIndex): DocumentIndex {
+  return {
+    upsert: (entry: DocumentIndexEntry): void => {
+      index.upsert(entry);
+    },
+    remove: (path: string): void => {
+      index.remove(path);
+    }
+  };
 }
 
 async function loadCursorSecret(config: BrainConfig): Promise<Uint8Array> {
@@ -175,46 +140,62 @@ async function loadCursorSecret(config: BrainConfig): Promise<Uint8Array> {
   return new Uint8Array(bytes);
 }
 
-function buildServices(
+function localRecallEvent(
+  local: LocalHandlerDeps,
+  ctx: AuthenticatedContext,
+  request: RecallRequestInput,
+  result: RecallResult,
+  started: number,
+  log: (line: string) => void
+): RecallResult {
+  try {
+    local.journal.recordRetrievalV2(
+      retrievalEventFromRecall(ctx, result, {
+        filter:
+          request.project === undefined && request.scope === undefined
+            ? { mode: 'all' }
+            : { mode: 'project', identifier: (request.project ?? request.scope) as string },
+        searched_project_ids: [],
+        primary_project_id: null,
+        duration_ms: Math.max(0, Date.now() - started)
+      })
+    );
+  } catch (error) {
+    log(internalDiagnostic(error));
+  }
+  return result;
+}
+
+type RecallRequestInput = Parameters<BrainServices['recall']>[1];
+
+function buildLocalServices(
+  local: LocalHandlerDeps,
+  delivery: BrainServices['result_delivery'],
+  log: (line: string) => void
+): BrainServices {
+  return {
+    contract_version: 2,
+    result_delivery: delivery ?? 'structured',
+    reportDiagnostic: log,
+    capture: (ctx, request): Promise<MutationReceipt> => captureLocal(ctx, request, local),
+    review: (ctx, request) => reviewLocal(ctx, request, local),
+    read: (ctx, request): Promise<ReadResult> => readLocal(ctx, request, local),
+    status: (ctx, request): Promise<StatusResult> => statusLocal(ctx, request, local),
+    feedback: (ctx, request) => feedbackLocal(ctx, request, local),
+    projectEnsure: (ctx, request): Promise<ProjectEnsureResult> => projectEnsureLocal(ctx, request, local),
+    recall: async (ctx, request): Promise<RecallResult> => {
+      const started = Date.now();
+      const result = await recallLocal(ctx, request, local);
+      return localRecallEvent(local, ctx, request, result, started, log);
+    }
+  };
+}
+
+function buildLegacyServices(
   deps: BrainDeps,
   delivery: BrainServices['result_delivery'],
-  log: (line: string) => void,
-  local?: LocalBrain
+  log: (line: string) => void
 ): BrainServices {
-  if (local !== undefined) {
-    return {
-      contract_version: 2,
-      result_delivery: delivery ?? 'structured',
-      reportDiagnostic: log,
-      capture: (ctx, request): Promise<MutationReceipt> => localCapture(ctx, request, local),
-      review: (ctx, request) => localReview(ctx, request, local),
-      read: (ctx, request): Promise<ReadResult> => localRead(ctx, request, local),
-      status: (ctx, request): Promise<StatusResult> => localStatus(ctx, request, local),
-      feedback: (ctx, request) => localFeedback(ctx, request, local),
-      projectEnsure: (ctx, request): Promise<ProjectEnsureResult> =>
-        localProjectEnsure(ctx, request, local),
-      recall: async (ctx, request): Promise<RecallResult> => {
-        const started = Date.now();
-        const result = await localRecall(ctx, request, local);
-        try {
-          deps.journal.recordRetrievalV2(
-            retrievalEventFromRecall(ctx, result, {
-              filter:
-                request.project === undefined && request.scope === undefined
-                  ? { mode: 'all' }
-                  : { mode: 'project', identifier: (request.project ?? request.scope) as string },
-              searched_project_ids: [],
-              primary_project_id: null,
-              duration_ms: Math.max(0, Date.now() - started)
-            })
-          );
-        } catch (error) {
-          log(internalDiagnostic(error));
-        }
-        return result;
-      }
-    };
-  }
   return {
     contract_version: 1,
     result_delivery: delivery ?? 'structured',
@@ -335,7 +316,8 @@ class ReadLimiter {
 
 class BrainRuntimeImpl implements BrainRuntime {
   readonly config: BrainConfig;
-  deps!: BrainDeps;
+  deps: BrainDeps | undefined;
+  localDeps: LocalHandlerDeps | undefined;
   services!: BrainServices;
   tokenDigest = '';
   port = 0;
@@ -406,7 +388,6 @@ class BrainRuntimeImpl implements BrainRuntime {
         ids: this.ids
       });
       this.journal = journal;
-      const scopeRegistry = new ScopeRegistry(this.config.scopes, journal);
       if (knowledgeExists && !journal.hasOperationalHistory()) {
         if (!journal.hasOperationalLossAcknowledgement()) {
           throw recoveryRequired(
@@ -414,109 +395,22 @@ class BrainRuntimeImpl implements BrainRuntime {
           );
         }
       }
-      const backend =
-        this.options.backend ??
-        (this.useLocal()
-          ? new LocalOnlyBackend()
-          : new BasicMemoryBackend({
-              url: this.config.backend_endpoint,
-              projects: scopeRegistry.all().map((scope) => scope.backend_project),
-              timeout_ms: this.config.limits.backend_timeout_ms
-            }));
-      this.backend = backend;
-      await backend.connect();
-      for (const scope of scopeRegistry.all()) backend.registerScope(scope);
-      for (const project of journal.listReadyProjects()) {
-        const binding = journal.getProjectBinding(project.project.id);
-        if (binding === undefined) {
-          journal.markProjectRecoveryRequired(
-            project.project.id,
-            'startup_verification',
-            'MISSING_BINDING'
-          );
-          continue;
-        }
-        const scope = {
-          id: project.project.id,
-          backend_project: binding.backend_project,
-          relative_root: project.project.relative_root,
-          repository_aliases: []
-        };
-        try {
-          vault.registerScope(scope);
-          const verified = await backend.verifyProject(
-            binding.backend_project,
-            `/app/data/${binding.backend_relative_root}`
-          );
-          if (!verified) {
-            throw new BrainError({
-              code: 'BACKEND_PROTOCOL_ERROR',
-              message: 'ready repository project is missing from the backend'
-            });
-          }
-          backend.registerScope(scope);
-          scopeRegistry.registerReadyProject(project, binding);
-        } catch (error) {
-          if (
-            isBrainError(error) &&
-            ['RECOVERY_REQUIRED', 'FORBIDDEN', 'CONFLICT', 'BACKEND_PROTOCOL_ERROR'].includes(error.code)
-          ) {
-            journal.markProjectRecoveryRequired(
-              project.project.id,
-              'startup_verification',
-              error.code
-            );
-            scopeRegistry.quarantineProject(project.project.id);
-            continue;
-          }
-          throw error;
-        }
+      if (this.options.backend !== undefined) {
+        const scopeRegistry = new ScopeRegistry(this.config.scopes, journal);
+        await this.startLegacy(journal, scopeRegistry, vault, this.options.backend);
       }
-      const catalogue = RevisionCatalogue.open(cataloguePath, {
-        vault,
-        scopes: scopeRegistry.all(),
-        clock: this.clock,
-        approval_provenance: new JournalApprovalProvenance(journal)
-      });
-      this.catalogue = catalogue;
-      const mutations = new MutationCoordinator({
-        config: this.config,
-        scopeRegistry,
-        backend,
-        vault,
-        catalogue,
-        journal,
-        clock: this.clock,
-        ids: this.ids
-      });
-      const deps: BrainDeps = {
-        config: this.config,
-        scopeRegistry,
-        backend,
-        vault,
-        catalogue: catalogue as CataloguePort,
-        journal,
-        clock: this.clock,
-        ids: this.ids,
-        mutations
-      };
-      this.deps = deps;
-
-      await recoverPending(deps).then((report) => {
-        this.logRecovery(report);
-      });
-      await this.startupReconcile();
-      await this.startCurrentVault();
-      await this.openLocalBrain(journal);
+      await this.openCurrentVault(vault);
+      if (this.options.backend === undefined) {
+        await this.openLocalRuntime(journal, vault);
+      }
+      await this.runCurrentVaultReconcile(vault);
       await loadCursorSecret(this.config);
 
-      const base = buildServices(
-        deps,
-        this.config.result_delivery,
-        this.log,
-        this.localBrain
-      );
-      const wrapped = this.options.wrapServices?.(base, deps) ?? base;
+      const base =
+        this.localDeps !== undefined
+          ? buildLocalServices(this.localDeps, this.config.result_delivery, this.log)
+          : buildLegacyServices(this.requireDeps(), this.config.result_delivery, this.log);
+      const wrapped = this.options.wrapServices?.(base, this.deps) ?? base;
       this.services = trackedServices(
         { ...base, ...wrapped },
         (work) => this.guardOperation(work),
@@ -546,12 +440,14 @@ class BrainRuntimeImpl implements BrainRuntime {
       }, PRUNE_INTERVAL_MS);
       this.pruneTimer.unref?.();
 
-      const reconcileInterval =
-        this.config.limits.reconcile_interval_ms ?? RECONCILE_INTERVAL_MS;
-      this.reconcileTimer = setInterval(() => {
-        this.periodicReconcile();
-      }, reconcileInterval);
-      this.reconcileTimer.unref?.();
+      if (this.deps !== undefined) {
+        const reconcileInterval =
+          this.config.limits.reconcile_interval_ms ?? RECONCILE_INTERVAL_MS;
+        this.reconcileTimer = setInterval(() => {
+          this.periodicReconcile();
+        }, reconcileInterval);
+        this.reconcileTimer.unref?.();
+      }
 
       this.ready = true;
       started = true;
@@ -560,6 +456,14 @@ class BrainRuntimeImpl implements BrainRuntime {
         await this.cleanup();
       }
     }
+  }
+
+  private requireDeps(): BrainDeps {
+    const deps = this.deps;
+    if (deps === undefined) {
+      throw new Error('the legacy dependency graph is not active');
+    }
+    return deps;
   }
 
   private async knowledgeExists(vault: VaultPort, cataloguePath: string): Promise<boolean> {
@@ -692,14 +596,108 @@ class BrainRuntimeImpl implements BrainRuntime {
     }
   }
 
+  private async startLegacy(
+    journal: Journal,
+    scopeRegistry: ScopeRegistry,
+    vault: VaultPort,
+    backend: BackendPort
+  ): Promise<void> {
+    this.backend = backend;
+    await backend.connect();
+    for (const scope of scopeRegistry.all()) backend.registerScope(scope);
+    for (const project of journal.listReadyProjects()) {
+      const binding = journal.getProjectBinding(project.project.id);
+      if (binding === undefined) {
+        journal.markProjectRecoveryRequired(
+          project.project.id,
+          'startup_verification',
+          'MISSING_BINDING'
+        );
+        continue;
+      }
+      const scope = {
+        id: project.project.id,
+        backend_project: binding.backend_project,
+        relative_root: project.project.relative_root,
+        repository_aliases: []
+      };
+      try {
+        vault.registerScope(scope);
+        const verified = await backend.verifyProject(
+          binding.backend_project,
+          `/app/data/${binding.backend_relative_root}`
+        );
+        if (!verified) {
+          throw new BrainError({
+            code: 'BACKEND_PROTOCOL_ERROR',
+            message: 'ready repository project is missing from the backend'
+          });
+        }
+        backend.registerScope(scope);
+        scopeRegistry.registerReadyProject(project, binding);
+      } catch (error) {
+        if (
+          isBrainError(error) &&
+          ['RECOVERY_REQUIRED', 'FORBIDDEN', 'CONFLICT', 'BACKEND_PROTOCOL_ERROR'].includes(error.code)
+        ) {
+          journal.markProjectRecoveryRequired(
+            project.project.id,
+            'startup_verification',
+            error.code
+          );
+          scopeRegistry.quarantineProject(project.project.id);
+          continue;
+        }
+        throw error;
+      }
+    }
+    const catalogue = RevisionCatalogue.open(join(this.config.mounts.state, 'catalogue.db'), {
+      vault,
+      scopes: scopeRegistry.all(),
+      clock: this.clock,
+      approval_provenance: new JournalApprovalProvenance(journal)
+    });
+    this.catalogue = catalogue;
+    const mutations = new MutationCoordinator({
+      config: this.config,
+      scopeRegistry,
+      backend,
+      vault,
+      catalogue,
+      journal,
+      clock: this.clock,
+      ids: this.ids
+    });
+    const deps: BrainDeps = {
+      config: this.config,
+      scopeRegistry,
+      backend,
+      vault,
+      catalogue: catalogue as CataloguePort,
+      journal,
+      clock: this.clock,
+      ids: this.ids,
+      mutations
+    };
+    this.deps = deps;
+
+    await recoverPending(deps).then((report) => {
+      this.logRecovery(report);
+    });
+    await this.startupReconcile();
+  }
+
   private async startupReconcile(): Promise<void> {
-    const report = await this.deps.mutations.serialize(() => reconcileVault(this.deps));
+    const report = await this.requireDeps().mutations.serialize(() => reconcileVault(this.requireDeps()));
     this.logReconcile(report);
   }
 
-  private async startCurrentVault(): Promise<void> {
-    const vault = this.deps.vault as VaultPort & Partial<CurrentVault>;
-    if (typeof vault.listMarkdown !== 'function' || typeof vault.readMarkdown !== 'function') {
+  private async openCurrentVault(vault: VaultPort): Promise<void> {
+    const currentVault = vault as VaultPort & Partial<CurrentVault>;
+    if (
+      typeof currentVault.listMarkdown !== 'function' ||
+      typeof currentVault.readMarkdown !== 'function'
+    ) {
       return;
     }
     let revisions: RevisionStore;
@@ -711,15 +709,20 @@ class BrainRuntimeImpl implements BrainRuntime {
     }
     const current = CurrentCatalogue.open({ revisions, ids: this.ids });
     this.currentIndex = current;
-    let index: SearchIndex | undefined;
     try {
       const indexPath = join(this.config.mounts.state, 'index', 'search.sqlite');
       mkdirSync(dirname(indexPath), { recursive: true });
-      index = openSearchIndex(indexPath);
-      this.searchIndex = index;
+      this.searchIndex = openSearchIndex(indexPath);
     } catch (error) {
       this.log(internalDiagnostic(error));
     }
+  }
+
+  private async runCurrentVaultReconcile(vault: VaultPort): Promise<void> {
+    const current = this.currentIndex;
+    if (current === undefined) return;
+    const index = this.searchIndex;
+    const currentVault = vault as VaultPort & CurrentVault;
     const syncIndex = (report: ReconcileCurrentVaultReport): void => {
       if (index === undefined) return;
       try {
@@ -730,7 +733,7 @@ class BrainRuntimeImpl implements BrainRuntime {
     };
     const observer = observeCurrentVault({
       root: this.config.mounts.vault,
-      vault: vault as CurrentVault,
+      vault: currentVault,
       catalogue: current,
       signal: this.shutdown.signal,
       interval_ms: this.config.limits.reconcile_interval_ms ?? RECONCILE_INTERVAL_MS,
@@ -743,7 +746,7 @@ class BrainRuntimeImpl implements BrainRuntime {
     this.currentObserver = observer;
     try {
       const report = await reconcileCurrentVault({
-        vault: vault as CurrentVault,
+        vault: currentVault,
         catalogue: current,
         signal: this.shutdown.signal
       });
@@ -756,27 +759,22 @@ class BrainRuntimeImpl implements BrainRuntime {
     }
   }
 
-  private useLocal(): boolean {
-    return this.options.local !== undefined || this.options.backend === undefined;
-  }
-
-  private async openLocalBrain(journal: Journal): Promise<void> {
-    if (!this.useLocal()) return;
+  private async openLocalRuntime(journal: Journal, vault: VaultPort): Promise<void> {
     const catalogue = this.currentIndex;
     const index = this.searchIndex;
-    const vault = this.deps.vault as VaultPort & CurrentVault;
+    const currentVault = vault as VaultPort & CurrentVault;
     if (
       catalogue === undefined ||
       index === undefined ||
-      typeof vault.listMarkdown !== 'function' ||
-      typeof vault.readMarkdown !== 'function'
+      typeof currentVault.listMarkdown !== 'function' ||
+      typeof currentVault.readMarkdown !== 'function'
     ) {
       throw recoveryRequired('the local document store requires a readable vault');
     }
     const documents = await openDocumentStore({
       vault: this.config.mounts.vault,
       state: this.config.mounts.state,
-      index: index as unknown as DocumentIndex,
+      index: documentIndexAdapter(index),
       clock: this.clock,
       ids: this.ids
     });
@@ -790,7 +788,7 @@ class BrainRuntimeImpl implements BrainRuntime {
       catalogue,
       index,
       journal,
-      vault,
+      vault: currentVault,
       vaultRoot: this.config.mounts.vault,
       ...(this.options.local?.worker === undefined ? {} : { worker: this.options.local.worker }),
       close: async () => {
@@ -798,7 +796,8 @@ class BrainRuntimeImpl implements BrainRuntime {
         await documents.close();
       }
     };
-    await (await buildLocalHandlerDeps(this.localBrain)).mutations.recover();
+    this.localDeps = await buildLocalHandlerDeps(this.localBrain);
+    await this.localDeps.mutations.recover();
   }
 
   private logCurrentReconcile(report: ReconcileCurrentVaultReport): void {
@@ -813,13 +812,14 @@ class BrainRuntimeImpl implements BrainRuntime {
   }
 
   private periodicReconcile(): void {
-    if (this.reconciling || this.closing) return;
+    const deps = this.deps;
+    if (deps === undefined || this.reconciling || this.closing) return;
     this.reconciling = true;
     const work = async (): Promise<void> => {
       try {
-        const recovery = await recoverPending(this.deps);
+        const recovery = await recoverPending(deps);
         this.logRecovery(recovery);
-        const report = await this.deps.mutations.serialize(() => reconcileVault(this.deps));
+        const report = await deps.mutations.serialize(() => reconcileVault(deps));
         this.logReconcile(report);
       } catch (error) {
         this.log(internalDiagnostic(error));
@@ -900,6 +900,7 @@ class BrainRuntimeImpl implements BrainRuntime {
     this.currentObserver = undefined;
     await this.localBrain?.close().catch(() => undefined);
     this.localBrain = undefined;
+    this.localDeps = undefined;
     this.currentIndex?.close();
     this.currentIndex = undefined;
     this.searchIndex?.close();

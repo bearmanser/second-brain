@@ -697,11 +697,13 @@ test('status and recall report index lag from durable pending index work', async
   }
 });
 
-test('the local brain facade only delegates read, recall, and status to the canonical handlers', async () => {
-  const { readFile } = await import('node:fs/promises');
-  const source = await readFile(new URL('../../src/features/local-brain.ts', import.meta.url), 'utf8');
-  expect(source).not.toMatch(/encodeCursor|decodeCursor|base64url|candidates\(|rerankCandidates|selectFinalCandidates|listIncomplete|readRevision/);
-  expect(source).toMatch(/readLocal/);
-  expect(source).toMatch(/recallLocal/);
-  expect(source).toMatch(/statusLocal/);
+test('the deleted local brain facade leaves the canonical handlers as the only implementation', async () => {
+  const { access, readFile } = await import('node:fs/promises');
+  await expect(access(new URL('../../src/features/local-brain.ts', import.meta.url))).rejects.toMatchObject({
+    code: 'ENOENT'
+  });
+  const runtime = await readFile(new URL('../../src/runtime.ts', import.meta.url), 'utf8');
+  expect(runtime).toMatch(/readLocal/);
+  expect(runtime).toMatch(/recallLocal/);
+  expect(runtime).toMatch(/statusLocal/);
 });

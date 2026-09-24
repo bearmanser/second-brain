@@ -425,11 +425,11 @@ test('brain_status exposes recovering health, blocked writes, and available read
     });
     expect(structured(pending).outcome).toBe('pending');
 
-    const originalList = h.runtime.deps.vault.list.bind(h.runtime.deps.vault);
-    h.runtime.deps.vault.list = async () => {
+    const originalList = h.runtime.deps!.vault.list.bind(h.runtime.deps!.vault);
+    h.runtime.deps!.vault.list = async () => {
       throw new Error('vault unavailable');
     };
-    const report = await recoverPending(h.runtime.deps);
+    const report = await recoverPending(h.runtime.deps!);
     expect(report.blocking_operations).toHaveLength(1);
 
     const status = await owner.callTool({ name: 'brain_status', arguments: {} });
@@ -458,8 +458,8 @@ test('brain_status exposes recovering health, blocked writes, and available read
     expect((blocked as { isError?: boolean }).isError).toBe(true);
     expect(JSON.stringify(blocked)).toMatch(/RECOVERY_REQUIRED/);
 
-    h.runtime.deps.vault.list = originalList;
-    const cleared = await recoverPending(h.runtime.deps);
+    h.runtime.deps!.vault.list = originalList;
+    const cleared = await recoverPending(h.runtime.deps!);
     expect(cleared.blocking_operations).toHaveLength(0);
   } finally {
     await owner.close().catch(() => undefined);
