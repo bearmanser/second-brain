@@ -374,6 +374,44 @@ test('a legacy storage-key-only record binds to its document operation when unam
   }
 });
 
+test('a supersede plan must bind every replacement in its supersession chain', async () => {
+  const ground = await openGround();
+  try {
+    const sourceId = randomUUID();
+    const middleId = randomUUID();
+    const finalId = randomUUID();
+    const source = await ground.store.put({ path: 'Inbox/Source.md', raw: managed(sourceId, 'source'),
+      expectedEtag: null, idempotencyKey: randomUUID(), source: 'test' });
+    const middleRaw = managed(middleId, 'middle').replace('status: candidate',
+      `status: superseded\nbrain_replacement_id: ${finalId}`);
+    const middle = await ground.store.put({ path: 'Inbox/Middle.md', raw: middleRaw,
+      expectedEtag: null, idempotencyKey: randomUUID(), source: 'test' });
+    const final = await ground.store.put({ path: 'Inbox/Final.md', raw: managed(finalId, 'final'),
+      expectedEtag: null, idempotencyKey: randomUUID(), source: 'test' });
+    const key = randomUUID();
+    const intent: LocalOperationIntent = { tool: 'brain_review', action: 'supersede', project_id: null,
+      idempotency_key: key, payload: { action: 'supersede', idempotency_key: key, id: sourceId,
+        expected_etag: source.etag, replacement_id: middleId, rationale: 'replacement' },
+      preconditions: { id: sourceId, etag: source.etag } };
+    const sourceCondition = { kind: 'note' as const, id: sourceId, expected: { kind: 'present' as const,
+      path: source.path, etag: source.etag, revision_id: source.revision_id } };
+    const middleCondition = { kind: 'note' as const, id: middleId, expected: { kind: 'present' as const,
+      path: middle.path, etag: middle.etag, revision_id: middle.revision_id } };
+    const finalCondition = { kind: 'note' as const, id: finalId, expected: { kind: 'present' as const,
+      path: final.path, etag: final.etag, revision_id: final.revision_id } };
+    const plan = (read_set: LocalPlannedOperation['read_set']) => ({ kind: 'note' as const, heads: [], parents: [],
+      read_set, effects: [{ kind: 'write' as const, write: { path: source.path, id: sourceId,
+        revision_id: randomUUID(), raw: managed(sourceId, 'superseded'), parents: [] } }] });
+    await expect(ground.coordinator.run(intent, () => plan([sourceCondition, middleCondition]) as LocalPlannedOperation))
+      .rejects.toMatchObject({ code: 'INVALID_INPUT' });
+    expect(ground.operations.findByKey(key)?.plan_json).toBeNull();
+    const completeKey = randomUUID();
+    await expect(ground.coordinator.run({ ...intent, idempotency_key: completeKey,
+      payload: { ...intent.payload, idempotency_key: completeKey } } as LocalOperationIntent,
+      () => plan([sourceCondition, middleCondition, finalCondition]) as LocalPlannedOperation)).resolves.toBeDefined();
+  } finally { await ground.dispose(); }
+});
+
 test('an ambiguous legacy storage-key record reports recovery required', async () => {
   const ground = await openGround();
   try {

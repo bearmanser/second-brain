@@ -45,7 +45,7 @@ import { JournalApprovalProvenance, indexReconciledDocuments, reconcileVault } f
 import { recoverPending } from './operations/recovery.js';
 import { ScopeRegistry } from './projects/scope-registry.js';
 import { BasicMemoryBackend } from './storage/basic-memory.js';
-import { Journal } from './storage/journal.js';
+import { Journal, LocalOperationJournal } from './storage/journal.js';
 import { openRevisionStore, type RevisionStore } from './storage/revision-store.js';
 import { openSearchIndex, type SearchIndex } from './storage/search-index.js';
 import { FileVault } from './storage/vault.js';
@@ -779,11 +779,13 @@ class BrainRuntimeImpl implements BrainRuntime {
       clock: this.clock,
       ids: this.ids
     });
+    const operations = LocalOperationJournal.open(join(this.config.mounts.state, 'operations.sqlite'));
     this.localBrain = {
       config: this.config,
       clock: this.clock,
       ids: this.ids,
       documents,
+      operations,
       catalogue,
       index,
       journal,
@@ -791,6 +793,7 @@ class BrainRuntimeImpl implements BrainRuntime {
       vaultRoot: this.config.mounts.vault,
       ...(this.options.local?.worker === undefined ? {} : { worker: this.options.local.worker }),
       close: async () => {
+        operations.close();
         await documents.close();
       }
     };

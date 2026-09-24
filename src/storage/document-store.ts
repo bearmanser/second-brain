@@ -24,7 +24,7 @@ import {
   type LocalWriteRecord
 } from './journal.js';
 import { openRevisionStore, revisionHasId, type RevisionStore } from './revision-store.js';
-import { listVaultFilePaths, readBoundedBytes, vaultNoteSegments } from './vault.js';
+import { listVaultFilePaths, scanVaultFilePaths, readBoundedBytes, vaultNoteSegments } from './vault.js';
 
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const IDEMPOTENCY_KEY_MAX_LENGTH = 256;
@@ -302,6 +302,7 @@ export interface ConsolidationFaults {
   beforeRemovalStage?(path: string): void | Promise<void>;
   afterRemovalStage?(path: string): void | Promise<void>;
   afterRemovalProgress?(path: string): void | Promise<void>;
+  afterRemovalDispose?(path: string): void | Promise<void>;
   afterDocumentComplete?(): void | Promise<void>;
   beforeReceipt?(): void | Promise<void>;
 }
@@ -423,6 +424,7 @@ export interface DocumentStore {
   consolidate(input: DocumentStoreConsolidateInput): Promise<DocumentStorePutResult>;
   getConsolidationReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
   hasConsolidationManifest(idempotencyKey: string): boolean;
+  recallExclusions(): { paths: Set<string>; ids: Set<string> };
   getDocumentReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
   getMoveReceipt(idempotencyKey: string): RenameReceipt | undefined;
   recover(): Promise<DocumentStoreRecoveryReport>;
@@ -783,6 +785,27 @@ class LocalDocumentStore implements DocumentStore {
     return this.journal.findConsolidationByKey(idempotencyKey) !== undefined;
   }
 
+  recallExclusions(): { paths: Set<string>; ids: Set<string> } {
+    const paths = new Set(this.journal.listIndex().filter((row) => row.revision_id === 'remove')
+      .map((row) => row.path));
+    const ids = new Set<string>();
+    for (const record of this.journal.listIncompleteConsolidations()) {
+      let manifest: DocumentStoreConsolidateInput;
+      try { manifest = JSON.parse(record.manifest_json) as DocumentStoreConsolidateInput; }
+      catch (error) { throw recoveryRequired('the pending consolidation manifest is unreadable', error); }
+      if (!Array.isArray(manifest.heads) || !Array.isArray(manifest.removals) ||
+          manifest.logicalId !== record.logical_id) {
+        throw recoveryRequired('the pending consolidation manifest is incomplete');
+      }
+      ids.add(record.logical_id);
+      paths.add(manifest.path);
+      for (const head of manifest.heads) paths.add(head.path);
+      for (const removal of manifest.removals) paths.add(removal.path);
+      for (const edit of manifest.referenceEdits ?? []) paths.add(edit.path);
+    }
+    return { paths, ids };
+  }
+
   getDocumentReceipt(idempotencyKey: string): DocumentStorePutResult | undefined {
     const record = this.journal.findByKey(idempotencyKey);
     if (record !== undefined && record.state === 'complete' && record.receipt_json !== null) {
@@ -993,7 +1016,23 @@ class LocalDocumentStore implements DocumentStore {
     if (progress.removals === undefined) progress = { ...progress, removals: {} };
     for (const removal of input.removals) {
       const entry = progress.removals?.[removal.path];
-      if (entry?.disposed === true) continue;
+      if (entry?.disposed === true) {
+        await this.disposeRecordedRemoval(removal, entry);
+        this.journal.deleteDocument(removal.path);
+        if (this.journal.listIndex().some((row) => row.path === removal.path && row.revision_id === 'remove')) {
+          if (this.index?.remove === undefined) {
+            save('removals_applied', { removal_index_failed: true });
+          } else {
+            try {
+              await this.index.remove(removal.path);
+              this.journal.dequeueIndex(removal.path);
+            } catch {
+              save('removals_applied', { removal_index_failed: true });
+            }
+          }
+        }
+        continue;
+      }
       await this.stageRemoval(removal, progress, save);
     }
 
@@ -1025,6 +1064,21 @@ class LocalDocumentStore implements DocumentStore {
       if ((await readNoteFile(this.vaultRoot, vaultNoteSegments(removal.path))) !== undefined) {
         return failRecovery(`absorbed path ${removal.path} reappeared before the document receipt`);
       }
+    }
+    const inventory = await scanVaultFilePaths(this.vaultRoot);
+    if (!inventory.complete) return failRecovery('the final consolidation inventory is incomplete');
+    const currentPaths: string[] = [];
+    for (const path of inventory.paths) {
+      const file = await readNoteFile(this.vaultRoot, vaultNoteSegments(path));
+      if (file === undefined) return failRecovery(`the final inventory changed at ${path}`);
+      try {
+        if (parseDocument(file.raw, path).id === input.logicalId) currentPaths.push(path);
+      } catch (error) {
+        return failRecovery(`the final inventory could not verify ${path}`, error);
+      }
+    }
+    if (currentPaths.length !== 1 || currentPaths[0] !== input.path) {
+      return failRecovery('an unexpected current duplicate appeared during consolidation');
     }
     const primaryRecord = this.journal.findByKey(`${input.idempotencyKey}:primary`);
     const stored = current.receipt_json;
@@ -1165,8 +1219,6 @@ class LocalDocumentStore implements DocumentStore {
         (await this.revisions.readRevision(removal.expected_id, removal.expected_revision_id)).hash !== entry.sha256) {
       throw recoveryRequired(`staged absorbed identity for ${removal.path} cannot be verified`);
     }
-    await rm(join(entry.staging, 'absorbed'), { force: true });
-    await rmdir(entry.staging).catch(() => undefined);
     this.journal.enqueueIndex({ path: removal.path, revision_id: 'remove', raw_hash: entry.sha256,
       enqueued_at: this.clock.now().toISOString() });
     progress.removals = {
@@ -1174,10 +1226,12 @@ class LocalDocumentStore implements DocumentStore {
       [removal.path]: { ...entry, disposed: true }
     };
     save('removals_applied');
+    await this.disposeRecordedRemoval(removal, progress.removals[removal.path]);
+    await this.runConsolidationFault('afterRemovalDispose', 'the staged copy could not be disposed', removal.path);
     this.journal.deleteDocument(removal.path);
-    if (this.index !== undefined) {
+    if (this.index?.remove !== undefined) {
       try {
-        await this.index.remove?.(removal.path);
+        await this.index.remove(removal.path);
         this.journal.dequeueIndex(removal.path);
       } catch {
         save('removals_applied', { removal_index_failed: true });
@@ -1185,6 +1239,28 @@ class LocalDocumentStore implements DocumentStore {
     } else {
       save('removals_applied', { removal_index_failed: true });
     }
+  }
+
+  private async disposeRecordedRemoval(
+    removal: DocumentStoreRemoval,
+    entry: { staging: string; sha256: string; disposed: boolean }
+  ): Promise<void> {
+    if (entry.disposed !== true || entry.sha256 !== removal.expected_etag) {
+      throw recoveryRequired(`removal of ${removal.path} has no verified disposition`);
+    }
+    if (await readNoteFile(this.vaultRoot, vaultNoteSegments(removal.path), { requireUtf8: false }) !== undefined) {
+      throw recoveryRequired(`absorbed path ${removal.path} reappeared after disposition`);
+    }
+    const stageSegments = [
+      ...vaultNoteSegments(removal.path).slice(0, -1),
+      entry.staging.slice(entry.staging.lastIndexOf('/') + 1), 'absorbed'
+    ];
+    const staged = await readNoteFile(this.vaultRoot, stageSegments, { requireUtf8: false });
+    if (staged !== undefined) {
+      if (staged.hash !== entry.sha256) throw recoveryRequired(`staged copy of ${removal.path} changed after disposition`);
+      await rm(join(entry.staging, 'absorbed'));
+    }
+    await rmdir(entry.staging).catch(() => undefined);
   }
 
   private async runConsolidationFault(
@@ -2388,6 +2464,7 @@ class LocalDocumentStore implements DocumentStore {
       throw error;
     }
     if (await this.findIdCollision(record.id, record.path) !== undefined) return 'skip';
+    await this.revisions.bindCurrent(record.id, record.path, record.revision_id, observed.hash);
     const receipt = await this.finalize(
       record,
       observed,

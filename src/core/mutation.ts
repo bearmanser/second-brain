@@ -1545,7 +1545,7 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     const identity = this.allocate(record, intent, observed);
     const planned = await plan(identity, observed);
     this.assertPlanReadSet(planned);
-    this.bindPlanToIntent(intent, planned);
+    await this.bindPlanToIntent(intent, planned);
     this.deps.operations.update(record.operation_id, {
       plan_json: JSON.stringify(planned),
       storage_key: JSON.stringify(this.storageKeys(record.idempotency_key, planned)),
@@ -1772,7 +1772,32 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     }
     const specs = this.subordinateSpecs(plan);
     const expectedKeys = specs.map((spec) => `${record.idempotency_key}:${spec.key}`);
-    if (JSON.stringify(legacyKeys) !== JSON.stringify(expectedKeys)) {
+    let compatibleConsolidation = false;
+    if (plan.kind === 'note' && specs.length === 1 && specs[0].kind === 'consolidation') {
+      const former = plan.effects.map((effect, index) =>
+        `${record.idempotency_key}:${effect.kind === 'move' ? 'move' : 'doc'}:${index}`);
+      former.push(`${record.idempotency_key}:consolidate:primary`,
+        `${record.idempotency_key}:consolidate:manifest`);
+      (plan.reference_edits ?? []).forEach((_edit, index) => former.push(`${record.idempotency_key}:ref:${index}`));
+      compatibleConsolidation = JSON.stringify(legacyKeys) === JSON.stringify(former) &&
+        this.deps.documents.hasConsolidationManifest?.(expectedKeys[0]) === true;
+      if (compatibleConsolidation) {
+        const primary = plan.effects.find((effect) => effect.kind === 'write');
+        const put = this.deps.documents.getDocumentReceipt(`${record.idempotency_key}:consolidate:primary`);
+        const consolidated = this.deps.documents.getConsolidationReceipt(expectedKeys[0]);
+        if (primary?.kind !== 'write' ||
+            (put !== undefined && (put.id !== primary.write.id || put.revision_id !== primary.write.revision_id ||
+              put.path !== primary.write.path)) ||
+            (consolidated !== undefined && (consolidated.id !== primary.write.id ||
+              consolidated.revision_id !== primary.write.revision_id || consolidated.path !== primary.write.path)) ||
+            former.filter((key) => key !== `${record.idempotency_key}:consolidate:primary`).some((key) =>
+              this.deps.documents.getDocumentReceipt(key) !== undefined ||
+              this.deps.documents.getMoveReceipt(key) !== undefined)) {
+          compatibleConsolidation = false;
+        }
+      }
+    }
+    if (JSON.stringify(legacyKeys) !== JSON.stringify(expectedKeys) && !compatibleConsolidation) {
       throw localRecovery(
         'the legacy subordinate linkage does not match this plan and cannot be rebound safely'
       );
@@ -1836,7 +1861,7 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     return this.subordinateSpecs(plan).map((spec) => `${key}:${spec.key}`);
   }
 
-  private bindPlanToIntent(intent: LocalOperationIntent, plan: LocalPlannedOperation): void {
+  private async bindPlanToIntent(intent: LocalOperationIntent, plan: LocalPlannedOperation): Promise<void> {
     if (plan.kind !== 'note') return;
     const preconditions = preconditionsOf(intent);
     if (intent.action === 'resolve') {
@@ -1856,11 +1881,30 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
       }
     }
     if (intent.action === 'supersede') {
-      const replacementId = intent.payload.replacement_id;
-      if (!plan.read_set.some((condition) => condition.kind === 'note' &&
-          condition.id === replacementId && condition.expected.kind === 'present' &&
-          condition.expected.revision_id.length > 0 && condition.expected.etag.length > 0)) {
-        throw localInvalid('the supersede plan must bind its replacement identity and revision');
+      let replacementId: string | undefined = intent.payload.replacement_id;
+      const visited = new Set([intent.payload.id]);
+      while (replacementId !== undefined) {
+        if (visited.has(replacementId)) throw localConflict('the supersession chain contains a cycle');
+        visited.add(replacementId);
+        const heads = await this.resolveConflictHeads(replacementId);
+        if (heads.length !== 1 || heads[0].revision_id.length === 0) {
+          throw localConflict(`replacement ${replacementId} has no unique durable current revision`);
+        }
+        const head = heads[0];
+        if (!plan.read_set.some((condition) => condition.kind === 'note' &&
+            condition.id === replacementId && condition.expected.kind === 'present' &&
+            condition.expected.path === head.path && condition.expected.revision_id === head.revision_id &&
+            condition.expected.etag === head.etag)) {
+          throw localInvalid(`the supersede plan must bind replacement ${replacementId} and its revision`);
+        }
+        const file = await this.readPathOrUndefined(head.path);
+        if (file === undefined) throw localConflict(`replacement ${replacementId} disappeared`);
+        const parsed = parseDocument(file.raw, head.path);
+        const next = parsed.properties.replacement_id ?? parsed.properties.brain_replacement_id;
+        if (parsed.status === 'superseded' && (typeof next !== 'string' || next.length === 0)) {
+          throw localRecovery(`replacement ${replacementId} has an incomplete supersession chain`);
+        }
+        replacementId = typeof next === 'string' ? next : undefined;
       }
     }
     if (preconditions.etag !== undefined) {
@@ -2278,6 +2322,17 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     }
     if (plan.kind === 'note' && !plan.effects.some((effect) => effect.kind === 'remove')) {
       for (const [index, effect] of plan.effects.entries()) {
+        if (effect.kind === 'move' && effect.write !== undefined &&
+            this.recordedEffect(record, index + 1000) === undefined) {
+          const write = this.deps.documents.getDocumentReceipt(`${record.idempotency_key}:doc:${index + 1000}`);
+          if (write !== undefined) {
+            this.recordEffect(record, index + 1000, {
+              path: write.path, etag: write.etag, id: write.id,
+              revision_id: write.revision_id, document_complete: true
+            });
+            this.linkSubordinate(record, index + 1000, write.operation_id);
+          }
+        }
         if (this.recordedEffect(record, index) !== undefined) continue;
         if (effect.kind === 'write' || effect.kind === 'adopt') {
           const stored = this.deps.documents.getDocumentReceipt(
@@ -2300,16 +2355,14 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
             `${record.idempotency_key}:move:${index}`
           );
           if (stored !== undefined) {
-            const destination = await this.readPathOrUndefined(stored.to);
-            if (destination !== undefined) {
-              this.recordEffect(record, index, {
-                path: stored.to,
-                etag: destination.etag,
-                id: destination.id,
-                revision_id: destination.revision_id,
-                document_complete: true
-              });
+            if (stored.to !== effect.to_path || stored.from !== effect.from_path || !stored.verified) {
+              throw localRecovery(`move ${index} does not match its persisted plan`);
             }
+            this.recordEffect(record, index, {
+              path: stored.to,
+              etag: this.originalMoveEtag(record, plan, effect, index),
+              document_complete: true
+            });
             this.linkSubordinate(record, index, stored.operation_id);
           }
         }
@@ -2342,9 +2395,10 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
       }
     } else {
       if (!this.preconditionsValidated(this.liveRecord(record)) &&
-          !Object.values(this.readProgress(this.liveRecord(record)).effects ?? {}).every(
-            (effect) => effect.document_complete === true
-          )) {
+          !(plan.kind === 'note' && plan.effects.every((effect, index) =>
+            this.recordedEffect(record, index)?.document_complete === true &&
+            (effect.kind !== 'move' || effect.write === undefined ||
+              this.recordedEffect(record, index + 1000)?.document_complete === true)))) {
         throw localRecovery('an applied effect has no durable validated-preconditions boundary');
       }
       await this.verifyPartial(record, plan);
@@ -2358,8 +2412,13 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
   ): Promise<void> {
     const effects = this.readProgress(this.liveRecord(record)).effects ?? {};
     const allComplete = plan.kind === 'note' && plan.effects.length > 0 &&
-      plan.effects.every((_effect, index) => effects[String(index)]?.document_complete === true);
+      plan.effects.every((effect, index) => effects[String(index)]?.document_complete === true &&
+        (effect.kind !== 'move' || effect.write === undefined ||
+          effects[String(index + 1000)]?.document_complete === true));
     for (const [index, postcondition] of Object.entries(effects)) {
+      if (plan.kind === 'note' && Number(index) < plan.effects.length &&
+          plan.effects[Number(index)]?.kind === 'move' &&
+          effects[String(Number(index) + 1000)] !== undefined) continue;
       if (allComplete && postcondition.document_complete === true) continue;
       const current = await this.readPathOrUndefined(postcondition.path);
       if (
@@ -2394,7 +2453,9 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
   ): Promise<LocalOperationReceipt> {
     const effects = this.readProgress(this.liveRecord(record)).effects ?? {};
     const completedDocument = plan.kind === 'note' && plan.effects.length > 0 &&
-      plan.effects.every((_effect, index) => effects[String(index)]?.document_complete === true);
+      plan.effects.every((effect, index) => effects[String(index)]?.document_complete === true &&
+        (effect.kind !== 'move' || effect.write === undefined ||
+          effects[String(index + 1000)]?.document_complete === true));
     if (!this.preconditionsValidated(this.liveRecord(record)) && !completedDocument) {
       throw localRecovery('the plan cannot execute without a durable validated-preconditions boundary');
     }
@@ -2693,14 +2754,33 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     if (effect.write === undefined) throw localInvalid('a move write is required');
     const stored = this.deps.documents.getDocumentReceipt(`${record.idempotency_key}:doc:${index + 1000}`);
     if (stored !== undefined) return stored;
+    const expected = this.originalMoveEtag(record, plan, effect, index);
     const destination = await this.readPathOrUndefined(effect.to_path);
+    if (destination?.etag !== expected) {
+      throw localRecovery(`move ${index} destination changed before its optional write`);
+    }
     const put = await this.putEffect(record, effect.write, plan, index + 1000,
-      effect.write.path === effect.to_path ? destination?.etag : undefined);
+      effect.write.path === effect.to_path ? expected : undefined);
     this.recordEffect(record, index + 1000, {
       path: put.path, etag: put.etag, id: put.id, revision_id: put.revision_id
     });
     this.linkSubordinate(record, index + 1000, put.operation_id);
     return put;
+  }
+
+  private originalMoveEtag(
+    record: LocalOperationRecord,
+    plan: LocalPlannedOperation,
+    effect: Extract<LocalDocumentEffect, { kind: 'move' }>,
+    index: number
+  ): string {
+    const expected = this.expectedEtagFor(effect.from_path, plan.read_set);
+    const persisted = this.storedRename(record, index)?.source_hash;
+    if (effect.write === undefined && persisted !== undefined) return persisted;
+    if (expected === null || (persisted !== undefined && persisted !== expected)) {
+      throw localRecovery(`move ${index} changed from its original source precondition`);
+    }
+    return expected;
   }
 
   private async moveEffect(

@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { lstat, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -10,6 +10,9 @@ import {
 } from '../../src/storage/document-store.js';
 import { vaultSandbox } from '../helpers/vault-sandbox.js';
 import { LocalWriteJournal } from '../../src/storage/journal.js';
+import { openRevisionStore } from '../../src/storage/revision-store.js';
+import { CurrentCatalogue, reconcileCurrentVault } from '../../src/notes/current-catalogue.js';
+import { FileVault } from '../../src/storage/vault.js';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -544,6 +547,31 @@ test('recovery does not catalogue a visible revision missing from durable histor
     await restarted.close();
     await s.dispose();
   }
+});
+
+test('recovery binds the original revision after replacement before catalogue reconciliation', async () => {
+  const s = await vaultSandbox();
+  const id = randomUUID();
+  const revisionId = randomUUID();
+  const path = 'Inbox/Interrupted binding.md';
+  const raw = `---\nid: ${id}\nbrain_schema_version: 2\ntype: note\nstatus: candidate\n---\n\n# Original revision\n`;
+  const store = await openDocumentStore({ vault: s.vault, state: s.state, faults: {
+    afterReplace() { throw new Error('stop before binding'); }
+  } });
+  try {
+    await expect(store.put({ path, raw, expectedEtag: null, idempotencyKey: randomUUID(),
+      source: 'test', revisionId, parents: [] })).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+  } finally { await store.close(); }
+  const restarted = await openDocumentStore({ vault: s.vault, state: s.state });
+  const revisions = await openRevisionStore(s.state);
+  const catalogue = CurrentCatalogue.open({ revisions, ids: { next: () => randomUUID() } });
+  try {
+    await restarted.recover();
+    await reconcileCurrentVault({ vault: new FileVault(s.vault, []), catalogue });
+    expect(await revisions.currentBinding(id, path, createHash('sha256').update(raw).digest('hex'))).toBe(revisionId);
+    expect(catalogue.getByPath(path)?.revision_id).toBe(revisionId);
+    expect((await restarted.readRevision(id, revisionId)).raw).toBe(raw);
+  } finally { catalogue.close(); revisions.close(); await restarted.close(); await s.dispose(); }
 });
 
 test('recovery does not catalogue a revision with a corrupt history sidecar', async () => {

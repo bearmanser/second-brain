@@ -619,3 +619,79 @@ test('an optional post-move write reserves and links its own document operation 
     expect(await brain.coordinator.run(intent, plan)).toEqual(receipt);
   } finally { await brain.dispose(); }
 });
+
+test('a pending optional move write cannot replace a human-edited destination on recovery', async () => {
+  const brain = await openBrain();
+  try {
+    const key = randomUUID();
+    const id = randomUUID();
+    const from = 'Inbox/Source.md';
+    const to = 'Inbox/Target.md';
+    const seeded = await brain.store.put({ path: from, raw: managed(id, 'original'), expectedEtag: null,
+      idempotencyKey: `${key}:seed`, source: 'test_seed' });
+    const updated = managed(id, 'intended write');
+    const edited = managed(id, 'human edit');
+    const intent: LocalOperationIntent = { tool: 'brain_review', action: 'move', project_id: null, idempotency_key: key,
+      payload: { action: 'move', idempotency_key: key, id, target_path: to, expected_etag: seeded.etag, rationale: 'relocate' },
+      preconditions: { id, etag: seeded.etag, target_path: to } };
+    const plan: LocalOperationPlan = () => ({ kind: 'note', heads: [], parents: [], read_set: [
+      { kind: 'note', id, expected: { kind: 'present', path: from, etag: seeded.etag, revision_id: seeded.revision_id } },
+      { kind: 'path', path: to, expected: { kind: 'absent' } }
+    ], effects: [{ kind: 'move', from_path: from, to_path: to,
+      write: { path: to, id, revision_id: randomUUID(), raw: updated,
+        parents: [{ revision_id: seeded.revision_id, raw_hash: seeded.etag }] } }] });
+    await brain.store.close();
+    brain.store = await openDocumentStore({ vault: brain.vaultRoot, state: brain.state,
+      faults: { beforeReplace: () => { throw new Error('interrupt optional write'); } } });
+    brain.coordinator = makeCoordinator(brain);
+    await expect(brain.coordinator.run(intent, plan)).rejects.toBeDefined();
+    expect(brain.store.getMoveReceipt(`${key}:move:0`)).toBeDefined();
+    expect(brain.store.getDocumentReceipt(`${key}:doc:1000`)).toBeUndefined();
+    await writeFile(join(brain.vaultRoot, to), edited);
+    await brain.reopen();
+    const report = await brain.coordinator.recover();
+    expect(report.finalized).toBe(0);
+    expect(brain.operations.findByKey(key)?.receipt_json).toBeNull();
+    expect((await brain.store.readPath(to)).raw).toBe(edited);
+  } finally { await brain.dispose(); }
+});
+
+test.each([
+  { label: 'after human destination edit', validated: true, edited: true },
+  { label: 'without validated preconditions', validated: false, edited: false }
+])('a completed move with an unstarted optional write stays blocked $label', async ({ validated, edited: humanEdit }) => {
+  const brain = await openBrain();
+  try {
+    const key = randomUUID();
+    const id = randomUUID();
+    const from = 'Inbox/Source.md';
+    const to = 'Inbox/Target.md';
+    const seeded = await brain.store.put({ path: from, raw: managed(id, 'original'), expectedEtag: null,
+      idempotencyKey: `${key}:seed`, source: 'test_seed' });
+    const planned = { kind: 'note' as const, heads: [], parents: [], read_set: [
+      { kind: 'note' as const, id, expected: { kind: 'present' as const, path: from,
+        etag: seeded.etag, revision_id: seeded.revision_id } },
+      { kind: 'path' as const, path: to, expected: { kind: 'absent' as const } }
+    ], effects: [{ kind: 'move' as const, from_path: from, to_path: to,
+      write: { path: to, id, revision_id: randomUUID(), raw: managed(id, 'intended write'),
+        parents: [{ revision_id: seeded.revision_id, raw_hash: seeded.etag }] } }] };
+    const move = planRename({ from, to, files: await collectRenameSnapshots(brain.vaultRoot),
+      idempotency_key: `${key}:move:0` });
+    await brain.store.applyRename(move);
+    const now = new Date().toISOString();
+    const operation = brain.operations.reserve({ operation_id: randomUUID(), idempotency_key: key,
+      tool: 'brain_review', action: 'move', project_id: null, payload_hash: 'a'.repeat(64),
+      payload_json: '{}', created_at: now, updated_at: now }).record;
+    brain.operations.update(operation.operation_id, { plan_json: JSON.stringify(planned),
+      storage_key: JSON.stringify([`${key}:move:0`, `${key}:doc:1000`]),
+      progress_json: JSON.stringify({ preconditions_validated: validated }), updated_at: now });
+    const edited = managed(id, 'human edit');
+    if (humanEdit) await writeFile(join(brain.vaultRoot, to), edited);
+    await brain.reopen();
+    const report = await brain.coordinator.recover();
+    expect(report.finalized).toBe(0);
+    expect(brain.operations.findByKey(key)?.receipt_json).toBeNull();
+    expect(brain.store.getDocumentReceipt(`${key}:doc:1000`)).toBeUndefined();
+    expect((await brain.store.readPath(to)).raw).toBe(humanEdit ? edited : managed(id, 'original'));
+  } finally { await brain.dispose(); }
+});

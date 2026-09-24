@@ -14,6 +14,8 @@ import type {
 } from '../../src/core/types.js';
 import { CurrentCatalogue, reconcileCurrentVault } from '../../src/notes/current-catalogue.js';
 import { openSearchIndex } from '../../src/storage/search-index.js';
+import { localRecall, type LocalBrain } from '../../src/features/local-brain.js';
+import { reviewerContext } from '../fixtures/principals.js';
 import {
   openDocumentStore,
   type DocumentIndex,
@@ -687,6 +689,12 @@ test('a recreated absorbed path keeps the operation recovery-blocking', async ()
       ground.coordinator.run(resolveIntent(key, id, expected), resolvePlan(spec))
     ).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
     expect((await ground.store.readPath('Knowledge/B.md')).raw).toContain('branch B');
+    await ground.reopenStore();
+    const report = await ground.coordinator.recover();
+    expect(report.finalized).toBe(0);
+    expect(report.blocking_operations).toContain(ground.operations.findByKey(key)?.operation_id);
+    expect((await ground.store.readPath('Knowledge/B.md')).raw).toContain('branch B');
+    expect((await ground.revisions.readRevision(id, b.revisionId)).raw).toBe(b.raw);
   } finally {
     await ground.dispose();
   }
@@ -731,9 +739,135 @@ test('a symlink substituted at the absorbed path discards no bytes', async () =>
     expect((await ground.store.readPath('Knowledge/A.md')).raw).toContain('resolved');
     expect(await readFile(join(ground.vaultRoot, 'Knowledge/Protected.md'), 'utf8')).toBe(protectedRaw);
     expect((await ground.revisions.readRevision(id, b.revisionId)).raw).toBe(b.raw);
+    await ground.reopenStore();
+    const report = await ground.coordinator.recover();
+    expect(report.finalized).toBe(0);
+    expect(report.blocking_operations).toContain(ground.operations.findByKey(key)?.operation_id);
+    expect(await readFile(join(ground.vaultRoot, 'Knowledge/Protected.md'), 'utf8')).toBe(protectedRaw);
+    expect((await ground.revisions.readRevision(id, b.revisionId)).raw).toBe(b.raw);
   } finally {
     await ground.dispose();
   }
+});
+
+test('a third identity arriving after installation prevents a consolidation receipt', async () => {
+  const { ground, id, a, b } = await twoHeadGround();
+  try {
+    const key = randomUUID();
+    const spec: ResolveSpec = { id, survivorPath: 'Knowledge/A.md', survivorEtag: a.hash,
+      removalPaths: [{ path: 'Knowledge/B.md', id, revisionId: b.revisionId, etag: b.hash }],
+      resolutionRaw: managed(id, 'resolved'), resolutionRevision: randomUUID() };
+    const heads = await ground.coordinator.enumerateConflictHeads(id);
+    const third = managed(id, 'unexpected third');
+    await ground.store.close();
+    ground.store = await openDocumentStore({ vault: ground.vaultRoot, state: ground.sandbox.state,
+      faults: { consolidation: { afterRemovalProgress: async () => {
+        await writeFile(join(ground.vaultRoot, 'Knowledge/Third.md'), third);
+      } } } });
+    ground.coordinator = makeCoordinator(ground);
+    await expect(ground.coordinator.run(resolveIntent(key, id, heads.map((head) => ({
+      revision_id: head.revision_id, etag: head.etag }))), resolvePlan(spec)))
+      .rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(ground.store.getConsolidationReceipt(`${key}:consolidate`)).toBeUndefined();
+    expect(await readFile(join(ground.vaultRoot, 'Knowledge/Third.md'), 'utf8')).toBe(third);
+  } finally { await ground.dispose(); }
+});
+
+test('a crash after staged-copy disposal resumes from durable disposition', async () => {
+  const { ground, id, a, b } = await twoHeadGround();
+  try {
+    const key = randomUUID();
+    const spec: ResolveSpec = { id, survivorPath: 'Knowledge/A.md', survivorEtag: a.hash,
+      removalPaths: [{ path: 'Knowledge/B.md', id, revisionId: b.revisionId, etag: b.hash }],
+      resolutionRaw: managed(id, 'resolved'), resolutionRevision: randomUUID() };
+    const heads = await ground.coordinator.enumerateConflictHeads(id);
+    await ground.store.close();
+    ground.store = await openDocumentStore({ vault: ground.vaultRoot, state: ground.sandbox.state,
+      faults: { consolidation: { afterRemovalDispose: () => { throw new Error('crash after disposal'); } } } });
+    ground.coordinator = makeCoordinator(ground);
+    await expect(ground.coordinator.run(resolveIntent(key, id, heads.map((head) => ({
+      revision_id: head.revision_id, etag: head.etag }))), resolvePlan(spec))).rejects.toBeDefined();
+    await ground.reopenStore();
+    expect((await ground.coordinator.recover()).finalized).toBe(1);
+    expect((await ground.store.readPath('Knowledge/A.md')).raw).toBe(spec.resolutionRaw);
+    await expect(ground.store.readPath('Knowledge/B.md')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect((await ground.revisions.readRevision(id, b.revisionId)).raw).toBe(b.raw);
+  } finally { await ground.dispose(); }
+});
+
+test('a persisted legacy consolidation key array rebinds only its original batch', async () => {
+  const { ground, id, a, b } = await twoHeadGround();
+  try {
+    const key = randomUUID();
+    const spec: ResolveSpec = { id, survivorPath: 'Knowledge/A.md', survivorEtag: a.hash,
+      removalPaths: [{ path: 'Knowledge/B.md', id, revisionId: b.revisionId, etag: b.hash }],
+      resolutionRaw: managed(id, 'resolved'), resolutionRevision: randomUUID() };
+    const expected = (await ground.coordinator.enumerateConflictHeads(id)).map(({ revision_id, etag }) => ({ revision_id, etag }));
+    const receipt = await ground.coordinator.run(resolveIntent(key, id, expected), resolvePlan(spec));
+    ground.operations.deleteSubordinates(receipt.operation_id);
+    ground.operations.update(receipt.operation_id, { state: 'pending', receipt_json: null,
+      storage_key: JSON.stringify([`${key}:doc:0`, `${key}:doc:1`,
+        `${key}:consolidate:primary`, `${key}:consolidate:manifest`]),
+      updated_at: new Date().toISOString() });
+    await ground.reopenStore();
+    expect(await ground.coordinator.run(resolveIntent(key, id, expected), resolvePlan(spec))).toEqual(receipt);
+    expect(ground.operations.listSubordinates(receipt.operation_id)).toMatchObject([
+      { key: `${key}:consolidate`, document_operation_id: expect.any(String) }
+    ]);
+    expect((await ground.revisions.readRevision(id, b.revisionId)).raw).toBe(b.raw);
+  } finally { await ground.dispose(); }
+});
+
+test('a legacy consolidation key colliding with another document operation cannot be rebound', async () => {
+  const { ground, id, a, b } = await twoHeadGround();
+  try {
+    const key = randomUUID();
+    const spec: ResolveSpec = { id, survivorPath: 'Knowledge/A.md', survivorEtag: a.hash,
+      removalPaths: [{ path: 'Knowledge/B.md', id, revisionId: b.revisionId, etag: b.hash }],
+      resolutionRaw: managed(id, 'resolved'), resolutionRevision: randomUUID() };
+    const expected = (await ground.coordinator.enumerateConflictHeads(id)).map(({ revision_id, etag }) => ({ revision_id, etag }));
+    const receipt = await ground.coordinator.run(resolveIntent(key, id, expected), resolvePlan(spec));
+    const otherId = randomUUID();
+    await ground.store.put({ path: 'Knowledge/Unrelated.md', raw: managed(otherId, 'other'),
+      expectedEtag: null, idempotencyKey: `${key}:doc:0`, source: 'test' });
+    ground.operations.deleteSubordinates(receipt.operation_id);
+    ground.operations.update(receipt.operation_id, { state: 'pending', receipt_json: null,
+      storage_key: JSON.stringify([`${key}:doc:0`, `${key}:doc:1`,
+        `${key}:consolidate:primary`, `${key}:consolidate:manifest`]),
+      updated_at: new Date().toISOString() });
+    await expect(ground.coordinator.run(resolveIntent(key, id, expected), resolvePlan(spec)))
+      .rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(ground.operations.listSubordinates(receipt.operation_id)).toEqual([]);
+    expect((await ground.store.readPath('Knowledge/Unrelated.md')).id).toBe(otherId);
+  } finally { await ground.dispose(); }
+});
+
+test('V2 recall excludes a matching intermediate survivor while consolidation is incomplete', async () => {
+  const { ground, id, a, b } = await twoHeadGround();
+  const index = openSearchIndex(':memory:');
+  try {
+    const key = randomUUID();
+    const spec: ResolveSpec = { id, survivorPath: 'Knowledge/A.md', survivorEtag: a.hash,
+      removalPaths: [{ path: 'Knowledge/B.md', id, revisionId: b.revisionId, etag: b.hash }],
+      resolutionRaw: managed(id, 'intermediate marker'), resolutionRevision: randomUUID() };
+    const expected = (await ground.coordinator.enumerateConflictHeads(id)).map(({ revision_id, etag }) => ({ revision_id, etag }));
+    await ground.store.close();
+    ground.store = await openDocumentStore({ vault: ground.vaultRoot, state: ground.sandbox.state,
+      faults: { consolidation: { afterRemovalProgress: () => { throw new Error('stop at staged removal'); } } } });
+    ground.coordinator = makeCoordinator(ground);
+    await expect(ground.coordinator.run(resolveIntent(key, id, expected), resolvePlan(spec))).rejects.toBeDefined();
+    index.upsert({ path: 'Knowledge/A.md', id, revision_id: spec.resolutionRevision,
+      raw: spec.resolutionRaw, etag: sha256(spec.resolutionRaw) });
+    expect(index.candidates({ query: 'intermediate', limit: 10, statuses: ['candidate'] })
+      .some((hit) => hit.path === 'Knowledge/A.md')).toBe(true);
+    await ground.refresh();
+    expect(ground.catalogue.getByPath('Knowledge/A.md')?.hash).toBe(sha256(spec.resolutionRaw));
+    const brain = { config: { scopes: [] }, clock, ids, documents: ground.store,
+      catalogue: ground.catalogue, index, journal: { listProjects: () => [] }, vault: new FileVault(ground.vaultRoot, []),
+      vaultRoot: ground.vaultRoot } as unknown as LocalBrain;
+    const found = await localRecall(reviewerContext, { query: 'intermediate', include_candidates: true }, brain);
+    expect(found.items).toEqual([]);
+  } finally { index.close(); await ground.dispose(); }
 });
 
 test('a three-head fork consolidates with all parents and history retained', async () => {
@@ -939,6 +1073,8 @@ test('failed removal from an existing index remains pending until durable retry 
     const b = await writeManaged(ground, id, 'Knowledge/B.md', managed(id, 'b'), parents);
     index.upsert({ path: 'Knowledge/B.md', raw: b.raw, etag: b.hash, id, revision_id: b.revisionId });
     expect(index.paths()).toContain('Knowledge/B.md');
+    expect(index.candidates({ query: 'b', limit: 10, statuses: ['candidate'] })
+      .some((hit) => hit.path === 'Knowledge/B.md')).toBe(true);
     await ground.refresh();
     const expected = (await ground.coordinator.enumerateConflictHeads(id)).map(({ revision_id, etag }) => ({ revision_id, etag }));
     const receipt = await ground.coordinator.run(resolveIntent(randomUUID(), id, expected), resolvePlan({
@@ -947,6 +1083,14 @@ test('failed removal from an existing index remains pending until durable retry 
       resolutionRaw: managed(id, 'resolved'), resolutionRevision: randomUUID()
     }));
     expect(receipt).toMatchObject({ kind: 'note', indexed: false });
+    index.upsert({ path: 'Knowledge/B.md', raw: b.raw, etag: b.hash, id, revision_id: b.revisionId });
+    expect(index.paths()).toContain('Knowledge/B.md');
+    expect(ground.store.recallExclusions().paths.has('Knowledge/B.md')).toBe(true);
+    const brain = { config: { scopes: [] }, clock, ids, documents: ground.store,
+      catalogue: ground.catalogue, index, journal: { listProjects: () => [] },
+      vault: new FileVault(ground.vaultRoot, []), vaultRoot: ground.vaultRoot } as unknown as LocalBrain;
+    const pendingRecall = await localRecall(reviewerContext, { query: 'b', include_candidates: true }, brain);
+    expect(pendingRecall.items.some((item) => item.relative_path === 'Knowledge/B.md')).toBe(false);
     const unresolved = await ground.store.recover();
     expect(unresolved.pending).toContain('Knowledge/B.md');
     failRemoval = false;

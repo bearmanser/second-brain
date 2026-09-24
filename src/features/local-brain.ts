@@ -18,7 +18,7 @@ import { collectRenameSnapshots, planRename } from '../notes/rename.js';
 import { indexReconciledDocuments } from '../notes/reconcile.js';
 import { normalizeRepositoryIdentity, scopeCandidateForRepository } from '../projects/identity.js';
 import type { DocumentStore } from '../storage/document-store.js';
-import type { Journal } from '../storage/journal.js';
+import type { Journal, LocalOperationJournal } from '../storage/journal.js';
 import type { SearchIndex } from '../storage/search-index.js';
 import type {
   AuthenticatedContext,
@@ -96,6 +96,7 @@ export interface LocalBrain {
   catalogue: CurrentCatalogue;
   index: SearchIndex;
   journal: Journal;
+  operations?: LocalOperationJournal;
   vault: CurrentVault;
   vaultRoot: string;
   worker?: RerankWorker;
@@ -299,6 +300,25 @@ export async function localRecall(
     ...(input.kinds === undefined || input.kinds.length === 0 ? {} : { types: input.kinds }),
     statuses
   });
+  const excluded = brain.documents.recallExclusions();
+  for (const record of brain.operations?.listIncomplete() ?? []) {
+    if (record.plan_json === null) continue;
+    let plan: { kind?: string; heads?: { id: string; path: string }[];
+      effects?: { kind: string; path?: string; write?: { path: string }; from_path?: string; to_path?: string }[];
+      reference_edits?: { path: string }[] };
+    try { plan = JSON.parse(record.plan_json) as typeof plan; }
+    catch (error) { throw new BrainError({ code: 'RECOVERY_REQUIRED', message: 'pending recall exclusion plan is unreadable', cause: error }); }
+    if (plan.kind !== 'note') continue;
+    for (const head of plan.heads ?? []) { excluded.ids.add(head.id); excluded.paths.add(head.path); }
+    for (const effect of plan.effects ?? []) {
+      for (const path of [effect.path, effect.write?.path, effect.from_path, effect.to_path]) {
+        if (path !== undefined) excluded.paths.add(path);
+      }
+    }
+    for (const edit of plan.reference_edits ?? []) excluded.paths.add(edit.path);
+  }
+  candidates = candidates.filter((candidate) => !excluded.paths.has(candidate.path) &&
+    !excluded.ids.has(candidate.id ?? ''));
   if (project !== undefined) {
     const allowed = new Set([project]);
     if (scope.selected_shared) allowed.add(LEGACY_SHARED_CATEGORY);
@@ -331,6 +351,7 @@ export async function localRecall(
   const items: (SourceRef & { excerpt: string; reasons: string[] })[] = [];
   let staleExcluded = false;
   for (const candidate of selected) {
+    if (excluded.paths.has(candidate.path) || excluded.ids.has(candidate.id ?? '')) continue;
     const source = brain.catalogue.getByPath(candidate.path);
     if (source === undefined || source.hash !== candidate.source_hash) {
       staleExcluded = true;
