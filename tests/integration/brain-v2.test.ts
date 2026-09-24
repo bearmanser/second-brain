@@ -227,12 +227,37 @@ test('one token runs the whole lifecycle on the local V2 store', async () => {
     });
     expect(feedback.recorded).toBe(true);
 
+    const afterFeedback = await services.read(ctx, { id: captured.id });
+    expect(afterFeedback.source.revision_id).toBe(moved.revision_id);
+
     const status = await services.status(ctx, {});
     expect(status.protocol).toBe(2);
     expect(status.local?.index.state).toBe('ready');
     expect(status.features?.text_search).toBe(true);
-    const serialized = JSON.stringify(status);
-    expect(serialized).not.toMatch(/permission|can_read|can_write|can_review|authorized_scopes/);
+
+    const results: unknown[] = [
+      ensured,
+      captured,
+      approved,
+      recalled,
+      readById,
+      readByPath,
+      revised,
+      current,
+      moved,
+      feedback,
+      afterFeedback,
+      status
+    ];
+    for (const result of results) {
+      expect(JSON.stringify(result)).not.toMatch(
+        /permission|can_read|can_write|can_review|authorized_scopes/
+      );
+    }
+    expect(ensured).not.toHaveProperty('permissions');
+    expect(ensured).not.toHaveProperty('backend_project');
+    expect(status).not.toHaveProperty('can_write');
+    expect(status).not.toHaveProperty('can_review');
   } finally {
     await brain.dispose();
   }
@@ -319,6 +344,28 @@ test('a reranked request falls back transparently to lexical order without Laya'
     const legacy = await services.recall(ctx, { query: 'fallback marker', mode: 'hybrid' });
     expect(legacy.mode).toBe('text');
     expect(legacy.warnings.join(' ')).toContain('hybrid_deprecated');
+  } finally {
+    await brain.dispose();
+  }
+});
+
+test('a capture with no project routes to the Inbox without a role or grant', async () => {
+  const brain = await startBrain();
+  const ctx = context();
+  const { services } = brain.runtime;
+  try {
+    const captured = receiptOf(
+      await services.capture(ctx, {
+        idempotency_key: randomUUID(),
+        note: note('Inbox note', 'inbox routing marker')
+      })
+    );
+    const read = await services.read(ctx, { id: captured.id });
+    expect(read.source.relative_path.startsWith('Inbox/')).toBe(true);
+    expect(read.markdown).toContain('inbox routing marker');
+    expect(JSON.stringify(read)).not.toMatch(
+      /permission|can_read|can_write|can_review|authorized_scopes/
+    );
   } finally {
     await brain.dispose();
   }

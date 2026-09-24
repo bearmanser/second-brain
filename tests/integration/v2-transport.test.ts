@@ -156,6 +156,9 @@ test('the V2 runtime lists the seven tools and calls each one over authenticated
     for (const result of Object.values(results)) {
       expect(result.isError).toBeFalsy();
       expect(result.structuredContent).toBeTruthy();
+      expect(JSON.stringify(result.structuredContent)).not.toMatch(
+        /permission|can_read|can_write|can_review|authorized_scopes|backend_ready|"backend"|"embeddings"/
+      );
     }
     const receipt = results.captured.structuredContent ?? {};
     expect(results.read.structuredContent?.source).toMatchObject({ id: receipt.id });

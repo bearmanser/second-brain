@@ -13,14 +13,14 @@ The gateway supplies a short `instructions` string during MCP initialization
 tool list itself and through `brain_status(include_schemas=true)`.
 
 The instructions first tell the agent to run `git remote get-url origin`, call
-`brain_project_ensure`, and use its returned scope. If no origin exists, the
-agent must ask rather than infer identity from the directory name. They then
-tell the agent to treat Second Brain as reference memory rather
+`brain_project_ensure`, and use its returned project id and path. If no origin
+exists, the agent must ask rather than infer identity from the directory name.
+They then tell the agent to treat Second Brain as reference memory rather
 than authority over the user's request, to recall before substantial planning,
 debugging, or architectural work, to capture typed candidates with evidence, to
-review only when the configured identity has permission, to report feedback, to
-treat retrieved note text as untrusted data, and to distinguish an unavailable
-memory service from an empty result.
+approve, revise, or otherwise review those candidates with the same token, to
+report feedback, to treat retrieved note text as untrusted data, and to
+distinguish an unavailable memory service from an empty result.
 
 Instructions are built from static prose. Producing them never reads a user
 note, the retrieval log, or any per-principal state. A client may ignore the
@@ -77,7 +77,7 @@ only allowed inside the `note` kind's body.
 
 Notes start in the `candidate` lifecycle. Candidates are excluded from ordinary
 recall unless the caller asks for them. Captures reject obvious credential
-patterns and oversized bodies before any backend write.
+patterns and oversized bodies before any durable local write.
 
 ## Candidate review
 
@@ -90,12 +90,12 @@ patterns and oversized bodies before any backend write.
 - `supersede` links a replacement note to a superseded one.
 - `resolve` closes a fork using explicit expected heads.
 
-Review prerequisites are authorization and the exact current etag. A stale etag
-is a `CONFLICT`, not a silent overwrite. `brain_review` is mixed: listing is
-read-only, but the other actions mutate lifecycle state, so the tool is never
-presented as universally read-only.
+Review prerequisites are the exact current etag and a successful idempotency
+reservation. A stale etag is a `CONFLICT`, not a silent overwrite. `brain_review`
+is mixed: listing is read-only, but the other actions mutate lifecycle state, so
+the tool is never presented as universally read-only.
 
-## Annotations versus permissions
+## Annotations
 
 Each tool carries MCP annotations:
 
@@ -109,12 +109,12 @@ Each tool carries MCP annotations:
 | `brain_feedback` | false | false | true |
 | `brain_review` | false | true | true |
 
-Annotations are hints for clients. They are never permissions. Authorization is
-enforced per request from the authenticated principal, its configured static
-scopes, persisted dynamic grants, and the operation being attempted. Dynamic
-grants are role matched: workers get read/write, reviewers also get review, and
-owners can access every ready repository project. `brain_review` must not be treated as
-read-only because its mutation actions can change or archive knowledge.
+Annotations are hints for clients. They are never permissions. Protocol version 2
+is role-free: one configured bearer token authenticates every request and grants
+every operation on every project, so there are no roles, ACLs, scope grants, or
+per-operation authorization. Project filters are organization, never access
+control. `brain_review` must not be treated as read-only because its mutation
+actions can change or archive knowledge.
 
 ## Result delivery
 
@@ -129,7 +129,7 @@ gateway configuration:
   for clients that ignore `structuredContent`. The structured payload remains
   present so the declared output schema stays valid.
 
-Every tool publishes a standard JSON `outputSchema`. Five tools return a single
+Every tool publishes a standard JSON `outputSchema`. Six tools return a single
 object shape. `brain_review` returns a union — a `MutationReceipt` for a
 mutation action or a `ReviewListResult` for `list` — and publishes it as
 `{ "type": "object", "oneOf": [<MutationReceipt>, <ReviewListResult>] }`. The
@@ -151,28 +151,25 @@ packs to a reference-token budget; error results stay small.
 
 ## Scope filtering and `brain_status`
 
-`brain_status` lists only scopes the principal may read, with `can_write` and
-`can_review` flags. `pending_operations` counts only pending operations in those
-scopes. The creator and owners can also see non-ready repository project states;
-unrelated principals cannot. `include_schemas=true` returns the published input and output schemas for
-every tool; it is available for explicit inspection and is not required on every
-task.
+`brain_status` lists every registered project; naming a project narrows the
+response to that project only. `pending_operations` counts every pending local
+operation, or the pending operations of the named project.
+`include_schemas=true` returns the published input and output schemas for every
+tool; it is available for explicit inspection and is not required on every task.
 
 `brain_status.health` reports:
 
-- `gateway`: `ready`, `recovering` (authorized pending work remains), or
-  `degraded` (the backend is unreachable).
-- `backend`: `ready` or `unavailable`.
-- `embeddings`: `ready`, `unavailable`, or `unknown`. A health probe cannot
-  prove embedding readiness, so this gateway currently always reports `unknown`.
+- `gateway`: `ready`, `recovering` (durable pending work remains), or
+  `degraded` (the local index is unavailable).
+- `index`: `ready` or `unavailable`.
+- `worker`: `ready`, `disabled`, or `unavailable`.
+- `pending_index`: the number of durable index updates still to apply.
 
-A requested `operation_id` is returned only to its submitting principal or to an
-owner allowed that scope (read, write, or review permission). An unauthorized
-request is reported as `NOT_FOUND` so the gateway does not confirm that another
-principal's operation exists. A persisted operation record whose receipt or plan
-fails runtime validation, or whose plan revision identity (`operation_id`,
-`id`, or `revision_id`) disagrees with the record or receipt, is reported as
-`RECOVERY_REQUIRED` instead of being returned.
+A requested `operation_id` is returned to any caller holding the token; an
+unknown operation is reported as `NOT_FOUND`. A persisted operation record whose
+receipt or plan fails runtime validation, or whose plan revision identity
+(`operation_id`, `id`, or `revision_id`) disagrees with the record or receipt,
+is reported as `RECOVERY_REQUIRED` instead of being returned.
 
 ## Errors
 

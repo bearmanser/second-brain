@@ -10,6 +10,8 @@ import {
 } from '../../src/contracts/protocol.js';
 import { notePathSchema, noteInputSchemaV2 } from '../../src/contracts/content.js';
 import { RECALL_MODES } from '../../src/core/types.js';
+import { buildInstructions } from '../../src/mcp/instructions.js';
+import { legacyToolDefinitions, toolDefinitions } from '../../src/mcp/tools.js';
 import { vaultNoteSegments } from '../../src/storage/vault.js';
 
 const ID = '44b093c5-71db-4785-b9a5-bb8118304278';
@@ -255,4 +257,36 @@ test('a leading-space vault segment is an exact, distinct read, move and adopt i
     operation: { action: 'adopt', idempotency_key: ID, path, expected_etag: ETAG, rationale: 'adopt' }
   }).operation).toMatchObject({ path });
   expect(notePathSchema.parse('Knowledge/Laya.md')).not.toBe(path);
+});
+
+test('V2 public tool schemas carry no permission or backend fields while legacy schemas do', () => {
+  const forbidden = /permission|can_read|can_write|can_review|authorized_scopes|backend_ready|backend_project|"embeddings"/;
+  for (const definition of toolDefinitions) {
+    expect(JSON.stringify(definition.outputSchema), definition.name).not.toMatch(forbidden);
+  }
+  const statusV2 = toolDefinitions.find((definition) => definition.name === 'brain_status')?.outputSchema as {
+    properties: { protocol?: unknown; scopes?: unknown; health?: { properties?: Record<string, unknown> } };
+  };
+  expect(statusV2.properties.protocol).toMatchObject({ const: 2 });
+  expect(statusV2.properties).not.toHaveProperty('scopes');
+  expect(statusV2.properties.health?.properties).not.toHaveProperty('backend');
+  expect(statusV2.properties.health?.properties).not.toHaveProperty('embeddings');
+
+  const ensureV1 = legacyToolDefinitions.find(
+    (definition) => definition.name === 'brain_project_ensure'
+  )?.outputSchema as { required?: string[] };
+  expect(ensureV1.required).toContain('backend_ready');
+  const statusV1 = JSON.stringify(
+    legacyToolDefinitions.find((definition) => definition.name === 'brain_status')?.outputSchema
+  );
+  expect(statusV1).toContain('"backend"');
+  expect(statusV1).toContain('"embeddings"');
+});
+
+test('the shipped instructions describe the role-free contract, candidates, fallback, and readable sources', () => {
+  const text = buildInstructions();
+  expect(text).toContain('there are no roles or permissions');
+  expect(text).toContain('typed candidates');
+  expect(text).toContain('fallback');
+  expect(text).toContain('a managed id, a vault-relative path, or an unambiguous title');
 });

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { expect, test } from 'vitest';
 import {
   LEGACY_WARNING_HYBRID_DEPRECATED,
@@ -6,6 +7,54 @@ import {
   normalizeRecallRequest,
   normalizeRecallScope
 } from '../../src/contracts/compatibility.js';
+import { SYSTEM_ACTOR, type AuthenticatedContext, type NoteInput } from '../../src/core/types.js';
+import type { LayaCandidate, LayaScoreResult } from '../../src/retrieval/laya-protocol.js';
+import type { RerankWorker, RerankWorkerHealth } from '../../src/retrieval/reranker.js';
+import { startLocalHttpHarness } from '../support/harness.js';
+
+const WORKER_FINGERPRINT = 'f'.repeat(64);
+
+class StubWorker implements RerankWorker {
+  health(): RerankWorkerHealth {
+    return {
+      state: 'ready',
+      model_fingerprint: WORKER_FINGERPRINT,
+      question_version: 'relevance-2026-09-23.1'
+    };
+  }
+
+  async score(input: {
+    request_id: string;
+    query: string;
+    candidates: readonly LayaCandidate[];
+    signal?: AbortSignal;
+  }): Promise<LayaScoreResult> {
+    return {
+      model_fingerprint: WORKER_FINGERPRINT,
+      question_version: 'relevance-2026-09-23.1',
+      scores: input.candidates.map((candidate) => ({
+        chunk_key: candidate.chunk_key,
+        probabilities: { A: 0.5, B: 0, C: 0.5 },
+        input_tokens: 4,
+        truncated: false
+      }))
+    };
+  }
+}
+
+function localContext(): AuthenticatedContext {
+  return { actor: SYSTEM_ACTOR, request_id: randomUUID(), signal: new AbortController().signal };
+}
+
+function memoryNote(title: string, marker: string): NoteInput {
+  return {
+    title,
+    tags: ['legacy-compat'],
+    content: { kind: 'note', summary: marker, body_markdown: `# ${title}\n\n${marker}\n` },
+    evidence: [],
+    related_ids: []
+  };
+}
 
 const canonical: Record<string, string> = {
   freellmapi: 'freellmapi',
@@ -112,4 +161,103 @@ test('normalizeRecallRequest combines the canonical filter and the executed mode
   expect(normalized.mode).toBe('reranked');
   expect(normalized.warnings.join(' ')).toContain(LEGACY_WARNING_HYBRID_DEPRECATED);
   expect(normalized.warnings).toContain(LEGACY_WARNING_INCLUDE_SHARED_DEPRECATED);
+});
+
+test('legacy scope aliases, include_shared, and hybrid execute against the V2 runtime', async () => {
+  const h = await startLocalHttpHarness({ worker: new StubWorker() });
+  try {
+    const ctx = localContext();
+    const services = h.runtime.services;
+    const marker = `legacy compatibility marker ${randomUUID()}`;
+
+    const projectNote = await services.capture(ctx, {
+      idempotency_key: randomUUID(),
+      project: 'freellmapi',
+      note: memoryNote('Legacy project note', marker)
+    });
+    await services.review(ctx, {
+      operation: {
+        action: 'approve',
+        idempotency_key: randomUUID(),
+        id: projectNote.id,
+        expected_etag: projectNote.etag as string,
+        rationale: 'approve the legacy project note'
+      }
+    });
+
+    const sharedNote = await services.capture(ctx, {
+      idempotency_key: randomUUID(),
+      project: 'shared',
+      note: memoryNote('Legacy shared note', marker)
+    });
+    await services.review(ctx, {
+      operation: {
+        action: 'approve',
+        idempotency_key: randomUUID(),
+        id: sharedNote.id,
+        expected_etag: sharedNote.etag as string,
+        rationale: 'approve the legacy shared note'
+      }
+    });
+
+    const whole = await services.recall(ctx, { query: marker });
+    const ids = (result: { items: { id: string }[] }): string[] =>
+      [...new Set(result.items.map((item) => item.id))].sort();
+    expect(ids(whole)).toEqual([projectNote.id, sharedNote.id].sort());
+
+    const narrowed = await services.recall(ctx, { scope: 'freellmapi', query: marker });
+    expect(ids(narrowed)).toEqual([projectNote.id]);
+
+    const alias = await services.recall(ctx, { scope: 'free-llm-api', query: marker });
+    expect(ids(alias)).toEqual([projectNote.id]);
+
+    const withShared = await services.recall(ctx, {
+      scope: 'freellmapi',
+      include_shared: true,
+      query: marker
+    });
+    expect(withShared.warnings).toContain(LEGACY_WARNING_INCLUDE_SHARED_DEPRECATED);
+    expect(ids(withShared)).toEqual([projectNote.id, sharedNote.id].sort());
+    expect(withShared.partial).toBe(false);
+
+    const hybrid = await services.recall(ctx, { query: marker, mode: 'hybrid' });
+    expect(hybrid.mode).toBe('reranked');
+    expect(hybrid.warnings.some((warning) => warning.startsWith(LEGACY_WARNING_HYBRID_DEPRECATED))).toBe(
+      true
+    );
+  } finally {
+    await h.close();
+  }
+});
+
+test('an unknown legacy scope fails clearly on the V2 runtime and never widens the search', async () => {
+  const h = await startLocalHttpHarness();
+  try {
+    const ctx = localContext();
+    const services = h.runtime.services;
+    const marker = `unknown scope marker ${randomUUID()}`;
+    const receipt = await services.capture(ctx, {
+      idempotency_key: randomUUID(),
+      project: 'freellmapi',
+      note: memoryNote('Unknown scope note', marker)
+    });
+    await services.review(ctx, {
+      operation: {
+        action: 'approve',
+        idempotency_key: randomUUID(),
+        id: receipt.id,
+        expected_etag: receipt.etag as string,
+        rationale: 'approve before the unknown-scope recall'
+      }
+    });
+
+    const whole = await services.recall(ctx, { query: marker });
+    expect(whole.items.map((item) => item.id)).toContain(receipt.id);
+
+    await expect(services.recall(ctx, { scope: 'ghost-project', query: marker })).rejects.toMatchObject({
+      code: 'NOT_FOUND'
+    });
+  } finally {
+    await h.close();
+  }
 });
