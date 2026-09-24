@@ -23,7 +23,8 @@ import {
   reconcile,
   resolveProjectId,
   scopeForPath,
-  sourceRef
+  sourceRef,
+  mutationReceipt
 } from './local-support.js';
 import type {
   AuthenticatedContext,
@@ -337,11 +338,24 @@ export async function localStatus(
     }));
   }
   if (input.operation_id !== undefined) {
-    const record = brain.journal.get(input.operation_id);
-    if (record === undefined) throw notFound('the requested operation is not available');
-    if (record.receipt_json !== undefined) {
-      result.operation = JSON.parse(record.receipt_json) as MutationReceipt;
+    const status = (await buildLocalHandlerDeps(brain)).mutations.status(input.operation_id);
+    if (status === undefined) throw notFound('the requested operation is not available');
+    if (selectedId !== undefined && status.project_id !== selectedId) {
+      throw notFound('the requested operation is not available in this project');
     }
+    if (status.receipt?.kind === 'note') result.operation = mutationReceipt(status.receipt);
+    else if (status.receipt?.kind === 'project_ensure') {
+      result.operation = {
+        operation_id: status.receipt.operation_id,
+        repository_identity: status.receipt.repository_identity,
+        scope: status.receipt.project_id,
+        project_id: status.receipt.project_id,
+        relative_root: status.receipt.relative_root,
+        created: status.receipt.created,
+        materialized: status.receipt.materialized,
+        warnings: status.receipt.warnings
+      } as StatusResult['operation'];
+    } else if (status.receipt !== undefined) result.operation = status.receipt as unknown as StatusResult['operation'];
   }
   if (input.include_schemas === true) {
     result.schemas = {};

@@ -174,7 +174,7 @@ export function mutationReceipt(
     materialized: true,
     indexed: result.indexed,
     etag: result.etag,
-    possible_duplicates: [],
+    possible_duplicates: result.possible_duplicates ?? [],
     warnings: [...result.warnings, ...warnings]
   };
 }
@@ -304,10 +304,20 @@ export interface LocalHandlerOverrides {
   mutations?: LocalHandlerDeps['mutations'];
 }
 
+const sharedLocalDeps = new WeakMap<LocalBrain, Promise<LocalHandlerDeps>>();
+
 export async function buildLocalHandlerDeps(
   brain: LocalBrain,
   overrides: LocalHandlerOverrides = {}
 ): Promise<LocalHandlerDeps> {
+  if (Object.keys(overrides).length === 0) {
+    const cached = sharedLocalDeps.get(brain);
+    if (cached !== undefined) return cached;
+    const pending = buildLocalHandlerDeps(brain, { operations: brain.operations });
+    sharedLocalDeps.set(brain, pending);
+    try { return await pending; }
+    catch (error) { sharedLocalDeps.delete(brain); throw error; }
+  }
   const operations = overrides.operations ?? brain.operations;
   if (operations === undefined) {
     throw recoveryRequired('the local operation journal is not configured');
@@ -325,7 +335,9 @@ export async function buildLocalHandlerDeps(
       ids: brain.ids,
       revisions,
       projects: {
-        getProjectByIdentity: (identity) => brain.journal.getProjectByIdentity(identity)
+        getProjectByIdentity: (identity) => brain.journal.getProjectByIdentity(identity),
+        reserveProject: (input) => brain.journal.reserveProject(input),
+        markProjectReady: (id) => brain.journal.markProjectReady(id)
       }
     });
   return {

@@ -513,13 +513,12 @@ export async function projectEnsureLocal(
     }
     const existing = deps.journal.getProjectByIdentity(identity);
     if (existing !== undefined) {
-      if (existing.state !== 'ready') deps.journal.markProjectReady(existing.project.id);
-      const ready = deps.journal.getProjectById(existing.project.id) ?? existing;
+      if (existing.state !== 'ready') throw localRecoveryRequired('the project is still provisioning');
       return {
         kind: 'project_ensure',
         repository_identity: identity,
-        project_id: ready.project.id,
-        relative_root: ready.project.relative_root,
+        project_id: existing.project.id,
+        relative_root: existing.project.relative_root,
         created: false,
         read_set: [
           {
@@ -527,8 +526,8 @@ export async function projectEnsureLocal(
             repository_identity: identity,
             expected: {
               kind: 'present',
-              project_id: ready.project.id,
-              version: ready.updated_at
+              project_id: existing.project.id,
+              version: existing.updated_at
             }
           }
         ]
@@ -547,36 +546,19 @@ export async function projectEnsureLocal(
     ];
     const displayName = parsed.data.display_name ?? safeBasename(identity.split('/').at(-1) ?? identity);
     const relativeRoot = allocateProjectRoot(displayName, occupied);
-    deps.journal.reserveProject({
-      repository_identity: identity,
-      project_id: projectId,
-      display_name: displayName,
-      relative_root: relativeRoot,
-      backend_project: projectId,
-      backend_relative_root: relativeRoot,
-      created_by_actor_id: ctx.actor.id,
-      creation_operation_id: allocated.operation_id
-    });
-    deps.journal.markProjectReady(projectId);
-    const ready = deps.journal.getProjectById(projectId);
-    if (ready === undefined) {
-      throw localRecoveryRequired('the reserved project could not be read back');
-    }
     return {
       kind: 'project_ensure',
       repository_identity: identity,
       project_id: projectId,
-      relative_root: ready.project.relative_root,
+      relative_root: relativeRoot,
       created: true,
+      display_name: displayName,
+      created_by_actor_id: ctx.actor.id,
       read_set: [
         {
           kind: 'project',
           repository_identity: identity,
-          expected: {
-            kind: 'present',
-            project_id: projectId,
-            version: ready.updated_at
-          }
+          expected: { kind: 'absent' }
         }
       ]
     };

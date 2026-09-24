@@ -524,6 +524,8 @@ export type LocalPlannedOperation =
       parents: readonly LocalRevisionParent[];
       effects: readonly LocalDocumentEffect[];
       reference_edits?: readonly LocalReferenceEdit[];
+      possible_duplicates?: SourceRef[];
+      advisory_warnings?: string[];
     }
   | {
       kind: 'project_ensure';
@@ -532,6 +534,8 @@ export type LocalPlannedOperation =
       project_id: string;
       relative_root: string;
       created: boolean;
+      display_name?: string;
+      created_by_actor_id?: string;
     }
   | {
       kind: 'feedback';
@@ -558,6 +562,7 @@ export type LocalOperationReceipt =
       etag: string;
       indexed: boolean;
       warnings: string[];
+      possible_duplicates?: SourceRef[];
     }
   | {
       kind: 'project_ensure';
@@ -596,6 +601,7 @@ export interface LocalRecoveryReport {
 
 export interface LocalMutationCoordinatorPort {
   run(intent: LocalOperationIntent, plan: LocalOperationPlan): Promise<LocalOperationReceipt>;
+  runLazy(intent: LocalOperationIntent, prepare: () => Promise<LocalOperationPlan>): Promise<LocalOperationReceipt>;
   status(operation_id: string): LocalOperationStatus | undefined;
   recover(): Promise<LocalRecoveryReport>;
   enumerateConflictHeads(id: string): Promise<LocalConflictHead[]>;

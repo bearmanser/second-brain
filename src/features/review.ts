@@ -1,5 +1,6 @@
+import { createHash } from 'node:crypto';
 import { BrainError, isBrainError } from '../contracts/errors.js';
-import { reviewRequestSchema } from '../contracts/protocol.js';
+import { reviewRequestSchema, reviewRequestSchemaV2 } from '../contracts/protocol.js';
 import type { BrainDeps, MutationIntent, RevisionBuilder } from '../core/mutation.js';
 import type {
   AuthenticatedContext,
@@ -19,14 +20,16 @@ import { assertNoCredentials } from '../security/redact.js';
 import { validateRelatedIds } from './related.js';
 
 import {
-  documentFromNote,
   parseDocument,
   parseSources,
   renderDocument,
   reviseDocument
 } from '../notes/document-codec.js';
 import { contentKindForType, type CurrentDocument } from '../notes/document.js';
+import { NOTE_REGISTRY } from '../notes/registry.js';
 import { collectRenameSnapshots, planRename } from '../notes/rename.js';
+import { extractLinks } from '../notes/links.js';
+import { resolveLink } from '../notes/link-resolver.js';
 import type {
   AuthenticatedContext as LocalContext,
   LocalExpectedHead,
@@ -44,7 +47,9 @@ import {
   invalidInput as localInvalidInput,
   mutationReceipt,
   reconcileDeps,
-  sourceRefForDeps
+  scopeForPathDeps,
+  sourceRefForDeps,
+  validateRelatedIdsLocal
 } from './local-support.js';
 
 const REVIEW_TOOL = 'brain_review';
@@ -75,8 +80,8 @@ function recoveryRequired(message: string, cause?: unknown): BrainError {
   return new BrainError({ code: 'RECOVERY_REQUIRED', message, cause });
 }
 
-function parseRequest(input: ReviewRequest): ReviewRequest {
-  const parsed = reviewRequestSchema.safeParse(input);
+function parseRequest(input: ReviewRequest, local = false): ReviewRequest {
+  const parsed = (local ? reviewRequestSchemaV2 : reviewRequestSchema).safeParse(input);
   if (!parsed.success) {
     const detail = parsed.error.issues
       .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
@@ -113,7 +118,9 @@ function normalizeNote(note: NoteInput): NoteInput {
       description: normalizeString(entry.description),
       ...(entry.observed_at === undefined ? {} : { observed_at: entry.observed_at })
     })),
-    related_ids: [...note.related_ids]
+    related_ids: [...note.related_ids],
+    ...(note.type === undefined ? {} : { type: note.type }),
+    ...(note.source === undefined ? {} : { source: normalizeString(note.source) })
   };
 }
 
@@ -621,16 +628,24 @@ export async function review(
 
 
 function previousInputForRevision(base: CurrentDocument): LocalNoteInput {
+  const kind = contentKindForType(base.type);
+  const sections = new Map<string, string>();
+  const matches = [...base.body.matchAll(/^## ([^\n]+)\n([\s\S]*?)(?=^## |$(?![\s\S]))/gm)];
+  for (const match of matches) sections.set(match[1], match[2].trim());
+  const content: Record<string, unknown> = { kind };
+  for (const spec of NOTE_REGISTRY[kind].sections) {
+    const text = sections.get(spec.title);
+    if (text === undefined) continue;
+    content[spec.field] = spec.form === 'yaml_list'
+      ? text.split('\n').filter((line) => line.startsWith('- ')).map((line) => line.slice(2))
+      : text;
+  }
   return {
     title: base.title,
     tags: [...base.tags],
-    content: {
-      kind: 'note',
-      summary: base.title,
-      body_markdown: contentKindForType(base.type) === 'note' ? '' : base.body
-    },
-    evidence: [],
-    related_ids: []
+    content: content as unknown as LocalNoteInput['content'],
+    evidence: parseSources(base.body).evidence,
+    related_ids: (sections.get('Related') ?? '').match(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi) ?? []
   };
 }
 
@@ -640,22 +655,13 @@ function preservedDocument(
   status: CurrentDocument['status']
 ): CurrentDocument {
   const now = new Date().toISOString();
-  if (contentKindForType(base.type) === 'note') {
-    return reviseDocument(base, note, {
-      previous: previousInputForRevision(base),
-      meta: { status, updated: now }
-    });
-  }
-  return documentFromNote(note, {
-    path: base.path,
-    ...(base.id === undefined ? {} : { id: base.id }),
-    status,
-    ...(base.project === undefined ? {} : { project: base.project }),
-    aliases: base.aliases,
-    tags: base.tags,
-    created: base.created,
-    updated: now,
-    properties: base.properties
+  return reviseDocument(base, note, {
+    previous: previousInputForRevision(base),
+    meta: {
+      status, updated: now,
+      ...(note.type === undefined ? {} : { type: note.type }),
+      ...(note.source === undefined ? {} : { properties: { source: note.source } })
+    }
   });
 }
 
@@ -693,11 +699,42 @@ async function deriveReferenceEdits(
   deps: LocalHandlerDeps,
   logicalId: string,
   absorbed: readonly string[],
-  survivor: string
-): Promise<LocalReferenceEdit[]> {
-  const files = await collectRenameSnapshots(deps.vaultRoot);
+  survivor: string,
+  resolvedRaw: string
+): Promise<{ edits: LocalReferenceEdit[]; primary: string }> {
+  const originals = await collectRenameSnapshots(deps.vaultRoot);
+  const files = originals.map((file) => file.path === survivor
+    ? { ...file, raw: resolvedRaw, hash: createHash('sha256').update(resolvedRaw).digest('hex') }
+    : { ...file });
   const removed = new Set(absorbed);
-  const merged = new Map<string, LocalReferenceEdit>();
+  const affected = new Set<string>();
+  const anchor = (fragment: string): boolean => {
+    let decoded: string;
+    try { decoded = decodeURIComponent(fragment); } catch { return false; }
+    if (decoded.startsWith('^')) {
+      return resolvedRaw.includes(decoded);
+    }
+    return resolvedRaw.split('\n').some((line) => {
+      const match = /^#{1,6}\s+(.+?)\s*#*\s*$/.exec(line);
+      return match !== null && match[1].trim().toLowerCase().replace(/[^\p{L}\p{N} -]/gu, '')
+        .replace(/\s+/g, '-') === decoded.toLowerCase();
+    });
+  };
+  const catalogue = new Map(originals.filter((file) => file.path.endsWith('.md'))
+    .map((file) => [file.path, deps.catalogue.getByPath(file.path)?.id]));
+  for (const file of originals) {
+    if (removed.has(file.path)) continue;
+    for (const reference of extractLinks(file.path === survivor ? resolvedRaw : file.raw)) {
+      const outcome = resolveLink(reference, file.path, catalogue);
+      if (outcome.state === 'ambiguous' && outcome.paths.some((path) => removed.has(path))) {
+        throw conflict(`an ambiguous reference in ${file.path} blocks the resolution`);
+      }
+      if (outcome.state === 'resolved' && removed.has(outcome.path) &&
+          reference.fragment !== undefined && !anchor(reference.fragment)) {
+        throw conflict(`fragment ${reference.fragment} in ${file.path} is missing from the resolution`);
+      }
+    }
+  }
   for (const from of absorbed) {
     const plan = planRename({
       from,
@@ -712,40 +749,46 @@ async function deriveReferenceEdits(
       throw conflict(`the resolution cannot rewrite references from ${from}`);
     }
     for (const unresolved of plan.unresolved) {
-      if (unresolved.path === survivor || unresolved.path === from) continue;
-      if (unresolved.reason === 'ambiguous') {
-        throw conflict(
-          `an ambiguous reference to ${from} in ${unresolved.path} blocks the resolution`
-        );
+      if (removed.has(unresolved.path)) continue;
+      if ((unresolved.paths?.includes(from) ?? false) ||
+          (unresolved.reason !== 'unresolved' &&
+            (unresolved.target === from || unresolved.target === from.slice(0, -3)))) {
+        throw conflict(`a reference to ${from} in ${unresolved.path} cannot be rewritten`);
       }
     }
     for (const edit of plan.edits) {
-      if (removed.has(edit.path) || edit.path === survivor) continue;
-      const existing = merged.get(edit.path);
-      if (existing !== undefined) {
-        if (existing.raw !== edit.raw) {
-          throw conflict(`references in ${edit.path} cannot be composed safely`);
-        }
-        continue;
-      }
-      const source = deps.catalogue.getByPath(edit.path);
-      merged.set(edit.path, {
-        path: edit.path,
-        expected_etag: edit.expected_hash,
-        raw: edit.raw,
-        ...(source?.id === undefined
-          ? {}
-          : {
-              managed: {
-                id: source.id,
-                revision_id: deps.ids.next(),
-                parents: []
-              }
-            })
-      });
+      if (removed.has(edit.path)) continue;
+      const file = files.find((item) => item.path === edit.path);
+      if (file === undefined) throw recoveryRequired(`reference ${edit.path} vanished during planning`);
+      file.raw = edit.raw;
+      file.hash = createHash('sha256').update(edit.raw).digest('hex');
+      affected.add(edit.path);
     }
   }
-  return [...merged.values()];
+  return {
+    primary: files.find((file) => file.path === survivor)?.raw ?? resolvedRaw,
+    edits: [...affected].filter((path) => path !== survivor).map((path) => {
+      const original = originals.find((file) => file.path === path);
+      const final = files.find((file) => file.path === path);
+      if (original === undefined || final === undefined) throw recoveryRequired('a reference snapshot vanished');
+      const source = deps.catalogue.getByPath(path);
+      if (source?.id !== undefined && source.revision_id === undefined) {
+        throw recoveryRequired(`managed reference ${path} has no durable revision identity`);
+      }
+      return {
+        path,
+        expected_etag: original.hash,
+        raw: final.raw,
+        ...(source?.id === undefined ? {} : {
+          managed: {
+            id: source.id,
+            revision_id: deps.ids.next(),
+            parents: [{ revision_id: source.revision_id as string, raw_hash: original.hash }]
+          }
+        })
+      };
+    })
+  };
 }
 
 async function resolvePlan(
@@ -769,7 +812,6 @@ async function resolvePlan(
   const ordered = [...heads].sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
   const survivor = ordered[0];
   const absorbed = ordered.slice(1);
-  const survivors = new Set([survivor.path]);
   const removals = absorbed.map((head) => ({
     kind: 'remove' as const,
     path: head.path,
@@ -777,18 +819,19 @@ async function resolvePlan(
     expected_revision_id: head.revision_id,
     expected_etag: head.etag
   }));
-  const referenceEdits = await deriveReferenceEdits(
+  const base = await readDocument(deps, survivor.path);
+  const document = preservedDocument(base, operation.note, 'candidate');
+  const rewrites = await deriveReferenceEdits(
     deps,
     operation.id,
     absorbed.map((head) => head.path),
-    survivor.path
+    survivor.path,
+    renderDocument({ ...document, path: survivor.path })
   );
-  const base = await readDocument(deps, survivor.path);
+  const referenceEdits = rewrites.edits;
   const parents = heads.map((head) => ({ revision_id: head.revision_id, raw_hash: head.etag }));
   return (identity) => {
     if (identity.kind !== 'note') throw localInvalidInput('resolve requires a note identity');
-    const document = preservedDocument(base, operation.note, 'candidate');
-    const resolved: CurrentDocument = { ...document, path: survivor.path };
     const readSet: LocalReadCondition[] = [
       {
         kind: 'heads',
@@ -821,7 +864,7 @@ async function resolvePlan(
           kind: 'write',
           write: {
             path: survivor.path,
-            raw: renderDocument(resolved),
+            raw: rewrites.primary,
             id: operation.id,
             revision_id: identity.revision_id,
             parents
@@ -840,196 +883,202 @@ export async function reviewLocal(
   deps: LocalHandlerDeps
 ): Promise<LocalMutationReceipt | LocalReviewListResult> {
   if (ctx.signal.aborted) throw new BrainError({ code: 'CANCELLED', message: 'the review was cancelled' });
-  const request = parseRequest(input);
-  await reconcileDeps(deps);
+  const request = parseRequest(input, true);
   const operation = request.operation;
+  const selected = request.project === undefined && request.scope === undefined
+    ? undefined
+    : deps.projects.resolve(request.project ?? request.scope)?.id;
+  if (request.project !== undefined && request.scope !== undefined &&
+      deps.projects.resolve(request.project)?.id !== deps.projects.resolve(request.scope)?.id) {
+    throw localInvalidInput('project and scope select different projects');
+  }
+  const requireProjectPath = (path: string): void => {
+    if (selected !== undefined && scopeForPathDeps(deps, path) !== selected) {
+      throw conflict(`path ${path} is outside the selected project`);
+    }
+  };
   if (operation.action === 'list') {
-    const items = deps.catalogue
-      .all()
-      .filter((source) => (operation.filter === 'candidate' ? source.status === 'candidate' : false))
+    await reconcileDeps(deps);
+    const sources = operation.filter === 'candidate' ? deps.catalogue.all().filter((source) => source.status === 'candidate')
+      : deps.catalogue.conflictIds().flatMap((id) => deps.catalogue.conflictsFor(id));
+    const items = sources
+      .filter((source) => selected === undefined || scopeForPathDeps(deps, source.path) === selected)
       .map((source) => sourceRefForDeps(deps, source));
     return { items };
   }
-  if (operation.action === 'resolve') {
-    const plan = await resolvePlan(deps, operation);
-    const intent: LocalOperationIntent = {
-      tool: 'brain_review',
-      action: 'resolve',
-      project_id: null,
-      idempotency_key: operation.idempotency_key,
-      payload: operation,
-      preconditions: { id: operation.id, expected_heads: [...operation.expected_heads] }
-    };
-    const result = await deps.mutations.run(intent, plan);
+  const intent: LocalOperationIntent = {
+    tool: 'brain_review',
+    action: operation.action,
+    project_id: selected ?? null,
+    idempotency_key: operation.idempotency_key,
+    payload: operation,
+    preconditions: operation.action === 'resolve'
+      ? { id: operation.id, expected_heads: [...operation.expected_heads] }
+      : operation.action === 'adopt'
+        ? { path: operation.path, etag: operation.expected_etag }
+        : operation.action === 'move'
+          ? { id: operation.id, etag: operation.expected_etag, target_path: operation.target_path }
+          : { id: operation.id, etag: operation.expected_etag }
+  } as LocalOperationIntent;
+  const result = await deps.mutations.runLazy(intent, async () => {
     await reconcileDeps(deps);
-    return mutationReceipt(result);
-  }
-  if (operation.action === 'move') {
+    if (operation.action === 'resolve') {
+      validateRelatedIdsLocal(operation.note.related_ids, deps);
+      rejectCredentialText(operation.note);
+      const heads = await deps.mutations.enumerateConflictHeads(operation.id);
+      for (const head of heads) requireProjectPath(head.path);
+      return resolvePlan(deps, operation);
+    }
+    if (operation.action === 'move') {
+      const source = currentByReferenceDeps(deps, { id: operation.id });
+      requireProjectPath(source.path);
+      requireProjectPath(operation.target_path);
+      if (source.id === undefined) throw conflict(`note ${operation.id} is unmanaged and cannot be moved`);
+      if (source.etag !== operation.expected_etag) {
+        throw conflict(`note ${operation.id} changed since the expected etag`);
+      }
+      const plan: LocalOperationPlan = (identity) => {
+        if (identity.kind !== 'note') throw localInvalidInput('move requires a note identity');
+        return {
+          kind: 'note',
+          heads: [],
+          parents: [],
+          read_set: [
+            noteReadCondition({
+              id: source.id as string,
+              path: source.path,
+              revision_id: source.revision_id ?? source.hash,
+              etag: source.etag
+            }),
+            { kind: 'path', path: operation.target_path, expected: { kind: 'absent' } }
+          ],
+          effects: [{ kind: 'move', from_path: source.path, to_path: operation.target_path }]
+        };
+      };
+      return plan;
+    }
+    if (operation.action === 'adopt') {
+      requireProjectPath(operation.path);
+      const file = await deps.documents.readPath(operation.path);
+      if (file.etag !== operation.expected_etag) {
+        throw conflict(`path ${operation.path} changed since the expected etag`);
+      }
+      const parsed = parseDocument(file.raw, operation.path);
+      if (parsed.id !== undefined) throw conflict('adoption requires an unmanaged document');
+      const plan: LocalOperationPlan = (identity) => {
+        if (identity.kind !== 'note') throw localInvalidInput('adopt requires a note identity');
+        const adopted = { ...parsed, id: identity.note_id };
+        return {
+          kind: 'note',
+          heads: [],
+          parents: [],
+          read_set: [
+            { kind: 'path', path: operation.path, expected: { kind: 'present', etag: operation.expected_etag } }
+          ],
+          effects: [
+            {
+              kind: 'write',
+              write: {
+                path: operation.path,
+                raw: renderDocument(adopted),
+                id: adopted.id as string,
+                revision_id: identity.revision_id,
+                parents: []
+              }
+            }
+          ]
+        };
+      };
+      return plan;
+    }
     const source = currentByReferenceDeps(deps, { id: operation.id });
-    if (source.id === undefined) throw conflict(`note ${operation.id} is unmanaged and cannot be moved`);
+    requireProjectPath(source.path);
+    if (source.id === undefined) throw conflict(`note ${operation.id} is unmanaged`);
     if (source.etag !== operation.expected_etag) {
       throw conflict(`note ${operation.id} changed since the expected etag`);
     }
-    const intent: LocalOperationIntent = {
-      tool: 'brain_review',
-      action: 'move',
-      project_id: null,
-      idempotency_key: operation.idempotency_key,
-      payload: operation,
-      preconditions: { id: operation.id, etag: operation.expected_etag, target_path: operation.target_path }
-    };
-    const plan: LocalOperationPlan = (identity) => {
-      if (identity.kind !== 'note') throw localInvalidInput('move requires a note identity');
-      return {
-        kind: 'note',
-        heads: [],
-        parents: [],
-        read_set: [
-          noteReadCondition({
-            id: source.id as string,
-            path: source.path,
-            revision_id: source.revision_id ?? source.hash,
-            etag: source.etag
-          }),
-          { kind: 'path', path: operation.target_path, expected: { kind: 'absent' } }
-        ],
-        effects: [{ kind: 'move', from_path: source.path, to_path: operation.target_path }]
-      };
-    };
-    const result = await deps.mutations.run(intent, plan);
-    await reconcileDeps(deps);
-    return mutationReceipt(result);
-  }
-  if (operation.action === 'adopt') {
-    const file = await deps.documents.readPath(operation.path);
-    if (file.etag !== operation.expected_etag) {
-      throw conflict(`path ${operation.path} changed since the expected etag`);
+    const base = await readDocument(deps, source.path);
+    if (operation.action === 'revise') {
+      validateRelatedIdsLocal(operation.note.related_ids, deps);
+      rejectCredentialText(operation.note);
     }
-    const parsed = parseDocument(file.raw, operation.path);
-    const intent: LocalOperationIntent = {
-      tool: 'brain_review',
-      action: 'adopt',
-      project_id: null,
-      idempotency_key: operation.idempotency_key,
-      payload: operation,
-      preconditions: { path: operation.path, etag: operation.expected_etag }
-    };
-    const plan: LocalOperationPlan = (identity) => {
-      if (identity.kind !== 'note') throw localInvalidInput('adopt requires a note identity');
-      const adopted = parsed.id === undefined ? { ...parsed, id: identity.note_id } : parsed;
+    const plan: LocalOperationPlan = async (identity) => {
+      if (identity.kind !== 'note') throw localInvalidInput('review requires a note identity');
+      let document: CurrentDocument;
+      if (source.revision_id === undefined) throw recoveryRequired('the current note has no durable revision identity');
+      const parents = [{ revision_id: source.revision_id, raw_hash: source.hash }];
+      const readSet: LocalReadCondition[] = [
+        noteReadCondition({
+          id: source.id as string,
+          path: source.path,
+          revision_id: source.revision_id ?? source.hash,
+          etag: source.etag
+        })
+      ];
+      if (operation.action === 'approve') {
+        if (!approveEvidenceOk(base)) {
+          throw localInvalidInput('approval requires at least one non-hypothesis evidence item');
+        }
+        document = { ...base, status: 'active', updated: new Date().toISOString() };
+      } else if (operation.action === 'archive') {
+        document = { ...base, status: 'archived', updated: new Date().toISOString() };
+      } else if (operation.action === 'supersede') {
+        const replacement = deps.catalogue.getById(operation.replacement_id);
+        if (replacement === undefined) throw conflict('supersession requires an existing replacement');
+        if (replacement.status !== 'active') throw conflict('supersession requires an active replacement');
+        let cursor: string | undefined = operation.replacement_id;
+        const visited = new Set<string>([operation.id]);
+        while (cursor !== undefined) {
+          if (visited.has(cursor)) throw conflict('supersession would create a replacement cycle');
+          visited.add(cursor);
+          const heads = await deps.mutations.enumerateConflictHeads(cursor);
+          if (heads.length !== 1) {
+            throw conflict(`replacement ${cursor} has no unique durable current revision`);
+          }
+          const head = heads[0];
+          readSet.push(
+            noteReadCondition({
+              id: cursor,
+              path: head.path,
+              revision_id: head.revision_id,
+              etag: head.etag
+            })
+          );
+          const linkDocument = await readDocument(deps, head.path);
+          const next = linkDocument.properties.replacement_id;
+          cursor = typeof next === 'string' ? next : undefined;
+        }
+        document = {
+          ...base,
+          status: 'superseded',
+          updated: new Date().toISOString(),
+          properties: { ...base.properties, replacement_id: operation.replacement_id }
+        };
+      } else {
+        if (operation.action !== 'revise') throw localInvalidInput('unsupported review action');
+        document = preservedDocument(base, operation.note, 'candidate');
+      }
       return {
         kind: 'note',
         heads: [],
-        parents: [],
-        read_set: [
-          { kind: 'path', path: operation.path, expected: { kind: 'present', etag: operation.expected_etag } }
-        ],
+        parents,
+        read_set: readSet as unknown as import('../core/types.js').LocalReadSet,
         effects: [
           {
             kind: 'write',
             write: {
-              path: operation.path,
-              raw: renderDocument(adopted),
-              id: adopted.id as string,
+              path: source.path,
+              raw: renderDocument(document),
+              id: source.id as string,
               revision_id: identity.revision_id,
-              parents: []
+              parents
             }
           }
         ]
       };
     };
-    const result = await deps.mutations.run(intent, plan);
-    await reconcileDeps(deps);
-    return mutationReceipt(result);
-  }
-  const source = currentByReferenceDeps(deps, { id: operation.id });
-  if (source.id === undefined) throw conflict(`note ${operation.id} is unmanaged`);
-  if (source.etag !== operation.expected_etag) {
-    throw conflict(`note ${operation.id} changed since the expected etag`);
-  }
-  const base = await readDocument(deps, source.path);
-  const intent: LocalOperationIntent = {
-    tool: 'brain_review',
-    action: operation.action,
-    project_id: null,
-    idempotency_key: operation.idempotency_key,
-    payload: operation,
-    preconditions: { id: operation.id, etag: operation.expected_etag }
-  } as LocalOperationIntent;
-  const plan: LocalOperationPlan = async (identity) => {
-    if (identity.kind !== 'note') throw localInvalidInput('review requires a note identity');
-    let document: CurrentDocument;
-    const readSet: LocalReadCondition[] = [
-      noteReadCondition({
-        id: source.id as string,
-        path: source.path,
-        revision_id: source.revision_id ?? source.hash,
-        etag: source.etag
-      })
-    ];
-    if (operation.action === 'approve') {
-      if (!approveEvidenceOk(base)) {
-        throw localInvalidInput('approval requires at least one non-hypothesis evidence item');
-      }
-      document = { ...base, status: 'active', updated: new Date().toISOString() };
-    } else if (operation.action === 'archive') {
-      document = { ...base, status: 'archived', updated: new Date().toISOString() };
-    } else if (operation.action === 'supersede') {
-      const replacement = deps.catalogue.getById(operation.replacement_id);
-      if (replacement === undefined) throw conflict('supersession requires an existing replacement');
-      if (replacement.status !== 'active') throw conflict('supersession requires an active replacement');
-      let cursor: string | undefined = operation.replacement_id;
-      const visited = new Set<string>([operation.id]);
-      while (cursor !== undefined) {
-        if (visited.has(cursor)) throw conflict('supersession would create a replacement cycle');
-        visited.add(cursor);
-        const heads = await deps.mutations.enumerateConflictHeads(cursor);
-        if (heads.length !== 1) {
-          throw conflict(`replacement ${cursor} has no unique durable current revision`);
-        }
-        const head = heads[0];
-        readSet.push(
-          noteReadCondition({
-            id: cursor,
-            path: head.path,
-            revision_id: head.revision_id,
-            etag: head.etag
-          })
-        );
-        const linkDocument = await readDocument(deps, head.path);
-        const next = linkDocument.properties.replacement_id;
-        cursor = typeof next === 'string' ? next : undefined;
-      }
-      document = {
-        ...base,
-        status: 'superseded',
-        updated: new Date().toISOString(),
-        properties: { ...base.properties, replacement_id: operation.replacement_id }
-      };
-    } else {
-      if (operation.action !== 'revise') throw localInvalidInput('unsupported review action');
-      document = preservedDocument(base, operation.note, 'candidate');
-    }
-    return {
-      kind: 'note',
-      heads: [],
-      parents: [],
-      read_set: readSet as unknown as import('../core/types.js').LocalReadSet,
-      effects: [
-        {
-          kind: 'write',
-          write: {
-            path: source.path,
-            raw: renderDocument(document),
-            id: source.id as string,
-            revision_id: identity.revision_id,
-            parents: []
-          }
-        }
-      ]
-    };
-  };
-  const result = await deps.mutations.run(intent, plan);
-  await reconcileDeps(deps);
+    return plan;
+  });
+  try { await reconcileDeps(deps); } catch { return mutationReceipt(result); }
   return mutationReceipt(result);
 }

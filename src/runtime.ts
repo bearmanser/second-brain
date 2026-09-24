@@ -61,6 +61,7 @@ import {
   localStatus,
   type LocalBrain
 } from './features/local-brain.js';
+import { buildLocalHandlerDeps } from './features/local-support.js';
 import { InstanceLock, MutationCoordinator, type BrainDeps } from './core/mutation.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
@@ -797,6 +798,7 @@ class BrainRuntimeImpl implements BrainRuntime {
         await documents.close();
       }
     };
+    await (await buildLocalHandlerDeps(this.localBrain)).mutations.recover();
   }
 
   private logCurrentReconcile(report: ReconcileCurrentVaultReport): void {

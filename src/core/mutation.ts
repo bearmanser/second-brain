@@ -1358,8 +1358,10 @@ export interface LocalObservedCatalogue {
 
 export interface LocalProjectLookup {
   getProjectByIdentity(repositoryIdentity: string):
-    | { project: { id: string }; updated_at: string }
+    | { project: { id: string; relative_root: string }; updated_at: string; state: string; provisioning?: { creation_operation_id: string } }
     | undefined;
+  reserveProject?(input: { repository_identity: string; project_id: string; display_name: string; relative_root: string; backend_project: string; backend_relative_root: string; created_by_actor_id: string; creation_operation_id: string }): unknown;
+  markProjectReady?(id: string): unknown;
 }
 
 export interface EffectPostcondition {
@@ -1401,7 +1403,9 @@ function localRecovery(message: string, cause?: unknown): BrainError {
 
 function canonicalRequest(intent: LocalOperationIntent): { hash: string; json: string } {
   const json = JSON.stringify(
-    canonicalize({ tool: intent.tool, action: intent.action, payload: intent.payload })
+    canonicalize({ tool: intent.tool, action: intent.action, payload: intent.payload,
+      ...(intent.tool !== 'brain_review' || intent.project_id === null
+        ? {} : { project_id: intent.project_id }) })
   );
   return { hash: createHash('sha256').update(json, 'utf8').digest('hex'), json };
 }
@@ -1442,7 +1446,11 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
   }
 
   run(intent: LocalOperationIntent, plan: LocalOperationPlan): Promise<LocalOperationReceipt> {
-    return this.withLock(() => this.runSerialized(intent, plan));
+    return this.runLazy(intent, async () => plan);
+  }
+
+  runLazy(intent: LocalOperationIntent, prepare: () => Promise<LocalOperationPlan>): Promise<LocalOperationReceipt> {
+    return this.withLock(() => this.runSerialized(intent, prepare));
   }
 
   status(operation_id: string): LocalOperationStatus | undefined {
@@ -1525,7 +1533,7 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
 
   private async runSerialized(
     intent: LocalOperationIntent,
-    plan: LocalOperationPlan
+    prepare: () => Promise<LocalOperationPlan>
   ): Promise<LocalOperationReceipt> {
     const request = canonicalRequest(intent);
     const existing = this.deps.operations.findByKey(intent.idempotency_key);
@@ -1543,6 +1551,7 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     }, () => this.deps.ids.next());
     if (reserved.kind === 'replay') return this.replay(intent, reserved.record, request.hash);
     const record = reserved.record;
+    const plan = await prepare();
     const observed = await this.observe(intent);
     const identity = this.allocate(record, intent, observed);
     const planned = await plan(identity, observed);
@@ -2384,6 +2393,14 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     plan: LocalPlannedOperation
   ): Promise<void> {
     this.bindLegacySubordinates(record, plan);
+    if (plan.kind === 'project_ensure' && plan.created) {
+      const existing = this.deps.projects?.getProjectByIdentity(plan.repository_identity);
+      if (existing?.provisioning?.creation_operation_id === record.operation_id &&
+          existing.project.id === plan.project_id && existing.project.relative_root === plan.relative_root) {
+        await this.executePlan(record, plan);
+        return;
+      }
+    }
     if (plan.kind === 'note' && plan.effects.some((effect) => effect.kind === 'remove') &&
         this.deps.documents.hasConsolidationManifest?.(`${record.idempotency_key}:consolidate`)) {
       if (!this.preconditionsValidated(this.liveRecord(record))) {
@@ -2606,6 +2623,7 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     }
     const storageKey = `${record.idempotency_key}:local`;
     if (plan.kind === 'project_ensure') {
+      await this.applyProjectEnsure(record, plan);
       const receipt: LocalOperationReceipt = {
         kind: 'project_ensure',
         operation_id: record.operation_id,
@@ -2655,10 +2673,51 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
       path: targetPath,
       etag: final.etag,
       indexed: last?.indexed ?? moveReceipt?.moved_indexed ?? false,
-      warnings: []
+      warnings: plan.advisory_warnings ?? [],
+      ...(plan.possible_duplicates === undefined ? {} : { possible_duplicates: plan.possible_duplicates })
     };
     this.finalize(record, receipt, storageKey);
     return receipt;
+  }
+
+  private async applyProjectEnsure(
+    record: LocalOperationRecord,
+    plan: Extract<LocalPlannedOperation, { kind: 'project_ensure' }>
+  ): Promise<void> {
+    const existing = this.deps.projects?.getProjectByIdentity(plan.repository_identity);
+    if (!plan.created) {
+      if (existing?.project.id !== plan.project_id || existing.state !== 'ready') {
+        throw localConflict('the ensured project changed before receipt finalization');
+      }
+      return;
+    }
+    if (existing !== undefined &&
+        (existing.project.id !== plan.project_id || existing.project.relative_root !== plan.relative_root ||
+         existing.provisioning?.creation_operation_id !== record.operation_id)) {
+      throw localConflict('the project identity was claimed by another operation');
+    }
+    if (existing === undefined) {
+      if (plan.display_name === undefined || plan.created_by_actor_id === undefined ||
+          this.deps.projects?.reserveProject === undefined) {
+        throw localRecovery('the persisted project plan cannot be materialized');
+      }
+      this.deps.projects.reserveProject({
+        repository_identity: plan.repository_identity,
+        project_id: plan.project_id,
+        display_name: plan.display_name,
+        relative_root: plan.relative_root,
+        backend_project: plan.project_id,
+        backend_relative_root: plan.relative_root,
+        created_by_actor_id: plan.created_by_actor_id,
+        creation_operation_id: record.operation_id
+      });
+    }
+    this.deps.projects?.markProjectReady?.(plan.project_id);
+    const ready = this.deps.projects?.getProjectByIdentity(plan.repository_identity);
+    if (ready?.state !== 'ready' || ready.project.id !== plan.project_id ||
+        ready.provisioning?.creation_operation_id !== record.operation_id) {
+      throw localRecovery('the planned project was not durably materialized');
+    }
   }
 
   private async executeConsolidation(

@@ -16,14 +16,16 @@ import { captureLocal } from '../../src/features/capture.js';
 import { reviewLocal } from '../../src/features/review.js';
 import { feedbackLocal } from '../../src/features/feedback.js';
 import { projectEnsureLocal } from '../../src/features/project-ensure.js';
-import { localRead } from '../../src/features/local-brain.js';
+import { localRead, localStatus } from '../../src/features/local-brain.js';
 import { buildLocalHandlerDeps, type LocalBrain } from '../../src/features/local-support.js';
 import { openDocumentStore, type DocumentStore } from '../../src/storage/document-store.js';
 import { Journal, LocalOperationJournal } from '../../src/storage/journal.js';
 import { openRevisionStore, type RevisionStore } from '../../src/storage/revision-store.js';
 import { openSearchIndex } from '../../src/storage/search-index.js';
 import { FileVault } from '../../src/storage/vault.js';
+import { renderDocument, parseDocument, documentFromNote } from '../../src/notes/document-codec.js';
 import { vaultSandbox } from '../helpers/vault-sandbox.js';
+import { normalizeRepositoryIdentity, scopeCandidateForRepository } from '../../src/projects/identity.js';
 
 const clock = { now: () => new Date() };
 const ids = { next: () => randomUUID() };
@@ -103,7 +105,7 @@ async function openGround(): Promise<Ground> {
     close: async () => undefined
   };
   const deps = await buildLocalHandlerDeps(brain);
-  return {
+  const ground: Ground = {
     brain,
     deps,
     store,
@@ -115,17 +117,41 @@ async function openGround(): Promise<Ground> {
     state: sandbox.state,
     dispose: async () => {
       try {
-        operations.close();
+        ground.operations.close();
       } catch {
         undefined;
       }
-      journal.close();
-      await store.close();
-      catalogue.close();
-      index.close();
+      ground.journal.close();
+      await ground.store.close();
+      ground.catalogue.close();
+      ground.brain.index.close();
       await sandbox.dispose();
     }
   };
+  return ground;
+}
+
+async function restartGround(ground: Ground): Promise<void> {
+  ground.operations.close();
+  ground.journal.close();
+  await ground.store.close();
+  ground.catalogue.close();
+  ground.brain.index.close();
+  ground.operations = LocalOperationJournal.open(join(ground.state, 'operations.sqlite'));
+  ground.journal = Journal.open(join(ground.state, 'journal.db'), { clock, ids });
+  ground.revisions = await openRevisionStore(ground.state);
+  ground.store = await openDocumentStore({ vault: ground.vaultRoot, state: ground.state });
+  ground.catalogue = CurrentCatalogue.open({ revisions: ground.revisions, ids });
+  ground.brain = {
+    ...ground.brain,
+    operations: ground.operations,
+    journal: ground.journal,
+    documents: ground.store,
+    catalogue: ground.catalogue,
+    index: openSearchIndex(':memory:')
+  };
+  ground.deps = await buildLocalHandlerDeps(ground.brain);
+  await refresh(ground);
 }
 
 async function refresh(ground: Ground): Promise<void> {
@@ -147,38 +173,37 @@ test('every review lifecycle action works through the local coordinator', async 
     const listed = await reviewLocal(c, { operation: { action: 'list', filter: 'candidate' } }, ground.deps);
     expect('items' in listed && listed.items.some((item) => item.id === captured.id)).toBe(true);
 
+    const approveRequest = { operation: {
+      action: 'approve' as const, idempotency_key: randomUUID(), id: captured.id,
+      expected_etag: captured.etag as string, rationale: 'evidence verified'
+    } };
     const approved = await reviewLocal(
       c,
-      {
-        operation: {
-          action: 'approve',
-          idempotency_key: randomUUID(),
-          id: captured.id,
-          expected_etag: captured.etag as string,
-          rationale: 'evidence verified'
-        }
-      },
+      approveRequest,
       ground.deps
     );
     expect('outcome' in approved && approved.outcome).toBe('stored');
+    expect(await reviewLocal(c, approveRequest, ground.deps)).toEqual(approved);
     await refresh(ground);
     expect(ground.catalogue.getById(captured.id)?.status).toBe('active');
 
+    const reviseRequest = { operation: {
+      action: 'revise' as const, idempotency_key: randomUUID(), id: captured.id,
+      expected_etag: ground.catalogue.getById(captured.id)?.etag as string,
+      rationale: 'tighten', note: note('Lifecycle decision', 'lifecycle revised', 'decision')
+    } };
     const revised = await reviewLocal(
       c,
-      {
-        operation: {
-          action: 'revise',
-          idempotency_key: randomUUID(),
-          id: captured.id,
-          expected_etag: ground.catalogue.getById(captured.id)?.etag as string,
-          rationale: 'tighten',
-          note: note('Lifecycle decision', 'lifecycle revised', 'decision')
-        }
-      },
+      reviseRequest,
       ground.deps
     );
     expect('outcome' in revised && revised.outcome).toBe('stored');
+    expect((await ground.revisions.readRevisionMetadata(captured.id, (revised as { revision_id: string }).revision_id))
+      .parents.map((parent) => parent.revision_id)).toEqual([(approved as { revision_id: string }).revision_id]);
+    expect(await reviewLocal(c, reviseRequest, ground.deps)).toEqual(revised);
+    expect(await reviewLocal(c, approveRequest, ground.deps)).toEqual(approved);
+    await expect(reviewLocal(c, { operation: { ...reviseRequest.operation, rationale: 'different' } }, ground.deps))
+      .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
     await refresh(ground);
     expect(ground.catalogue.getById(captured.id)?.status).toBe('candidate');
 
@@ -283,57 +308,55 @@ test('capture, approve, revise, move and adopt replay stably and reject differen
     ).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
 
     await refresh(ground);
-    const status = ground.deps.mutations.status(first.operation_id);
-    expect(status?.state).toBe('finalized');
+    const status = await localStatus(c, { operation_id: first.operation_id }, ground.brain);
+    expect(status.operation?.operation_id).toBe(first.operation_id);
 
     const moveKey = randomUUID();
-    await reviewLocal(
+    const moveRequest = {
+      operation: {
+        action: 'move' as const,
+        idempotency_key: moveKey,
+        id: first.id,
+        target_path: 'Inbox/Moved stable.md',
+        expected_etag: ground.catalogue.getById(first.id)?.etag as string,
+        rationale: 'relocate'
+      }
+    };
+    const moved = await reviewLocal(
       c,
-      {
-        operation: {
-          action: 'move',
-          idempotency_key: moveKey,
-          id: first.id,
-          target_path: 'Inbox/Moved stable.md',
-          expected_etag: ground.catalogue.getById(first.id)?.etag as string,
-          rationale: 'relocate'
-        }
-      },
+      moveRequest,
       ground.deps
     );
-    const movedAgain = await reviewLocal(
-      c,
-      {
-        operation: {
-          action: 'move',
-          idempotency_key: moveKey,
-          id: first.id,
-          target_path: 'Inbox/Moved stable.md',
-          expected_etag: ground.catalogue.getById(first.id)?.etag as string,
-          rationale: 'relocate'
-        }
-      },
-      ground.deps
-    );
-    expect('outcome' in movedAgain && movedAgain.outcome).toBe('stored');
+    expect(await reviewLocal(c, moveRequest, ground.deps)).toEqual(moved);
 
     await mkdir(join(ground.vaultRoot, 'Knowledge'), { recursive: true });
     await writeFile(join(ground.vaultRoot, 'Knowledge/Plain.md'), '# Plain\n\nbody\n');
     const adoptKey = randomUUID();
+    const adoptRequest = {
+      operation: {
+        action: 'adopt' as const,
+        idempotency_key: adoptKey,
+        path: 'Knowledge/Plain.md',
+        expected_etag: createHash('sha256').update('# Plain\n\nbody\n').digest('hex'),
+        rationale: 'adopt'
+      }
+    };
     const adopted = await reviewLocal(
       c,
-      {
-        operation: {
-          action: 'adopt',
-          idempotency_key: adoptKey,
-          path: 'Knowledge/Plain.md',
-          expected_etag: 'a'.repeat(64),
-          rationale: 'adopt'
-        }
-      },
+      adoptRequest,
       ground.deps
-    ).catch(() => undefined);
-    expect(adopted).toBeUndefined();
+    );
+    expect(await reviewLocal(c, adoptRequest, ground.deps)).toEqual(adopted);
+    const managedPath = 'Inbox/Moved stable.md';
+    const managedFile = await ground.store.readPath(managedPath);
+    await expect(reviewLocal(c, { operation: {
+      action: 'adopt', idempotency_key: randomUUID(), path: managedPath,
+      expected_etag: managedFile.etag, rationale: 'cannot re-adopt managed'
+    } }, ground.deps)).rejects.toMatchObject({ code: 'CONFLICT' });
+    await expect(reviewLocal(c, { operation: { ...adoptRequest.operation, rationale: 'changed' } }, ground.deps))
+      .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+    await expect(reviewLocal(c, { operation: { ...moveRequest.operation, rationale: 'changed' } }, ground.deps))
+      .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
   } finally {
     await ground.dispose();
   }
@@ -350,6 +373,9 @@ test('project ensure is durable, idempotent, and replays its original receipt', 
       ground.deps
     );
     expect(first.created).toBe(true);
+    expect((await localStatus(c, { operation_id: first.operation_id }, ground.brain)).operation?.operation_id)
+      .toBe(first.operation_id);
+    await restartGround(ground);
     const replay = await projectEnsureLocal(
       c,
       { idempotency_key: key, remote_url: 'https://github.com/example/handlers.git' },
@@ -372,6 +398,96 @@ test('project ensure is durable, idempotent, and replays its original receipt', 
   }
 });
 
+test('a persisted project plan is recovered after restart before any registry effect', async () => {
+  const ground = await openGround();
+  const identity = normalizeRepositoryIdentity('https://github.com/example/interrupted.git');
+  const projectId = scopeCandidateForRepository(identity);
+  const operationId = randomUUID();
+  const key = randomUUID();
+  const now = new Date().toISOString();
+  try {
+    ground.operations.reserve({
+      operation_id: operationId, idempotency_key: key, tool: 'brain_project_ensure', action: 'ensure',
+      project_id: null, payload_hash: 'a'.repeat(64), payload_json: '{}', created_at: now, updated_at: now
+    });
+    ground.operations.update(operationId, {
+      plan_json: JSON.stringify({
+        kind: 'project_ensure', repository_identity: identity, project_id: projectId,
+        relative_root: 'Projects/Interrupted', display_name: 'Interrupted',
+        created_by_actor_id: SYSTEM_ACTOR.id, created: true,
+        read_set: [{ kind: 'project', repository_identity: identity, expected: { kind: 'absent' } }]
+      }), updated_at: now
+    });
+    expect(ground.journal.getProjectByIdentity(identity)).toBeUndefined();
+    await restartGround(ground);
+    const recovered = await ground.deps.mutations.recover();
+    expect(recovered.finalized).toBe(1);
+    expect(ground.deps.mutations.status(operationId)?.receipt).toMatchObject({ created: true, project_id: projectId });
+    expect(ground.journal.getProjectByIdentity(identity)?.state).toBe('ready');
+  } finally {
+    await ground.dispose();
+  }
+});
+
+test('a project created after plan persistence but before its receipt recovers the original created flag', async () => {
+  const ground = await openGround();
+  const identity = normalizeRepositoryIdentity('https://github.com/example/partially-created.git');
+  const id = scopeCandidateForRepository(identity);
+  const operationId = randomUUID();
+  const now = new Date().toISOString();
+  try {
+    ground.operations.reserve({ operation_id: operationId, idempotency_key: randomUUID(),
+      tool: 'brain_project_ensure', action: 'ensure', project_id: null,
+      payload_hash: 'b'.repeat(64), payload_json: '{}', created_at: now, updated_at: now });
+    ground.operations.update(operationId, { plan_json: JSON.stringify({
+      kind: 'project_ensure', repository_identity: identity, project_id: id,
+      relative_root: 'Projects/Partially-created', display_name: 'Partially created',
+      created_by_actor_id: SYSTEM_ACTOR.id, created: true,
+      read_set: [{ kind: 'project', repository_identity: identity, expected: { kind: 'absent' } }]
+    }), progress_json: JSON.stringify({ preconditions_validated: true }), updated_at: now });
+    ground.journal.reserveProject({ repository_identity: identity, project_id: id,
+      display_name: 'Partially created', relative_root: 'Projects/Partially-created',
+      created_by_actor_id: SYSTEM_ACTOR.id, creation_operation_id: operationId });
+    await restartGround(ground);
+    expect(await ground.deps.mutations.recover()).toEqual({ inspected: 1, finalized: 1, recovered: 1, conflicted: 0, pending: 0, blocking_operations: [] });
+    expect(ground.journal.getProjectByIdentity(identity)?.state).toBe('ready');
+    expect(ground.deps.mutations.status(operationId)?.receipt).toMatchObject({ created: true, materialized: true });
+  } finally { await ground.dispose(); }
+});
+
+test('V2 capture and review accept additive type and source without losing either', async () => {
+  const ground = await openGround();
+  const c = ctx();
+  try {
+    const input: NoteInput = { ...note('Human research', 'human'), type: 'research', source: 'local-notes' };
+    const first = await captureLocal(c, { idempotency_key: randomUUID(), note: input }, ground.deps);
+    const path = ground.catalogue.getById(first.id)?.path as string;
+    expect(parseDocument((await ground.store.readPath(path)).raw, path)).toMatchObject({ type: 'research', properties: { source: 'local-notes' } });
+    const second = await reviewLocal(c, { operation: {
+      action: 'revise', idempotency_key: randomUUID(), id: first.id,
+      expected_etag: first.etag as string, rationale: 'update source',
+      note: { ...input, source: 'updated-local' }
+    } }, ground.deps);
+    expect('outcome' in second && second.outcome).toBe('stored');
+    expect(parseDocument((await ground.store.readPath(path)).raw, path).properties.source).toBe('updated-local');
+  } finally { await ground.dispose(); }
+});
+
+test('per-runtime handler calls share a coordinator and serialize concurrent path allocation', async () => {
+  const ground = await openGround();
+  try {
+    expect((await buildLocalHandlerDeps(ground.brain)).mutations).toBe(ground.deps.mutations);
+    const [a, b] = await Promise.all([
+      captureLocal(ctx(), { idempotency_key: randomUUID(), note: note('Same concurrent title', 'a') },
+        await buildLocalHandlerDeps(ground.brain)),
+      captureLocal(ctx(), { idempotency_key: randomUUID(), note: note('Same concurrent title', 'b') },
+        await buildLocalHandlerDeps(ground.brain))
+    ]);
+    expect(a.id).not.toBe(b.id);
+    expect(ground.catalogue.all().filter((item) => item.title === 'Same concurrent title')).toHaveLength(2);
+  } finally { await ground.dispose(); }
+});
+
 test('resolve uses the accepted consolidation and preserves branches for history and feedback', async () => {
   const ground = await openGround();
   const c = ctx();
@@ -389,13 +505,16 @@ test('resolve uses the accepted consolidation and preserves branches for history
     });
     const headRaw = (marker: string): string =>
       `---\nid: ${id}\nbrain_schema_version: 2\ntype: note\nstatus: candidate\n---\n\n# ${marker}\n\n${marker}\n`;
-    const aRaw = headRaw('branch A');
+    const aRaw = `${headRaw('branch A')}\n[[Knowledge/B#Anchor|inside]]\n`;
     const bRaw = headRaw('branch B');
+    const cRaw = headRaw('branch C');
     const aRev = randomUUID();
     const bRev = randomUUID();
+    const cRev = randomUUID();
     for (const [path, raw, revisionId] of [
       ['Knowledge/A.md', aRaw, aRev],
-      ['Knowledge/B.md', bRaw, bRev]
+      ['Knowledge/B.md', bRaw, bRev],
+      ['Knowledge/C.md', cRaw, cRev]
     ] as const) {
       await ground.revisions.persistRevision(id, revisionId, raw);
       await ground.revisions.persistRevisionMetadata({
@@ -409,25 +528,62 @@ test('resolve uses the accepted consolidation and preserves branches for history
       await writeFile(absolute, raw);
       await ground.revisions.bindCurrent(id, path, revisionId, createHash('sha256').update(raw, 'utf8').digest('hex'));
     }
+    const backlink = '---\ntype: note\n---\n\n[[Knowledge/B#Anchor|B]] and [[Knowledge/C#Anchor|C]]\n';
+    await writeFile(join(ground.vaultRoot, 'Knowledge/Backlinks.md'), backlink);
+    const referringId = randomUUID();
+    const referringRevision = randomUUID();
+    const referringPath = 'Knowledge/Managed backlinks.md';
+    await ground.store.put({ path: referringPath,
+      raw: `---\nid: ${referringId}\ntype: note\nstatus: candidate\n---\n\n[Branch B](./B.md#Anchor) and ![[Knowledge/C#Anchor]]\n`,
+      expectedEtag: null, idempotencyKey: randomUUID(), source: 'seed',
+      revisionId: referringRevision, parents: [] });
     await refresh(ground);
     const heads = await ground.deps.mutations.enumerateConflictHeads(id);
-    expect(heads.length).toBe(2);
+    expect(heads.length).toBe(3);
+    const conflicts = await reviewLocal(c, { operation: { action: 'list', filter: 'conflict' } }, ground.deps);
+    expect('items' in conflicts && conflicts.items.filter((item) => item.id === id)).toHaveLength(3);
+    const filteredConflicts = await reviewLocal(c, { project: 'shared',
+      operation: { action: 'list', filter: 'conflict' } }, ground.deps);
+    expect('items' in filteredConflicts && filteredConflicts.items.some((item) => item.id === id)).toBe(false);
     const expected = heads.map((head) => ({ revision_id: head.revision_id, etag: head.etag }));
+    await expect(reviewLocal(c, { operation: {
+      action: 'resolve', idempotency_key: randomUUID(), id,
+      expected_heads: expected, rationale: 'missing anchor', note: note('resolved', 'no anchor')
+    } }, ground.deps)).rejects.toMatchObject({ code: 'CONFLICT' });
+    await expect(reviewLocal(c, { project: 'shared', operation: {
+      action: 'resolve', idempotency_key: randomUUID(), id,
+      expected_heads: expected, rationale: 'wrong project', note: note('resolved', 'resolved')
+    } }, ground.deps)).rejects.toMatchObject({ code: 'CONFLICT' });
+    const resolveRequest = {
+      operation: {
+        action: 'resolve' as const,
+        idempotency_key: randomUUID(),
+        id,
+        expected_heads: expected,
+        rationale: 'merge branches',
+        note: { ...note('resolved', 'resolved'), content: { kind: 'note' as const, summary: 'resolved', body_markdown: '## Anchor\n\n^block\n' } }
+      }
+    };
     const result = await reviewLocal(
       c,
-      {
-        operation: {
-          action: 'resolve',
-          idempotency_key: randomUUID(),
-          id,
-          expected_heads: expected,
-          rationale: 'merge branches',
-          note: note('resolved', 'resolved')
-        }
-      },
+      resolveRequest,
       ground.deps
     );
     expect('outcome' in result && result.revision_id).toBeTruthy();
+    expect(await reviewLocal(c, resolveRequest, ground.deps)).toEqual(result);
+    await expect(reviewLocal(c, { operation: { ...resolveRequest.operation, rationale: 'different' } }, ground.deps))
+      .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+    const resolution = ground.deps.mutations.status((result as { operation_id: string }).operation_id);
+    expect(resolution?.receipt).toMatchObject({ revision_id: (result as { revision_id: string }).revision_id });
+    const metadata = await ground.revisions.readRevisionMetadata(id, (result as { revision_id: string }).revision_id);
+    expect(metadata?.parents.map((parent) => parent.revision_id).sort()).toEqual([aRev, bRev, cRev].sort());
+    await expect(ground.store.readPath('Knowledge/B.md')).rejects.toBeDefined();
+    await expect(ground.store.readPath('Knowledge/C.md')).rejects.toBeDefined();
+    expect((await ground.store.readPath('Knowledge/Backlinks.md')).raw).toContain('[[Knowledge/A#Anchor|B]] and [[Knowledge/A#Anchor|C]]');
+    expect((await ground.store.readPath('Knowledge/A.md')).raw).toContain('[[Knowledge/A#Anchor|inside]]');
+    const managed = (await ground.store.readPath(referringPath)).raw;
+    expect(managed).toContain('[Branch B](./A.md#Anchor) and ![[Knowledge/A#Anchor]]');
+    expect(ground.catalogue.getById(referringId)?.revision_id).not.toBe(referringRevision);
     await refresh(ground);
     expect(ground.catalogue.getById(id)?.status).toBe('candidate');
     const historical = await localRead(c, { id, revision_id: aRev }, ground.brain);
@@ -496,17 +652,58 @@ test('approval requires non-hypothesis evidence and supersession rejects cycles'
       )
     ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
 
-    void c;
+    const a = await captureLocal(c, { idempotency_key: randomUUID(), note: note('Cycle A', 'a') }, ground.deps);
+    const b = randomUUID();
+    const path = 'Knowledge/Cycle B.md';
+    await ground.store.put({ path, raw: `---\nid: ${b}\ntype: note\nstatus: active\nreplacement_id: ${a.id}\n---\n\n# Cycle B\n`,
+      expectedEtag: null, idempotencyKey: randomUUID(), source: 'seed', revisionId: randomUUID(), parents: [] });
+    await refresh(ground);
+    await expect(reviewLocal(c, { operation: {
+      action: 'supersede', idempotency_key: randomUUID(), id: a.id,
+      expected_etag: ground.catalogue.getById(a.id)?.etag as string,
+      rationale: 'cycle', replacement_id: b
+    } }, ground.deps)).rejects.toMatchObject({ code: 'CONFLICT', message: expect.stringContaining('cycle') });
   } finally {
     await ground.dispose();
   }
+});
+
+test('explicit project filters constrain list and mutations without changing project identity', async () => {
+  const ground = await openGround();
+  const c = ctx();
+  try {
+    const project = await projectEnsureLocal(c, { idempotency_key: randomUUID(),
+      remote_url: 'https://github.com/example/project-filter.git' }, ground.deps);
+    const captured = await captureLocal(c, { project: project.project_id,
+      idempotency_key: randomUUID(), note: note('Project filter', 'value') }, ground.deps);
+    const listed = await reviewLocal(c, { project: project.repository_identity,
+      operation: { action: 'list', filter: 'candidate' } }, ground.deps);
+    expect('items' in listed && listed.items.map((item) => item.id)).toContain(captured.id);
+    const outside = await reviewLocal(c, { project: 'shared',
+      operation: { action: 'list', filter: 'candidate' } }, ground.deps);
+    expect('items' in outside && outside.items.map((item) => item.id)).not.toContain(captured.id);
+    await expect(reviewLocal(c, { project: 'shared', operation: {
+      action: 'approve', idempotency_key: randomUUID(), id: captured.id,
+      expected_etag: captured.etag as string, rationale: 'outside filter'
+    } }, ground.deps)).rejects.toMatchObject({ code: 'CONFLICT' });
+    const approveOperation = { action: 'approve' as const, idempotency_key: randomUUID(), id: captured.id,
+      expected_etag: captured.etag as string, rationale: 'inside filter' };
+    const approved = await reviewLocal(c, { project: project.repository_identity, operation: approveOperation }, ground.deps);
+    expect(ground.deps.mutations.status((approved as { operation_id: string }).operation_id)?.project_id)
+      .toBe(project.project_id);
+    expect(await reviewLocal(c, { project: project.project_id, operation: approveOperation }, ground.deps))
+      .toEqual(approved);
+    await expect(reviewLocal(c, { project: 'shared', operation: approveOperation }, ground.deps))
+      .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+  } finally { await ground.dispose(); }
 });
 
 test('duplicate titles produce a bounded capture advisory', async () => {
   const ground = await openGround();
   const c = ctx();
   try {
-    await captureLocal(c, { idempotency_key: randomUUID(), note: note('Duplicate title', 'one') }, ground.deps);
+    const key = randomUUID();
+    const first = await captureLocal(c, { idempotency_key: key, note: note('Duplicate title', 'one') }, ground.deps);
     const second = await captureLocal(
       c,
       { idempotency_key: randomUUID(), note: note('Duplicate title', 'two') },
@@ -514,6 +711,8 @@ test('duplicate titles produce a bounded capture advisory', async () => {
     );
     expect(second.possible_duplicates.length).toBeGreaterThanOrEqual(1);
     expect(second.possible_duplicates.length).toBeLessThanOrEqual(5);
+    expect(await captureLocal(c, { idempotency_key: key, note: note('Duplicate title', 'one') }, ground.deps))
+      .toEqual(first);
   } finally {
     await ground.dispose();
   }
@@ -578,6 +777,24 @@ test('related IDs are validated and human properties survive a revise', async ()
     await refresh(ground);
     const after = (await ground.store.readPath('Knowledge/Preserved.md')).raw;
     expect(after).toContain('custom: keep');
+    await expect(reviewLocal(c, { operation: {
+      action: 'revise', idempotency_key: randomUUID(), id: managedId,
+      expected_etag: ground.catalogue.getById(managedId)?.etag as string,
+      rationale: 'bad relationship', note: { ...note('Preserved', 'revised'), related_ids: [randomUUID()] }
+    } }, ground.deps)).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+    const decisionId = randomUUID();
+    const decisionPath = 'Knowledge/Human decision.md';
+    const structuredRaw = renderDocument(documentFromNote(note('Human decision', 'old', 'decision'), {
+      path: decisionPath, id: decisionId, status: 'candidate'
+    })).replace('## Decision', '## Human journal\n\nPersonal context stays.\n\n## Decision');
+    await ground.store.put({ path: decisionPath, raw: structuredRaw, expectedEtag: null,
+      idempotencyKey: randomUUID(), source: 'seed', revisionId: randomUUID(), parents: [] });
+    await refresh(ground);
+    await reviewLocal(c, { operation: { action: 'revise', idempotency_key: randomUUID(),
+      id: decisionId, expected_etag: ground.catalogue.getById(decisionId)?.etag as string,
+      rationale: 'revise structured', note: note('Human decision', 'new', 'decision')
+    } }, ground.deps);
+    expect((await ground.store.readPath(decisionPath)).raw).toContain('Personal context stays.');
   } finally {
     await ground.dispose();
   }
