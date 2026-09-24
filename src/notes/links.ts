@@ -84,7 +84,6 @@ const EXTERNAL_SCHEMES: ReadonlySet<string> = new Set([
 ]);
 
 const FRONTMATTER_DELIMITER = /^\uFEFF?---[ \t]*$/;
-const WIKILINK_PATTERN = /(!?)\[\[([^[\]]*?)\]\]/g;
 const MARKDOWN_PATTERN = /(!?)\[([^\]]*)\]\(([^()\s]+)\)/g;
 
 export function isExternalTarget(target: string): boolean {
@@ -134,9 +133,9 @@ function isEscaped(text: string, index: number): boolean {
   return backslashes % 2 === 1;
 }
 
-function inside(ranges: readonly [number, number][], offset: number): boolean {
-  for (const [start, end] of ranges) {
-    if (offset >= start && offset < end) return true;
+function overlapsAny(ranges: readonly [number, number][], start: number, end: number): boolean {
+  for (const [rangeStart, rangeEnd] of ranges) {
+    if (start < rangeEnd && rangeStart < end) return true;
   }
   return false;
 }
@@ -171,27 +170,59 @@ function splitWikilinkInner(
   };
 }
 
+function findWikilinkClose(text: string, from: number): number {
+  let cursor = from;
+  while (cursor < text.length) {
+    const character = text[cursor];
+    if (character === '\\') {
+      cursor += 2;
+      continue;
+    }
+    if (character === ']' && text[cursor + 1] === ']') return cursor;
+    cursor += 1;
+  }
+  return -1;
+}
+
 function scanWikilinks(
   text: string,
   base: number,
   excluded: readonly [number, number][],
   output: LinkReference[]
 ): void {
-  const pattern = new RegExp(WIKILINK_PATTERN.source, 'g');
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(text)) !== null) {
-    const start = base + match.index;
-    if (isEscaped(text, match.index)) continue;
-    if (inside(excluded, start)) continue;
-    const inner = splitWikilinkInner(match[2]);
-    if (inner === undefined) continue;
-    output.push({
-      ...inner,
-      embed: match[1] === '!',
-      start,
-      end: start + match[0].length,
-      syntax: 'wikilink'
-    });
+  let index = 0;
+  while (index < text.length) {
+    const open = text.indexOf('[[', index);
+    if (open === -1) break;
+    const bang = open > 0 && text[open - 1] === '!';
+    if (bang && isEscaped(text, open - 1)) {
+      index = open + 1;
+      continue;
+    }
+    if (isEscaped(text, open)) {
+      index = open + 1;
+      continue;
+    }
+    const close = findWikilinkClose(text, open + 2);
+    if (close === -1) {
+      index = open + 1;
+      continue;
+    }
+    const start = base + (bang ? open - 1 : open);
+    const end = base + close + 2;
+    if (!overlapsAny(excluded, start, end)) {
+      const inner = splitWikilinkInner(text.slice(open + 2, close));
+      if (inner !== undefined) {
+        output.push({
+          ...inner,
+          embed: bang,
+          start,
+          end,
+          syntax: 'wikilink'
+        });
+      }
+    }
+    index = close + 2;
   }
 }
 
@@ -263,6 +294,18 @@ function markdownReference(node: MarkdownNode, base: number): LinkReference | un
   };
 }
 
+function labelSpan(node: MarkdownNode): [number, number] | undefined {
+  let start: number | undefined;
+  let end: number | undefined;
+  for (const child of node.children ?? []) {
+    const range = nodeRange(child);
+    if (range === undefined) continue;
+    if (start === undefined || range[0] < start) start = range[0];
+    if (end === undefined || range[1] > end) end = range[1];
+  }
+  return start === undefined || end === undefined ? undefined : [start, end];
+}
+
 function scanBody(body: string, base: number, output: LinkReference[]): void {
   const excluded: [number, number][] = [];
   const references: LinkReference[] = [];
@@ -283,6 +326,13 @@ function scanBody(body: string, base: number, output: LinkReference[]): void {
       if (node.type === 'link' || node.type === 'image') {
         const reference = markdownReference(node, base);
         if (reference !== undefined) references.push(reference);
+        const label = node.type === 'image' ? undefined : labelSpan(node);
+        if (label === undefined) {
+          excluded.push([base + range[0], base + range[1]]);
+        } else {
+          excluded.push([base + range[0], base + label[0]]);
+          excluded.push([base + label[1], base + range[1]]);
+        }
       }
     });
   }

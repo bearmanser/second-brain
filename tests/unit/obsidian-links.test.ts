@@ -118,3 +118,31 @@ test('rejects self-supersession and supersession cycles but allows related cycle
 test('generates alias links from a canonical path rather than a bare alias', () => {
   expect(aliasLink('Knowledge/Laya', 'Classifier')).toBe('[[Knowledge/Laya|Classifier]]');
 });
+
+test('rejects a wikilink whose match crosses an inline-code region', () => {
+  const raw = '[[Note `code`]]\n';
+  expect(extractLinks(raw)).toEqual([]);
+});
+
+test('rejects a wikilink whose match crosses an HTML region', () => {
+  const raw = '[[Note <span>]]\n';
+  expect(extractLinks(raw)).toEqual([]);
+});
+
+test('does not scan Markdown link destinations for wikilinks', () => {
+  const raw = '[see]([[Destination]]) and [[Real]]\n';
+  const links = extractLinks(raw);
+  expect(links.filter((link) => link.syntax === 'wikilink').map((link) => link.target)).toEqual([
+    'Real'
+  ]);
+  expect(links.find((link) => link.syntax === 'markdown')).toMatchObject({
+    target: '[[Destination]]'
+  });
+});
+
+test('keeps escaped brackets inside a wikilink and reports raw offsets', () => {
+  const raw = '[[Notes\\[draft\\]]]\n';
+  const links = extractLinks(raw);
+  expect(links.map((link) => link.target)).toEqual(['Notes[draft]']);
+  expect(raw.slice(links[0].start, links[0].end)).toBe('[[Notes\\[draft\\]]]');
+});

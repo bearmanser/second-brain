@@ -1,4 +1,13 @@
-import { isExternalTarget, type LinkReference, type LinkReferenceInput, type LinkSyntax, type RelationshipEdge, type ResolvedRelationship } from './links.js';
+import { BrainError } from '../contracts/errors.js';
+import {
+  isExternalTarget,
+  validateSupersessionGraph,
+  type LinkReference,
+  type LinkReferenceInput,
+  type LinkSyntax,
+  type RelationshipEdge,
+  type ResolvedRelationship
+} from './links.js';
 
 export type LinkResolution =
   | { state: 'resolved'; path: string; id?: string }
@@ -50,8 +59,17 @@ function catalogueEntries(catalogue: LinkCatalogue): CatalogueEntry[] {
   return entries;
 }
 
+function toSlashes(value: string): string {
+  return value.replace(/\\/g, '/');
+}
+
 function normalizePath(value: string): string {
-  return value.replace(/\\/g, '/').replace(/^\.\//, '');
+  return toSlashes(value).replace(/^\.\//, '');
+}
+
+function basename(value: string): string {
+  const slash = value.lastIndexOf('/');
+  return slash === -1 ? value : value.slice(slash + 1);
 }
 
 function decodePath(value: string): string {
@@ -78,12 +96,16 @@ function sourceDirectory(sourcePath: string): string {
   return slash === -1 ? '' : normalized.slice(0, slash);
 }
 
-function joinRelative(base: string, relative: string): string {
+function joinRelative(base: string, relative: string): string | undefined {
   const segments = base.length === 0 ? [] : base.split('/');
   for (const part of relative.split('/')) {
     if (part.length === 0 || part === '.') continue;
-    if (part === '..') segments.pop();
-    else segments.push(part);
+    if (part === '..') {
+      if (segments.length === 0) return undefined;
+      segments.pop();
+      continue;
+    }
+    segments.push(part);
   }
   return segments.join('/');
 }
@@ -123,39 +145,64 @@ export function resolveLink(
   if (rawTarget.length === 0) return { state: 'unresolved', target: rawTarget };
   if (isExternalTarget(rawTarget)) return { state: 'unresolved', target: rawTarget };
   const decoded = decodePath(rawTarget);
-  const normalized = normalizePath(decoded);
-  const absolute = normalized.startsWith('/');
-  const withoutRoot = normalized.replace(/^\/+/, '');
-  if (withoutRoot.length === 0) return { state: 'unresolved', target: rawTarget };
+  const slashed = toSlashes(decoded);
+  const absolute = slashed.startsWith('/');
+  const dotRelative = slashed === '.' || slashed.startsWith('./') || slashed.startsWith('../');
   const syntax: LinkSyntax | undefined = reference.syntax;
-  const dotRelative = withoutRoot.startsWith('./') || withoutRoot.startsWith('../');
-  const relative = dotRelative || (syntax === 'markdown' && !absolute);
+  const markdownRelative = syntax === 'markdown' && !absolute;
+  const relative = dotRelative || markdownRelative;
 
   const entries = catalogueEntries(catalogue);
-  const byId = entries.filter((entry) => entry.id !== undefined && (entry.id === rawTarget || entry.id === decoded));
+  const byId = entries.filter(
+    (entry) => entry.id !== undefined && (entry.id === rawTarget || entry.id === decoded)
+  );
   if (byId.length > 0) return resolutionFor(byId, rawTarget);
 
-  const exact = new Set<string>();
-  const suffix = new Set<string>();
   if (relative) {
-    const joined = withExtension(joinRelative(sourceDirectory(sourcePath), withoutRoot)).normalize('NFC');
-    exact.add(joined);
-    suffix.add(joined);
-  } else {
-    const vaultPath = withExtension(withoutRoot).normalize('NFC');
-    exact.add(vaultPath);
-    suffix.add(vaultPath);
+    const joined = joinRelative(sourceDirectory(sourcePath), slashed);
+    if (joined === undefined) return { state: 'unresolved', target: rawTarget };
+    const candidate = withExtension(joined).normalize('NFC');
+    const matches = matchTier(entries, new Set([candidate]), (path, wanted) => path === wanted);
+    if (matches.length > 0) return resolutionFor(matches, rawTarget);
+    return { state: 'unresolved', target: rawTarget };
   }
 
-  const exactMatches = matchTier(entries, exact, (path, candidate) => path === candidate);
+  const vault = slashed.replace(/^\/+/, '');
+  if (vault.length === 0) return { state: 'unresolved', target: rawTarget };
+  const vaultPath = withExtension(vault).normalize('NFC');
+
+  if (!vault.includes('/')) {
+    const matches = matchTier(entries, new Set([vaultPath]), (path, wanted) => basename(path) === wanted);
+    if (matches.length > 0) return resolutionFor(matches, rawTarget);
+    return { state: 'unresolved', target: rawTarget };
+  }
+
+  const exactMatches = matchTier(entries, new Set([vaultPath]), (path, wanted) => path === wanted);
   if (exactMatches.length > 0) return resolutionFor(exactMatches, rawTarget);
   const suffixMatches = matchTier(
     entries,
-    suffix,
-    (path, candidate) => path === candidate || path.endsWith(`/${candidate}`)
+    new Set([vaultPath]),
+    (path, wanted) => path === wanted || path.endsWith(`/${wanted}`)
   );
   if (suffixMatches.length > 0) return resolutionFor(suffixMatches, rawTarget);
   return { state: 'unresolved', target: rawTarget };
+}
+
+export function acceptRelationships(edges: readonly ResolvedRelationship[]): ResolvedRelationship[] {
+  const validation = validateSupersessionGraph(edges);
+  if (!validation.ok) {
+    if (validation.reason === 'self-supersession') {
+      throw new BrainError({
+        code: 'INVALID_INPUT',
+        message: `a note cannot supersede itself: ${validation.path}`
+      });
+    }
+    throw new BrainError({
+      code: 'CONFLICT',
+      message: `supersession cycle: ${validation.cycle.join(' -> ')}`
+    });
+  }
+  return [...edges];
 }
 
 export function resolveRelationships(
@@ -175,7 +222,7 @@ export function resolveRelationships(
       ...(outcome.id === undefined ? {} : { id: outcome.id })
     });
   }
-  return resolved;
+  return acceptRelationships(resolved);
 }
 
 export type { LinkReference, RelationshipEdge, ResolvedRelationship };

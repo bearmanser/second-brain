@@ -1,5 +1,9 @@
 import { expect, test } from 'vitest';
-import { resolveLink, resolveRelationships } from '../../src/notes/link-resolver.js';
+import {
+  acceptRelationships,
+  resolveLink,
+  resolveRelationships
+} from '../../src/notes/link-resolver.js';
 
 const catalogue = new Map<string, string | undefined>([
   ['Home.md', 'id-home'],
@@ -7,6 +11,13 @@ const catalogue = new Map<string, string | undefined>([
   ['Projects/Second Brain/Research/Laya.md', 'id-laya-project'],
   ['Knowledge/My Note.md', 'id-space'],
   ['Attachments/diagram.png', undefined],
+  ['Projects/A/Note.md', 'id-a-note']
+]);
+
+const relativeCatalogue = new Map<string, string | undefined>([
+  ['Outside.md', 'id-outside'],
+  ['Knowledge/Laya.md', 'id-laya-knowledge'],
+  ['Projects/A/Laya.md', 'id-a-laya'],
   ['Projects/A/Note.md', 'id-a-note']
 ]);
 
@@ -132,4 +143,77 @@ test('omits unresolved and ambiguous relationship edges instead of guessing', ()
     }
   ];
   expect(resolveRelationships(edges, 'Home.md', catalogue)).toEqual([]);
+});
+
+test('returns ambiguous candidates when a bare filename matches the root and a project', () => {
+  const withRoot = new Map<string, string | undefined>([
+    ['Laya.md', 'id-root'],
+    ['Projects/Other/Laya.md', 'id-other'],
+    ['Notes/Note.md', undefined]
+  ]);
+  expect(resolveLink({ target: 'Laya' }, 'Notes/Note.md', withRoot)).toEqual({
+    state: 'ambiguous',
+    target: 'Laya',
+    paths: ['Laya.md', 'Projects/Other/Laya.md']
+  });
+});
+
+test('resolves an explicit ./ relative link from the source directory', () => {
+  expect(resolveLink({ target: './Laya.md' }, 'Projects/A/Note.md', relativeCatalogue)).toEqual({
+    state: 'resolved',
+    path: 'Projects/A/Laya.md',
+    id: 'id-a-laya'
+  });
+});
+
+test('does not fall back to an unrelated project for an explicit relative link', () => {
+  const noSibling = new Map<string, string | undefined>([
+    ['Knowledge/Laya.md', 'id-laya-knowledge'],
+    ['Projects/A/Note.md', 'id-a-note']
+  ]);
+  expect(resolveLink({ target: './Laya.md' }, 'Projects/A/Note.md', noSibling)).toEqual({
+    state: 'unresolved',
+    target: './Laya.md'
+  });
+});
+
+test('rejects a relative link that escapes the vault root', () => {
+  expect(
+    resolveLink({ target: '../../../../Outside.md' }, 'Projects/A/Note.md', relativeCatalogue)
+  ).toEqual({ state: 'unresolved', target: '../../../../Outside.md' });
+});
+
+test('rejects a resolved self-supersession at the relationship boundary', () => {
+  const edges = [
+    {
+      kind: 'supersedes' as const,
+      reference: {
+        target: 'Knowledge/Laya',
+        embed: false,
+        start: 0,
+        end: 0,
+        syntax: 'wikilink' as const
+      }
+    }
+  ];
+  expect(() => resolveRelationships(edges, 'Knowledge/Laya.md', catalogue)).toThrowError(
+    /supersede/i
+  );
+});
+
+test('rejects a supersession cycle at the relationship boundary', () => {
+  expect(() =>
+    acceptRelationships([
+      { kind: 'supersedes', source: 'A.md', target: 'B.md' },
+      { kind: 'supersedes', source: 'B.md', target: 'A.md' }
+    ])
+  ).toThrowError(/cycle/i);
+});
+
+test('allows an ordinary related cycle at the relationship boundary', () => {
+  const edges = [
+    { kind: 'related' as const, source: 'A.md', target: 'B.md' },
+    { kind: 'related' as const, source: 'B.md', target: 'A.md' }
+  ];
+  expect(acceptRelationships(edges)).toEqual(edges);
 });
