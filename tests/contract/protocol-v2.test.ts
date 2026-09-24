@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { expect, test } from 'vitest';
 import {
   captureRequestSchema,
@@ -289,4 +290,26 @@ test('the shipped instructions describe the role-free contract, candidates, fall
   expect(text).toContain('typed candidates');
   expect(text).toContain('fallback');
   expect(text).toContain('a managed id, a vault-relative path, or an unambiguous title');
+});
+
+test('the example opencode configuration is valid JSONC for the single-token V2 surface', async () => {
+  const text = await readFile(new URL('../../config/opencode.example.jsonc', import.meta.url), 'utf8');
+  const json = text
+    .split('\n')
+    .filter((line) => !/^\s*\/\//.test(line))
+    .join('\n');
+  const parsed = JSON.parse(json) as {
+    mcp: {
+      servers: Record<
+        string,
+        { type: string; url: string; oauth: boolean; codemode: boolean; headers: Record<string, string> }
+      >;
+    };
+  };
+  const server = parsed.mcp.servers['second-brain'];
+  expect(server.type).toBe('remote');
+  expect(server.url).toBe('http://127.0.0.1:7331/mcp');
+  expect(server.oauth).toBe(false);
+  expect(server.codemode).toBe(false);
+  expect(server.headers.Authorization).toBe('Bearer {env:SECOND_BRAIN_TOKEN}');
 });
