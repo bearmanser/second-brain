@@ -765,6 +765,9 @@ function controlledStore(real: RevisionStore): {
       },
       readRevision: (id, revisionId) => real.readRevision(id, revisionId),
       hasRevision: (id, revisionId) => real.hasRevision(id, revisionId),
+      persistRevisionMetadata: (metadata) => real.persistRevisionMetadata(metadata),
+      readRevisionMetadata: (id, revisionId) => real.readRevisionMetadata(id, revisionId),
+      findRevisionByHash: (id, hash) => real.findRevisionByHash(id, hash),
       close: () => real.close()
     }
   };

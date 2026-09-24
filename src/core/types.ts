@@ -496,7 +496,25 @@ export interface LocalPendingWrite {
 export type LocalDocumentEffect =
   | { kind: 'write'; write: LocalPendingWrite }
   | { kind: 'move'; from_path: string; to_path: string; write?: LocalPendingWrite }
-  | { kind: 'adopt'; path: string; write: LocalPendingWrite };
+  | { kind: 'adopt'; path: string; write: LocalPendingWrite }
+  | {
+      kind: 'remove';
+      path: string;
+      expected_id: string;
+      expected_revision_id: string;
+      expected_etag: string;
+    };
+
+export interface LocalReferenceEdit {
+  path: string;
+  expected_etag: string;
+  raw: string;
+  managed?: {
+    id: string;
+    revision_id: string;
+    parents: readonly LocalRevisionParent[];
+  };
+}
 
 export type LocalPlannedOperation =
   | {
@@ -505,6 +523,7 @@ export type LocalPlannedOperation =
       heads: readonly LocalConflictHead[];
       parents: readonly LocalRevisionParent[];
       effects: readonly LocalDocumentEffect[];
+      reference_edits?: readonly LocalReferenceEdit[];
     }
   | {
       kind: 'project_ensure';

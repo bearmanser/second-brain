@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { link, lstat, mkdir, open, rm } from 'node:fs/promises';
+import { link, lstat, mkdir, open, readdir, rm } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { BrainError, isBrainError } from '../contracts/errors.js';
@@ -63,12 +63,22 @@ export interface StoredPreimageBytes {
   path: string;
 }
 
+export interface RevisionMetadata {
+  id: string;
+  revision_id: string;
+  parents: readonly { revision_id: string; raw_hash: string }[];
+  created_at: string;
+}
+
 export interface RevisionStore {
   persistPreimage(id: string, raw: string): Promise<StoredPreimageBytes>;
   verifyPreimage(id: string, hash: string): Promise<void>;
   persistRevision(id: string, revisionId: string, raw: string): Promise<StoredRevisionBytes>;
   readRevision(id: string, revisionId: string): Promise<StoredRevisionBytes>;
   hasRevision(id: string, revisionId: string): Promise<boolean>;
+  persistRevisionMetadata(metadata: RevisionMetadata): Promise<void>;
+  readRevisionMetadata(id: string, revisionId: string): Promise<RevisionMetadata>;
+  findRevisionByHash(id: string, hash: string): Promise<string | undefined>;
   close(): void;
 }
 
@@ -329,6 +339,95 @@ class FileRevisionStore implements RevisionStore {
     } catch {
       return false;
     }
+  }
+
+  async persistRevisionMetadata(metadata: RevisionMetadata): Promise<void> {
+    const safeId = requireUuid(metadata.id, 'id');
+    const safeRevision = requireUuid(metadata.revision_id, 'revision_id');
+    const directory = await ensureDirectoryChain(this.state, ['history', safeId, 'revisions']);
+    const payload = JSON.stringify({
+      id: safeId,
+      revision_id: safeRevision,
+      parents: metadata.parents.map((parent) => ({
+        revision_id: requireUuid(parent.revision_id, 'parent revision_id'),
+        raw_hash: requireHash(parent.raw_hash, 'parent raw_hash')
+      })),
+      created_at: metadata.created_at
+    });
+    await writeImmutable(directory, `${safeRevision}.json`, payload, `revision metadata ${safeRevision}`);
+  }
+
+  async readRevisionMetadata(id: string, revisionId: string): Promise<RevisionMetadata> {
+    const safeId = requireUuid(id, 'id');
+    const safeRevision = requireUuid(revisionId, 'revision_id');
+    const directory = await assertExistingDirectoryChain(this.state, ['history', safeId, 'revisions']);
+    const buffer = await readBoundedFile(
+      join(directory, `${safeRevision}.json`),
+      `revision metadata ${safeRevision}`
+    );
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(buffer.toString('utf8'));
+    } catch (cause) {
+      throw recoveryRequired(`revision metadata ${safeRevision} is malformed`, cause);
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw recoveryRequired(`revision metadata ${safeRevision} is malformed`);
+    }
+    const record = parsed as Record<string, unknown>;
+    if (record.id !== safeId || record.revision_id !== safeRevision) {
+      throw recoveryRequired(`revision metadata ${safeRevision} does not match its identity`);
+    }
+    const parentsRaw = record.parents;
+    if (!Array.isArray(parentsRaw)) {
+      throw recoveryRequired(`revision metadata ${safeRevision} has no parents`);
+    }
+    const parents = parentsRaw.map((entry) => {
+      if (entry === null || typeof entry !== 'object') {
+        throw recoveryRequired(`revision metadata ${safeRevision} has a malformed parent`);
+      }
+      const parent = entry as Record<string, unknown>;
+      return {
+        revision_id: requireUuid(String(parent.revision_id), 'parent revision_id'),
+        raw_hash: requireHash(String(parent.raw_hash), 'parent raw_hash')
+      };
+    });
+    const created = typeof record.created_at === 'string' ? record.created_at : '';
+    if (created.length === 0) {
+      throw recoveryRequired(`revision metadata ${safeRevision} has no created_at`);
+    }
+    return { id: safeId, revision_id: safeRevision, parents, created_at: created };
+  }
+
+  async findRevisionByHash(id: string, hash: string): Promise<string | undefined> {
+    const safeId = requireUuid(id, 'id');
+    const safeHash = requireHash(hash, 'hash');
+    let directory: string;
+    try {
+      directory = await assertExistingDirectoryChain(this.state, ['history', safeId, 'revisions']);
+    } catch (error) {
+      if (isBrainError(error) && error.code === 'NOT_FOUND') return undefined;
+      throw error;
+    }
+    let entries: string[];
+    try {
+      entries = await readdir(directory);
+    } catch (error) {
+      if (hasErrno(error, 'ENOENT')) return undefined;
+      throw recoveryRequired(`revision directory for ${safeId} cannot be read`, error);
+    }
+    const matches: string[] = [];
+    for (const entry of entries) {
+      if (!entry.endsWith('.sha256')) continue;
+      const revisionId = entry.slice(0, -'.sha256'.length);
+      if (!UUID_PATTERN.test(revisionId)) continue;
+      const recorded = await readBoundedFile(
+        join(directory, entry),
+        `revision hash ${revisionId}`
+      );
+      if (recorded.toString('ascii').trim() === safeHash) matches.push(revisionId);
+    }
+    return matches.length === 1 ? matches[0] : undefined;
   }
 
   close(): void {

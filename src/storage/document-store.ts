@@ -15,7 +15,14 @@ import {
   type RenamePlan,
   type RenameReceipt
 } from '../notes/rename.js';
-import { LocalWriteJournal, type LocalMoveRecord, type LocalMoveFileRecord, type LocalWriteRecord } from './journal.js';
+import {
+  LocalWriteJournal,
+  type LocalConsolidationRecord,
+  type LocalConsolidationState,
+  type LocalMoveRecord,
+  type LocalMoveFileRecord,
+  type LocalWriteRecord
+} from './journal.js';
 import { openRevisionStore, revisionHasId, type RevisionStore } from './revision-store.js';
 import { listVaultFilePaths, readBoundedBytes, vaultNoteSegments } from './vault.js';
 
@@ -309,6 +316,9 @@ export interface DocumentStorePutInput {
   expectedEtag: string | null;
   idempotencyKey: string;
   source: string;
+  revisionId?: string;
+  parents?: readonly { revision_id: string; raw_hash: string }[];
+  allowDuplicateIdPaths?: readonly string[];
 }
 
 export interface DocumentStorePutResult {
@@ -338,11 +348,62 @@ export interface DocumentStoreRecoveryReport {
   pending: string[];
 }
 
+export interface DocumentStoreConsolidationHead {
+  path: string;
+  id: string;
+  revision_id: string;
+  etag: string;
+  raw: string;
+  parents: readonly { revision_id: string; raw_hash: string }[];
+}
+
+export interface DocumentStoreRemoval {
+  path: string;
+  expected_id: string;
+  expected_revision_id: string;
+  expected_etag: string;
+}
+
+export interface DocumentStoreReferenceEdit {
+  path: string;
+  expected_etag: string;
+  raw: string;
+  managed?: {
+    id: string;
+    revision_id: string;
+    parents: readonly { revision_id: string; raw_hash: string }[];
+  };
+}
+
+export interface DocumentStoreConsolidateInput {
+  idempotencyKey: string;
+  operationId: string;
+  logicalId: string;
+  path: string;
+  raw: string;
+  revisionId: string;
+  expectedEtag: string;
+  parents: readonly { revision_id: string; raw_hash: string }[];
+  heads: readonly DocumentStoreConsolidationHead[];
+  removals: readonly DocumentStoreRemoval[];
+  referenceEdits: readonly DocumentStoreReferenceEdit[];
+  source: string;
+}
+
+interface ConsolidationProgress {
+  history?: boolean;
+  primary?: boolean;
+  references?: boolean;
+  removals?: Record<string, { staging: string; sha256: string; disposed: boolean }>;
+  removals_done?: boolean;
+}
+
 export interface DocumentStore {
   put(input: DocumentStorePutInput): Promise<DocumentStorePutResult>;
   readPath(path: string): Promise<DocumentStoreReadResult>;
   readRevision(id: string, revisionId: string): Promise<DocumentStoreRevisionRead>;
   applyRename(plan: RenamePlan): Promise<RenameReceipt>;
+  consolidate(input: DocumentStoreConsolidateInput): Promise<DocumentStorePutResult>;
   recover(): Promise<DocumentStoreRecoveryReport>;
   close(): Promise<void>;
 }
@@ -362,7 +423,10 @@ function payloadHash(input: DocumentStorePutInput): string {
       path: input.path,
       raw: input.raw,
       expectedEtag: input.expectedEtag,
-      source: input.source
+      source: input.source,
+      revisionId: input.revisionId ?? null,
+      parents: input.parents ?? null,
+      allowDuplicateIdPaths: input.allowDuplicateIdPaths ?? null
     })
   );
 }
@@ -504,7 +568,7 @@ class LocalDocumentStore implements DocumentStore {
     }
 
     const id = record?.id ?? parsed.id ?? observedId ?? existingByPath?.id ?? this.ids.next();
-    const revisionId = record?.revision_id ?? this.ids.next();
+    const revisionId = record?.revision_id ?? input.revisionId ?? this.ids.next();
     const document = parsed.id === undefined ? { ...parsed, id } : parsed;
     const rawToWrite = parsed.id === undefined ? renderDocument(document) : input.raw;
     if (!revisionHasId(rawToWrite, id)) {
@@ -570,7 +634,7 @@ class LocalDocumentStore implements DocumentStore {
         }
       }
     }
-    const collision = await this.findIdCollision(id, input.path);
+    const collision = await this.findIdCollision(id, input.path, input.allowDuplicateIdPaths);
     if (collision !== undefined) {
       this.markConflict(record, timestamp);
       throw conflict(`logical id ${id} already exists at ${collision}`);
@@ -582,6 +646,14 @@ class LocalDocumentStore implements DocumentStore {
         await this.revisions.persistPreimage(id, observed.raw);
       }
       await this.revisions.persistRevision(id, revisionId, rawToWrite);
+      if (input.parents !== undefined) {
+        await this.ensureRevisionMetadata(
+          id,
+          revisionId,
+          input.parents,
+          parsed.created ?? timestamp
+        );
+      }
     } catch (error) {
       throw wrapIo('revision history could not be persisted', error);
     }
@@ -628,12 +700,316 @@ class LocalDocumentStore implements DocumentStore {
     return this.finalize(record, after, id, revisionId, timestamp, true);
   }
 
-  private async findUncataloguedId(id: string, targetPath: string): Promise<string | undefined> {
+  async consolidate(input: DocumentStoreConsolidateInput): Promise<DocumentStorePutResult> {
+    return this.withLock(() => this.consolidateSerialized(input));
+  }
+
+  private async consolidateSerialized(
+    input: DocumentStoreConsolidateInput
+  ): Promise<DocumentStorePutResult> {
+    this.assertOpen();
+    vaultNoteSegments(input.path);
+    if (input.heads.length < 2) throw invalidInput('a consolidation requires at least two heads');
+    if (input.removals.length !== input.heads.length - 1) {
+      throw invalidInput('each non-surviving head requires exactly one removal effect');
+    }
+    const headPaths = new Set(input.heads.map((head) => head.path));
+    if (!headPaths.has(input.path)) {
+      throw invalidInput('the survivor path must be one of the verified heads');
+    }
+    for (const removal of input.removals) {
+      vaultNoteSegments(removal.path);
+      if (!headPaths.has(removal.path)) {
+        throw invalidInput(`removal ${removal.path} does not map to a verified head`);
+      }
+    }
+    if (input.removals.some((removal) => removal.path === input.path)) {
+      throw invalidInput('the survivor path cannot also be removed');
+    }
+    for (const edit of input.referenceEdits) vaultNoteSegments(edit.path);
+    const manifestJson = JSON.stringify(input);
+    const existing = this.journal.findConsolidationByKey(input.idempotencyKey);
+    if (existing !== undefined && existing.state === 'complete' && existing.receipt_json !== null) {
+      return JSON.parse(existing.receipt_json) as DocumentStorePutResult;
+    }
+    const timestamp = this.clock.now().toISOString();
+    const record =
+      existing ??
+      this.journal.reserveConsolidation({
+        operation_id: input.operationId,
+        idempotency_key: input.idempotencyKey,
+        logical_id: input.logicalId,
+        manifest_json: manifestJson,
+        created_at: timestamp,
+        updated_at: timestamp
+      }).record;
+    return this.runConsolidation(record);
+  }
+
+  private async ensureRevisionMetadata(
+    id: string,
+    revisionId: string,
+    parents: readonly { revision_id: string; raw_hash: string }[],
+    createdAt: string
+  ): Promise<void> {
+    try {
+      const existing = await this.revisions.readRevisionMetadata(id, revisionId);
+      if (JSON.stringify(existing.parents) !== JSON.stringify(parents)) {
+        throw recoveryRequired(`revision metadata ${revisionId} does not match the consolidation manifest`);
+      }
+      return;
+    } catch (error) {
+      if (!(isBrainError(error) && error.code === 'NOT_FOUND')) throw error;
+    }
+    await this.revisions.persistRevisionMetadata({
+      id,
+      revision_id: revisionId,
+      parents,
+      created_at: createdAt
+    });
+  }
+
+  private async runConsolidation(record: LocalConsolidationRecord): Promise<DocumentStorePutResult> {
+    let current = record;
+    const input = JSON.parse(current.manifest_json) as DocumentStoreConsolidateInput;
+    let progress = JSON.parse(current.progress_json) as ConsolidationProgress;
+    const save = (state: LocalConsolidationState, extra?: Partial<ConsolidationProgress>): void => {
+      progress = { ...progress, ...(extra ?? {}) };
+      current = this.journal.updateConsolidation(current.operation_id, {
+        progress_json: JSON.stringify(progress),
+        state,
+        updated_at: this.clock.now().toISOString()
+      });
+    };
+    const failRecovery = (message: string, cause?: unknown): never => {
+      this.journal.updateConsolidation(current.operation_id, {
+        state: 'recovery_required',
+        progress_json: JSON.stringify(progress),
+        updated_at: this.clock.now().toISOString()
+      });
+      throw recoveryRequired(message, cause);
+    };
+
+    if (progress.history !== true) {
+      try {
+        for (const head of input.heads) {
+          await this.revisions.persistRevision(head.id, head.revision_id, head.raw);
+          await this.ensureRevisionMetadata(
+            head.id,
+            head.revision_id,
+            head.parents,
+            this.clock.now().toISOString()
+          );
+        }
+        await this.revisions.persistRevision(input.logicalId, input.revisionId, input.raw);
+        await this.ensureRevisionMetadata(
+          input.logicalId,
+          input.revisionId,
+          input.parents,
+          this.clock.now().toISOString()
+        );
+        for (const edit of input.referenceEdits) {
+          if (edit.managed !== undefined) {
+            await this.revisions.persistRevision(edit.managed.id, edit.managed.revision_id, edit.raw);
+            await this.revisions.persistRevisionMetadata({
+              id: edit.managed.id,
+              revision_id: edit.managed.revision_id,
+              parents: edit.managed.parents,
+              created_at: this.clock.now().toISOString()
+            });
+          } else {
+            const observed = await readNoteFile(this.vaultRoot, vaultNoteSegments(edit.path));
+            if (observed !== undefined) {
+              await this.revisions.persistPreimage(input.operationId, observed.raw);
+            }
+          }
+        }
+      } catch (error) {
+        failRecovery('consolidation history could not be persisted', error);
+      }
+      save('history_persisted', { history: true });
+    }
+
+    if (progress.primary !== true) {
+      await this.putSerialized({
+        path: input.path,
+        raw: input.raw,
+        expectedEtag: input.expectedEtag,
+        idempotencyKey: `${input.idempotencyKey}:primary`,
+        source: input.source,
+        revisionId: input.revisionId,
+        parents: input.parents,
+        allowDuplicateIdPaths: input.removals.map((removal) => removal.path)
+      });
+      save('primary_applied', { primary: true });
+    }
+
+    if (progress.references !== true) {
+      for (const [index, edit] of input.referenceEdits.entries()) {
+        await this.putSerialized({
+          path: edit.path,
+          raw: edit.raw,
+          expectedEtag: edit.expected_etag,
+          idempotencyKey: `${input.idempotencyKey}:ref:${index}`,
+          source: input.source,
+          ...(edit.managed === undefined
+            ? {}
+            : { revisionId: edit.managed.revision_id, parents: edit.managed.parents })
+        });
+      }
+      save('references_applied', { references: true });
+    }
+
+    if (progress.removals === undefined) progress = { ...progress, removals: {} };
+    for (const removal of input.removals) {
+      const entry = progress.removals?.[removal.path];
+      if (entry?.disposed === true) continue;
+      await this.stageRemoval(removal, progress, save);
+    }
+    if (progress.removals_done !== true) save('removals_applied', { removals_done: true });
+
+    const finalPrimary = await readNoteFile(this.vaultRoot, vaultNoteSegments(input.path));
+    if (finalPrimary === undefined) {
+      return failRecovery('the resolution document disappeared before completion');
+    }
+    for (const removal of input.removals) {
+      if ((await readNoteFile(this.vaultRoot, vaultNoteSegments(removal.path))) !== undefined) {
+        return failRecovery(`absorbed path ${removal.path} is still present`);
+      }
+    }
+
+    const primaryRecord = this.journal.findByKey(`${input.idempotencyKey}:primary`);
+    const stored = current.receipt_json;
+    let receipt: DocumentStorePutResult;
+    if (stored !== null) {
+      receipt = JSON.parse(stored) as DocumentStorePutResult;
+    } else if (primaryRecord?.receipt_json !== null && primaryRecord?.receipt_json !== undefined) {
+      receipt = JSON.parse(primaryRecord.receipt_json) as DocumentStorePutResult;
+    } else {
+      receipt = {
+        id: input.logicalId,
+        path: input.path,
+        etag: finalPrimary.hash,
+        revision_id: input.revisionId,
+        indexed: false
+      };
+    }
+    this.journal.updateConsolidation(current.operation_id, {
+      state: 'complete',
+      receipt_json: JSON.stringify(receipt),
+      progress_json: JSON.stringify(progress),
+      updated_at: this.clock.now().toISOString()
+    });
+    return receipt;
+  }
+
+  private async stageRemoval(
+    removal: DocumentStoreRemoval,
+    progress: ConsolidationProgress,
+    save: (state: LocalConsolidationState, extra?: Partial<ConsolidationProgress>) => void
+  ): Promise<void> {
+    const segments = vaultNoteSegments(removal.path);
+    const target = join(this.vaultRoot, ...segments);
+    const staged = progress.removals?.[removal.path];
+    if (staged !== undefined && staged.disposed !== true) {
+      await this.finishRemoval(removal, progress, save);
+      return;
+    }
+    const observed = await readNoteFile(this.vaultRoot, segments, { requireUtf8: false });
+    if (observed === undefined) {
+      throw conflict(
+        `absorbed path ${removal.path} is missing without recorded removal progress`
+      );
+    }
+    if (observed.hash !== removal.expected_etag) {
+      throw conflict(`absorbed path ${removal.path} changed before removal`);
+    }
+    let observedId: string | undefined;
+    try {
+      observedId = parseDocument(observed.raw, removal.path).id;
+    } catch {
+      observedId = undefined;
+    }
+    if (observedId !== undefined && observedId !== removal.expected_id) {
+      throw conflict(`absorbed path ${removal.path} no longer carries its expected identity`);
+    }
+    const stagedDirectory = await mkdtemp(join(dirname(target), '.consolidate-stage-'));
+    const stagedPath = join(stagedDirectory, 'absorbed');
+    try {
+      await rename(target, stagedPath);
+      await syncDirectory(dirname(target));
+      const stagedBytes = await readNoteFile(
+        this.vaultRoot,
+        [...segments.slice(0, -1), stagedDirectory.slice(stagedDirectory.lastIndexOf('/') + 1), 'absorbed'],
+        { requireUtf8: false }
+      );
+      if (stagedBytes === undefined || stagedBytes.hash !== removal.expected_etag) {
+        throw recoveryRequired(
+          `staged absorbed bytes for ${removal.path} diverged from their expected identity`
+        );
+      }
+    } catch (error) {
+      throw recoveryRequired(`absorbed path ${removal.path} could not be staged`, error);
+    }
+    progress.removals = {
+      ...(progress.removals ?? {}),
+      [removal.path]: { staging: stagedDirectory, sha256: observed.hash, disposed: false }
+    };
+    save('removals_applied');
+    await this.finishRemoval(removal, progress, save);
+  }
+
+  private async finishRemoval(
+    removal: DocumentStoreRemoval,
+    progress: ConsolidationProgress,
+    save: (state: LocalConsolidationState, extra?: Partial<ConsolidationProgress>) => void
+  ): Promise<void> {
+    const entry = progress.removals?.[removal.path];
+    if (entry === undefined) {
+      throw recoveryRequired(`removal of ${removal.path} has no recorded staging progress`);
+    }
+    const stagedBytes = await readNoteFile(
+      this.vaultRoot,
+      [
+        ...vaultNoteSegments(removal.path).slice(0, -1),
+        entry.staging.slice(entry.staging.lastIndexOf('/') + 1),
+        'absorbed'
+      ],
+      { requireUtf8: false }
+    );
+    if (stagedBytes === undefined || stagedBytes.hash !== entry.sha256) {
+      throw recoveryRequired(`staged absorbed bytes for ${removal.path} cannot be verified`);
+    }
+    await rm(join(entry.staging, 'absorbed'), { force: true });
+    await rmdir(entry.staging).catch(() => undefined);
+    progress.removals = {
+      ...(progress.removals ?? {}),
+      [removal.path]: { ...entry, disposed: true }
+    };
+    save('removals_applied');
+    this.journal.deleteDocument(removal.path);
+    this.journal.dequeueIndex(removal.path);
+    if (this.index !== undefined) {
+      try {
+        this.index.remove?.(removal.path);
+      } catch {
+        undefined;
+      }
+    }
+  }
+
+  private async findUncataloguedId(
+    id: string,
+    targetPath: string,
+    allowed: readonly string[] = []
+  ): Promise<string | undefined> {
     const targetKey = collisionKey(targetPath);
+    const allowedKeys = new Set(allowed.map((path) => collisionKey(path)));
     const paths = await listVaultFilePaths(this.vaultRoot);
     for (const candidate of paths) {
       if (!candidate.endsWith('.md')) continue;
       if (collisionKey(candidate) === targetKey) continue;
+      if (allowedKeys.has(collisionKey(candidate))) continue;
       let segments: string[];
       try {
         segments = vaultNoteSegments(candidate);
@@ -653,12 +1029,19 @@ class LocalDocumentStore implements DocumentStore {
     return undefined;
   }
 
-  private async findIdCollision(id: string, path: string): Promise<string | undefined> {
+  private async findIdCollision(
+    id: string,
+    path: string,
+    allowed: readonly string[] = []
+  ): Promise<string | undefined> {
+    const allowedKeys = new Set(allowed.map((candidate) => collisionKey(candidate)));
     const byPath = this.journal.findDocumentByPath(path);
     if (byPath !== undefined && byPath.id !== id) return path;
     const byId = this.journal.findDocumentById(id);
-    if (byId !== undefined && byId.path !== path) return byId.path;
-    return this.findUncataloguedId(id, path);
+    if (byId !== undefined && byId.path !== path && !allowedKeys.has(collisionKey(byId.path))) {
+      return byId.path;
+    }
+    return this.findUncataloguedId(id, path, allowed);
   }
 
   private async verifyDurableHistory(record: LocalWriteRecord): Promise<void> {
@@ -1697,6 +2080,15 @@ class LocalDocumentStore implements DocumentStore {
         pending.delete(move.to_path);
       } else {
         pending.add(move.to_path);
+      }
+    }
+    for (const consolidation of this.journal.listIncompleteConsolidations()) {
+      try {
+        await this.runConsolidation(consolidation);
+        recovered.add(consolidation.logical_id);
+        pending.delete(consolidation.logical_id);
+      } catch {
+        pending.add(consolidation.logical_id);
       }
     }
     return { recovered: [...recovered], pending: [...pending] };

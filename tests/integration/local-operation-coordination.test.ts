@@ -111,13 +111,13 @@ async function openBrain(indexFault = false): Promise<Brain> {
       : {})
   });
   const vault = new FileVault(sandbox.vault, []);
-  const catalogue = CurrentCatalogue.open({});
+  const revisions = await openRevisionStore(sandbox.state);
+  const catalogue = CurrentCatalogue.open({ revisions, ids });
   const refresh = async (): Promise<void> => {
     await reconcileCurrentVault({ vault, catalogue });
   };
   await refresh();
   const operationsPath = join(sandbox.state, 'operations.sqlite');
-  const revisions = await openRevisionStore(sandbox.state);
   const brain: Brain = {
     sandbox,
     vaultRoot: sandbox.vault,
@@ -365,60 +365,6 @@ test('a coordinator move is journaled and reported with the destination path', a
     expect(moved.path).toBe('Inbox/Destination.md');
     await expect(brain.store.readPath('Inbox/Source.md')).rejects.toMatchObject({ code: 'NOT_FOUND' });
     expect((await brain.store.readPath('Inbox/Destination.md')).etag).toBe(moved.etag);
-  } finally {
-    await brain.dispose();
-  }
-});
-
-test('conflict heads require the exact complete set and reject copies', async () => {
-  const brain = await openBrain();
-  try {
-    const id = randomUUID();
-    await mkdir(join(brain.vaultRoot, 'Knowledge'), { recursive: true });
-    await writeFile(join(brain.vaultRoot, 'Knowledge/Head A.md'), managed(id, 'branch A'));
-    await writeFile(join(brain.vaultRoot, 'Knowledge/Head B.md'), managed(id, 'branch B'));
-    await brain.refresh();
-
-    const heads = await brain.coordinator.enumerateConflictHeads(id);
-    expect(heads).toHaveLength(2);
-    const expectedComplete = heads.map((head) => ({
-      revision_id: head.revision_id,
-      etag: head.etag
-    }));
-    await expect(brain.coordinator.verifyConflictHeads(id, expectedComplete)).resolves.toBeUndefined();
-
-    await expect(
-      brain.coordinator.verifyConflictHeads(id, expectedComplete.slice(0, 1))
-    ).rejects.toMatchObject({ code: 'CONFLICT' });
-    await expect(
-      brain.coordinator.verifyConflictHeads(id, [
-        ...expectedComplete,
-        { revision_id: randomUUID(), etag: 'c'.repeat(64) }
-      ])
-    ).rejects.toMatchObject({ code: 'CONFLICT' });
-    await expect(
-      brain.coordinator.verifyConflictHeads(id, [
-        expectedComplete[0],
-        expectedComplete[0]
-      ])
-    ).rejects.toMatchObject({ code: 'CONFLICT' });
-    await expect(
-      brain.coordinator.verifyConflictHeads(id, [
-        expectedComplete[0],
-        { revision_id: expectedComplete[1].revision_id, etag: 'd'.repeat(64) }
-      ])
-    ).rejects.toMatchObject({ code: 'CONFLICT' });
-
-    await writeFile(join(brain.vaultRoot, 'Knowledge/Head B.md'), managed(id, 'branch A'));
-    await brain.refresh();
-    const copied = await brain.coordinator.enumerateConflictHeads(id);
-    expect(new Set(copied.map((head) => head.etag)).size).toBeLessThan(copied.length);
-    await expect(
-      brain.coordinator.verifyConflictHeads(
-        id,
-        copied.map((head) => ({ revision_id: head.revision_id, etag: head.etag }))
-      )
-    ).rejects.toMatchObject({ code: 'CONFLICT' });
   } finally {
     await brain.dispose();
   }

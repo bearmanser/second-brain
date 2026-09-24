@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { watch as watchFiles, type FSWatcher } from 'node:fs';
 import { BrainError, isBrainError } from '../contracts/errors.js';
 import type { Clock, IdSource } from '../core/types.js';
@@ -313,6 +313,9 @@ export class CurrentCatalogue {
 
   async persistRevision(id: string | undefined, raw: string): Promise<string | undefined> {
     if (id === undefined || this.revisions === undefined) return undefined;
+    const hash = createHash('sha256').update(raw, 'utf8').digest('hex');
+    const existing = await this.revisions.findRevisionByHash(id, hash);
+    if (existing !== undefined) return existing;
     const revisionId = this.idSource.next();
     await this.revisions.persistRevision(id, revisionId, raw);
     return revisionId;

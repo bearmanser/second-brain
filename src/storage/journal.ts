@@ -2539,6 +2539,45 @@ export interface LocalMoveStepRecord {
   updated_at: string;
 }
 
+export type LocalConsolidationState =
+  | 'prepared'
+  | 'history_persisted'
+  | 'primary_applied'
+  | 'references_applied'
+  | 'removals_applied'
+  | 'complete'
+  | 'conflict'
+  | 'failed'
+  | 'recovery_required';
+
+export interface LocalConsolidationRecord {
+  operation_id: string;
+  idempotency_key: string;
+  logical_id: string;
+  manifest_json: string;
+  progress_json: string;
+  state: LocalConsolidationState;
+  receipt_json: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type LocalConsolidationReservationResult =
+  | { kind: 'new'; record: LocalConsolidationRecord }
+  | { kind: 'replay'; record: LocalConsolidationRecord };
+
+interface LocalConsolidationRow {
+  operation_id: string;
+  idempotency_key: string;
+  logical_id: string;
+  manifest_json: string;
+  progress_json: string;
+  state: string;
+  receipt_json: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 interface LocalWriteRow {
   operation_id: string;
   idempotency_key: string;
@@ -2741,6 +2780,39 @@ function toLocalMoveStep(row: LocalMoveStepRow): LocalMoveStepRecord {
   };
 }
 
+const LOCAL_CONSOLIDATION_STATES = [
+  'prepared',
+  'history_persisted',
+  'primary_applied',
+  'references_applied',
+  'removals_applied',
+  'complete',
+  'conflict',
+  'failed',
+  'recovery_required'
+] as const satisfies readonly LocalConsolidationState[];
+
+function requireLocalConsolidationState(value: string): LocalConsolidationState {
+  if ((LOCAL_CONSOLIDATION_STATES as readonly string[]).includes(value)) {
+    return value as LocalConsolidationState;
+  }
+  throw recoveryRequired('a local consolidation has an unknown stored state');
+}
+
+function toLocalConsolidation(row: LocalConsolidationRow): LocalConsolidationRecord {
+  return {
+    operation_id: row.operation_id,
+    idempotency_key: row.idempotency_key,
+    logical_id: row.logical_id,
+    manifest_json: row.manifest_json,
+    progress_json: row.progress_json,
+    state: requireLocalConsolidationState(row.state),
+    receipt_json: row.receipt_json,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
 const LOCAL_WRITE_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS local_write_operations (
      operation_id TEXT PRIMARY KEY,
@@ -2805,6 +2877,17 @@ const LOCAL_WRITE_SCHEMA = [
      state TEXT NOT NULL,
      updated_at TEXT NOT NULL,
      PRIMARY KEY (operation_id, ordinal)
+   )`,
+  `CREATE TABLE IF NOT EXISTS local_consolidations (
+     operation_id TEXT PRIMARY KEY,
+     idempotency_key TEXT NOT NULL UNIQUE,
+     logical_id TEXT NOT NULL,
+     manifest_json TEXT NOT NULL,
+     progress_json TEXT NOT NULL,
+     state TEXT NOT NULL,
+     receipt_json TEXT,
+     created_at TEXT NOT NULL,
+     updated_at TEXT NOT NULL
    )`
 ];
 
@@ -3194,6 +3277,97 @@ export class LocalWriteJournal {
     return rows.map(toLocalMoveStep);
   }
 
+  reserveConsolidation(
+    input: {
+      operation_id: string;
+      idempotency_key: string;
+      logical_id: string;
+      manifest_json: string;
+      created_at: string;
+      updated_at: string;
+    }
+  ): LocalConsolidationReservationResult {
+    this.assertOpen();
+    const existing = this.findConsolidationByKey(input.idempotency_key);
+    if (existing !== undefined) {
+      if (existing.manifest_json !== input.manifest_json) {
+        throw new BrainError({
+          code: 'IDEMPOTENCY_CONFLICT',
+          message: `idempotency key ${input.idempotency_key} was used for a different consolidation`
+        });
+      }
+      return { kind: 'replay', record: existing };
+    }
+    this.database
+      .prepare(
+        `INSERT INTO local_consolidations (
+           operation_id, idempotency_key, logical_id, manifest_json, progress_json,
+           state, receipt_json, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, '{}', 'prepared', NULL, ?, ?)`
+      )
+      .run(
+        input.operation_id,
+        input.idempotency_key,
+        input.logical_id,
+        input.manifest_json,
+        input.created_at,
+        input.updated_at
+      );
+    const stored = this.findConsolidationById(input.operation_id);
+    if (stored === undefined) {
+      throw recoveryRequired(`local consolidation ${input.operation_id} was not persisted`);
+    }
+    return { kind: 'new', record: stored };
+  }
+
+  updateConsolidation(
+    operation_id: string,
+    fields: Partial<
+      Pick<LocalConsolidationRecord, 'progress_json' | 'state' | 'receipt_json' | 'updated_at'>
+    >
+  ): LocalConsolidationRecord {
+    this.assertOpen();
+    const current = this.findConsolidationById(operation_id);
+    if (current === undefined) throw notFound(operation_id);
+    const next = { ...current, ...fields };
+    this.database
+      .prepare(
+        `UPDATE local_consolidations
+           SET progress_json = ?, state = ?, receipt_json = ?, updated_at = ?
+           WHERE operation_id = ?`
+      )
+      .run(next.progress_json, next.state, next.receipt_json, next.updated_at, operation_id);
+    const stored = this.findConsolidationById(operation_id);
+    if (stored === undefined) throw recoveryRequired(`local consolidation ${operation_id} disappeared`);
+    return stored;
+  }
+
+  findConsolidationByKey(idempotency_key: string): LocalConsolidationRecord | undefined {
+    this.assertOpen();
+    const row = this.database
+      .prepare('SELECT * FROM local_consolidations WHERE idempotency_key = ?')
+      .get(idempotency_key) as LocalConsolidationRow | undefined;
+    return row === undefined ? undefined : toLocalConsolidation(row);
+  }
+
+  findConsolidationById(operation_id: string): LocalConsolidationRecord | undefined {
+    this.assertOpen();
+    const row = this.database
+      .prepare('SELECT * FROM local_consolidations WHERE operation_id = ?')
+      .get(operation_id) as LocalConsolidationRow | undefined;
+    return row === undefined ? undefined : toLocalConsolidation(row);
+  }
+
+  listIncompleteConsolidations(): LocalConsolidationRecord[] {
+    this.assertOpen();
+    const rows = this.database
+      .prepare(
+        "SELECT * FROM local_consolidations WHERE state NOT IN ('complete', 'conflict', 'failed') ORDER BY created_at ASC, operation_id ASC"
+      )
+      .all() as LocalConsolidationRow[];
+    return rows.map(toLocalConsolidation);
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -3225,6 +3399,7 @@ export interface LocalOperationReservation {
 
 export interface LocalOperationRecord extends LocalOperationReservation {
   plan_json: string | null;
+  progress_json: string | null;
   state: LocalOperationJournalState;
   storage_key: string | null;
   receipt_json: string | null;
@@ -3245,6 +3420,7 @@ interface LocalOperationRow {
   payload_hash: string;
   payload_json: string;
   plan_json: string | null;
+  progress_json: string | null;
   state: string;
   storage_key: string | null;
   receipt_json: string | null;
@@ -3262,6 +3438,7 @@ const LOCAL_OPERATION_SCHEMA = [
      payload_hash TEXT NOT NULL,
      payload_json TEXT NOT NULL,
      plan_json TEXT,
+     progress_json TEXT,
      state TEXT NOT NULL,
      storage_key TEXT,
      receipt_json TEXT,
@@ -3289,6 +3466,7 @@ function toLocalOperation(row: LocalOperationRow): LocalOperationRecord {
     payload_hash: row.payload_hash,
     payload_json: row.payload_json,
     plan_json: row.plan_json,
+    progress_json: row.progress_json,
     state: requireLocalOperationState(row.state),
     storage_key: row.storage_key,
     receipt_json: row.receipt_json,
@@ -3317,6 +3495,11 @@ export class LocalOperationJournal {
       database.pragma('synchronous = FULL');
       if (path !== ':memory:') database.pragma('journal_mode = WAL');
       for (const statement of LOCAL_OPERATION_SCHEMA) database.exec(statement);
+      try {
+        database.exec('ALTER TABLE local_operations ADD COLUMN progress_json TEXT');
+      } catch {
+        undefined;
+      }
     } catch (error) {
       database.close();
       if (isBrainError(error)) throw error;
@@ -3343,9 +3526,9 @@ export class LocalOperationJournal {
       .prepare(
         `INSERT INTO local_operations (
            operation_id, idempotency_key, tool, action, project_id,
-           payload_hash, payload_json, plan_json, state, storage_key,
+           payload_hash, payload_json, plan_json, progress_json, state, storage_key,
            receipt_json, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'pending', NULL, NULL, ?, ?)`
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'pending', NULL, NULL, ?, ?)`
       )
       .run(
         input.operation_id,
@@ -3370,7 +3553,7 @@ export class LocalOperationJournal {
     fields: Partial<
       Pick<
         LocalOperationRecord,
-        'plan_json' | 'state' | 'storage_key' | 'receipt_json' | 'updated_at'
+        'plan_json' | 'progress_json' | 'state' | 'storage_key' | 'receipt_json' | 'updated_at'
       >
     >
   ): LocalOperationRecord {
@@ -3381,11 +3564,12 @@ export class LocalOperationJournal {
     this.database
       .prepare(
         `UPDATE local_operations
-           SET plan_json = ?, state = ?, storage_key = ?, receipt_json = ?, updated_at = ?
+           SET plan_json = ?, progress_json = ?, state = ?, storage_key = ?, receipt_json = ?, updated_at = ?
            WHERE operation_id = ?`
       )
       .run(
         next.plan_json,
+        next.progress_json,
         next.state,
         next.storage_key,
         next.receipt_json,
