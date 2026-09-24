@@ -9,7 +9,7 @@ import { readBoundedBytes } from './vault.js';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
-const FRONTMATTER_ID_PATTERN = /^(?:id|brain_id):[ \t]*([0-9a-fA-F-]{36})[ \t]*$/;
+const FRONTMATTER_ID_PATTERN = /^id:[ \t]*([0-9a-fA-F-]{36})[ \t]*$/;
 
 function invalidInput(message: string, cause?: unknown): BrainError {
   return new BrainError({ code: 'INVALID_INPUT', message, cause });
@@ -65,6 +65,7 @@ export interface StoredPreimageBytes {
 
 export interface RevisionStore {
   persistPreimage(id: string, raw: string): Promise<StoredPreimageBytes>;
+  verifyPreimage(id: string, hash: string): Promise<void>;
   persistRevision(id: string, revisionId: string, raw: string): Promise<StoredRevisionBytes>;
   readRevision(id: string, revisionId: string): Promise<StoredRevisionBytes>;
   hasRevision(id: string, revisionId: string): Promise<boolean>;
@@ -273,6 +274,16 @@ class FileRevisionStore implements RevisionStore {
     return { id: safeId, hash: stored.hash, path: stored.path };
   }
 
+  async verifyPreimage(id: string, hash: string): Promise<void> {
+    const safeId = requireUuid(id, 'id');
+    const safeHash = requireHash(hash, 'hash');
+    const directory = await assertExistingDirectoryChain(this.state, ['history', safeId, 'preimages']);
+    const buffer = await readBoundedFile(join(directory, `${safeHash}.md`), `preimage ${safeHash}`);
+    if (sha256(buffer) !== safeHash) {
+      throw recoveryRequired(`preimage ${safeHash} failed its recorded byte-integrity check`);
+    }
+  }
+
   async persistRevision(id: string, revisionId: string, raw: string): Promise<StoredRevisionBytes> {
     const safeId = requireUuid(id, 'id');
     const safeRevision = requireUuid(revisionId, 'revision_id');
@@ -302,7 +313,7 @@ class FileRevisionStore implements RevisionStore {
       throw recoveryRequired(`revision ${safeRevision} failed its recorded byte-integrity check`);
     }
     const documentId = readFrontmatterId(raw);
-    if (documentId !== undefined && documentId !== safeId.toLowerCase()) {
+    if (documentId !== safeId.toLowerCase()) {
       throw recoveryRequired(`revision ${safeRevision} does not belong to logical id ${safeId}`);
     }
     return { id: safeId, revision_id: safeRevision, raw, hash, path };

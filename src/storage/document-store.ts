@@ -59,7 +59,7 @@ function wrapIo(message: string, error: unknown): BrainError {
 }
 
 function isInside(parent: string, child: string): boolean {
-  return child === parent || child.startsWith(`${parent}${sep}`);
+  return child === parent || child.startsWith(parent.endsWith(sep) ? parent : `${parent}${sep}`);
 }
 
 async function syncDirectory(directory: string): Promise<void> {
@@ -417,7 +417,11 @@ class LocalDocumentStore implements DocumentStore {
     const document = parsed.id === undefined ? { ...parsed, id } : parsed;
     const rawToWrite = parsed.id === undefined ? renderDocument(document) : input.raw;
     const revisionHash = sha256(rawToWrite);
-    const preimageHash = observed?.hash ?? null;
+    const preimageHash = record === undefined ? observed?.hash ?? null : record.preimage_hash;
+    const hadReservation = record !== undefined;
+    if (record !== undefined && record.revision_hash !== revisionHash) {
+      throw recoveryRequired(`reserved revision ${revisionId} differs from the proposed bytes`);
+    }
 
     if (record === undefined) {
       await this.runFault('journalPrepare', 'the write journal could not be prepared');
@@ -439,9 +443,13 @@ class LocalDocumentStore implements DocumentStore {
     }
 
     const alreadyMaterialized =
-      observed !== undefined && observed.hash === revisionHash && observedId === id;
+      hadReservation && observed !== undefined && observed.hash === record.revision_hash && observedId === id;
 
     if (!alreadyMaterialized) {
+      if (record.preimage_hash !== (observed?.hash ?? null)) {
+        this.markConflict(record, timestamp);
+        throw conflict(`path ${input.path} changed since the operation was reserved`);
+      }
       if (observed === undefined) {
         if (input.expectedEtag !== null) {
           this.markConflict(record, timestamp);
@@ -467,21 +475,11 @@ class LocalDocumentStore implements DocumentStore {
           throw conflict(`path ${input.path} is managed by a different logical id`);
         }
       }
-      const byPath = this.journal.findDocumentByPath(input.path);
-      if (byPath !== undefined && byPath.id !== id) {
-        this.markConflict(record, timestamp);
-        throw conflict(`path ${input.path} is managed by another logical id`);
-      }
-      const byId = this.journal.findDocumentById(id);
-      if (byId !== undefined && byId.path !== input.path) {
-        this.markConflict(record, timestamp);
-        throw conflict(`logical id ${id} already exists at ${byId.path}`);
-      }
-      const vaultConflict = await this.findUncataloguedId(id, input.path);
-      if (vaultConflict !== undefined) {
-        this.markConflict(record, timestamp);
-        throw conflict(`logical id ${id} already exists at ${vaultConflict}`);
-      }
+    }
+    const collision = await this.findIdCollision(id, input.path);
+    if (collision !== undefined) {
+      this.markConflict(record, timestamp);
+      throw conflict(`logical id ${id} already exists at ${collision}`);
     }
 
     try {
@@ -495,10 +493,10 @@ class LocalDocumentStore implements DocumentStore {
     }
     record = this.journal.update(record.operation_id, {
       state: 'history_persisted',
-      preimage_hash: preimageHash,
-      revision_hash: revisionHash,
       updated_at: timestamp
     });
+
+    await this.verifyDurableHistory(record);
 
     if (!alreadyMaterialized) {
       await ensureWriteChain(this.vaultRoot, segments);
@@ -532,6 +530,7 @@ class LocalDocumentStore implements DocumentStore {
       this.markConflict(record, timestamp);
       throw conflict(`path ${input.path} diverged from the persisted revision after replacement`);
     }
+    await this.verifyDurableHistory(record);
     return this.finalize(record, after, id, revisionId, timestamp, true);
   }
 
@@ -558,6 +557,34 @@ class LocalDocumentStore implements DocumentStore {
       if (candidateId === id) return candidate;
     }
     return undefined;
+  }
+
+  private async findIdCollision(id: string, path: string): Promise<string | undefined> {
+    const byPath = this.journal.findDocumentByPath(path);
+    if (byPath !== undefined && byPath.id !== id) return path;
+    const byId = this.journal.findDocumentById(id);
+    if (byId !== undefined && byId.path !== path) return byId.path;
+    return this.findUncataloguedId(id, path);
+  }
+
+  private async verifyDurableHistory(record: LocalWriteRecord): Promise<void> {
+    if (record.id === null || record.revision_id === null || record.revision_hash === null) {
+      throw recoveryRequired(`operation ${record.operation_id} has no reserved revision`);
+    }
+    try {
+      if (record.preimage_hash !== null) {
+        await this.revisions.verifyPreimage(record.id, record.preimage_hash);
+      }
+      const revision = await this.revisions.readRevision(record.id, record.revision_id);
+      if (revision.hash !== record.revision_hash) {
+        throw recoveryRequired(`revision ${record.revision_id} differs from the reserved hash`);
+      }
+    } catch (error) {
+      if (isBrainError(error) && error.code === 'NOT_FOUND') {
+        throw recoveryRequired(`history for operation ${record.operation_id} is incomplete`, error);
+      }
+      throw wrapIo(`history for operation ${record.operation_id} is incomplete`, error);
+    }
   }
 
   private async finalize(
@@ -708,6 +735,13 @@ class LocalDocumentStore implements DocumentStore {
       return 'skip';
     }
     if (observedId !== record.id) return 'skip';
+    try {
+      await this.verifyDurableHistory(record);
+    } catch (error) {
+      if (isBrainError(error) && error.code === 'RECOVERY_REQUIRED') return 'skip';
+      throw error;
+    }
+    if (await this.findIdCollision(record.id, record.path) !== undefined) return 'skip';
     const receipt = await this.finalize(
       record,
       observed,

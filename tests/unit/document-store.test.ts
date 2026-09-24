@@ -119,6 +119,25 @@ test('a pre-existing target rejects a no-clobber create and stays untouched', as
   }
 });
 
+test('a fresh key cannot claim byte-identical managed bytes on an occupied path', async () => {
+  const s = await vaultSandbox();
+  const store = await openDocumentStore(s);
+  try {
+    const raw = '---\nid: 44b093c5-71db-4785-b9a5-bb8118304278\ntype: note\nstatus: candidate\n---\n\n# Existing\n';
+    await mkdir(join(s.vault, 'Inbox'), { recursive: true });
+    await writeFile(join(s.vault, 'Inbox/Existing.md'), raw);
+    await expect(store.put({
+      path: 'Inbox/Existing.md', raw, expectedEtag: null,
+      idempotencyKey: 'fresh-identical', source: 'test'
+    })).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(await readFile(join(s.vault, 'Inbox/Existing.md'), 'utf8')).toBe(raw);
+    expect((await store.readPath('Inbox/Existing.md')).revision_id).toBeUndefined();
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
 test('an expected etag for a missing path rejects the write', async () => {
   const s = await vaultSandbox();
   const store = await openDocumentStore(s);
@@ -363,6 +382,17 @@ test('overlapping vault and state roots are rejected', async () => {
   }
 });
 
+test('a filesystem-root vault rejects a nested state directory', async () => {
+  const s = await vaultSandbox();
+  try {
+    await expect(openDocumentStore({ vault: '/', state: s.state })).rejects.toMatchObject({
+      code: 'INVALID_INPUT'
+    });
+  } finally {
+    await s.dispose();
+  }
+});
+
 test('a symlinked history directory is rejected', async () => {
   const s = await vaultSandbox();
   try {
@@ -491,6 +521,38 @@ test('a revision whose recorded bytes belong to another logical id is rejected',
     await expect(store.readRevision(result.id, result.revision_id)).rejects.toMatchObject({
       code: 'RECOVERY_REQUIRED'
     });
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
+test('a historical revision missing its frontmatter id is rejected despite a matching sidecar', async () => {
+  const s = await vaultSandbox();
+  const store = await openDocumentStore(s);
+  try {
+    const result = await store.put({ path: 'Inbox/No id.md', raw: '# Initial\n', expectedEtag: null, idempotencyKey: 'no-id-history', source: 'test' });
+    const directory = join(s.state, 'history', result.id, 'revisions');
+    const raw = '---\ntype: note\nstatus: candidate\n---\n\n# No id\n';
+    await writeFile(join(directory, `${result.revision_id}.md`), raw);
+    await writeFile(join(directory, `${result.revision_id}.sha256`), sha256(raw));
+    await expect(store.readRevision(result.id, result.revision_id)).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
+test('a quoted foreign frontmatter id cannot pass historical identity verification', async () => {
+  const s = await vaultSandbox();
+  const store = await openDocumentStore(s);
+  try {
+    const result = await store.put({ path: 'Inbox/Quoted.md', raw: '# Initial\n', expectedEtag: null, idempotencyKey: 'quoted-history', source: 'test' });
+    const directory = join(s.state, 'history', result.id, 'revisions');
+    const raw = '---\nid: "11111111-1111-4111-8111-111111111111"\ntype: note\nstatus: candidate\n---\n\n# Foreign\n';
+    await writeFile(join(directory, `${result.revision_id}.md`), raw);
+    await writeFile(join(directory, `${result.revision_id}.sha256`), sha256(raw));
+    await expect(store.readRevision(result.id, result.revision_id)).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
   } finally {
     await store.close();
     await s.dispose();

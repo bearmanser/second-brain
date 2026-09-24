@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { expect, test } from 'vitest';
 import {
@@ -9,6 +9,7 @@ import {
   type DocumentIndexEntry
 } from '../../src/storage/document-store.js';
 import { vaultSandbox } from '../helpers/vault-sandbox.js';
+import { LocalWriteJournal } from '../../src/storage/journal.js';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -481,6 +482,190 @@ test('a retry after a partially completed replacement resumes instead of conflic
     expect(result.revision_id).toBeTruthy();
     expect(await revisionCount(s.state, result.id)).toBe(1);
     expect((await store.readPath(input.path)).revision_id).toBe(result.revision_id);
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
+test('recovery does not catalogue a visible revision missing from durable history', async () => {
+  const s = await vaultSandbox();
+  const path = 'Inbox/Missing history.md';
+  const store = await openDocumentStore({ vault: s.vault, state: s.state, faults: {
+    afterReplace() { throw new Error('crash after replacement'); }
+  } });
+  try {
+    await expect(store.put({ path, raw: '# Missing history\n', expectedEtag: null, idempotencyKey: 'missing-history', source: 'test' }))
+      .rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+  } finally {
+    await store.close();
+  }
+  const journal = LocalWriteJournal.open(join(s.state, 'documents.sqlite'));
+  const reservation = journal.findByKey('missing-history')!;
+  journal.close();
+  await rm(join(s.state, 'history', reservation.id!, 'revisions', `${reservation.revision_id}.md`));
+  const restarted = await openDocumentStore(s);
+  try {
+    expect((await restarted.readPath(path)).revision_id).toBeUndefined();
+    await expect(restarted.readRevision(reservation.id!, reservation.revision_id!)).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    const opened = LocalWriteJournal.open(join(s.state, 'documents.sqlite'));
+    try { expect(opened.findDocumentByPath(path)).toBeUndefined(); }
+    finally { opened.close(); }
+  } finally {
+    await restarted.close();
+    await s.dispose();
+  }
+});
+
+test('recovery does not catalogue a revision with a corrupt history sidecar', async () => {
+  const s = await vaultSandbox();
+  const path = 'Inbox/Corrupt sidecar.md';
+  const store = await openDocumentStore({ vault: s.vault, state: s.state, faults: {
+    afterReplace() { throw new Error('crash after replacement'); }
+  } });
+  try {
+    await expect(store.put({ path, raw: '# Corrupt sidecar\n', expectedEtag: null, idempotencyKey: 'corrupt-sidecar', source: 'test' }))
+      .rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+  } finally {
+    await store.close();
+  }
+  const journal = LocalWriteJournal.open(join(s.state, 'documents.sqlite'));
+  const reservation = journal.findByKey('corrupt-sidecar')!;
+  journal.close();
+  await writeFile(join(s.state, 'history', reservation.id!, 'revisions', `${reservation.revision_id}.sha256`), '0'.repeat(64));
+  const restarted = await openDocumentStore(s);
+  try {
+    expect((await restarted.readPath(path)).revision_id).toBeUndefined();
+    await expect(restarted.readRevision(reservation.id!, reservation.revision_id!)).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    const opened = LocalWriteJournal.open(join(s.state, 'documents.sqlite'));
+    try { expect(opened.findDocumentByPath(path)).toBeUndefined(); } finally { opened.close(); }
+  } finally {
+    await restarted.close();
+    await s.dispose();
+  }
+});
+
+test('a sidecar lost after replacement cannot be catalogued or receipted', async () => {
+  const s = await vaultSandbox();
+  const path = 'Inbox/Lost sidecar.md';
+  const store = await openDocumentStore({ vault: s.vault, state: s.state, faults: {
+    async afterReplace() {
+      const journal = LocalWriteJournal.open(join(s.state, 'documents.sqlite'));
+      const reservation = journal.findByKey('lost-sidecar')!;
+      journal.close();
+      await rm(join(s.state, 'history', reservation.id!, 'revisions', `${reservation.revision_id}.sha256`));
+    }
+  } });
+  try {
+    await expect(store.put({ path, raw: '# Lost sidecar\n', expectedEtag: null, idempotencyKey: 'lost-sidecar', source: 'test' }))
+      .rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect((await store.readPath(path)).revision_id).toBeUndefined();
+    const journal = LocalWriteJournal.open(join(s.state, 'documents.sqlite'));
+    try { expect(journal.findDocumentByPath(path)).toBeUndefined(); }
+    finally { journal.close(); }
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
+test('a retry preserves the reserved preimage when the visible note changes', async () => {
+  const s = await vaultSandbox();
+  let interrupt = false;
+  const store = await openDocumentStore({ vault: s.vault, state: s.state, faults: {
+    beforeReplace() { if (interrupt) throw new Error('crash before replacement'); }
+  } });
+  const path = 'Inbox/Preimage.md';
+  try {
+    const first = await store.put({ path, raw: '# Original\n', expectedEtag: null, idempotencyKey: 'preimage-create', source: 'test' });
+    const before = (await store.readPath(path)).raw;
+    interrupt = true;
+    const input = { path, raw: '# Replacement\n', expectedEtag: first.etag, idempotencyKey: 'preimage-retry', source: 'test' };
+    await expect(store.put(input)).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    await writeFile(join(s.vault, path), '# Human edit\n');
+    interrupt = false;
+    await expect(store.put(input)).rejects.toMatchObject({ code: 'CONFLICT' });
+    const journal = LocalWriteJournal.open(join(s.state, 'documents.sqlite'));
+    try { expect(journal.findByKey(input.idempotencyKey)?.preimage_hash).toBe(sha256(before)); }
+    finally { journal.close(); }
+    expect(await readFile(join(s.vault, path), 'utf8')).toBe('# Human edit\n');
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
+test('a materialized retry retains the original reserved preimage hash', async () => {
+  const s = await vaultSandbox();
+  let interrupt = false;
+  const store = await openDocumentStore({ vault: s.vault, state: s.state, faults: {
+    afterReplace() { if (interrupt) throw new Error('crash after replacement'); }
+  } });
+  const path = 'Inbox/Reserved preimage.md';
+  try {
+    const first = await store.put({ path, raw: '# Original\n', expectedEtag: null, idempotencyKey: 'reserved-preimage-create', source: 'test' });
+    const before = (await store.readPath(path)).raw;
+    interrupt = true;
+    const input = { path, raw: '# Revised\n', expectedEtag: first.etag, idempotencyKey: 'reserved-preimage-revise', source: 'test' };
+    await expect(store.put(input)).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    interrupt = false;
+    await store.put(input);
+    const journal = LocalWriteJournal.open(join(s.state, 'documents.sqlite'));
+    try { expect(journal.findByKey(input.idempotencyKey)?.preimage_hash).toBe(sha256(before)); }
+    finally { journal.close(); }
+  } finally {
+    await store.close();
+    await s.dispose();
+  }
+});
+
+test('recovery requires the reserved preimage before cataloguing a replaced revision', async () => {
+  const s = await vaultSandbox();
+  let interrupt = false;
+  const path = 'Inbox/Preimage recovery.md';
+  const store = await openDocumentStore({ vault: s.vault, state: s.state, faults: {
+    afterReplace() { if (interrupt) throw new Error('crash after replacement'); }
+  } });
+  let first: Awaited<ReturnType<typeof store.put>>;
+  try {
+    first = await store.put({ path, raw: '# Before\n', expectedEtag: null, idempotencyKey: 'preimage-recovery-create', source: 'test' });
+    interrupt = true;
+    await expect(store.put({ path, raw: '# After\n', expectedEtag: first.etag, idempotencyKey: 'preimage-recovery-revise', source: 'test' }))
+      .rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+  } finally { await store.close(); }
+  const journal = LocalWriteJournal.open(join(s.state, 'documents.sqlite'));
+  const reservation = journal.findByKey('preimage-recovery-revise')!;
+  journal.close();
+  await rm(join(s.state, 'history', reservation.id!, 'preimages', `${reservation.preimage_hash}.md`));
+  const restarted = await openDocumentStore(s);
+  try {
+    expect((await restarted.readPath(path)).revision_id).toBeUndefined();
+    const opened = LocalWriteJournal.open(join(s.state, 'documents.sqlite'));
+    try { expect(opened.findDocumentByPath(path)?.revision_id).toBe(first.revision_id); }
+    finally { opened.close(); }
+  } finally {
+    await restarted.close();
+    await s.dispose();
+  }
+});
+
+test('a materialized retry cannot catalogue an id duplicated by an uncatalogued note', async () => {
+  const s = await vaultSandbox();
+  let interrupt = true;
+  const id = '44b093c5-71db-4785-b9a5-bb8118304278';
+  const path = 'Inbox/Pending duplicate.md';
+  const raw = `---\nid: ${id}\ntype: note\nstatus: candidate\n---\n\n# Pending\n`;
+  const store = await openDocumentStore({ vault: s.vault, state: s.state, faults: {
+    afterReplace() { if (interrupt) throw new Error('crash after replacement'); }
+  } });
+  try {
+    const input = { path, raw, expectedEtag: null, idempotencyKey: 'materialized-duplicate', source: 'test' };
+    await expect(store.put(input)).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    await writeFile(join(s.vault, 'Inbox/Human duplicate.md'), raw);
+    interrupt = false;
+    await expect(store.put(input)).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect((await store.readPath(path)).revision_id).toBeUndefined();
+    expect(await readFile(join(s.vault, path), 'utf8')).toBe(raw);
   } finally {
     await store.close();
     await s.dispose();
