@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { expect, test } from 'vitest';
 import { ensureProject } from '../../src/features/project-ensure.js';
@@ -382,6 +382,40 @@ test('project ensure fails closed when the Projects inventory cannot be read', a
     ).toBeUndefined();
     expect(h.deps.journal.countProjects()).toBe(0);
     expect(readFileSync(projectsPath, 'utf8')).toBe('not a directory\n');
+  } finally {
+    await h.close();
+  }
+});
+
+test('project ensure refuses allocation for a dangling Projects symlink', async () => {
+  const h = await createHarness();
+  try {
+    const vault = h.deps.config.mounts.vault;
+    await symlink(join(vault, 'missing-target'), join(vault, 'Projects'));
+    await expect(
+      ensureProject(workerContext, request('https://github.com/example/dangling.git'), h.deps)
+    ).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(
+      h.deps.journal.getProjectByIdentity('github.com/example/dangling')
+    ).toBeUndefined();
+    expect(h.deps.journal.countProjects()).toBe(0);
+  } finally {
+    await h.close();
+  }
+});
+
+test('project ensure refuses allocation when the vault root is missing', async () => {
+  const h = await createHarness();
+  try {
+    const vault = h.deps.config.mounts.vault;
+    await rm(vault, { recursive: true, force: true });
+    await expect(
+      ensureProject(workerContext, request('https://github.com/example/no-vault.git'), h.deps)
+    ).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(
+      h.deps.journal.getProjectByIdentity('github.com/example/no-vault')
+    ).toBeUndefined();
+    expect(h.deps.journal.countProjects()).toBe(0);
   } finally {
     await h.close();
   }

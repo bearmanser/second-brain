@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readdirSync, type Dirent } from 'node:fs';
+import { lstatSync, readdirSync, type Dirent, type Stats } from 'node:fs';
 import { join } from 'node:path';
 import { BrainError, isBrainError } from '../contracts/errors.js';
 import { projectEnsureRequestSchema } from '../contracts/protocol.js';
@@ -79,28 +79,57 @@ interface PlannedProjectIdentity {
   relativeRoot: string;
 }
 
-function readProjectsDirectory(projectsDirectory: string): Dirent[] {
+function inventoryFailure(message: string, cause?: unknown): BrainError {
+  return new BrainError({
+    code: 'RECOVERY_REQUIRED',
+    message,
+    ...(cause === undefined ? {} : { cause })
+  });
+}
+
+function errnoOf(error: unknown): string | undefined {
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    typeof (error as { code?: unknown }).code === 'string'
+  ) {
+    return (error as { code: string }).code;
+  }
+  return undefined;
+}
+
+function inspectDirectory(path: string, message: string): Stats | undefined {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if (errnoOf(error) === 'ENOENT') return undefined;
+    throw inventoryFailure(message, error);
+  }
+}
+
+function readProjectsDirectory(vaultRoot: string): Dirent[] {
+  const rootInfo = inspectDirectory(vaultRoot, 'the vault root cannot be inspected');
+  if (rootInfo === undefined || !rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
+    throw inventoryFailure('the vault root is not a real directory');
+  }
+  const projectsDirectory = join(vaultRoot, PROJECTS_ROOT);
+  const projectsInfo = inspectDirectory(
+    projectsDirectory,
+    'the vault project directory cannot be inspected'
+  );
+  if (projectsInfo === undefined) return [];
+  if (!projectsInfo.isDirectory() || projectsInfo.isSymbolicLink()) {
+    throw inventoryFailure('the vault project directory is not a real directory');
+  }
   try {
     return readdirSync(projectsDirectory, { withFileTypes: true });
   } catch (error) {
-    if (
-      typeof error === 'object' &&
-      error !== null &&
-      (error as { code?: unknown }).code === 'ENOENT'
-    ) {
-      return [];
-    }
-    throw new BrainError({
-      code: 'RECOVERY_REQUIRED',
-      message: 'the vault project directory cannot be inspected',
-      cause: error
-    });
+    throw inventoryFailure('the vault project directory cannot be inspected', error);
   }
 }
 
 function vaultProjectRoots(deps: BrainDeps): string[] {
-  const projectsDirectory = join(deps.config.mounts.vault, PROJECTS_ROOT);
-  return readProjectsDirectory(projectsDirectory).map(
+  return readProjectsDirectory(deps.config.mounts.vault).map(
     (entry) => `${PROJECTS_ROOT}/${entry.name}`
   );
 }
