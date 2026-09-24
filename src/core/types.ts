@@ -168,6 +168,15 @@ export interface ReviewRequest extends ProjectSelector {
       };
 }
 
+export interface ReviewMoveOperation {
+  action: 'move';
+  idempotency_key: string;
+  id: string;
+  target_path: string;
+  expected_etag: string;
+  rationale: string;
+}
+
 export interface FeedbackRequest extends ProjectSelector {
   idempotency_key: string;
   id: string;

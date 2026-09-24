@@ -2487,6 +2487,49 @@ export type LocalWriteReservationResult =
   | { kind: 'new'; record: LocalWriteRecord }
   | { kind: 'replay'; record: LocalWriteRecord };
 
+export interface LocalMoveReservation {
+  operation_id: string;
+  idempotency_key: string;
+  from_path: string;
+  to_path: string;
+  payload_hash: string;
+  manifest_json: string;
+}
+
+export type LocalMoveState =
+  | 'prepared'
+  | 'manifest_persisted'
+  | 'validated'
+  | 'moved'
+  | 'edits_applied'
+  | 'records_updated'
+  | 'complete'
+  | 'conflict'
+  | 'failed';
+
+export interface LocalMoveRecord extends LocalMoveReservation {
+  state: LocalMoveState;
+  receipt_json: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface LocalMoveFileRecord {
+  operation_id: string;
+  path: string;
+  role: 'source' | 'edit';
+  expected_hash: string;
+  new_hash: string | null;
+  new_raw: string | null;
+  preimage_raw: string;
+  state: 'pending' | 'applied';
+  updated_at: string;
+}
+
+export type LocalMoveReservationResult =
+  | { kind: 'new'; record: LocalMoveRecord }
+  | { kind: 'replay'; record: LocalMoveRecord };
+
 interface LocalWriteRow {
   operation_id: string;
   idempotency_key: string;
@@ -2519,6 +2562,31 @@ interface LocalIndexRow {
   revision_id: string;
   raw_hash: string;
   enqueued_at: string;
+}
+
+interface LocalMoveRow {
+  operation_id: string;
+  idempotency_key: string;
+  from_path: string;
+  to_path: string;
+  payload_hash: string;
+  manifest_json: string;
+  state: string;
+  receipt_json: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface LocalMoveFileRow {
+  operation_id: string;
+  path: string;
+  role: string;
+  expected_hash: string;
+  new_hash: string | null;
+  new_raw: string | null;
+  preimage_raw: string;
+  state: string;
+  updated_at: string;
 }
 
 const LOCAL_WRITE_STATES = [
@@ -2577,6 +2645,68 @@ function toLocalIndex(row: LocalIndexRow): LocalIndexRecord {
   };
 }
 
+const LOCAL_MOVE_STATES = [
+  'prepared',
+  'manifest_persisted',
+  'validated',
+  'moved',
+  'edits_applied',
+  'records_updated',
+  'complete',
+  'conflict',
+  'failed'
+] as const satisfies readonly LocalMoveState[];
+
+const LOCAL_MOVE_FILE_STATES = ['pending', 'applied'] as const;
+
+function requireLocalMoveState(value: string): LocalMoveState {
+  if ((LOCAL_MOVE_STATES as readonly string[]).includes(value)) {
+    return value as LocalMoveState;
+  }
+  throw recoveryRequired('a local move has an unknown stored state');
+}
+
+function requireLocalMoveFileState(value: string): 'pending' | 'applied' {
+  if ((LOCAL_MOVE_FILE_STATES as readonly string[]).includes(value)) {
+    return value as 'pending' | 'applied';
+  }
+  throw recoveryRequired('a local move file has an unknown stored state');
+}
+
+function requireLocalMoveRole(value: string): 'source' | 'edit' {
+  if (value === 'source' || value === 'edit') return value;
+  throw recoveryRequired('a local move file has an unknown role');
+}
+
+function toLocalMove(row: LocalMoveRow): LocalMoveRecord {
+  return {
+    operation_id: row.operation_id,
+    idempotency_key: row.idempotency_key,
+    from_path: row.from_path,
+    to_path: row.to_path,
+    payload_hash: row.payload_hash,
+    manifest_json: row.manifest_json,
+    state: requireLocalMoveState(row.state),
+    receipt_json: row.receipt_json,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+function toLocalMoveFile(row: LocalMoveFileRow): LocalMoveFileRecord {
+  return {
+    operation_id: row.operation_id,
+    path: row.path,
+    role: requireLocalMoveRole(row.role),
+    expected_hash: row.expected_hash,
+    new_hash: row.new_hash,
+    new_raw: row.new_raw,
+    preimage_raw: row.preimage_raw,
+    state: requireLocalMoveFileState(row.state),
+    updated_at: row.updated_at
+  };
+}
+
 const LOCAL_WRITE_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS local_write_operations (
      operation_id TEXT PRIMARY KEY,
@@ -2608,6 +2738,30 @@ const LOCAL_WRITE_SCHEMA = [
      revision_id TEXT NOT NULL,
      raw_hash TEXT NOT NULL,
      enqueued_at TEXT NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS local_move_operations (
+     operation_id TEXT PRIMARY KEY,
+     idempotency_key TEXT NOT NULL UNIQUE,
+     from_path TEXT NOT NULL,
+     to_path TEXT NOT NULL,
+     payload_hash TEXT NOT NULL,
+     manifest_json TEXT NOT NULL,
+     state TEXT NOT NULL,
+     receipt_json TEXT,
+     created_at TEXT NOT NULL,
+     updated_at TEXT NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS local_move_files (
+     operation_id TEXT NOT NULL,
+     path TEXT NOT NULL,
+     role TEXT NOT NULL,
+     expected_hash TEXT NOT NULL,
+     new_hash TEXT,
+     new_raw TEXT,
+     preimage_raw TEXT NOT NULL,
+     state TEXT NOT NULL,
+     updated_at TEXT NOT NULL,
+     PRIMARY KEY (operation_id, path, role)
    )`
 ];
 
@@ -2807,6 +2961,139 @@ export class LocalWriteJournal {
   dequeueIndex(path: string): void {
     this.assertOpen();
     this.database.prepare('DELETE FROM local_index_queue WHERE path = ?').run(path);
+  }
+
+  reserveMove(
+    input: LocalMoveReservation & { created_at: string; updated_at: string }
+  ): LocalMoveReservationResult {
+    this.assertOpen();
+    const existing = this.findMoveByKey(input.idempotency_key);
+    if (existing !== undefined) {
+      if (existing.payload_hash !== input.payload_hash) {
+        throw new BrainError({
+          code: 'IDEMPOTENCY_CONFLICT',
+          message: `idempotency key ${input.idempotency_key} was used for a different move`
+        });
+      }
+      return { kind: 'replay', record: existing };
+    }
+    this.database
+      .prepare(
+        `INSERT INTO local_move_operations (
+           operation_id, idempotency_key, from_path, to_path, payload_hash, manifest_json,
+           state, receipt_json, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, 'prepared', NULL, ?, ?)`
+      )
+      .run(
+        input.operation_id,
+        input.idempotency_key,
+        input.from_path,
+        input.to_path,
+        input.payload_hash,
+        input.manifest_json,
+        input.created_at,
+        input.updated_at
+      );
+    const stored = this.findMoveById(input.operation_id);
+    if (stored === undefined) throw recoveryRequired(`local move ${input.operation_id} was not persisted`);
+    return { kind: 'new', record: stored };
+  }
+
+  updateMove(
+    operation_id: string,
+    fields: Partial<Pick<LocalMoveRecord, 'state' | 'receipt_json' | 'updated_at'>>
+  ): LocalMoveRecord {
+    this.assertOpen();
+    const current = this.findMoveById(operation_id);
+    if (current === undefined) throw notFound(operation_id);
+    const next = { ...current, ...fields };
+    this.database
+      .prepare(
+        `UPDATE local_move_operations
+           SET state = ?, receipt_json = ?, updated_at = ?
+           WHERE operation_id = ?`
+      )
+      .run(next.state, next.receipt_json, next.updated_at, operation_id);
+    const stored = this.findMoveById(operation_id);
+    if (stored === undefined) throw recoveryRequired(`local move ${operation_id} disappeared`);
+    return stored;
+  }
+
+  findMoveByKey(idempotency_key: string): LocalMoveRecord | undefined {
+    this.assertOpen();
+    const row = this.database
+      .prepare('SELECT * FROM local_move_operations WHERE idempotency_key = ?')
+      .get(idempotency_key) as LocalMoveRow | undefined;
+    return row === undefined ? undefined : toLocalMove(row);
+  }
+
+  findMoveById(operation_id: string): LocalMoveRecord | undefined {
+    this.assertOpen();
+    const row = this.database
+      .prepare('SELECT * FROM local_move_operations WHERE operation_id = ?')
+      .get(operation_id) as LocalMoveRow | undefined;
+    return row === undefined ? undefined : toLocalMove(row);
+  }
+
+  listIncompleteMoves(): LocalMoveRecord[] {
+    this.assertOpen();
+    const rows = this.database
+      .prepare(
+        "SELECT * FROM local_move_operations WHERE state NOT IN ('complete', 'conflict', 'failed') ORDER BY created_at ASC, operation_id ASC"
+      )
+      .all() as LocalMoveRow[];
+    return rows.map(toLocalMove);
+  }
+
+  insertMoveFile(input: LocalMoveFileRecord): void {
+    this.assertOpen();
+    this.database
+      .prepare(
+        `INSERT OR IGNORE INTO local_move_files (
+           operation_id, path, role, expected_hash, new_hash, new_raw, preimage_raw, state, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        input.operation_id,
+        input.path,
+        input.role,
+        input.expected_hash,
+        input.new_hash,
+        input.new_raw,
+        input.preimage_raw,
+        input.state,
+        input.updated_at
+      );
+  }
+
+  updateMoveFile(
+    operation_id: string,
+    path: string,
+    role: 'source' | 'edit',
+    state: 'pending' | 'applied',
+    updated_at: string
+  ): void {
+    this.assertOpen();
+    const result = this.database
+      .prepare(
+        `UPDATE local_move_files SET state = ?, updated_at = ?
+         WHERE operation_id = ? AND path = ? AND role = ?`
+      )
+      .run(state, updated_at, operation_id, path, role);
+    if (result.changes !== 1) {
+      throw recoveryRequired(`local move file ${path} could not be updated`);
+    }
+  }
+
+  listMoveFiles(operation_id: string): LocalMoveFileRecord[] {
+    this.assertOpen();
+    const rows = this.database
+      .prepare(
+        `SELECT * FROM local_move_files WHERE operation_id = ?
+         ORDER BY CASE role WHEN 'source' THEN 0 ELSE 1 END ASC, path ASC`
+      )
+      .all(operation_id) as LocalMoveFileRow[];
+    return rows.map(toLocalMoveFile);
   }
 
   close(): void {

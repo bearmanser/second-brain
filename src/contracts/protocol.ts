@@ -75,6 +75,15 @@ const reviewResolveOperation = z.strictObject({
   note: noteInputSchema
 });
 
+export const reviewMoveOperation = z.strictObject({
+  action: z.literal('move'),
+  idempotency_key: uuidSchema,
+  id: uuidSchema,
+  target_path: z.string().trim().min(1).max(1024),
+  expected_etag: etagSchema,
+  rationale: text
+});
+
 export const captureRequestSchema = z
   .strictObject({
     idempotency_key: uuidSchema,
