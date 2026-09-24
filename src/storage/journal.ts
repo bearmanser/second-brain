@@ -3452,6 +3452,7 @@ const LOCAL_OPERATION_SCHEMA = [
      effect_index INTEGER NOT NULL,
      kind TEXT NOT NULL,
      key TEXT NOT NULL UNIQUE,
+     document_operation_id TEXT,
      state TEXT NOT NULL,
      created_at TEXT NOT NULL,
      updated_at TEXT NOT NULL,
@@ -3492,6 +3493,7 @@ export interface LocalSubordinateRecord {
   effect_index: number;
   kind: string;
   key: string;
+  document_operation_id: string | null;
   state: LocalSubordinateState;
   created_at: string;
   updated_at: string;
@@ -3506,6 +3508,7 @@ interface LocalSubordinateRow {
   effect_index: number;
   kind: string;
   key: string;
+  document_operation_id: string | null;
   state: string;
   created_at: string;
   updated_at: string;
@@ -3522,6 +3525,7 @@ function toLocalSubordinate(row: LocalSubordinateRow): LocalSubordinateRecord {
     effect_index: row.effect_index,
     kind: row.kind,
     key: row.key,
+    document_operation_id: row.document_operation_id,
     state: requireLocalSubordinateState(row.state),
     created_at: row.created_at,
     updated_at: row.updated_at
@@ -3551,6 +3555,11 @@ export class LocalOperationJournal {
       for (const statement of LOCAL_OPERATION_SCHEMA) database.exec(statement);
       try {
         database.exec('ALTER TABLE local_operations ADD COLUMN progress_json TEXT');
+      } catch {
+        undefined;
+      }
+      try {
+        database.exec('ALTER TABLE local_subordinate_operations ADD COLUMN document_operation_id TEXT');
       } catch {
         undefined;
       }
@@ -3640,8 +3649,8 @@ export class LocalOperationJournal {
     this.database
       .prepare(
         `INSERT INTO local_subordinate_operations (
-           operation_id, effect_index, kind, key, state, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, 'reserved', ?, ?)`
+           operation_id, effect_index, kind, key, document_operation_id, state, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, NULL, 'reserved', ?, ?)`
       )
       .run(
         input.operation_id,
@@ -3666,6 +3675,35 @@ export class LocalOperationJournal {
       .prepare('SELECT * FROM local_subordinate_operations WHERE operation_id = ? ORDER BY effect_index ASC')
       .all(operation_id) as LocalSubordinateRow[];
     return rows.map(toLocalSubordinate);
+  }
+
+  setSubordinateDocumentOperation(
+    operation_id: string,
+    effect_index: number,
+    document_operation_id: string
+  ): void {
+    this.assertOpen();
+    this.database
+      .prepare(
+        `UPDATE local_subordinate_operations SET document_operation_id = ?, updated_at = ?
+         WHERE operation_id = ? AND effect_index = ?`
+      )
+      .run(document_operation_id, new Date().toISOString(), operation_id, effect_index);
+  }
+
+  findSubordinateByKey(key: string): LocalSubordinateRecord | undefined {
+    this.assertOpen();
+    const row = this.database
+      .prepare('SELECT * FROM local_subordinate_operations WHERE key = ?')
+      .get(key) as LocalSubordinateRow | undefined;
+    return row === undefined ? undefined : toLocalSubordinate(row);
+  }
+
+  deleteSubordinates(operation_id: string): void {
+    this.assertOpen();
+    this.database
+      .prepare('DELETE FROM local_subordinate_operations WHERE operation_id = ?')
+      .run(operation_id);
   }
 
   markSubordinate(operation_id: string, effect_index: number, state: LocalSubordinateState): void {

@@ -342,6 +342,7 @@ export interface DocumentStorePutResult {
   etag: string;
   revision_id: string;
   indexed: boolean;
+  operation_id?: string;
 }
 
 export interface DocumentStoreReadResult {
@@ -421,6 +422,8 @@ export interface DocumentStore {
   applyRename(plan: RenamePlan): Promise<RenameReceipt>;
   consolidate(input: DocumentStoreConsolidateInput): Promise<DocumentStorePutResult>;
   getConsolidationReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
+  getDocumentReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
+  getMoveReceipt(idempotencyKey: string): RenameReceipt | undefined;
   recover(): Promise<DocumentStoreRecoveryReport>;
   close(): Promise<void>;
 }
@@ -773,6 +776,22 @@ class LocalDocumentStore implements DocumentStore {
     const record = this.journal.findConsolidationByKey(idempotencyKey);
     if (record !== undefined && record.state === 'complete' && record.receipt_json !== null) {
       return JSON.parse(record.receipt_json) as DocumentStorePutResult;
+    }
+    return undefined;
+  }
+
+  getDocumentReceipt(idempotencyKey: string): DocumentStorePutResult | undefined {
+    const record = this.journal.findByKey(idempotencyKey);
+    if (record !== undefined && record.state === 'complete' && record.receipt_json !== null) {
+      return JSON.parse(record.receipt_json) as DocumentStorePutResult;
+    }
+    return undefined;
+  }
+
+  getMoveReceipt(idempotencyKey: string): RenameReceipt | undefined {
+    const record = this.journal.findMoveByKey(idempotencyKey);
+    if (record !== undefined && record.state === 'complete' && record.receipt_json !== null) {
+      return JSON.parse(record.receipt_json) as RenameReceipt;
     }
     return undefined;
   }
@@ -1268,7 +1287,8 @@ class LocalDocumentStore implements DocumentStore {
       path: record.path,
       etag: observed.hash,
       revision_id: revisionId,
-      indexed
+      indexed,
+      operation_id: record.operation_id
     };
     this.journal.update(record.operation_id, {
       state: 'complete',

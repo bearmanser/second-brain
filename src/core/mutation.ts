@@ -1333,6 +1333,8 @@ export interface LocalDocumentExecutor {
   applyRename(plan: RenamePlan): Promise<RenameReceipt>;
   consolidate(input: DocumentStoreConsolidateInput): Promise<DocumentStorePutResult>;
   getConsolidationReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
+  getDocumentReceipt(idempotencyKey: string): DocumentStorePutResult | undefined;
+  getMoveReceipt(idempotencyKey: string): RenameReceipt | undefined;
 }
 
 export interface LocalObservedCatalogueEntry {
@@ -1352,6 +1354,20 @@ export interface LocalProjectLookup {
   getProjectByIdentity(repositoryIdentity: string):
     | { project: { id: string }; updated_at: string }
     | undefined;
+}
+
+export interface EffectPostcondition {
+  path: string;
+  etag: string;
+  id?: string;
+  revision_id?: string;
+  document_complete?: boolean;
+}
+
+export interface LocalOperationProgress {
+  preconditions_validated?: boolean;
+  renames?: Record<string, RenamePlan>;
+  effects?: Record<string, EffectPostcondition>;
 }
 
 export interface LocalMutationCoordinatorDeps {
@@ -1470,7 +1486,7 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
           continue;
         }
         try {
-          await this.executePlan(record, plan);
+          await this.recoverOperation(record, plan);
           finalized += 1;
           recovered += 1;
         } catch (error) {
@@ -1578,6 +1594,7 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
       throw localRecovery(`operation ${record.operation_id} has no durable plan yet`);
     }
     const plan = JSON.parse(record.plan_json) as LocalPlannedOperation;
+    this.bindLegacySubordinates(record, plan);
     return this.executePlan(record, plan);
   }
 
@@ -1694,6 +1711,59 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
         created_at: record.created_at,
         updated_at: this.now()
       });
+    });
+  }
+
+  private bindLegacySubordinates(record: LocalOperationRecord, plan: LocalPlannedOperation): void {
+    const existing = this.deps.operations.listSubordinates(record.operation_id);
+    if (existing.length > 0) return;
+    if (record.storage_key === null) return;
+    let legacyKeys: unknown;
+    try {
+      legacyKeys = JSON.parse(record.storage_key);
+    } catch (cause) {
+      throw localRecovery('the legacy subordinate linkage is unreadable', cause);
+    }
+    if (!Array.isArray(legacyKeys) || legacyKeys.some((entry) => typeof entry !== 'string')) {
+      throw localRecovery('the legacy subordinate linkage is malformed');
+    }
+    const specs = this.subordinateSpecs(plan);
+    const expectedKeys = specs.map((spec) => `${record.idempotency_key}:${spec.key}`);
+    if (legacyKeys.length !== expectedKeys.length) {
+      throw localRecovery(
+        'the legacy subordinate linkage does not match this plan and cannot be rebound safely'
+      );
+    }
+    specs.forEach((spec, index) => {
+      const key = expectedKeys[index];
+      const candidates: string[] = [];
+      const document = this.deps.documents.getDocumentReceipt(key);
+      if (document?.operation_id !== undefined) candidates.push(document.operation_id);
+      const move = this.deps.documents.getMoveReceipt(key);
+      if (move?.operation_id !== undefined) candidates.push(move.operation_id);
+      if (spec.kind === 'consolidation') {
+        const consolidation = this.deps.documents.getConsolidationReceipt(key);
+        if (consolidation?.operation_id !== undefined) candidates.push(consolidation.operation_id);
+      }
+      const unique = [...new Set(candidates)];
+      if (unique.length > 1) {
+        throw localRecovery(`legacy subordinate key ${key} matches multiple document operations`);
+      }
+      this.deps.operations.reserveSubordinate({
+        operation_id: record.operation_id,
+        effect_index: index,
+        kind: spec.kind,
+        key,
+        created_at: record.created_at,
+        updated_at: this.now()
+      });
+      if (unique.length === 1) {
+        this.deps.operations.setSubordinateDocumentOperation(
+          record.operation_id,
+          index,
+          unique[0]
+        );
+      }
     });
   }
 
@@ -1868,9 +1938,13 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     }
   }
 
-  private async recheckPlan(plan: LocalPlannedOperation): Promise<void> {
+  private async recheckPlan(
+    plan: LocalPlannedOperation,
+    options: { skipPaths?: ReadonlySet<string>; skipHeads?: boolean } = {}
+  ): Promise<void> {
     for (const condition of plan.read_set) {
       if (condition.kind === 'path') {
+        if (options.skipPaths?.has(condition.path)) continue;
         const current = await this.readPathOrUndefined(condition.path);
         if (condition.expected.kind === 'absent') {
           if (current !== undefined) throw localConflict(`path ${condition.path} is no longer vacant`);
@@ -1888,8 +1962,9 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
         continue;
       }
       if (condition.kind === 'note') {
-        const heads = await this.resolveConflictHeads(condition.id);
         const expected = condition.expected;
+        if (expected.kind === 'present' && options.skipPaths?.has(expected.path)) continue;
+        const heads = await this.resolveConflictHeads(condition.id);
         if (expected.kind === 'absent') {
           if (heads.length > 0) throw localConflict(`note ${condition.id} already exists`);
           continue;
@@ -1905,6 +1980,7 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
         continue;
       }
       if (condition.kind === 'heads') {
+        if (options.skipHeads === true) continue;
         await this.verifyConflictHeads(condition.id, condition.expected_heads);
         continue;
       }
@@ -2103,6 +2179,102 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     }
   }
 
+  private async recoverOperation(
+    record: LocalOperationRecord,
+    plan: LocalPlannedOperation
+  ): Promise<void> {
+    if (plan.kind === 'note' && !plan.effects.some((effect) => effect.kind === 'remove')) {
+      for (const [index, effect] of plan.effects.entries()) {
+        if (this.recordedEffect(record, index) !== undefined) continue;
+        if (effect.kind === 'write' || effect.kind === 'adopt') {
+          const stored = this.deps.documents.getDocumentReceipt(
+            `${record.idempotency_key}:doc:${index}`
+          );
+          if (stored !== undefined) {
+            this.recordEffect(record, index, {
+              path: stored.path,
+              etag: stored.etag,
+              id: stored.id,
+              revision_id: stored.revision_id,
+              document_complete: true
+            });
+            this.linkSubordinate(record, index, stored.operation_id);
+          }
+          continue;
+        }
+        if (effect.kind === 'move') {
+          const stored = this.deps.documents.getMoveReceipt(
+            `${record.idempotency_key}:move:${index}`
+          );
+          if (stored !== undefined) {
+            const destination = await this.readPathOrUndefined(stored.to);
+            if (destination !== undefined) {
+              this.recordEffect(record, index, {
+                path: stored.to,
+                etag: destination.etag,
+                id: destination.id,
+                revision_id: destination.revision_id,
+                document_complete: true
+              });
+            }
+            this.linkSubordinate(record, index, stored.operation_id);
+          }
+        }
+      }
+    }
+    const applied = Object.keys(this.readProgress(this.liveRecord(record)).effects ?? {}).length;
+    if (applied === 0) {
+      try {
+        await this.recheckPlan(plan);
+      } catch (error) {
+        if (isBrainError(error) && error.code === 'CONFLICT') {
+          this.deps.operations.update(record.operation_id, {
+            state: 'conflicted',
+            updated_at: this.now()
+          });
+        }
+        throw error;
+      }
+    } else {
+      await this.verifyPartial(record, plan);
+    }
+    await this.executePlan(record, plan);
+  }
+
+  private async verifyPartial(
+    record: LocalOperationRecord,
+    plan: LocalPlannedOperation
+  ): Promise<void> {
+    const effects = this.readProgress(this.liveRecord(record)).effects ?? {};
+    for (const [index, postcondition] of Object.entries(effects)) {
+      if (postcondition.document_complete === true) continue;
+      const current = await this.readPathOrUndefined(postcondition.path);
+      if (
+        current === undefined ||
+        current.etag !== postcondition.etag ||
+        (postcondition.id !== undefined && current.id !== postcondition.id) ||
+        (postcondition.revision_id !== undefined &&
+          current.revision_id !== postcondition.revision_id)
+      ) {
+        throw localRecovery(`applied effect ${index} diverged from its recorded postcondition`);
+      }
+    }
+    try {
+      await this.recheckPlan(plan, {
+        skipPaths: this.appliedSkipPaths(record, plan),
+        skipHeads: true
+      });
+    } catch (error) {
+      if (isBrainError(error) && error.code === 'CONFLICT') {
+        throw localRecovery(
+          'an unfinished effect precondition changed after partial application',
+          error
+        );
+      }
+      throw error;
+    }
+  }
+
   private async executePlan(
     record: LocalOperationRecord,
     plan: LocalPlannedOperation
@@ -2115,14 +2287,75 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
         return this.executeConsolidation(record, plan);
       }
       for (const [index, effect] of plan.effects.entries()) {
+        const recorded = this.recordedEffect(record, index);
+        if (recorded !== undefined) {
+          if (recorded.document_complete !== true) {
+            const current = await this.readPathOrUndefined(recorded.path);
+            if (
+              current === undefined ||
+              current.etag !== recorded.etag ||
+              (recorded.id !== undefined && current.id !== recorded.id) ||
+              (recorded.revision_id !== undefined && current.revision_id !== recorded.revision_id)
+            ) {
+              throw localRecovery(`applied effect ${index} diverged from its recorded postcondition`);
+            }
+          }
+          if (effect.kind === 'move') {
+            moveReceipt = {
+              operation_id: record.operation_id,
+              from: effect.from_path,
+              to: recorded.path,
+              moved: true,
+              edited: [],
+              indexed: [],
+              moved_indexed: false,
+              verified: true
+            };
+          } else {
+            last = {
+              id: recorded.id ?? '',
+              path: recorded.path,
+              etag: recorded.etag,
+              revision_id: recorded.revision_id ?? '',
+              indexed: false
+            };
+          }
+          continue;
+        }
         if (effect.kind === 'write' || effect.kind === 'adopt') {
-          last = await this.putEffect(record, effect.write, plan, index);
+          const put = await this.putEffect(record, effect.write, plan, index);
+          last = put;
+          this.recordEffect(record, index, {
+            path: put.path,
+            etag: put.etag,
+            id: put.id,
+            revision_id: put.revision_id
+          });
+          this.linkSubordinate(record, index, put.operation_id);
           continue;
         }
         if (effect.kind !== 'move') continue;
         moveReceipt = await this.moveEffect(record, effect, index);
+        const destination = await this.readPathOrUndefined(effect.to_path);
+        if (destination !== undefined) {
+          this.recordEffect(record, index, {
+            path: effect.to_path,
+            etag: destination.etag,
+            id: destination.id,
+            revision_id: destination.revision_id
+          });
+        }
+        this.linkSubordinate(record, index, moveReceipt.operation_id);
         if (effect.write !== undefined) {
-          last = await this.putEffect(record, effect.write, plan, index + 1000);
+          const put = await this.putEffect(record, effect.write, plan, index + 1000);
+          last = put;
+          this.recordEffect(record, index + 1000, {
+            path: put.path,
+            etag: put.etag,
+            id: put.id,
+            revision_id: put.revision_id
+          });
+          this.linkSubordinate(record, index + 1000, put.operation_id);
         }
       }
     }
@@ -2284,6 +2517,16 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
       source: record.tool
     };
     const result = await this.deps.documents.consolidate(input);
+    const writeIndex = plan.effects.findIndex((effect) => effect.kind === 'write');
+    if (writeIndex >= 0) {
+      this.recordEffect(record, writeIndex, {
+        path: result.path,
+        etag: result.etag,
+        id: result.id,
+        revision_id: result.revision_id
+      });
+      this.linkSubordinate(record, writeIndex, result.operation_id);
+    }
     const receipt: LocalOperationReceipt = {
       kind: 'note',
       operation_id: record.operation_id,
@@ -2339,17 +2582,72 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     return this.deps.documents.applyRename(renamePlan);
   }
 
-  private readProgress(
-    record: LocalOperationRecord
-  ): { preconditions_validated?: boolean; renames?: Record<string, RenamePlan> } {
+  private readProgress(record: LocalOperationRecord): LocalOperationProgress {
     if (record.progress_json === null) return {};
     try {
-      return JSON.parse(record.progress_json) as {
-        preconditions_validated?: boolean;
-        renames?: Record<string, RenamePlan>;
-      };
+      return JSON.parse(record.progress_json) as LocalOperationProgress;
     } catch {
       return {};
+    }
+  }
+
+  private liveRecord(record: LocalOperationRecord): LocalOperationRecord {
+    return this.deps.operations.findById(record.operation_id) ?? record;
+  }
+
+  private recordedEffect(record: LocalOperationRecord, index: number): EffectPostcondition | undefined {
+    return this.readProgress(this.liveRecord(record)).effects?.[String(index)];
+  }
+
+  private recordEffect(
+    record: LocalOperationRecord,
+    index: number,
+    postcondition: EffectPostcondition
+  ): void {
+    const progress = this.readProgress(this.liveRecord(record));
+    progress.effects = { ...(progress.effects ?? {}), [String(index)]: postcondition };
+    this.deps.operations.update(record.operation_id, {
+      progress_json: JSON.stringify(progress),
+      updated_at: this.now()
+    });
+  }
+
+  private appliedEffectPaths(record: LocalOperationRecord): Set<string> {
+    const effects = this.readProgress(this.liveRecord(record)).effects ?? {};
+    return new Set(Object.values(effects).map((effect) => effect.path));
+  }
+
+  private appliedSkipPaths(record: LocalOperationRecord, plan: LocalPlannedOperation): Set<string> {
+    const effects = this.readProgress(this.liveRecord(record)).effects ?? {};
+    const skip = new Set<string>();
+    for (const index of Object.keys(effects)) {
+      if (plan.kind !== 'note') continue;
+      const effect = plan.effects[Number(index)];
+      if (effect === undefined) continue;
+      if (effect.kind === 'write' || effect.kind === 'adopt') skip.add(effect.write.path);
+      else if (effect.kind === 'move') {
+        skip.add(effect.from_path);
+        skip.add(effect.to_path);
+      } else skip.add(effect.path);
+    }
+    for (const effect of Object.values(effects)) skip.add(effect.path);
+    return skip;
+  }
+
+  private linkSubordinate(
+    record: LocalOperationRecord,
+    index: number,
+    documentOperationId: string | undefined
+  ): void {
+    if (documentOperationId === undefined) return;
+    try {
+      this.deps.operations.setSubordinateDocumentOperation(
+        record.operation_id,
+        index,
+        documentOperationId
+      );
+    } catch {
+      undefined;
     }
   }
 
@@ -2390,7 +2688,6 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     this.deps.operations.update(record.operation_id, {
       state: 'finalized',
       receipt_json: JSON.stringify(receipt),
-      storage_key: storageKey,
       updated_at: this.now()
     });
   }
