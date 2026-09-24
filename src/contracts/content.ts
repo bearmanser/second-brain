@@ -14,21 +14,23 @@ import { isProjectIdentifier } from '../projects/registry.js';
 const text = z.string().trim().min(1).max(8000);
 const texts = z.array(text).max(32);
 
-export const notePathPattern =
-  /^(?!\/)(?!.*\\)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\u0000)(?=.*\S).+$/;
-
 export const notePathSchema = z
   .string()
   .trim()
   .min(1)
   .max(1024)
   .refine(
-    (value) =>
-      !value.startsWith('/') &&
-      !value.includes('\\') &&
-      !value.includes('\u0000') &&
-      !value.split('/').some((segment) => segment === '.' || segment === '..' || segment.length === 0),
-    { message: 'note path must be an unambiguous vault-relative path' }
+    (value) => {
+      if (value.startsWith('/') || value.includes('\\') || value.includes('\u0000')) return false;
+      if (/[\u0000-\u001f\u007f]/u.test(value)) return false;
+      const segments = value.split('/');
+      if (segments.some((segment) => segment.length === 0 || segment === '.' || segment === '..')) {
+        return false;
+      }
+      if (segments.some((segment) => segment.startsWith('.'))) return false;
+      return segments[segments.length - 1].endsWith('.md');
+    },
+    { message: 'note path must be a safe vault-relative Markdown path' }
   );
 
 export const uuidSchema = z.uuid();
@@ -169,13 +171,26 @@ export const noteInputSchemaV2 = noteInputBaseV1
     type: documentTypeSchema.optional(),
     source: text.optional()
   })
+  .refine(
+    (value) => {
+      if (value.type === undefined) return true;
+      if ((NOTE_KINDS as readonly string[]).includes(value.type)) {
+        return value.content.kind === value.type;
+      }
+      return value.content.kind === 'note';
+    },
+    {
+      message:
+        'a human organization type requires flexible note content; a structured kind must match content.kind'
+    }
+  )
   .refine(withinInputBodyLimit, {
     message: 'note input exceeds the 256 KiB input body limit'
   });
 
-export const noteContentSchema = noteContentSchemaV2;
+export const noteContentSchema = noteContentSchemaV1;
 
-export const noteInputSchema = noteInputSchemaV2;
+export const noteInputSchema = noteInputSchemaV1;
 
 export const noteReferenceSchema = z.union([
   z.strictObject({ id: uuidSchema }),
@@ -185,5 +200,6 @@ export const noteReferenceSchema = z.union([
 
 export type NoteReferenceInput = z.infer<typeof noteReferenceSchema>;
 
-export type NoteContent = z.infer<typeof noteContentSchemaV2>;
+export type NoteContent = z.infer<typeof noteContentSchemaV1>;
+export type NoteInputV1 = z.infer<typeof noteInputSchemaV1>;
 export type NoteInputV2 = z.infer<typeof noteInputSchemaV2>;

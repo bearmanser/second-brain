@@ -244,7 +244,7 @@ test('the published tool contract is pinned', () => {
   expect(contract).toMatchInlineSnapshot(`
     [
       {
-        "input": "1cfbef90a1b9cc2bc209d4db7becd104082d2dab90c8c330a48e402cb62ff7ae",
+        "input": "8cf96af973581c3f8fd6c954a45694b1ccf66b9de148d07299d0fef2aa1acc98",
         "name": "brain_capture",
         "output": "57fce7c09c966db809d68ffe028e91904e9938860b97d457430451f4799dccc9",
       },
@@ -269,7 +269,7 @@ test('the published tool contract is pinned', () => {
         "output": "1bba962c7fe6f748ca285b4bd573dd3c64dd299b2d6470bce14dbff9055aa0a5",
       },
       {
-        "input": "d8b155fb969fade8d4a8f55ccb69f5de76402a89506f1231efd9371e0185cee9",
+        "input": "de0d22351181adaa0c6469ddaa6a8813cab0bc49ff30bca7e5c30698e96e8b2a",
         "name": "brain_review",
         "output": "4296f66f5b3aedc53103bae95c5571490de8f77b13c0e484461f168059f21504",
       },

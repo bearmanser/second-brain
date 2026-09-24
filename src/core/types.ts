@@ -114,6 +114,16 @@ export interface ProjectEnsureResult {
   warnings: string[];
 }
 
+export interface ProjectEnsureResultV2 {
+  operation_id: string;
+  repository_identity: string;
+  project_id: string;
+  relative_root: string;
+  created: boolean;
+  materialized: boolean;
+  warnings: string[];
+}
+
 export interface ProjectProvisioningPlan {
   repository_identity: string;
   project_id: string;
@@ -298,6 +308,32 @@ export interface StatusResult {
   schemas?: Record<string, unknown>;
 }
 
+export interface StatusResultV2 {
+  version: string;
+  protocol_version: string;
+  schema_version: 1;
+  protocol: 2;
+  projects: {
+    id: string;
+    display_name: string;
+    relative_root: string;
+    state: RepositoryProjectState;
+  }[];
+  health: {
+    gateway: 'ready' | 'recovering' | 'degraded';
+    index: 'ready' | 'unavailable';
+    worker: 'ready' | 'disabled' | 'unavailable';
+  };
+  features: {
+    reranking: boolean;
+    text_search: boolean;
+    fallback: boolean;
+  };
+  pending_operations: number;
+  operation?: MutationReceipt | ProjectEnsureResultV2;
+  schemas?: Record<string, unknown>;
+}
+
 export interface ScopeConfig {
   id: string;
   backend_project: string;
@@ -318,6 +354,120 @@ export interface AuthenticatedContext {
   readonly signal: AbortSignal;
 }
 
+export type LocalOperationState =
+  | 'pending'
+  | 'finalized'
+  | 'conflicted'
+  | 'recovery_required';
+
+export interface LocalOperationPreconditions {
+  id?: string;
+  revision_id?: string;
+  etag?: string;
+  target_path?: string;
+}
+
+export interface LocalOperationIntent {
+  tool: 'brain_capture' | 'brain_review' | 'brain_project_ensure' | 'brain_feedback';
+  action: string;
+  project_id: string | null;
+  idempotency_key: string;
+  payload: unknown;
+  preconditions: LocalOperationPreconditions;
+}
+
+export interface LocalAllocatedIdentity {
+  operation_id: string;
+  note_id: string;
+  revision_id: string;
+  path: string;
+  timestamp: string;
+}
+
+export interface LocalObservedSource {
+  path: string;
+  raw: string;
+  etag: string;
+  id?: string;
+  revision_id?: string;
+}
+
+export interface LocalPendingWrite {
+  path: string;
+  raw: string;
+  id: string;
+  revision_id: string;
+}
+
+export type LocalOperationPlan = (
+  identity: LocalAllocatedIdentity,
+  observed: LocalObservedSource | undefined
+) => Promise<LocalPendingWrite> | LocalPendingWrite;
+
+export interface LocalOperationReceipt {
+  operation_id: string;
+  id: string;
+  revision_id: string;
+  path: string;
+  etag: string;
+  indexed: boolean;
+  warnings: string[];
+}
+
+export interface LocalOperationStatus {
+  operation_id: string;
+  tool: string;
+  action: string;
+  project_id: string | null;
+  state: LocalOperationState;
+  receipt?: LocalOperationReceipt;
+}
+
+export interface LocalRecoveryReport {
+  inspected: number;
+  finalized: number;
+  conflicted: number;
+  recovered: number;
+  pending: number;
+  blocking_operations: string[];
+}
+
+export interface LocalMutationCoordinatorPort {
+  run(intent: LocalOperationIntent, plan: LocalOperationPlan): Promise<LocalOperationReceipt>;
+  status(operation_id: string): LocalOperationStatus | undefined;
+  recover(): Promise<LocalRecoveryReport>;
+}
+
+export interface ResolvedProject {
+  id: string;
+  display_name: string;
+  relative_root: string;
+  state: RepositoryProjectState;
+  repository_identity?: string;
+}
+
+export interface ProjectResolutionPort {
+  resolve(identifier: string | undefined): ResolvedProject | undefined;
+  canonicalId(identifier: string): string | undefined;
+  list(): ResolvedProject[];
+}
+
+export interface SourceCursorScope {
+  id: string;
+  path: string;
+  revision_id: string;
+  etag: string;
+}
+
+export interface SourceCursorPosition {
+  offset: number;
+}
+
+export interface SourceBoundCursorPort {
+  issue(input: SourceCursorScope & { offset: number; expires_at: string }): string;
+  verify(cursor: string, scope: SourceCursorScope): SourceCursorPosition;
+}
+
 export interface LocalHandlerDeps {
   config: BrainConfig;
   documents: DocumentStore;
@@ -328,6 +478,9 @@ export interface LocalHandlerDeps {
   vaultRoot: string;
   clock: Clock;
   ids: IdSource;
+  mutations: LocalMutationCoordinatorPort;
+  projects: ProjectResolutionPort;
+  cursors: SourceBoundCursorPort;
   worker?: RerankWorker;
 }
 
@@ -556,5 +709,5 @@ export interface RetrievalEventInputV2 {
 }
 
 export type NoteContentV1 = NoteContent;
-export type NoteInputV1 = NoteInput;
-export type StoredRevisionV1 = StoredRevision;
+export type NoteInputV1 = Omit<NoteInput, 'type' | 'source'>;
+export type StoredRevisionV1 = Omit<StoredRevision, 'note'> & { note: NoteInputV1 };

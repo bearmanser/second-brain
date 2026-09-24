@@ -39,7 +39,7 @@ export interface LegacyRecallInput {
 }
 
 export interface ProjectLookup {
-  exists(identifier: string): boolean;
+  canonicalId(identifier: string): string | undefined;
 }
 
 export interface NormalizedRecallScope {
@@ -81,6 +81,13 @@ export function unknownLegacyScope(identifier: string): BrainError {
   });
 }
 
+function conflictingAliases(): BrainError {
+  return new BrainError({
+    code: 'INVALID_INPUT',
+    message: 'project and scope refer to different projects'
+  });
+}
+
 export function normalizeRecallScope(
   input: LegacyRecallInput,
   lookup: ProjectLookup
@@ -89,9 +96,9 @@ export function normalizeRecallScope(
   if (input.include_shared !== undefined) {
     warnings.push(LEGACY_WARNING_INCLUDE_SHARED_DEPRECATED);
   }
-  const identifiers: string[] = [];
-  if (input.project !== undefined) identifiers.push(input.project);
-  if (input.scope !== undefined) identifiers.push(input.scope);
+  const identifiers = [input.project, input.scope].filter(
+    (value): value is string => value !== undefined
+  );
   if (identifiers.length === 0) {
     return {
       filter: { mode: 'all' },
@@ -100,18 +107,21 @@ export function normalizeRecallScope(
       warnings
     };
   }
-  if (input.project !== undefined && input.scope !== undefined && input.project !== input.scope) {
-    throw new BrainError({
-      code: 'INVALID_INPUT',
-      message: 'project and scope refer to different projects'
-    });
+  const resolved = identifiers.map((identifier) => ({
+    identifier,
+    canonical: lookup.canonicalId(identifier)
+  }));
+  for (const entry of resolved) {
+    if (entry.canonical === undefined) throw unknownLegacyScope(entry.identifier);
   }
-  const identifier = identifiers[0];
-  if (!lookup.exists(identifier)) throw unknownLegacyScope(identifier);
+  const canonicalIds = [...new Set(resolved.map((entry) => entry.canonical as string))];
+  if (canonicalIds.length > 1) throw conflictingAliases();
+  const canonical = canonicalIds[0];
+  const sharedCanonical = lookup.canonicalId(LEGACY_SHARED_CATEGORY);
   const selectedShared =
-    input.include_shared === true && input.project !== undefined && lookup.exists(LEGACY_SHARED_CATEGORY);
+    input.include_shared === true && sharedCanonical !== undefined && sharedCanonical !== canonical;
   return {
-    filter: { mode: 'project', identifier },
+    filter: { mode: 'project', identifier: canonical },
     include_shared: input.include_shared === true,
     selected_shared: selectedShared,
     warnings

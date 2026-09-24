@@ -281,11 +281,11 @@ export async function localRecall(
   if (ctx.signal.aborted) throw cancelled('the recall was cancelled');
   await reconcile(brain);
   const scope = normalizeRecallScope(input, {
-    exists: (identifier) => {
+    canonicalId: (identifier) => {
       try {
-        return resolveProjectId(brain, identifier) !== undefined;
+        return resolveProjectId(brain, identifier);
       } catch {
-        return false;
+        return undefined;
       }
     }
   });

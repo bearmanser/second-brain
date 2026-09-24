@@ -584,6 +584,76 @@ export async function startLegacyHttpHarness(options: HttpHarnessOptions = {}): 
   };
 }
 
+export interface LocalHttpHarness {
+  url: string;
+  token: string;
+  config: BrainConfig;
+  runtime: BrainRuntime;
+  connect(token: string, name?: string): Promise<Client>;
+  close(): Promise<void>;
+}
+
+export async function startLocalHttpHarness(
+  options: { token?: string } = {}
+): Promise<LocalHttpHarness> {
+  const root = await mkdtemp(join(tmpdir(), 'brain-local-http-'));
+  const vaultRoot = join(root, 'vault');
+  const stateDir = join(root, 'state');
+  await mkdir(vaultRoot, { recursive: true });
+  await mkdir(stateDir, { recursive: true });
+  for (const scope of scopeFixtures) {
+    await mkdir(join(vaultRoot, scope.relative_root), { recursive: true });
+  }
+  const token = options.token ?? newToken();
+  const cursorSecretFile = join(root, 'cursor.key');
+  await writeFile(cursorSecretFile, randomBytes(48));
+  const config: BrainConfig = {
+    endpoint: 'http://127.0.0.1:7331/mcp',
+    backend_endpoint: 'http://127.0.0.1:1/mcp',
+    port: 0,
+    mounts: { vault: vaultRoot, state: stateDir },
+    cursor_secret_file: cursorSecretFile,
+    scopes: scopeFixtures.map((scope) => ({ ...scope })),
+    limits: {
+      input_body_max_bytes: INPUT_BODY_MAX_BYTES,
+      rendered_note_max_bytes: RENDERED_NOTE_MAX_BYTES,
+      tool_result_max_bytes: TOOL_RESULT_MAX_BYTES,
+      backend_timeout_ms: BACKEND_TIMEOUT_MS,
+      materialization_timeout_ms: MATERIALIZATION_TIMEOUT_MS,
+      reconcile_interval_ms: RECONCILE_INTERVAL_MS,
+      concurrent_reads: CONCURRENT_READS,
+      project_provision_global_per_minute: PROJECT_PROVISION_GLOBAL_PER_MINUTE,
+      dynamic_projects_max: DYNAMIC_PROJECTS_MAX
+    },
+    allowed_hosts: ['127.0.0.1', 'localhost'],
+    allowed_origins: [],
+    result_delivery: 'structured'
+  };
+  const runtime = await createRuntime(config, {
+    token_digest: tokenDigest(token),
+    logger: () => undefined
+  });
+  return {
+    url: runtime.url,
+    token,
+    config,
+    runtime,
+    connect: async (value: string, name = 'brain-local-http-test') => {
+      const client = new Client({ name, version: '1.0.0' });
+      await client.connect(
+        new StreamableHTTPClientTransport(new URL(runtime.url), {
+          requestInit: { headers: { Authorization: `Bearer ${value}` } }
+        })
+      );
+      return client;
+    },
+    close: async () => {
+      await runtime.close();
+      await rm(root, { recursive: true, force: true }).catch(() => undefined);
+    }
+  };
+}
+
 const DOCKER_REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const DOCKER_WORK_ROOT = '/tmp/opencode';
 const DOCKER_SUITE_TIMEOUT_MS = 2_400_000;

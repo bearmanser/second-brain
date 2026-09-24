@@ -11,6 +11,7 @@ import {
   cursorSchema,
   etagSchema,
   noteInputSchema,
+  noteInputSchemaV2,
   notePathSchema,
   noteReferenceSchema,
   projectIdentifierSchema,
@@ -108,6 +109,15 @@ export const captureRequestSchema = z
   })
   .refine(withinInputBodyLimit, { message: 'input body exceeds the 256 KiB limit' });
 
+export const captureRequestSchemaV2 = z
+  .strictObject({
+    idempotency_key: uuidSchema,
+    project: projectIdentifierSchema.optional(),
+    scope: scopeIdSchema.optional(),
+    note: noteInputSchemaV2
+  })
+  .refine(withinInputBodyLimit, { message: 'input body exceeds the 256 KiB limit' });
+
 export const projectEnsureRequestSchema = z
   .strictObject({
     idempotency_key: uuidSchema,
@@ -165,6 +175,25 @@ export const reviewRequestSchema = z
       reviewReviseOperation,
       reviewSupersedeOperation,
       reviewResolveOperation,
+      reviewMoveOperation,
+      reviewAdoptOperation
+    ])
+  })
+  .refine(withinInputBodyLimit, { message: 'input body exceeds the 256 KiB limit' });
+
+const reviewReviseOperationV2 = reviewReviseOperation.extend({ note: noteInputSchemaV2 });
+const reviewResolveOperationV2 = reviewResolveOperation.extend({ note: noteInputSchemaV2 });
+
+export const reviewRequestSchemaV2 = z
+  .strictObject({
+    project: projectIdentifierSchema.optional(),
+    scope: scopeIdSchema.optional(),
+    operation: z.discriminatedUnion('action', [
+      reviewListOperation,
+      reviewDecisionOperation,
+      reviewReviseOperationV2,
+      reviewSupersedeOperation,
+      reviewResolveOperationV2,
       reviewMoveOperation,
       reviewAdoptOperation
     ])
