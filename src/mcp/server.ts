@@ -33,6 +33,8 @@ import {
   toToolError,
   toToolResult,
   internalDiagnostic,
+  legacyRequestSchemas,
+  legacyToolDefinitions,
   type ToolDefinition,
   type ToolName
 } from './tools.js';
@@ -47,6 +49,7 @@ export interface BrainServices {
   status(ctx: AuthenticatedContext, request: StatusRequest): Promise<StatusResult>;
   readonly result_delivery?: ResultDelivery;
   readonly reportDiagnostic?: (message: string) => void;
+  readonly contract_version?: 1 | 2;
 }
 
 export const OUTPUT_SCHEMA_META_KEY = 'second-brain/outputSchema';
@@ -189,6 +192,97 @@ const TOOL_OUTPUT_SCHEMAS: Partial<Record<ToolName, z.ZodType>> = {
   brain_status: statusOutputSchema
 };
 
+const projectEnsureOutputSchemaV2 = z.strictObject({
+  operation_id: uuidOutputSchema,
+  repository_identity: z.string(),
+  project_id: z.string(),
+  relative_root: z.string(),
+  created: z.boolean(),
+  materialized: z.boolean(),
+  warnings: stringListOutputSchema
+});
+
+const statusOutputSchemaV2 = z.strictObject({
+  version: z.string(),
+  protocol_version: z.string(),
+  schema_version: z.literal(1),
+  protocol: z.literal(2),
+  projects: z.array(z.strictObject({
+    id: z.string(),
+    display_name: z.string(),
+    relative_root: z.string(),
+    state: z.enum(['provisioning', 'ready', 'recovery_required'])
+  })),
+  health: z.strictObject({
+    gateway: z.enum(['ready', 'recovering', 'degraded']),
+    index: z.enum(['ready', 'unavailable']),
+    worker: z.enum(['ready', 'disabled', 'unavailable'])
+  }),
+  features: z.strictObject({
+    reranking: z.boolean(), text_search: z.boolean(), fallback: z.boolean()
+  }),
+  pending_operations: z.number(),
+  operation: z.union([mutationReceiptOutputSchema, projectEnsureOutputSchemaV2]).optional(),
+  schemas: z.record(z.string(), z.unknown()).optional()
+});
+
+const TOOL_OUTPUT_SCHEMAS_V2: Partial<Record<ToolName, z.ZodType>> = {
+  ...TOOL_OUTPUT_SCHEMAS,
+  brain_project_ensure: projectEnsureOutputSchemaV2,
+  brain_status: statusOutputSchemaV2
+};
+
+function v2PublicResult(tool: ToolName, value: unknown): unknown {
+  if (tool === 'brain_project_ensure') {
+    const result = value as ProjectEnsureResult;
+    if (result.project_id === undefined || result.relative_root === undefined) {
+      throw new Error('V2 project ensure result is missing its local project identity');
+    }
+    return {
+      operation_id: result.operation_id,
+      repository_identity: result.repository_identity,
+      project_id: result.project_id,
+      relative_root: result.relative_root,
+      created: result.created,
+      materialized: result.materialized,
+      warnings: result.warnings
+    };
+  }
+  if (tool === 'brain_status') {
+    const result = value as StatusResult;
+    if (result.protocol !== 2 || result.local === undefined || result.features === undefined) {
+      throw new Error('V2 status result is missing its local capabilities');
+    }
+    const workerState = result.local.worker.state;
+    return {
+      version: result.version,
+      protocol_version: result.protocol_version,
+      schema_version: result.schema_version,
+      protocol: 2,
+      projects: (result.projects ?? []).map((project) => ({
+        id: project.scope,
+        display_name: project.display_name,
+        relative_root: project.relative_root,
+        state: project.state
+      })),
+      health: {
+        gateway: result.health.gateway,
+        index: result.local.index.state,
+        worker: workerState === 'ready' || workerState === 'disabled' ? workerState : 'unavailable'
+      },
+      features: result.features,
+      pending_operations: result.pending_operations,
+      ...(result.operation === undefined ? {} : {
+        operation: 'repository_identity' in result.operation
+          ? v2PublicResult('brain_project_ensure', result.operation)
+          : result.operation
+      }),
+      ...(result.schemas === undefined ? {} : { schemas: result.schemas })
+    };
+  }
+  return value;
+}
+
 export function publishedOutputSchema(definition: ToolDefinition): Record<string, unknown> {
   if (definition.name === 'brain_review') {
     const branches = (definition.outputSchema as { oneOf?: unknown[] }).oneOf ?? [];
@@ -197,8 +291,8 @@ export function publishedOutputSchema(definition: ToolDefinition): Record<string
   return definition.outputSchema;
 }
 
-export function publishedTools(): Tool[] {
-  return toolDefinitions.map((definition) => ({
+export function publishedTools(definitions: readonly ToolDefinition[] = toolDefinitions): Tool[] {
+  return definitions.map((definition) => ({
     name: definition.name,
     title: definition.annotations.title,
     description: definition.description,
@@ -233,22 +327,27 @@ export function createMcpServer(services: BrainServices, ctx: AuthenticatedConte
     { instructions: buildInstructions() }
   );
   const delivery: ResultDelivery = services.result_delivery ?? 'structured';
+  const version = services.contract_version ?? 1;
+  const definitions = version === 2 ? toolDefinitions : legacyToolDefinitions;
+  const inputs = version === 2 ? requestSchemas : legacyRequestSchemas;
+  const outputs = version === 2 ? TOOL_OUTPUT_SCHEMAS_V2 : TOOL_OUTPUT_SCHEMAS;
 
-  for (const definition of toolDefinitions) {
-    const outputSchema = TOOL_OUTPUT_SCHEMAS[definition.name];
+  for (const definition of definitions) {
+    const outputSchema = outputs[definition.name];
     server.registerTool(
       definition.name,
       {
         title: definition.annotations.title,
         description: definition.description,
-        inputSchema: requestSchemas[definition.name],
+        inputSchema: inputs[definition.name],
         annotations: { ...definition.annotations },
         _meta: { [OUTPUT_SCHEMA_META_KEY]: definition.outputSchema },
         ...(outputSchema === undefined ? {} : { outputSchema })
       },
       async (args: unknown): Promise<CallToolResult> => {
         try {
-          const result = await TOOL_HANDLERS[definition.name](services, ctx, args);
+          const raw = await TOOL_HANDLERS[definition.name](services, ctx, args);
+          const result = version === 2 ? v2PublicResult(definition.name, raw) : raw;
           return toToolResult(definition.name, result, delivery) as unknown as CallToolResult;
         } catch (error) {
           if (!isBrainError(error)) {
@@ -260,7 +359,7 @@ export function createMcpServer(services: BrainServices, ctx: AuthenticatedConte
     );
   }
 
-  const tools = publishedTools();
+  const tools = publishedTools(definitions);
   server.server.removeRequestHandler('tools/list');
   server.server.setRequestHandler(ListToolsRequestSchema, () => ({ tools }));
 

@@ -4,11 +4,13 @@ import type { ResultDelivery } from '../config/schema.js';
 import { BrainError, isBrainError } from '../contracts/errors.js';
 import {
   captureRequestSchema,
+  captureRequestSchemaV2,
   feedbackRequestSchema,
   projectEnsureRequestSchema,
   readRequestSchema,
   recallRequestSchema,
   reviewRequestSchema,
+  reviewRequestSchemaV2,
   statusRequestSchema
 } from '../contracts/protocol.js';
 import { TOOL_RESULT_MAX_BYTES } from '../core/limits.js';
@@ -69,13 +71,19 @@ export interface ToolErrorPayload {
 }
 
 export const requestSchemas = {
-  brain_capture: captureRequestSchema,
+  brain_capture: captureRequestSchemaV2,
   brain_feedback: feedbackRequestSchema,
   brain_project_ensure: projectEnsureRequestSchema,
   brain_read: readRequestSchema,
   brain_recall: recallRequestSchema,
-  brain_review: reviewRequestSchema,
+  brain_review: reviewRequestSchemaV2,
   brain_status: statusRequestSchema
+} as const satisfies Record<ToolName, z.ZodType>;
+
+export const legacyRequestSchemas = {
+  ...requestSchemas,
+  brain_capture: captureRequestSchema,
+  brain_review: reviewRequestSchema
 } as const satisfies Record<ToolName, z.ZodType>;
 
 const STRING = { type: 'string' } as const;
@@ -203,18 +211,91 @@ const feedbackResultSchema: Record<string, unknown> = {
   }
 };
 
-const projectEnsureResultSchema: Record<string, unknown> = {
+const projectEnsureResultSchemaV2: Record<string, unknown> = {
   type: 'object',
   additionalProperties: false,
   required: [
     'operation_id',
     'repository_identity',
-    'scope',
+    'project_id',
+    'relative_root',
     'created',
-    'backend_ready',
     'materialized',
     'warnings'
   ],
+  properties: {
+    operation_id: UUID,
+    repository_identity: STRING,
+    project_id: STRING,
+    relative_root: STRING,
+    created: { type: 'boolean' },
+    materialized: { type: 'boolean' },
+    warnings: STRING_ARRAY
+  }
+};
+
+const statusResultSchemaV2: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  required: [
+    'version',
+    'protocol_version',
+    'schema_version',
+    'protocol',
+    'projects',
+    'health',
+    'features',
+    'pending_operations'
+  ],
+  properties: {
+    version: STRING,
+    protocol_version: { type: 'string' },
+    schema_version: { type: 'number', const: SCHEMA_VERSION },
+    protocol: { type: 'number', const: 2 },
+    health: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['gateway', 'index', 'worker'],
+      properties: {
+        gateway: { type: 'string', enum: ['ready', 'recovering', 'degraded'] },
+        index: { type: 'string', enum: ['ready', 'unavailable'] },
+        worker: { type: 'string', enum: ['ready', 'disabled', 'unavailable'] }
+      }
+    },
+    features: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['reranking', 'text_search', 'fallback'],
+      properties: {
+        reranking: { type: 'boolean' },
+        text_search: { type: 'boolean' },
+        fallback: { type: 'boolean' }
+      }
+    },
+    pending_operations: { type: 'number' },
+    projects: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['id', 'display_name', 'relative_root', 'state'],
+        properties: {
+          id: STRING,
+          state: { type: 'string', enum: ['provisioning', 'ready', 'recovery_required'] },
+          display_name: STRING,
+          relative_root: STRING
+        }
+      }
+    },
+    operation: { oneOf: [mutationReceiptSchema, projectEnsureResultSchemaV2] },
+    schemas: { type: 'object' }
+  }
+};
+
+const projectEnsureResultSchemaV1: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['operation_id', 'repository_identity', 'scope', 'created', 'backend_ready', 'materialized', 'warnings'],
   properties: {
     operation_id: UUID,
     repository_identity: STRING,
@@ -228,32 +309,18 @@ const projectEnsureResultSchema: Record<string, unknown> = {
   }
 };
 
-const statusResultSchema: Record<string, unknown> = {
+const statusResultSchemaV1: Record<string, unknown> = {
   type: 'object',
   additionalProperties: false,
-  required: [
-    'version',
-    'protocol_version',
-    'schema_version',
-    'scopes',
-    'health',
-    'pending_operations'
-  ],
+  required: ['version', 'protocol_version', 'schema_version', 'scopes', 'health', 'pending_operations'],
   properties: {
     version: STRING,
-    protocol_version: { type: 'string' },
+    protocol_version: STRING,
     schema_version: { type: 'number', const: SCHEMA_VERSION },
     protocol: { type: 'number', const: 2 },
     scopes: {
       type: 'array',
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['id'],
-        properties: {
-          id: SCOPE
-        }
-      }
+      items: { type: 'object', additionalProperties: false, required: ['id'], properties: { id: SCOPE } }
     },
     health: {
       type: 'object',
@@ -270,48 +337,27 @@ const statusResultSchema: Record<string, unknown> = {
       additionalProperties: false,
       properties: {
         index: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            state: { type: 'string', enum: ['ready', 'unavailable'] },
-            documents: { type: 'number' }
-          }
+          type: 'object', additionalProperties: false,
+          properties: { state: { type: 'string', enum: ['ready', 'unavailable'] }, documents: { type: 'number' } }
         },
         worker: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            state: { type: 'string' },
-            model_fingerprint: STRING
-          }
+          type: 'object', additionalProperties: false,
+          properties: { state: STRING, model_fingerprint: STRING }
         }
       }
     },
     features: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        reranking: { type: 'boolean' },
-        text_search: { type: 'boolean' },
-        fallback: { type: 'boolean' }
-      }
+      type: 'object', additionalProperties: false,
+      properties: { reranking: { type: 'boolean' }, text_search: { type: 'boolean' }, fallback: { type: 'boolean' } }
     },
     pending_operations: { type: 'number' },
     projects: {
-      type: 'array',
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['scope', 'state'],
-        properties: {
-          scope: SCOPE,
-          state: { type: 'string', enum: ['provisioning', 'ready', 'recovery_required'] },
-          display_name: STRING,
-          relative_root: STRING
-        }
+      type: 'array', items: {
+        type: 'object', additionalProperties: false, required: ['scope', 'state'],
+        properties: { scope: SCOPE, state: { type: 'string', enum: ['provisioning', 'ready', 'recovery_required'] }, display_name: STRING, relative_root: STRING }
       }
     },
-    operation: { oneOf: [mutationReceiptSchema, projectEnsureResultSchema] },
+    operation: { oneOf: [mutationReceiptSchema, projectEnsureResultSchemaV1] },
     schemas: { type: 'object' }
   }
 };
@@ -319,11 +365,17 @@ const statusResultSchema: Record<string, unknown> = {
 const OUTPUT_SCHEMAS: Record<ToolName, Record<string, unknown>> = {
   brain_capture: mutationReceiptSchema,
   brain_feedback: feedbackResultSchema,
-  brain_project_ensure: projectEnsureResultSchema,
+  brain_project_ensure: projectEnsureResultSchemaV2,
   brain_read: readResultSchema,
   brain_recall: recallResultSchema,
   brain_review: { oneOf: [mutationReceiptSchema, reviewListResultSchema] },
-  brain_status: statusResultSchema
+  brain_status: statusResultSchemaV2
+};
+
+const LEGACY_OUTPUT_SCHEMAS: Record<ToolName, Record<string, unknown>> = {
+  ...OUTPUT_SCHEMAS,
+  brain_project_ensure: projectEnsureResultSchemaV1,
+  brain_status: statusResultSchemaV1
 };
 
 const DESCRIPTIONS: Record<ToolName, string> = {
@@ -400,6 +452,14 @@ export const toolDefinitions: readonly ToolDefinition[] = TOOL_NAMES.map((name) 
   description: DESCRIPTIONS[name],
   inputSchema: z.toJSONSchema(requestSchemas[name]) as Record<string, unknown>,
   outputSchema: OUTPUT_SCHEMAS[name],
+  annotations: ANNOTATIONS[name]
+}));
+
+export const legacyToolDefinitions: readonly ToolDefinition[] = TOOL_NAMES.map((name) => ({
+  name,
+  description: DESCRIPTIONS[name],
+  inputSchema: z.toJSONSchema(legacyRequestSchemas[name]) as Record<string, unknown>,
+  outputSchema: LEGACY_OUTPUT_SCHEMAS[name],
   annotations: ANNOTATIONS[name]
 }));
 

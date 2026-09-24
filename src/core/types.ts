@@ -364,24 +364,79 @@ export interface LocalOperationPreconditions {
   id?: string;
   revision_id?: string;
   etag?: string;
+  path?: string;
   target_path?: string;
+  expected_heads?: readonly LocalExpectedHead[];
 }
 
-export interface LocalOperationIntent {
-  tool: 'brain_capture' | 'brain_review' | 'brain_project_ensure' | 'brain_feedback';
-  action: string;
+export interface LocalExpectedHead {
+  revision_id: string;
+  etag: string;
+}
+
+interface LocalOperationBase {
   project_id: string | null;
   idempotency_key: string;
-  payload: unknown;
-  preconditions: LocalOperationPreconditions;
 }
 
-export interface LocalAllocatedIdentity {
+type LocalReviewAction = Exclude<ReviewRequest['operation']['action'], 'list' | 'approve' | 'archive'>;
+
+type LocalReviewPreconditions<Action extends LocalReviewAction> = Action extends 'resolve'
+  ? { id: string; expected_heads: readonly LocalExpectedHead[] }
+  : Action extends 'adopt'
+    ? { path: string; etag: string }
+    : Action extends 'move'
+      ? { id: string; etag: string; target_path: string }
+      : { id: string; etag: string };
+
+export type LocalOperationIntent =
+  | (LocalOperationBase & {
+      tool: 'brain_capture';
+      action: 'capture';
+      payload: CaptureRequest;
+      preconditions: { target_path?: string };
+    })
+  | (LocalOperationBase & {
+      tool: 'brain_review';
+      action: 'approve' | 'archive';
+      payload: Extract<ReviewRequest['operation'], { action: 'approve' | 'archive' }>;
+      preconditions: { id: string; etag: string };
+    })
+  | {
+      [Action in LocalReviewAction]: LocalOperationBase & {
+        tool: 'brain_review';
+        action: Action;
+        payload: Extract<ReviewRequest['operation'], { action: Action }>;
+        preconditions: LocalReviewPreconditions<Action>;
+      };
+    }[LocalReviewAction]
+  | (LocalOperationBase & {
+      tool: 'brain_project_ensure';
+      action: 'ensure';
+      payload: ProjectEnsureRequest;
+      preconditions: Record<string, never>;
+    })
+  | (LocalOperationBase & {
+      tool: 'brain_feedback';
+      action: 'record';
+      payload: FeedbackRequest;
+      preconditions: { id: string; revision_id: string };
+    });
+
+interface LocalAllocatedBase {
   operation_id: string;
-  note_id: string;
-  revision_id: string;
-  path: string;
   timestamp: string;
+  storage_operation_ids: readonly string[];
+}
+
+export type LocalAllocatedIdentity =
+  | (LocalAllocatedBase & { kind: 'note'; note_id: string; revision_id: string; path: string })
+  | (LocalAllocatedBase & { kind: 'project_ensure' })
+  | (LocalAllocatedBase & { kind: 'feedback'; feedback_id: string });
+
+export interface LocalRevisionParent {
+  revision_id: string;
+  raw_hash: string;
 }
 
 export interface LocalObservedSource {
@@ -390,6 +445,18 @@ export interface LocalObservedSource {
   etag: string;
   id?: string;
   revision_id?: string;
+  parents?: readonly LocalRevisionParent[];
+}
+
+export interface LocalConflictHead extends LocalExpectedHead {
+  id: string;
+  path: string;
+  parents: readonly LocalRevisionParent[];
+}
+
+export interface LocalObservedState {
+  sources: readonly LocalObservedSource[];
+  heads: readonly LocalConflictHead[];
 }
 
 export interface LocalPendingWrite {
@@ -397,22 +464,69 @@ export interface LocalPendingWrite {
   raw: string;
   id: string;
   revision_id: string;
+  parents: readonly LocalRevisionParent[];
 }
+
+export type LocalDocumentEffect =
+  | { kind: 'write'; write: LocalPendingWrite }
+  | { kind: 'move'; from_path: string; to_path: string; write?: LocalPendingWrite }
+  | { kind: 'adopt'; path: string; write: LocalPendingWrite };
+
+export type LocalPlannedOperation =
+  | {
+      kind: 'note';
+      heads: readonly LocalConflictHead[];
+      parents: readonly LocalRevisionParent[];
+      effects: readonly LocalDocumentEffect[];
+    }
+  | {
+      kind: 'project_ensure';
+      repository_identity: string;
+      project_id: string;
+      relative_root: string;
+      created: boolean;
+    }
+  | {
+      kind: 'feedback';
+      feedback_id: string;
+      id: string;
+      revision_id: string;
+      verdict: FeedbackVerdict;
+      reason: string;
+    };
 
 export type LocalOperationPlan = (
   identity: LocalAllocatedIdentity,
-  observed: LocalObservedSource | undefined
-) => Promise<LocalPendingWrite> | LocalPendingWrite;
+  observed: LocalObservedState
+) => Promise<LocalPlannedOperation> | LocalPlannedOperation;
 
-export interface LocalOperationReceipt {
-  operation_id: string;
-  id: string;
-  revision_id: string;
-  path: string;
-  etag: string;
-  indexed: boolean;
-  warnings: string[];
-}
+export type LocalOperationReceipt =
+  | {
+      kind: 'note';
+      operation_id: string;
+      id: string;
+      revision_id: string;
+      path: string;
+      etag: string;
+      indexed: boolean;
+      warnings: string[];
+    }
+  | {
+      kind: 'project_ensure';
+      operation_id: string;
+      repository_identity: string;
+      project_id: string;
+      relative_root: string;
+      created: boolean;
+      materialized: boolean;
+      warnings: string[];
+    }
+  | {
+      kind: 'feedback';
+      operation_id: string;
+      feedback_id: string;
+      recorded: true;
+    };
 
 export interface LocalOperationStatus {
   operation_id: string;

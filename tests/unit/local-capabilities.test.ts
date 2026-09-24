@@ -1,8 +1,14 @@
 import { expect, test } from 'vitest';
 import { expectTypeOf } from 'vitest';
 import type {
+  LocalAllocatedIdentity,
   LocalHandlerDeps,
   LocalMutationCoordinatorPort,
+  LocalOperationIntent,
+  LocalOperationPlan,
+  LocalOperationReceipt,
+  LocalObservedState,
+  LocalPlannedOperation,
   ProjectResolutionPort,
   SourceBoundCursorPort,
   ProjectEnsureResult,
@@ -10,6 +16,131 @@ import type {
   StatusResult,
   StatusResultV2
 } from '../../src/core/types.js';
+import { lessonFixture, fixtureIds } from '../fixtures/content.js';
+
+const HASH = 'a'.repeat(64);
+const OTHER_HASH = 'b'.repeat(64);
+const KEY = fixtureIds.idempotencyKey;
+const HEADS = [
+  { revision_id: fixtureIds.revision, etag: HASH },
+  { revision_id: fixtureIds.replacement, etag: OTHER_HASH }
+];
+const PARENTS = [
+  { revision_id: fixtureIds.revision, raw_hash: HASH },
+  { revision_id: fixtureIds.replacement, raw_hash: OTHER_HASH }
+];
+
+test('operation intents construct every note mutation with explicit move, adopt and full fork heads', () => {
+  const base = { project_id: 'repo', idempotency_key: KEY };
+  const capture = {
+    ...base, tool: 'brain_capture', action: 'capture',
+    payload: { idempotency_key: KEY, note: lessonFixture }, preconditions: {}
+  } satisfies LocalOperationIntent;
+  const review = (action: 'approve' | 'archive') => ({
+    ...base, tool: 'brain_review' as const, action,
+    payload: { action, idempotency_key: KEY, id: fixtureIds.note, expected_etag: HASH, rationale: 'reviewed' },
+    preconditions: { id: fixtureIds.note, etag: HASH }
+  } satisfies LocalOperationIntent);
+  const revise = {
+    ...base, tool: 'brain_review', action: 'revise',
+    payload: { action: 'revise', idempotency_key: KEY, id: fixtureIds.note, expected_etag: HASH, rationale: 'correct', note: lessonFixture },
+    preconditions: { id: fixtureIds.note, etag: HASH }
+  } satisfies LocalOperationIntent;
+  const supersede = {
+    ...base, tool: 'brain_review', action: 'supersede',
+    payload: { action: 'supersede', idempotency_key: KEY, id: fixtureIds.note, expected_etag: HASH, rationale: 'replace', replacement_id: fixtureIds.replacement },
+    preconditions: { id: fixtureIds.note, etag: HASH }
+  } satisfies LocalOperationIntent;
+  const move = {
+    ...base, tool: 'brain_review', action: 'move',
+    payload: { action: 'move', idempotency_key: KEY, id: fixtureIds.note, target_path: 'Knowledge/Moved.md', expected_etag: HASH, rationale: 'relocate' },
+    preconditions: { id: fixtureIds.note, etag: HASH, target_path: 'Knowledge/Moved.md' }
+  } satisfies LocalOperationIntent;
+  const adopt = {
+    ...base, tool: 'brain_review', action: 'adopt',
+    payload: { action: 'adopt', idempotency_key: KEY, path: 'Knowledge/Human.md', expected_etag: HASH, rationale: 'adopt' },
+    preconditions: { path: 'Knowledge/Human.md', etag: HASH }
+  } satisfies LocalOperationIntent;
+  const resolve = {
+    ...base, tool: 'brain_review', action: 'resolve',
+    payload: { action: 'resolve', idempotency_key: KEY, id: fixtureIds.note, expected_heads: HEADS, rationale: 'merge both branches', note: lessonFixture },
+    preconditions: { id: fixtureIds.note, expected_heads: HEADS }
+  } satisfies LocalOperationIntent;
+  expect([capture, ...(['approve', 'archive'] as const).map(review), revise, supersede, move, adopt, resolve]
+    .map((intent) => intent.action)).toEqual([
+      'capture', 'approve', 'archive', 'revise', 'supersede', 'move', 'adopt', 'resolve'
+    ]);
+  expect(resolve.preconditions.expected_heads).toEqual(HEADS);
+});
+
+test('the note plan can retain all conflict heads and parents and express safe moves or adoption', async () => {
+  const identity: LocalAllocatedIdentity = {
+    kind: 'note', operation_id: KEY, timestamp: '2026-09-23T00:00:00Z',
+    storage_operation_ids: [fixtureIds.revision, fixtureIds.replacement],
+    note_id: fixtureIds.note, revision_id: KEY, path: 'Knowledge/Moved.md'
+  };
+  const observed: LocalObservedState = {
+    sources: [
+      { path: 'Knowledge/Original.md', raw: 'old', etag: HASH, id: fixtureIds.note, revision_id: fixtureIds.revision, parents: [] },
+      { path: 'Knowledge/Fork.md', raw: 'fork', etag: OTHER_HASH, id: fixtureIds.note, revision_id: fixtureIds.replacement, parents: [{ revision_id: fixtureIds.revision, raw_hash: HASH }] }
+    ],
+    heads: [
+      { id: fixtureIds.note, path: 'Knowledge/Original.md', ...HEADS[0], parents: [] },
+      { id: fixtureIds.note, path: 'Knowledge/Fork.md', ...HEADS[1], parents: [{ revision_id: fixtureIds.revision, raw_hash: HASH }] }
+    ]
+  };
+  const write = { path: identity.path, raw: 'resolved', id: identity.note_id, revision_id: identity.revision_id, parents: PARENTS };
+  const plan: LocalOperationPlan = async (_identity, state) => ({
+    kind: 'note', heads: state.heads, parents: PARENTS,
+    effects: [
+      { kind: 'move', from_path: state.sources[0].path, to_path: identity.path, write },
+      { kind: 'adopt', path: 'Knowledge/Human.md', write: { ...write, path: 'Knowledge/Human.md' } },
+      { kind: 'write', write: { ...write, path: 'Knowledge/History.md' } }
+    ]
+  });
+  const result: LocalPlannedOperation = await plan(identity, observed);
+  expect(result).toEqual({
+    kind: 'note', heads: observed.heads, parents: PARENTS,
+    effects: [
+      { kind: 'move', from_path: 'Knowledge/Original.md', to_path: 'Knowledge/Moved.md', write },
+      { kind: 'adopt', path: 'Knowledge/Human.md', write: { ...write, path: 'Knowledge/Human.md' } },
+      { kind: 'write', write: { ...write, path: 'Knowledge/History.md' } }
+    ]
+  });
+});
+
+test('project ensure and feedback intents plan durable receipts without fabricated note IDs', async () => {
+  const ensureIntent = {
+    tool: 'brain_project_ensure', action: 'ensure', project_id: null, idempotency_key: KEY,
+    payload: { idempotency_key: KEY, remote_url: 'git@github.com:example/repo.git' }, preconditions: {}
+  } satisfies LocalOperationIntent;
+  const feedbackIntent = {
+    tool: 'brain_feedback', action: 'record', project_id: 'repo', idempotency_key: KEY,
+    payload: { idempotency_key: KEY, id: fixtureIds.note, revision_id: fixtureIds.revision, verdict: 'useful', reason: 'verified' },
+    preconditions: { id: fixtureIds.note, revision_id: fixtureIds.revision }
+  } satisfies LocalOperationIntent;
+  const observed: LocalObservedState = { sources: [], heads: [] };
+  const ensureIdentity: LocalAllocatedIdentity = { kind: 'project_ensure', operation_id: KEY, timestamp: '2026-09-23T00:00:00Z', storage_operation_ids: [] };
+  const feedbackIdentity: LocalAllocatedIdentity = { kind: 'feedback', operation_id: KEY, feedback_id: fixtureIds.replacement, timestamp: '2026-09-23T00:00:00Z', storage_operation_ids: [] };
+  const ensurePlan: LocalOperationPlan = async () => ({
+    kind: 'project_ensure', repository_identity: 'github.com/example/repo', project_id: 'repo',
+    relative_root: 'Projects/Repo', created: true
+  });
+  const feedbackPlan: LocalOperationPlan = async () => ({
+    kind: 'feedback', feedback_id: feedbackIdentity.feedback_id,
+    id: fixtureIds.note, revision_id: fixtureIds.revision, verdict: 'useful', reason: 'verified'
+  });
+  expect(ensureIntent.action).toBe('ensure');
+  expect(feedbackIntent.action).toBe('record');
+  expect(await ensurePlan(ensureIdentity, observed)).toMatchObject({ kind: 'project_ensure', created: true });
+  expect(await feedbackPlan(feedbackIdentity, observed)).toMatchObject({ kind: 'feedback', revision_id: fixtureIds.revision });
+  const ensureReceipt: LocalOperationReceipt = {
+    kind: 'project_ensure', operation_id: KEY, repository_identity: 'github.com/example/repo',
+    project_id: 'repo', relative_root: 'Projects/Repo', created: true, materialized: true, warnings: []
+  };
+  const feedbackReceipt: LocalOperationReceipt = { kind: 'feedback', operation_id: KEY, feedback_id: fixtureIds.replacement, recorded: true };
+  expect([ensureReceipt.kind, feedbackReceipt.kind]).toEqual(['project_ensure', 'feedback']);
+});
 
 test('local handler dependencies expose the frozen capabilities', () => {
   expectTypeOf<LocalHandlerDeps['mutations']>().toEqualTypeOf<LocalMutationCoordinatorPort>();

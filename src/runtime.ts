@@ -182,6 +182,7 @@ function buildServices(
 ): BrainServices {
   if (local !== undefined) {
     return {
+      contract_version: 2,
       result_delivery: delivery ?? 'structured',
       reportDiagnostic: log,
       capture: (ctx, request): Promise<MutationReceipt> => localCapture(ctx, request, local),
@@ -214,6 +215,7 @@ function buildServices(
     };
   }
   return {
+    contract_version: 1,
     result_delivery: delivery ?? 'structured',
     reportDiagnostic: log,
     capture: (ctx, request): Promise<MutationReceipt> => capture(ctx, request, deps),

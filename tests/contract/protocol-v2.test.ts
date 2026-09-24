@@ -202,3 +202,35 @@ test('read, move, and adopt agree on the shared note path contract', () => {
     }).success
   ).toBe(true);
 });
+
+test('read, move, and adopt never silently change the identity of a supplied path', () => {
+  const paths = [' Knowledge/Laya.md', 'Knowledge/Laya.md ', 'Knowledge/ Laya.md'];
+  for (const path of paths) {
+    const accepted = notePathSchema.safeParse(path);
+    const read = readRequestSchema.safeParse({ path });
+    const move = reviewRequestSchemaV2.safeParse({
+      operation: {
+        action: 'move', idempotency_key: ID, id: ID, target_path: path,
+        expected_etag: ETAG, rationale: 'relocate'
+      }
+    });
+    const adopt = reviewRequestSchemaV2.safeParse({
+      operation: {
+        action: 'adopt', idempotency_key: ID, path,
+        expected_etag: ETAG, rationale: 'adopt'
+      }
+    });
+    for (const result of [accepted, read, move, adopt]) {
+      if (result.success) {
+        const parsed = result.data as string | { path?: string; operation?: { path?: string; target_path?: string } };
+        expect(typeof parsed === 'string' ? parsed : parsed.path ?? parsed.operation?.path ?? parsed.operation?.target_path).toBe(path);
+      }
+    }
+    if (path.startsWith(' ') || path.endsWith(' ')) {
+      expect(accepted.success).toBe(false);
+      expect(read.success).toBe(false);
+      expect(move.success).toBe(false);
+      expect(adopt.success).toBe(false);
+    }
+  }
+});

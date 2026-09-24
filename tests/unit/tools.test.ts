@@ -6,11 +6,13 @@ import { BrainError, BRAIN_ERROR_CODES } from '../../src/contracts/errors.js';
 import { brainConfigSchema } from '../../src/config/schema.js';
 import {
   captureRequestSchema,
+  captureRequestSchemaV2,
   feedbackRequestSchema,
   readRequestSchema,
   recallRequestSchema,
   projectEnsureRequestSchema,
   reviewRequestSchema,
+  reviewRequestSchemaV2,
   statusRequestSchema
 } from '../../src/contracts/protocol.js';
 import { TOOL_RESULT_MAX_BYTES } from '../../src/core/limits.js';
@@ -22,7 +24,9 @@ import type {
   ReviewListResult,
   SourceRef,
   StatusResult,
-  ProjectEnsureResult
+  ProjectEnsureResult,
+  StatusResultV2,
+  ProjectEnsureResultV2
 } from '../../src/core/types.js';
 import { SYSTEM_ACTOR } from '../../src/core/types.js';
 import { capture } from '../../src/features/capture.js';
@@ -36,7 +40,10 @@ import {
   sanitizeDiagnostic,
   toToolError,
   toToolResult,
-  toolDefinitions
+  toolDefinitions,
+  legacyToolDefinitions,
+  legacyRequestSchemas,
+  requestSchemas as activeRequestSchemas
 } from '../../src/mcp/tools.js';
 import type { ToolCallResult, ToolName } from '../../src/mcp/tools.js';
 import type { ResultDelivery } from '../../src/config/schema.js';
@@ -55,12 +62,12 @@ const digest = (value: unknown): string =>
   createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
 
 const requestSchemas: Record<ToolName, z.ZodType> = {
-  brain_capture: captureRequestSchema,
+  brain_capture: captureRequestSchemaV2,
   brain_feedback: feedbackRequestSchema,
   brain_project_ensure: projectEnsureRequestSchema,
   brain_read: readRequestSchema,
   brain_recall: recallRequestSchema,
-  brain_review: reviewRequestSchema,
+  brain_review: reviewRequestSchemaV2,
   brain_status: statusRequestSchema
 };
 
@@ -117,24 +124,76 @@ const readSample: ReadResult = {
 
 const reviewListSample: ReviewListResult = { items: [source] };
 const feedbackSample: FeedbackResult = { feedback_id: fixtureIds.revision, recorded: true };
-const statusSample: StatusResult = {
+const statusSample: StatusResultV2 = {
   version: APPLICATION_VERSION,
   protocol_version: PROTOCOL_VERSION,
   schema_version: 1,
-  scopes: [{ id: 'freellmapi' }],
-  health: { gateway: 'ready', backend: 'ready', embeddings: 'unknown' },
+  protocol: 2,
+  projects: [{ id: 'freellmapi', display_name: 'FreeLLM', relative_root: 'Projects/FreeLLM', state: 'ready' }],
+  health: { gateway: 'ready', index: 'ready', worker: 'disabled' },
+  features: { reranking: false, text_search: true, fallback: true },
   pending_operations: 0
 };
 
-const projectEnsureSample: ProjectEnsureResult = {
+const projectEnsureSample: ProjectEnsureResultV2 = {
   operation_id: fixtureIds.idempotencyKey,
   repository_identity: 'github.com/bearmanser/second-brain',
-  scope: 'second-brain',
+  project_id: 'second-brain',
+  relative_root: 'Projects/Second Brain',
   created: true,
-  backend_ready: true,
   materialized: true,
   warnings: []
 };
+
+test('active V2 tool registrations accept additive capture and review input while V1 validators reject it', () => {
+  const note = { ...lessonFixture, type: 'lesson', source: 'user statement' };
+  const capture = { idempotency_key: key(1), note };
+  const review = {
+    operation: {
+      action: 'revise', idempotency_key: key(2), id: fixtureIds.note,
+      expected_etag: 'a'.repeat(64), rationale: 'correct', note
+    }
+  };
+  expect(captureRequestSchema.safeParse(capture).success).toBe(false);
+  expect(reviewRequestSchema.safeParse(review).success).toBe(false);
+  expect(legacyRequestSchemas.brain_capture.safeParse(capture).success).toBe(false);
+  expect(legacyRequestSchemas.brain_review.safeParse(review).success).toBe(false);
+  expect(activeRequestSchemas.brain_capture.safeParse(capture).success).toBe(true);
+  expect(activeRequestSchemas.brain_review.safeParse(review).success).toBe(true);
+  const definitions = byName();
+  const captureProps = (definitions.brain_capture.inputSchema.properties as Record<string, unknown>).note as { properties: Record<string, unknown> };
+  expect(captureProps.properties.type).toBeDefined();
+  expect(captureProps.properties.source).toBeDefined();
+  const reviewInput = JSON.stringify(definitions.brain_review.inputSchema);
+  expect(reviewInput).toContain('"source"');
+  expect(reviewInput).toContain('"type"');
+  const legacy = Object.fromEntries(legacyToolDefinitions.map((tool) => [tool.name, tool]));
+  const legacyCapture = (legacy.brain_capture.inputSchema.properties as Record<string, unknown>).note as { properties: Record<string, unknown> };
+  expect(legacyCapture.properties).not.toHaveProperty('source');
+});
+
+test('published V2 project ensure and status schemas exclude backend flags', () => {
+  const definitions = byName();
+  const ensure = definitions.brain_project_ensure.outputSchema as { required: string[]; properties: Record<string, unknown> };
+  expect(ensure.required).toContain('project_id');
+  expect(ensure.required).toContain('relative_root');
+  expect(ensure.required).not.toContain('backend_ready');
+  expect(ensure.properties).not.toHaveProperty('backend_ready');
+  const status = definitions.brain_status.outputSchema as {
+    required: string[]; properties: Record<string, { required?: string[]; properties?: Record<string, unknown> }>
+  };
+  expect(status.required).toContain('projects');
+  expect(status.required).not.toContain('scopes');
+  expect(status.properties.health.required).toEqual(['gateway', 'index', 'worker']);
+  expect(status.properties.health.properties).not.toHaveProperty('backend');
+  expect(status.properties.health.properties).not.toHaveProperty('embeddings');
+  const project = (status.properties.projects as { items: { required: string[] } }).items;
+  expect(project.required).toEqual(['id', 'display_name', 'relative_root', 'state']);
+  const legacy = Object.fromEntries(legacyToolDefinitions.map((tool) => [tool.name, tool]));
+  expect((legacy.brain_project_ensure.outputSchema as { required: string[] }).required).toContain('backend_ready');
+  const legacyStatus = legacy.brain_status.outputSchema as { properties: Record<string, { required?: string[] }> };
+  expect(legacyStatus.properties.health.required).toContain('backend');
+});
 
 test('exposes only the seven controlled Brain tools', () => {
   expect(toolDefinitions.map((item) => item.name).sort()).toEqual([
@@ -244,7 +303,7 @@ test('the published tool contract is pinned', () => {
   expect(contract).toMatchInlineSnapshot(`
     [
       {
-        "input": "8cf96af973581c3f8fd6c954a45694b1ccf66b9de148d07299d0fef2aa1acc98",
+        "input": "1cfbef90a1b9cc2bc209d4db7becd104082d2dab90c8c330a48e402cb62ff7ae",
         "name": "brain_capture",
         "output": "57fce7c09c966db809d68ffe028e91904e9938860b97d457430451f4799dccc9",
       },
@@ -256,7 +315,7 @@ test('the published tool contract is pinned', () => {
       {
         "input": "bab96ef550ee128f67bf979e6be07349c1923bcac7051613b1ae7678b36c0e23",
         "name": "brain_project_ensure",
-        "output": "6591c834431f34d8c3b17c024feeec42cd1db294e890230b80dfebff3104a0c1",
+        "output": "7d19155bb6c566689e63e197b0892f58980f71cbdce0a18f8c9d33c7f4871c61",
       },
       {
         "input": "78e53562be503059fd476f02cb7d4c8516e040414244e47cea64c55e4d21fdd2",
@@ -269,14 +328,14 @@ test('the published tool contract is pinned', () => {
         "output": "1bba962c7fe6f748ca285b4bd573dd3c64dd299b2d6470bce14dbff9055aa0a5",
       },
       {
-        "input": "de0d22351181adaa0c6469ddaa6a8813cab0bc49ff30bca7e5c30698e96e8b2a",
+        "input": "d8b155fb969fade8d4a8f55ccb69f5de76402a89506f1231efd9371e0185cee9",
         "name": "brain_review",
         "output": "4296f66f5b3aedc53103bae95c5571490de8f77b13c0e484461f168059f21504",
       },
       {
         "input": "b08c7c6e06ed73a354cdcd37ef9fc28a5d454f4e7a7394270bc295db8a285579",
         "name": "brain_status",
-        "output": "a6189f5a3e6de53685a88144d4aec348570d045d7c173038fe0d1eb2882cbf71",
+        "output": "ed9670d6925720a0c6e36fbb49b1833ae5880f0a7f9ac473207513435441e46d",
       },
     ]
   `);
@@ -396,26 +455,16 @@ test('representative tool schemas are pinned in full', () => {
               "type": "boolean",
             },
           },
+          "required": [
+            "reranking",
+            "text_search",
+            "fallback",
+          ],
           "type": "object",
         },
         "health": {
           "additionalProperties": false,
           "properties": {
-            "backend": {
-              "enum": [
-                "ready",
-                "unavailable",
-              ],
-              "type": "string",
-            },
-            "embeddings": {
-              "enum": [
-                "ready",
-                "unavailable",
-                "unknown",
-              ],
-              "type": "string",
-            },
             "gateway": {
               "enum": [
                 "ready",
@@ -424,46 +473,27 @@ test('representative tool schemas are pinned in full', () => {
               ],
               "type": "string",
             },
+            "index": {
+              "enum": [
+                "ready",
+                "unavailable",
+              ],
+              "type": "string",
+            },
+            "worker": {
+              "enum": [
+                "ready",
+                "disabled",
+                "unavailable",
+              ],
+              "type": "string",
+            },
           },
           "required": [
             "gateway",
-            "backend",
-            "embeddings",
+            "index",
+            "worker",
           ],
-          "type": "object",
-        },
-        "local": {
-          "additionalProperties": false,
-          "properties": {
-            "index": {
-              "additionalProperties": false,
-              "properties": {
-                "documents": {
-                  "type": "number",
-                },
-                "state": {
-                  "enum": [
-                    "ready",
-                    "unavailable",
-                  ],
-                  "type": "string",
-                },
-              },
-              "type": "object",
-            },
-            "worker": {
-              "additionalProperties": false,
-              "properties": {
-                "model_fingerprint": {
-                  "type": "string",
-                },
-                "state": {
-                  "type": "string",
-                },
-              },
-              "type": "object",
-            },
-          },
           "type": "object",
         },
         "operation": {
@@ -600,9 +630,6 @@ test('representative tool schemas are pinned in full', () => {
             {
               "additionalProperties": false,
               "properties": {
-                "backend_ready": {
-                  "type": "boolean",
-                },
                 "created": {
                   "type": "boolean",
                 },
@@ -622,10 +649,6 @@ test('representative tool schemas are pinned in full', () => {
                 "repository_identity": {
                   "type": "string",
                 },
-                "scope": {
-                  "pattern": "^[a-z][a-z0-9-]{0,63}$",
-                  "type": "string",
-                },
                 "warnings": {
                   "items": {
                     "type": "string",
@@ -636,9 +659,9 @@ test('representative tool schemas are pinned in full', () => {
               "required": [
                 "operation_id",
                 "repository_identity",
-                "scope",
+                "project_id",
+                "relative_root",
                 "created",
-                "backend_ready",
                 "materialized",
                 "warnings",
               ],
@@ -656,11 +679,10 @@ test('representative tool schemas are pinned in full', () => {
               "display_name": {
                 "type": "string",
               },
-              "relative_root": {
+              "id": {
                 "type": "string",
               },
-              "scope": {
-                "pattern": "^[a-z][a-z0-9-]{0,63}$",
+              "relative_root": {
                 "type": "string",
               },
               "state": {
@@ -673,7 +695,9 @@ test('representative tool schemas are pinned in full', () => {
               },
             },
             "required": [
-              "scope",
+              "id",
+              "display_name",
+              "relative_root",
               "state",
             ],
             "type": "object",
@@ -694,22 +718,6 @@ test('representative tool schemas are pinned in full', () => {
         "schemas": {
           "type": "object",
         },
-        "scopes": {
-          "items": {
-            "additionalProperties": false,
-            "properties": {
-              "id": {
-                "pattern": "^[a-z][a-z0-9-]{0,63}$",
-                "type": "string",
-              },
-            },
-            "required": [
-              "id",
-            ],
-            "type": "object",
-          },
-          "type": "array",
-        },
         "version": {
           "type": "string",
         },
@@ -718,8 +726,10 @@ test('representative tool schemas are pinned in full', () => {
         "version",
         "protocol_version",
         "schema_version",
-        "scopes",
+        "protocol",
+        "projects",
         "health",
+        "features",
         "pending_operations",
       ],
       "type": "object",

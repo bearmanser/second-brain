@@ -16,11 +16,11 @@ const texts = z.array(text).max(32);
 
 export const notePathSchema = z
   .string()
-  .trim()
   .min(1)
   .max(1024)
   .refine(
     (value) => {
+      if (value.trim() !== value) return false;
       if (value.startsWith('/') || value.includes('\\') || value.includes('\u0000')) return false;
       if (/[\u0000-\u001f\u007f]/u.test(value)) return false;
       const segments = value.split('/');
