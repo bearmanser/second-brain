@@ -119,11 +119,6 @@ export async function verifyVaultMigration(input: unknown): Promise<MigrationVer
 
   const vaultPaths = await listVaultFilePaths(manifest.vault_root);
   const catalogue = new Map<string, string | undefined>();
-  for (const move of manifest.moves) {
-    if (move.project_root === undefined) continue;
-    const leaf = move.project_root.slice(move.project_root.lastIndexOf('/') + 1);
-    catalogue.set(`${move.project_root}/${leaf}.md`, undefined);
-  }
   const markdownFiles: { path: string; raw: string }[] = [];
   for (const path of vaultPaths) {
     if (path.toLowerCase().endsWith('.md')) {

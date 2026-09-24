@@ -6,7 +6,7 @@ import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { BrainError, isBrainError } from '../../contracts/errors.js';
 import { DEFAULT_TYPE_FOR_KIND, type CurrentDocument } from '../../notes/document.js';
 import { renderDocument, renderNoteBody } from '../../notes/document-codec.js';
-import { decodeRevision } from '../../notes/codec.js';
+import { decodeRevision, payloadHash } from '../../notes/codec.js';
 import { resolveHead } from '../../notes/catalogue.js';
 import { extractLinks, isExternalTarget, type LinkReference } from '../../notes/links.js';
 import { resolveLink, type LinkCatalogue } from '../../notes/link-resolver.js';
@@ -14,7 +14,13 @@ import { allocateNotePath, allocateProjectRoot, collisionKey } from '../../notes
 import { KIND_FOLDERS } from '../../notes/registry.js';
 import { hasBrainMarker, readBoundedBytes } from '../../storage/vault.js';
 import { revisionLocation } from '../../storage/revision-store.js';
-import { buildManifest, validateManifest, type BackupManifest, type ManifestFile } from '../backup.js';
+import {
+  buildManifest,
+  validateManifest,
+  verifyManifest,
+  type BackupManifest,
+  type ManifestFile
+} from '../backup.js';
 import type { Lifecycle, NoteKind, StoredRevision } from '../../core/types.js';
 import type { InventoryRow } from './inventory.js';
 import { inventoryTree } from './inventory.js';
@@ -100,6 +106,7 @@ export interface MigrationMove {
   current_sha256: string;
   history_destinations: { revision_id: string; destination_path: string }[];
   approval_preserved: boolean;
+  approval_valid: boolean;
 }
 
 export interface MigrationRewrite {
@@ -118,6 +125,7 @@ export interface MigrationManifest {
   vault_root: string;
   state_root: string;
   project_names: Record<string, string>;
+  output_exclusions: string[];
   source_fingerprint: SourceFingerprint;
   moves: MigrationMove[];
   history_copies: MigrationHistoryCopy[];
@@ -145,6 +153,14 @@ export interface MigrationPhaseRecord {
   artifacts: { path: string; sha256: string }[];
 }
 
+export interface MigrationRollbackRecord {
+  status: 'running' | 'complete';
+  updated_at: string;
+  restored_sources: string[];
+  restored_rewrites: string[];
+  removed_current: string[];
+}
+
 export interface MigrationJournal {
   version: number;
   migration_id: string;
@@ -153,6 +169,14 @@ export interface MigrationJournal {
   created_at: string;
   updated_at: string;
   phases: Record<MigrationPhase, MigrationPhaseRecord>;
+  post_migration_inventory?: { path: string; sha256: string }[];
+  rollback?: MigrationRollbackRecord;
+}
+
+export interface MigrationBackupVerification {
+  receipt: BackupManifest;
+  backup_root: string;
+  verified_files: number;
 }
 
 export interface MigrationFaults {
@@ -164,6 +188,7 @@ export interface PlanVaultMigrationInput {
   state: string;
   projectNames: Record<string, string>;
   outputDirectory?: string;
+  exclude?: string[];
   clock?: { now(): Date };
 }
 
@@ -347,7 +372,7 @@ function isExcludedStatePath(stateRoot: string, relativePath: string, excluded: 
 export async function fingerprintSource(input: {
   vault: string;
   state: string;
-  outputDirectory?: string;
+  exclude?: string[];
 }): Promise<SourceFingerprint> {
   const vaultRoot = resolve(input.vault);
   const stateRoot = resolve(input.state);
@@ -360,12 +385,12 @@ export async function fingerprintSource(input: {
   if (isInsideOrEqual(vaultRoot, stateRoot) || isInsideOrEqual(stateRoot, vaultRoot)) {
     throw invalidInput('the vault and state roots must not overlap');
   }
+  const excluded = new Set<string>([resolve(stateRoot, MIGRATION_DIRECTORY)]);
+  for (const entry of input.exclude ?? []) {
+    if (typeof entry === 'string' && entry.length > 0) excluded.add(resolve(entry));
+  }
   const vaultRows = await inventoryTree(vaultRoot);
   const stateRows = await inventoryTree(stateRoot);
-  const excluded = new Set<string>([resolve(stateRoot, MIGRATION_DIRECTORY)]);
-  if (input.outputDirectory !== undefined && input.outputDirectory.length > 0) {
-    excluded.add(resolve(input.outputDirectory));
-  }
   const stateFiles = stateRows
     .filter((row) => !isExcludedStatePath(stateRoot, row.path, excluded))
     .map(toFingerprint);
@@ -479,6 +504,42 @@ export function assertJournal(value: unknown): MigrationJournal {
       })
     };
   }
+  const inventory = record.post_migration_inventory;
+  const postMigrationInventory =
+    inventory === undefined
+      ? undefined
+      : Array.isArray(inventory)
+        ? inventory.map((entry) => {
+            const item = entry as { path?: unknown; sha256?: unknown };
+            if (typeof item?.path !== 'string' || typeof item?.sha256 !== 'string') {
+              throw recoveryRequired('the migration journal has a malformed post-migration inventory');
+            }
+            return { path: item.path, sha256: item.sha256 };
+          })
+        : (() => {
+            throw recoveryRequired('the migration journal has a malformed post-migration inventory');
+          })();
+  let rollback: MigrationRollbackRecord | undefined;
+  if (record.rollback !== undefined) {
+    const entry = record.rollback as Record<string, unknown>;
+    if (
+      entry === null ||
+      typeof entry !== 'object' ||
+      (entry.status !== 'running' && entry.status !== 'complete') ||
+      !Array.isArray(entry.restored_sources) ||
+      !Array.isArray(entry.restored_rewrites) ||
+      !Array.isArray(entry.removed_current)
+    ) {
+      throw recoveryRequired('the migration journal has a malformed rollback record');
+    }
+    rollback = {
+      status: entry.status,
+      updated_at: typeof entry.updated_at === 'string' ? entry.updated_at : '',
+      restored_sources: entry.restored_sources.filter((value): value is string => typeof value === 'string'),
+      restored_rewrites: entry.restored_rewrites.filter((value): value is string => typeof value === 'string'),
+      removed_current: entry.removed_current.filter((value): value is string => typeof value === 'string')
+    };
+  }
   return {
     version: MIGRATION_JOURNAL_VERSION,
     migration_id: record.migration_id,
@@ -486,7 +547,9 @@ export function assertJournal(value: unknown): MigrationJournal {
     state: record.state,
     created_at: typeof record.created_at === 'string' ? record.created_at : '',
     updated_at: typeof record.updated_at === 'string' ? record.updated_at : '',
-    phases: normalized
+    phases: normalized,
+    ...(postMigrationInventory === undefined ? {} : { post_migration_inventory: postMigrationInventory }),
+    ...(rollback === undefined ? {} : { rollback })
   };
 }
 
@@ -511,8 +574,8 @@ export async function markPhase(
   return journal;
 }
 
-export function buildMigrationBackupReceipt(fingerprint: SourceFingerprint): BackupManifest {
-  const files: ManifestFile[] = [
+export function migrationBackupFiles(fingerprint: SourceFingerprint): ManifestFile[] {
+  return [
     ...fingerprint.vault.map((file) => ({
       path: `vault/${file.path}`,
       size: file.bytes,
@@ -524,7 +587,10 @@ export function buildMigrationBackupReceipt(fingerprint: SourceFingerprint): Bac
       sha256: file.sha256
     }))
   ];
-  return buildManifest(files, {
+}
+
+export function buildMigrationBackupReceipt(fingerprint: SourceFingerprint): BackupManifest {
+  return buildManifest(migrationBackupFiles(fingerprint), {
     application: 'second-brain',
     schema: 1,
     images: {},
@@ -532,26 +598,57 @@ export function buildMigrationBackupReceipt(fingerprint: SourceFingerprint): Bac
   });
 }
 
-export function verifyMigrationBackupReceipt(receipt: unknown, fingerprint: SourceFingerprint): void {
-  const validated = validateManifest(receipt);
-  const expected = new Map(
-    buildMigrationBackupReceipt(fingerprint).files.map((file) => [file.path, file.sha256])
-  );
+export function assertBackupRootSeparation(fingerprint: SourceFingerprint, backupRoot: string): void {
+  const resolvedRoot = resolve(backupRoot);
+  if (
+    isInsideOrEqual(resolve(fingerprint.vault_root), resolvedRoot) ||
+    isInsideOrEqual(resolve(fingerprint.state_root), resolvedRoot) ||
+    isInsideOrEqual(resolvedRoot, resolve(fingerprint.vault_root)) ||
+    isInsideOrEqual(resolvedRoot, resolve(fingerprint.state_root))
+  ) {
+    throw invalidInput('the backup root must be separate from the live vault and state');
+  }
+}
+
+export async function verifyMigrationBackupReceipt(
+  receipt: unknown,
+  fingerprint: SourceFingerprint,
+  backupRoot: string | undefined
+): Promise<MigrationBackupVerification> {
+  if (typeof backupRoot !== 'string' || backupRoot.length === 0) {
+    throw invalidInput('a verified backup root is required before applying a migration');
+  }
+  let validated: BackupManifest;
+  try {
+    validated = validateManifest(receipt);
+  } catch (error) {
+    throw invalidInput('the migration backup receipt is not a valid backup manifest', error);
+  }
   if (validated.files.length === 0) {
     throw invalidInput('the migration backup receipt is empty');
   }
+  assertBackupRootSeparation(fingerprint, backupRoot);
+  try {
+    await verifyManifest(backupRoot, validated);
+  } catch (error) {
+    throw recoveryRequired('the migration backup cannot be verified from its media', error);
+  }
+  const expected = new Map(
+    migrationBackupFiles(fingerprint).map((file) => [file.path, { size: file.size, sha256: file.sha256 }])
+  );
   for (const file of validated.files) {
     const wanted = expected.get(file.path);
     if (wanted === undefined) {
       throw conflict(`the migration backup receipt names an unexpected file: ${file.path}`);
     }
-    if (wanted !== file.sha256) {
-      throw conflict(`the migration backup receipt does not match the source for ${file.path}`);
+    if (wanted.sha256 !== file.sha256 || wanted.size !== file.size) {
+      throw conflict(`the migration backup receipt does not match the backup media for ${file.path}`);
     }
   }
   if (validated.files.length !== expected.size) {
     throw conflict('the migration backup receipt is missing source files');
   }
+  return { receipt: validated, backup_root: resolve(backupRoot), verified_files: validated.files.length };
 }
 
 interface ParsedManagedFile {
@@ -564,9 +661,25 @@ function blocker(kind: MigrationBlockerKind, reason: string, extra: Partial<Migr
   return { kind, reason, ...extra };
 }
 
+export function projectHubPath(projectRoot: string): string {
+  const leaf = projectRoot.slice(projectRoot.lastIndexOf('/') + 1);
+  return `${projectRoot}/${leaf}.md`;
+}
+
 function projectProperty(projectRoot: string): string {
   const leaf = projectRoot.slice(projectRoot.lastIndexOf('/') + 1);
   return `[[${projectRoot}/${leaf}]]`;
+}
+
+export function effectiveLifecycle(revision: StoredRevision): Lifecycle {
+  const approval = revision.approval;
+  if (approval === undefined) return revision.status === 'active' ? 'candidate' : revision.status;
+  if (approval.payload_hash !== payloadHash(revision)) return 'candidate';
+  return revision.status;
+}
+
+export function approvalIsValid(revision: StoredRevision): boolean {
+  return revision.approval !== undefined && revision.approval.payload_hash === payloadHash(revision);
 }
 
 function cleanProperties(revision: StoredRevision): Record<string, unknown> {
@@ -581,7 +694,7 @@ function cleanProperties(revision: StoredRevision): Record<string, unknown> {
 export function buildCurrentDocument(
   revision: StoredRevision,
   currentPath: string,
-  projectRoot: string | undefined
+  projectLink: string | undefined
 ): CurrentDocument {
   const kind = revision.note.content.kind;
   const extras = revision.extra_markdown.trim().length > 0 ? { human: [revision.extra_markdown] } : {};
@@ -590,8 +703,8 @@ export function buildCurrentDocument(
     path: currentPath,
     title: revision.note.title,
     type: DEFAULT_TYPE_FOR_KIND[kind],
-    status: revision.status,
-    ...(projectRoot === undefined ? {} : { project: projectProperty(projectRoot) }),
+    status: effectiveLifecycle(revision),
+    ...(projectLink === undefined ? {} : { project: projectLink }),
     aliases: [],
     tags: [...revision.note.tags],
     created: revision.created_at,
@@ -599,6 +712,27 @@ export function buildCurrentDocument(
     properties: cleanProperties(revision),
     body: renderNoteBody(revision.note, extras)
   };
+}
+
+function peekLogicalId(raw: string): string | undefined {
+  const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+  const lines = text.split('\n');
+  if (lines[0]?.trim() !== '---') return undefined;
+  let close = -1;
+  for (let index = 1; index < lines.length; index += 1) {
+    if (lines[index].trim() === '---') {
+      close = index;
+      break;
+    }
+  }
+  if (close === -1) return undefined;
+  for (const line of lines.slice(1, close)) {
+    const match = /^[ \t]*brain_id:[ \t]*(.+?)[ \t]*$/.exec(line);
+    if (match === null) continue;
+    const value = match[1].replace(/^["']|["']$/g, '');
+    if (UUID_PATTERN.test(value)) return value.toLowerCase();
+  }
+  return undefined;
 }
 
 function stripNoteExtension(path: string): string {
@@ -779,23 +913,36 @@ export async function planVaultMigration(input: PlanVaultMigrationInput): Promis
   const now = (input.clock ?? { now: () => new Date() }).now().toISOString();
   const vaultRoot = resolve(input.vault);
   const stateRoot = resolve(input.state);
+  const outputExclusions = [
+    ...(input.exclude ?? []),
+    ...(input.outputDirectory === undefined ? [] : [input.outputDirectory])
+  ]
+    .filter((entry): entry is string => typeof entry === 'string' && entry.length > 0)
+    .map((entry) => resolve(entry));
+  for (const exclusion of outputExclusions) {
+    if (isInsideOrEqual(vaultRoot, exclusion)) {
+      throw invalidInput('the migration output must not be written inside the vault');
+    }
+  }
   const fingerprint = await fingerprintSource({
     vault: vaultRoot,
     state: stateRoot,
-    ...(input.outputDirectory === undefined ? {} : { outputDirectory: input.outputDirectory })
+    exclude: outputExclusions
   });
   const texts = await readVaultTextFiles(vaultRoot, fingerprint.vault);
+  const vaultPathSet = new Set(fingerprint.vault.map((row) => row.path));
 
   const blockers: MigrationBlocker[] = [];
   const parsed: ParsedManagedFile[] = [];
   const blockedPaths = new Set<string>();
+  const failures: { path: string; sha256: string; id?: string; kind: MigrationBlockerKind }[] = [];
   const managedRows = fingerprint.vault.filter(
     (row) => row.path.toLowerCase().endsWith('.md') && hasBrainMarker(texts.get(row.path) ?? '')
   );
   for (const row of managedRows) {
     const raw = texts.get(row.path);
     if (raw === undefined) {
-      blockers.push(blocker('malformed', 'managed note is not valid UTF-8', { path: row.path }));
+      failures.push({ path: row.path, sha256: row.sha256, kind: 'malformed' });
       blockedPaths.add(row.path);
       continue;
     }
@@ -808,7 +955,8 @@ export async function planVaultMigration(input: PlanVaultMigrationInput): Promis
     } catch (error) {
       const code = isBrainError(error) ? error.code : 'INVALID_INPUT';
       const kind: MigrationBlockerKind = code === 'UNSUPPORTED_SCHEMA' ? 'unknown_schema' : 'malformed';
-      blockers.push(blocker(kind, code === 'UNSUPPORTED_SCHEMA' ? 'unsupported schema version' : 'malformed managed note', { path: row.path }));
+      const id = peekLogicalId(raw);
+      failures.push({ path: row.path, sha256: row.sha256, kind, ...(id === undefined ? {} : { id }) });
       blockedPaths.add(row.path);
     }
   }
@@ -823,6 +971,31 @@ export async function planVaultMigration(input: PlanVaultMigrationInput): Promis
     const group = groups.get(item.revision.id) ?? [];
     group.push(item);
     groups.set(item.revision.id, group);
+  }
+
+  const failuresById = new Map<string, typeof failures>();
+  for (const failure of failures) {
+    if (failure.id === undefined) continue;
+    const list = failuresById.get(failure.id) ?? [];
+    list.push(failure);
+    failuresById.set(failure.id, list);
+  }
+  for (const failure of failures) {
+    if (failure.id !== undefined) continue;
+    blockers.push(
+      blocker(failure.kind, `managed note ${failure.path} has no recoverable identity`, {
+        path: failure.path
+      })
+    );
+  }
+  for (const [id, list] of failuresById) {
+    if (groups.has(id)) continue;
+    blockers.push(
+      blocker(list[0].kind, `note ${id} has no parseable revision`, {
+        id,
+        paths: list.map((failure) => failure.path).sort()
+      })
+    );
   }
 
   for (const [id, group] of groups) {
@@ -843,19 +1016,26 @@ export async function planVaultMigration(input: PlanVaultMigrationInput): Promis
   const headPaths = new Map<string, string>();
   const candidates: { id: string; group: ParsedManagedFile[]; head: ParsedManagedFile }[] = [];
   for (const [id, group] of [...groups.entries()].sort((left, right) => (left[0] < right[0] ? -1 : 1))) {
+    const failed = failuresById.get(id) ?? [];
     const resolution = resolveHead(
       group.map((item) => ({ revision: item.revision, raw_hash: item.sha256, relative_path: item.path }))
     );
     const duplicate = group.some((item) => (revisionCounts.get(item.revision.revision_id) ?? 0) > 1);
-    if (resolution.state !== 'ready' || duplicate) {
-      const reasons = resolution.state === 'conflict' ? resolution.reasons : ['duplicate_revision_id'];
+    if (failed.length > 0 || resolution.state !== 'ready' || duplicate) {
+      const reasons =
+        failed.length > 0
+          ? ['unreadable_revision']
+          : resolution.state === 'conflict'
+            ? resolution.reasons
+            : ['duplicate_revision_id'];
       blockers.push(
-        blocker('fork', `note ${id} has no unique valid head (${reasons.join(', ')})`, {
+        blocker('fork', `note ${id} cannot be migrated (${reasons.join(', ')})`, {
           id,
-          paths: group.map((item) => item.path)
+          paths: [...group.map((item) => item.path), ...failed.map((failure) => failure.path)].sort()
         })
       );
       for (const item of group) blockedPaths.add(item.path);
+      for (const failure of failed) blockedPaths.add(failure.path);
       continue;
     }
     const head = group.find(
@@ -935,7 +1115,9 @@ export async function planVaultMigration(input: PlanVaultMigrationInput): Promis
 
   for (const { candidate, currentPath } of allocated) {
     const head = candidate.head.revision;
-    const document = buildCurrentDocument(head, currentPath, projectRoots.get(head.scope));
+    const root = projectRoots.get(head.scope) as string;
+    const projectLink = vaultPathSet.has(projectHubPath(root)) ? projectProperty(root) : undefined;
+    const document = buildCurrentDocument(head, currentPath, projectLink);
     const outcome = rewriteFileLinks({
       raw: renderDocument(document),
       sourcePath: candidate.head.path,
@@ -954,7 +1136,7 @@ export async function planVaultMigration(input: PlanVaultMigrationInput): Promis
       scope: head.scope,
       title: head.note.title,
       kind: head.note.content.kind,
-      status: head.status,
+      status: effectiveLifecycle(head),
       ...(projectRoots.get(head.scope) === undefined ? {} : { project_root: projectRoots.get(head.scope) as string }),
       head_revision_id: candidate.head.revision.revision_id,
       head_source_path: candidate.head.path,
@@ -965,7 +1147,8 @@ export async function planVaultMigration(input: PlanVaultMigrationInput): Promis
       current_raw: raw,
       current_sha256: sha256(raw),
       history_destinations: [],
-      approval_preserved: head.approval !== undefined
+      approval_preserved: head.approval !== undefined,
+      approval_valid: approvalIsValid(head)
     });
     for (const item of candidate.group) {
       const destination = historyDestination(stateRoot, item.revision.id, item.revision.revision_id);
@@ -1026,6 +1209,7 @@ export async function planVaultMigration(input: PlanVaultMigrationInput): Promis
     vault_root: vaultRoot,
     state_root: stateRoot,
     project_names: { ...projectNames },
+    output_exclusions: outputExclusions,
     source_fingerprint: fingerprint,
     moves,
     history_copies: historyCopies.sort((left, right) =>
@@ -1057,6 +1241,9 @@ export function assertManifest(value: unknown): MigrationManifest {
   }
   if (!Array.isArray(record.rewrites) || !Array.isArray(record.blockers)) {
     throw invalidInput('the migration manifest is malformed');
+  }
+  if (!Array.isArray(record.output_exclusions)) {
+    throw invalidInput('the migration manifest has no output exclusions');
   }
   if (record.source_fingerprint === null || typeof record.source_fingerprint !== 'object') {
     throw invalidInput('the migration manifest has no source fingerprint');

@@ -76,6 +76,12 @@ test('planning the frozen fixture records resolved heads, copies, and fork block
     );
     expect(preference?.status).toBe('active');
     expect(preference?.approval_preserved).toBe(true);
+    expect(preference?.approval_valid).toBe(true);
+    expect(plan.output_exclusions).toEqual([]);
+    for (const move of plan.moves) {
+      const raw = move.current_raw;
+      expect(raw).not.toContain('project:');
+    }
     expect(plan.manifest_sha256).toMatch(/^[a-f0-9]{64}$/);
   } finally {
     await s.dispose();

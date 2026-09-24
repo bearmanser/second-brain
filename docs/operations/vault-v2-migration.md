@@ -14,11 +14,17 @@ writer stopped, and operator review of the inspection report.
 ```sh
 node dist/cli.js vault-v2 inspect --report /var/lib/second-brain/migrations/inspection.json
 node dist/cli.js vault-v2 plan --output /var/lib/second-brain/migrations/manifest.json
-node dist/cli.js vault-v2 apply --manifest /var/lib/second-brain/migrations/manifest.json --backup-receipt /var/lib/second-brain/migrations/backup.json --maintenance
+node dist/cli.js vault-v2 apply --manifest /var/lib/second-brain/migrations/manifest.json --backup-receipt /var/lib/second-brain/migrations/backup.json --backup-root /var/lib/second-brain/backup --maintenance
+node dist/cli.js vault-v2 apply --manifest /var/lib/second-brain/migrations/manifest.json --backup-receipt /var/lib/second-brain/migrations/backup.json --backup-root /var/lib/second-brain/backup --maintenance --partial
 node dist/cli.js vault-v2 verify --manifest /var/lib/second-brain/migrations/manifest.json
-node dist/cli.js vault-v2 resume --manifest /var/lib/second-brain/migrations/manifest.json --maintenance
+node dist/cli.js vault-v2 resume --manifest /var/lib/second-brain/migrations/manifest.json --backup-root /var/lib/second-brain/backup --maintenance
 node dist/cli.js vault-v2 rollback --manifest /var/lib/second-brain/migrations/manifest.json --maintenance
 ```
+
+The backup media at `--backup-root` mirrors the source as `vault/<path>` and
+`state/<path>`. The backup receipt lists those paths with hashes computed from
+the backup itself; applying re-reads the backup media and refuses unless every
+recorded hash and size still matches the live source fingerprint.
 
 The vault and state directories come from the runtime configuration
 (`BRAIN_VAULT_DIR`, `BRAIN_STATE_DIR`) and can be overridden with `--vault` and
@@ -48,16 +54,27 @@ name or modification time.
 
 Forks, duplicate revision identifiers, malformed content, unsupported schema
 versions, unmappable project identities, and unsafe targets are recorded as
-blockers. A blocked note is reported and left byte-for-byte in place. It is
-never discarded and never moved to a guessed note. Notes that are not blocked
-still migrate.
+blockers. An unreadable managed file is associated with its recoverable
+`brain_id` so it blocks the whole affected logical note; if no identity can be
+recovered it is reported as an actionable unresolved blocker. A blocked note is
+reported and left byte-for-byte in place. It is never discarded and never moved
+to a guessed note.
+
+Applying refuses by default whenever any blocker exists and enumerates every
+blocked item. An operator can opt in to partial migration with `--partial`,
+which migrates only the unblocked notes and still reports the full blocked set.
 
 ## Applying
 
-Applying requires a saved, hash-verified manifest, a verified backup receipt,
-and exclusive maintenance mode (`--maintenance`). The backup receipt is a
-standard backup manifest whose file hashes must match the freshly recomputed
-source fingerprint; a mismatch refuses the apply.
+Applying requires a saved, hash-verified manifest, a verified backup, and
+exclusive maintenance mode (`--maintenance`). The backup must be present at
+`--backup-root`; applying re-reads the backup media, hashes it, and refuses
+unless the receipt matches both the backup bytes and the freshly recomputed
+source fingerprint. A mismatch refuses the apply.
+
+Maintenance is enforced by the state-wide gateway lock, so the migration and
+the serving gateway cannot mutate concurrently; the lock is released when the
+command finishes.
 
 Migration steps are journaled, restartable, and idempotent:
 
@@ -75,9 +92,14 @@ targets the exact source paths named in the manifest.
 Relative links are resolved against each source's original location, including
 attachments, and rewritten through the actual old-to-new path map rather than
 by substituting UUID-shaped strings. One current file is materialized per
-resolved logical note, preserving logical ids, approval provenance, and
-historical revision ids without preserving caller permissions. Unmanaged human
-notes, attachments, `.obsidian` settings, and Canvas/Base files are preserved.
+resolved logical note, preserving logical ids, approval records, and historical
+revision ids without preserving caller permissions. Approval status is only
+carried into a readable note when its recorded payload hash is valid; otherwise
+the note is conservatively materialized as an unreviewed candidate while its
+raw approval record stays in durable history. A project hub link is written
+only when the hub file already exists; until then the project association is
+kept in the manifest without emitting a broken link. Unmanaged human notes,
+attachments, `.obsidian` settings, and Canvas/Base files are preserved.
 
 ## Verifying
 
@@ -89,9 +111,11 @@ code means the migration needs operator attention.
 ## Rolling back
 
 Rollback is exact only while the migrated vault has not received new writes.
-If any migrated current file, rewritten file, or restored legacy path differs
-from its recorded post-migration hash, rollback stops and reports the
-divergence instead of overwriting newer work. Otherwise it removes generated
-current notes and restores the original legacy revision files from durable
-history. Migration history is retained after rollback for diagnosis, and
-recovery never requires Basic Memory to remain online.
+Before changing anything it verifies every durable history copy, every
+destination, and that the live vault inventory still matches the recorded
+post-migration inventory; any added, changed, or removed file stops rollback
+and is reported instead of overwriting newer work. Only then does it restore
+legacy revisions and remove generated notes, journaling each stage so an
+interrupted rollback can restart without destroying data. Migration history is
+retained after rollback for diagnosis, and recovery never requires Basic Memory
+to remain online.

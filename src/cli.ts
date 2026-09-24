@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { loadTokenDigest } from './config/load.js';
 import { BrainError, isBrainError } from './contracts/errors.js';
@@ -479,7 +479,13 @@ async function runVaultV2(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Prom
   if (subcommand === 'inspect') {
     const report = flagString(parsed.flags, 'report');
     if (report === undefined) throw invalidInput('vault-v2 inspect requires --report');
-    const plan = await planVaultMigration({ vault, state, projectNames, clock });
+    const plan = await planVaultMigration({
+      vault,
+      state,
+      projectNames,
+      outputDirectory: dirname(resolve(report)),
+      clock
+    });
     const inspection = buildInspectionReport(plan);
     await writeFile(report, `${JSON.stringify(inspection, null, 2)}\n`, 'utf8');
     process.stdout.write(renderInspectionReport(inspection));
@@ -488,7 +494,13 @@ async function runVaultV2(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Prom
   if (subcommand === 'plan') {
     const output = flagString(parsed.flags, 'output');
     if (output === undefined) throw invalidInput('vault-v2 plan requires --output');
-    const plan = await planVaultMigration({ vault, state, projectNames, clock });
+    const plan = await planVaultMigration({
+      vault,
+      state,
+      projectNames,
+      outputDirectory: dirname(resolve(output)),
+      clock
+    });
     await writeFile(output, `${JSON.stringify(plan, null, 2)}\n`, 'utf8');
     process.stdout.write(
       `vault-v2 manifest ${plan.manifest_sha256}: ${plan.moves.length} moves, ` +
@@ -501,12 +513,14 @@ async function runVaultV2(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Prom
     if (manifestPath === undefined) throw invalidInput(`vault-v2 ${subcommand} requires --manifest`);
     const maintenance = flagBoolean(parsed.flags, 'maintenance');
     const receiptPath = flagString(parsed.flags, 'backup-receipt');
+    const backupRoot = flagString(parsed.flags, 'backup-root');
+    const partial = flagBoolean(parsed.flags, 'partial');
     const manifest = await readJsonFile(manifestPath, 'manifest');
     const backupReceipt = receiptPath === undefined ? undefined : await readJsonFile(receiptPath, 'backup receipt');
     const result =
       subcommand === 'apply'
-        ? await applyVaultMigration(manifest, { maintenance, backupReceipt, clock })
-        : await resumeVaultMigration(manifest, { maintenance, backupReceipt, clock });
+        ? await applyVaultMigration(manifest, { maintenance, backupReceipt, backupRoot, partial, clock })
+        : await resumeVaultMigration(manifest, { maintenance, backupReceipt, backupRoot, partial, clock });
     process.stdout.write(`vault-v2 ${result.status}: ${result.manifest_sha256}\n`);
     return 0;
   }

@@ -1,6 +1,9 @@
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import { BrainError, isBrainError } from '../../contracts/errors.js';
+import { mkdir } from 'node:fs/promises';
+import { BrainError } from '../../contracts/errors.js';
+import { InstanceLock } from '../../core/mutation.js';
+import { openRevisionStore } from '../../storage/revision-store.js';
+import { inventoryTree } from './inventory.js';
+import { verifyVaultMigration } from './verify.js';
 import {
   MIGRATION_PHASES,
   assertManifest,
@@ -15,23 +18,26 @@ import {
   readJournal,
   removeFileIfMatches,
   replaceFileAtomic,
-  stateAbsolutePath,
   sha256,
+  stateAbsolutePath,
   vaultAbsolutePath,
   verifyMigrationBackupReceipt,
   writeJournal,
   writeNewFileNoClobber,
+  type MigrationBlocker,
   type MigrationFaults,
   type MigrationJournal,
   type MigrationManifest,
   type MigrationPhase
 } from './plan.js';
-import { openRevisionStore } from '../../storage/revision-store.js';
-import { verifyVaultMigration } from './verify.js';
+
+export const MAINTENANCE_LOCK_NAME = 'gateway.lock';
 
 export interface ApplyVaultMigrationOptions {
   maintenance: boolean;
   backupReceipt: unknown;
+  backupRoot?: string;
+  partial?: boolean;
   faults?: MigrationFaults;
   clock?: { now(): Date };
 }
@@ -40,6 +46,7 @@ export interface ApplyVaultMigrationResult {
   status: 'applied' | 'resumed' | 'noop';
   manifest_sha256: string;
   phases: MigrationPhase[];
+  blocked: MigrationBlocker[];
   counts: {
     moves: number;
     history_copies: number;
@@ -60,14 +67,6 @@ function recoveryRequired(message: string, cause?: unknown): BrainError {
   return new BrainError({ code: 'RECOVERY_REQUIRED', message, cause });
 }
 
-function hasErrno(error: unknown, code: string): boolean {
-  return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === code;
-}
-
-function wrapIo(message: string, error: unknown): BrainError {
-  return isBrainError(error) ? error : recoveryRequired(message, error);
-}
-
 function sameFingerprint(
   left: MigrationManifest['source_fingerprint'],
   right: MigrationManifest['source_fingerprint']
@@ -79,34 +78,16 @@ function sameFingerprint(
   );
 }
 
-export async function acquireMaintenanceLock(
-  state: string,
-  migrationId: string,
-  now: string
-): Promise<void> {
-  const directory = journalDirectory(state, migrationId);
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  const lockPath = join(directory, 'maintenance.lock');
-  try {
-    await writeFile(
-      lockPath,
-      `${JSON.stringify({ migration_id: migrationId, pid: process.pid, started_at: now })}\n`,
-      { flag: 'wx', mode: 0o600 }
-    );
-    return;
-  } catch (error) {
-    if (!hasErrno(error, 'EEXIST')) throw wrapIo('the maintenance lock cannot be created', error);
-  }
-  const raw = await readFile(lockPath, 'utf8').catch(() => '');
-  let sameMigration = false;
-  try {
-    const parsed = JSON.parse(raw) as { migration_id?: unknown };
-    sameMigration = parsed.migration_id === migrationId;
-  } catch {
-    sameMigration = false;
-  }
-  if (sameMigration) return;
-  throw conflict('another migration holds exclusive maintenance mode');
+function enumerateBlockers(manifest: MigrationManifest): MigrationBlocker[] {
+  return manifest.blockers.map((entry) => ({
+    kind: entry.kind,
+    reason: entry.reason,
+    ...(entry.path === undefined ? {} : { path: entry.path }),
+    ...(entry.id === undefined ? {} : { id: entry.id }),
+    ...(entry.revision_id === undefined ? {} : { revision_id: entry.revision_id }),
+    ...(entry.scope === undefined ? {} : { scope: entry.scope }),
+    ...(entry.paths === undefined ? {} : { paths: [...entry.paths] })
+  }));
 }
 
 async function verifyRecordedState(
@@ -282,12 +263,18 @@ async function runMigration(
   if (options.maintenance !== true) {
     throw invalidInput('applying a migration requires exclusive maintenance mode');
   }
+  if (manifest.blockers.length > 0 && options.partial !== true) {
+    throw conflict(
+      `the migration has ${manifest.blockers.length} blocked items; resolve them or opt in to partial migration`
+    );
+  }
   if (manifest.moves.length === 0 && manifest.blockers.length > 0) {
     throw conflict('the migration has no resolvable notes and unresolved blockers');
   }
   if (manifestDigest(manifest) !== manifest.manifest_sha256) {
     throw conflict('the migration manifest failed its integrity check');
   }
+  const blocked = enumerateBlockers(manifest);
   const phases: MigrationPhase[] = [];
   let journal = await readJournal(manifest.state_root, manifest.manifest_sha256);
   if (journal !== undefined && journal.state === 'complete') {
@@ -300,6 +287,7 @@ async function runMigration(
       status: 'noop',
       manifest_sha256: manifest.manifest_sha256,
       phases: [],
+      blocked,
       counts: {
         moves: manifest.moves.length,
         history_copies: manifest.history_copies.length,
@@ -318,64 +306,81 @@ async function runMigration(
   const fingerprint = await fingerprintSource({
     vault: manifest.vault_root,
     state: manifest.state_root,
-    outputDirectory: journalDirectory(manifest.state_root, manifest.manifest_sha256)
+    exclude: manifest.output_exclusions
   });
   if (journal === undefined) {
     if (!sameFingerprint(manifest.source_fingerprint, fingerprint)) {
       throw conflict('the source vault changed since the manifest was recorded');
     }
     await verifyRecordedState(manifest, fingerprint);
-    verifyMigrationBackupReceipt(options.backupReceipt, fingerprint);
+    await verifyMigrationBackupReceipt(options.backupReceipt, fingerprint, options.backupRoot);
   } else {
     await verifyRecordedState(manifest, fingerprint);
   }
 
-  await acquireMaintenanceLock(manifest.state_root, manifest.manifest_sha256, now);
-  let active: MigrationJournal = journal ?? newJournal(manifest, now);
-  if (journal === undefined) {
-    await writeJournal(manifest.state_root, active);
-  }
-
-  const faults = options.faults ?? {};
-  const requirePhase = async (phase: MigrationPhase, run: () => Promise<{ path: string; sha256: string }[]>): Promise<void> => {
-    const record = active.phases[phase];
-    if (record.status === 'complete') {
-      await verifyJournalArtifacts(manifest, active, phase);
-      return;
+  const lock = InstanceLock.acquire(manifest.state_root, MAINTENANCE_LOCK_NAME);
+  try {
+    let active: MigrationJournal = journal ?? newJournal(manifest, now);
+    if (journal === undefined) {
+      await mkdir(journalDirectory(manifest.state_root, manifest.manifest_sha256), {
+        recursive: true,
+        mode: 0o700
+      });
+      await writeJournal(manifest.state_root, active);
     }
-    await assertFreeSpace(manifest);
-    const artifacts = await run();
-    active = await markPhase(manifest.state_root, active, phase, artifacts, now, faults);
-    phases.push(phase);
-  };
 
-  await requirePhase('history', async () => runHistoryPhase(manifest, now));
-  await requirePhase('materialize', async () => runMaterializePhase(manifest));
-  await requirePhase('remove_sources', async () => runRemoveSourcesPhase(manifest));
-  await requirePhase('rewrites', async () => runRewritesPhase(manifest));
-  if (active.phases.verify.status !== 'complete') {
-    await assertMigrated(manifest);
-    active = await markPhase(manifest.state_root, active, 'verify', [], now, faults);
-    phases.push('verify');
-  }
-  if (active.state !== 'complete') {
-    active.state = 'complete';
-    active.updated_at = now;
-    await writeJournal(manifest.state_root, active);
-    await faults.afterPhase?.('complete');
-    phases.push('complete');
-  }
-  return {
-    status: mode === 'resume' ? 'resumed' : 'applied',
-    manifest_sha256: manifest.manifest_sha256,
-    phases,
-    counts: {
-      moves: manifest.moves.length,
-      history_copies: manifest.history_copies.length,
-      rewrites: manifest.rewrites.length,
-      source_files_removed: manifest.history_copies.length
+    const faults = options.faults ?? {};
+    const requirePhase = async (
+      phase: MigrationPhase,
+      run: () => Promise<{ path: string; sha256: string }[]>
+    ): Promise<void> => {
+      const record = active.phases[phase];
+      if (record.status === 'complete') {
+        await verifyJournalArtifacts(manifest, active, phase);
+        return;
+      }
+      await assertFreeSpace(manifest);
+      const artifacts = await run();
+      active = await markPhase(manifest.state_root, active, phase, artifacts, now, faults);
+      phases.push(phase);
+    };
+
+    await requirePhase('history', async () => runHistoryPhase(manifest, now));
+    await requirePhase('materialize', async () => runMaterializePhase(manifest));
+    await requirePhase('remove_sources', async () => runRemoveSourcesPhase(manifest));
+    await requirePhase('rewrites', async () => runRewritesPhase(manifest));
+    if (active.phases.verify.status !== 'complete') {
+      await assertMigrated(manifest);
+      active = await markPhase(manifest.state_root, active, 'verify', [], now, faults);
+      phases.push('verify');
     }
-  };
+    if (active.state !== 'complete') {
+      const inventory = await inventoryTree(manifest.vault_root);
+      active.post_migration_inventory = inventory.map((row) => ({
+        path: row.path,
+        sha256: row.sha256
+      }));
+      active.state = 'complete';
+      active.updated_at = now;
+      await writeJournal(manifest.state_root, active);
+      await faults.afterPhase?.('complete');
+      phases.push('complete');
+    }
+    return {
+      status: mode === 'resume' ? 'resumed' : 'applied',
+      manifest_sha256: manifest.manifest_sha256,
+      phases,
+      blocked,
+      counts: {
+        moves: manifest.moves.length,
+        history_copies: manifest.history_copies.length,
+        rewrites: manifest.rewrites.length,
+        source_files_removed: manifest.history_copies.length
+      }
+    };
+  } finally {
+    lock.release();
+  }
 }
 
 export function applyVaultMigration(
@@ -392,6 +397,3 @@ export function resumeVaultMigration(
   return runMigration(manifest, options, 'resume');
 }
 
-export async function releaseMigrationLock(state: string, migrationId: string): Promise<void> {
-  await rm(join(journalDirectory(state, migrationId), 'maintenance.lock'), { force: true });
-}
