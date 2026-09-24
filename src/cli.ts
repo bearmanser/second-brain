@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -26,10 +27,20 @@ import { health } from './operations/health.js';
 import { selectLegacyCredentialDigest } from './operations/legacy-credentials.js';
 import {
   assertRecoveryMode,
+  describeRecoveryInput,
   recoverPending,
   requireRecoveryAuthorization,
-  summariseRecovery
+  summariseRecovery,
+  summariseRecoveryInput
 } from './operations/recovery.js';
+import {
+  importLocalVault,
+  readLocalBackupManifest,
+  rebuildLocalIndex,
+  restoreLocalBackup,
+  takeLocalBackup,
+  verifyLocalBackup
+} from './operations/local-rebuild.js';
 import { applyVaultMigration, formatMigrationBlockers, resumeVaultMigration } from './operations/vault-v2/apply.js';
 import { planVaultMigration } from './operations/vault-v2/plan.js';
 import { buildInspectionReport, renderInspectionReport } from './operations/vault-v2/report.js';
@@ -59,7 +70,11 @@ export type CliCommand =
   | 'recover'
   | 'recover-state'
   | 'rebuild-catalogue'
+  | 'rebuild-index'
   | 'backup-manifest'
+  | 'local-backup'
+  | 'local-restore'
+  | 'verify-local-backup'
   | 'validate-archive'
   | 'validate-store-links'
   | 'verify-backup'
@@ -75,7 +90,11 @@ export const CLI_COMMANDS: readonly CliCommand[] = [
   'recover',
   'recover-state',
   'rebuild-catalogue',
+  'rebuild-index',
   'backup-manifest',
+  'local-backup',
+  'local-restore',
+  'verify-local-backup',
   'validate-archive',
   'validate-store-links',
   'verify-backup',
@@ -96,7 +115,7 @@ const systemIds: IdSource = { next: () => randomUUID() };
 
 const USAGE = [
   'usage: node dist/cli.js <command> [options]',
-  'commands: serve | setup | health | recover | recover-state | rebuild-catalogue | backup-manifest | validate-archive | validate-store-links | verify-backup | auth | vault-v2 | obsidian | feedback'
+  'commands: serve | setup | health | recover | recover-state | rebuild-catalogue | rebuild-index | backup-manifest | local-backup | local-restore | verify-local-backup | validate-archive | validate-store-links | verify-backup | auth | vault-v2 | obsidian | feedback'
 ].join('\n');
 
 function invalidInput(message: string): BrainError {
@@ -303,6 +322,102 @@ async function runRebuildCatalogue(parsed: ParsedArguments, env: NodeJS.ProcessE
   }
 }
 
+async function runRebuildIndex(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promise<number> {
+  const config = resolveConfig(env);
+  const vault = flagString(parsed.flags, 'vault') ?? config.mounts.vault;
+  const state = flagString(parsed.flags, 'state') ?? config.mounts.state;
+  const lock = InstanceLock.acquire(state);
+  try {
+    const result = await rebuildLocalIndex({ vault, state });
+    if (result.status === 'rebuilt') {
+      process.stdout.write(
+        `index rebuilt: ${result.counts.documents} documents, ${result.counts.chunks} chunks, ` +
+          `fingerprint ${result.fingerprint}\n`
+      );
+      return 0;
+    }
+    process.stderr.write(
+      `index rebuild degraded: ${result.reason}; previous index ` +
+        `${result.previous_index === null ? 'absent' : 'retained'}\n`
+    );
+    return 1;
+  } finally {
+    lock.release();
+  }
+}
+
+async function runLocalBackup(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promise<number> {
+  const config = resolveConfig(env);
+  const vault = flagString(parsed.flags, 'vault') ?? config.mounts.vault;
+  const state = flagString(parsed.flags, 'state') ?? config.mounts.state;
+  const destination = requiredFlag(
+    parsed,
+    'destination',
+    'local-backup requires --destination for the backup directory'
+  );
+  const result = await takeLocalBackup({
+    vault,
+    state,
+    destination,
+    scope: flagBoolean(parsed.flags, 'vault-only') ? 'vault-only' : 'full',
+    includeSearchIndex: flagBoolean(parsed.flags, 'include-search-index'),
+    includeModelArtifacts: flagBoolean(parsed.flags, 'include-model-artifacts'),
+    ...(flagString(parsed.flags, 'config') === undefined
+      ? {}
+      : { config: flagString(parsed.flags, 'config') as string }),
+    secrets: flagList(parsed.flags, 'secret')
+  });
+  process.stdout.write(
+    `local backup: ${result.files} files (${result.manifest.scope}), manifest ${result.manifest_path}` +
+      `${result.sensitive ? ', sensitive' : ''}\n`
+  );
+  return 0;
+}
+
+async function runLocalRestore(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promise<number> {
+  const config = resolveConfig(env);
+  const vault = flagString(parsed.flags, 'vault') ?? config.mounts.vault;
+  const state = flagString(parsed.flags, 'state') ?? config.mounts.state;
+  const backupRoot = requiredFlag(parsed, 'backup', 'local-restore requires --backup for the backup directory');
+  if (flagBoolean(parsed.flags, 'vault-only')) {
+    const result = await importLocalVault({ backupRoot, vault });
+    process.stdout.write(
+      `local vault-only import: ${result.imported_files} files; ${summariseRecoveryInput(result.classification)}\n`
+    );
+    for (const warning of result.warnings) process.stderr.write(`warning: ${warning}\n`);
+    return 0;
+  }
+  const result = await restoreLocalBackup({ backupRoot, vault, state });
+  process.stdout.write(
+    `local restore: ${result.restored_files} files; ${summariseRecoveryInput(result.classification)}\n`
+  );
+  for (const warning of result.warnings) process.stderr.write(`warning: ${warning}\n`);
+  return 0;
+}
+
+async function runVerifyLocalBackup(parsed: ParsedArguments): Promise<number> {
+  const manifestPath = requiredFlag(parsed, 'manifest', 'verify-local-backup requires --manifest');
+  const root = flagString(parsed.flags, 'root');
+  const manifest = await readLocalBackupManifest(manifestPath);
+  const roots =
+    root === undefined
+      ? {
+          ...(flagString(parsed.flags, 'vault') === undefined ? {} : { vault: flagString(parsed.flags, 'vault') as string }),
+          ...(flagString(parsed.flags, 'state') === undefined ? {} : { state: flagString(parsed.flags, 'state') as string }),
+          ...(flagString(parsed.flags, 'config') === undefined ? {} : { config: flagString(parsed.flags, 'config') as string }),
+          ...(flagString(parsed.flags, 'secrets') === undefined ? {} : { secrets: flagString(parsed.flags, 'secrets') as string })
+        }
+      : { vault: join(root, 'vault'), state: join(root, 'state'), config: join(root, 'config'), secrets: join(root, 'secrets') };
+  const report = await verifyLocalBackup(manifest, roots);
+  process.stdout.write(
+    `local backup verify: ok=${report.ok} scope=${report.scope} files=${report.counts.files}` +
+      `${report.sensitive ? ' sensitive' : ''}; ${summariseRecoveryInput(report.classification)}\n`
+  );
+  for (const path of report.missing_files) process.stdout.write(`  missing ${path}\n`);
+  for (const path of report.checksum_failures) process.stdout.write(`  checksum ${path}\n`);
+  return report.ok ? 0 : 1;
+}
+
 function resolveAuthorization(
   parsed: ParsedArguments,
   env: NodeJS.ProcessEnv
@@ -318,6 +433,16 @@ async function runRecoverState(parsed: ParsedArguments, env: NodeJS.ProcessEnv):
   const config = resolveConfig(env);
   requireRecoveryAuthorization(resolveAuthorization(parsed, env), loadTokenDigest(env));
   const lock = InstanceLock.acquire(config.mounts.state);
+  process.stdout.write(
+    `${summariseRecoveryInput(
+      describeRecoveryInput({
+        vault: existsSync(config.mounts.vault),
+        history: existsSync(join(config.mounts.state, 'history')),
+        journal: existsSync(join(config.mounts.state, 'journal.db')),
+        index: existsSync(join(config.mounts.state, 'index', 'search.sqlite'))
+      })
+    )}\n`
+  );
   let journal: Journal | undefined;
   let catalogue: RevisionCatalogue | undefined;
   let backend: BasicMemoryBackend | undefined;
@@ -836,8 +961,16 @@ export async function runCli(
       return runRecoverState(parsed, env);
     case 'rebuild-catalogue':
       return runRebuildCatalogue(parsed, env);
+    case 'rebuild-index':
+      return runRebuildIndex(parsed, env);
     case 'backup-manifest':
       return runBackupManifest(parsed);
+    case 'local-backup':
+      return runLocalBackup(parsed, env);
+    case 'local-restore':
+      return runLocalRestore(parsed, env);
+    case 'verify-local-backup':
+      return runVerifyLocalBackup(parsed);
     case 'validate-archive':
       return runValidateArchive(parsed);
     case 'validate-store-links':

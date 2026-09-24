@@ -10,16 +10,37 @@ full recovery.
 | Store | Location | Nature | Rebuildable? |
 |---|---|---|---|
 | Markdown notes | host vault directory (`VAULT_PATH`) | **Authoritative** knowledge | No — must be preserved |
-| Revision catalogue | `brain-state` volume: `catalogue.db` | Derived head/graph index | Yes, from Markdown |
-| Basic Memory search index and embeddings | `memory-state` + `model-cache` volumes | Derived search index | Yes, with `basic-memory reindex` |
-| Operation journal | `brain-state` volume: `journal.db` | Separate persistent state: idempotency, recovery, retry history | No — restore from backup |
-| Feedback, retrieval, audit records | `brain-state` volume: `journal.db` | Separate persistent state | No — restore from backup |
-| Repository mappings and dynamic role grants | `brain-state` volume: `journal.db` | Separate persistent authorization state | No — restore from backup |
+| Revision snapshots | `brain-state` volume: `history/<id>/` | **Durable** revision history and preimages | No — restore from backup |
+| Operation journal | `brain-state` volume: `journal.db` | **Durable** idempotency, project records, feedback, retrieval traces/labels, approvals | No — restore from backup |
+| Local write journal | `brain-state` volume: `documents.sqlite` | **Durable** current-document bindings, write receipts, index queue | No — restore from backup |
+| Local operation journal | `brain-state` volume: `operations.sqlite` | **Durable** local mutation operation receipts | No — restore from backup |
+| Migration manifests | `brain-state` volume: `migrations/` | **Durable** vault-v2 migration receipts | No — restore from backup |
+| Search index | `brain-state` volume: `index/search.sqlite` | Disposable derived FTS index | Yes, with `rebuild-index` |
+| Model artifacts | `brain-state` volume: `models/` | Reproducible but useful for offline recovery | Yes, re-downloaded during model setup |
 
-Because the journal, feedback, repository mappings, and grants live in
-`journal.db`, an index or catalogue rebuild never reconstructs them. A missing
-`journal.db` triggers explicit recovery mode; the
-gateway never silently initialises a fresh database on a non-empty vault.
+Because history, the journals, project records, feedback, and migration receipts
+live outside the vault, an index rebuild never reconstructs them. A missing or
+damaged `journal.db` triggers explicit recovery mode; the gateway never silently
+initialises a fresh database on a non-empty vault, and `rebuild-index` refuses
+rather than deleting history or granting approvals implicitly.
+
+## Renamed and retired operator commands
+
+The local V2 runtime retires Basic Memory from normal operation. The following
+operator surfaces replace the earlier Basic Memory guidance:
+
+| Retired | Replacement |
+|---|---|
+| `basic-memory reindex` (inside the `memory` container) | `node dist/cli.js rebuild-index` |
+| `rebuild-catalogue` as a search reindex | `rebuild-index` (the legacy `rebuild-catalogue` command remains for the legacy catalogue only) |
+| Ad-hoc `cp` of a live `journal.db` | `node dist/cli.js local-backup` (SQLite backup API, WAL-safe) |
+| Manual vault-only `tar` export | `node dist/cli.js local-backup --vault-only` then `node dist/cli.js local-restore --vault-only` |
+| `verify-backup` for the Compose volume archive | `verify-local-backup` for the local V2 stores; `verify-backup` remains for `scripts/backup.sh` archives |
+
+`scripts/backup.sh`, `scripts/restore.sh`, and `scripts/rebuild.sh` remain the
+Compose-volume level tools for `brain-state`/`memory-state`/`model-cache`. The
+`local-*` commands below are the store-level tools and are also used by the
+integration tests.
 
 ## Startup recovery
 
@@ -150,6 +171,40 @@ node dist/cli.js backup-manifest \
   --image brain=node@sha256:…,basic-memory=ghcr.io/…@sha256:…
 ```
 
+### Local V2 store backup (`local-backup`)
+
+`node dist/cli.js local-backup --destination DIR [--vault-only] [--include-search-index] [--include-model-artifacts] [--config DIR] [--secret FILE]`
+
+The store-level backup writes `local-manifest.json` and a category-classified
+copy of the local V2 state:
+
+- **vault** — the authoritative Markdown (never contains secrets);
+- **revision snapshots** — `state/history/`;
+- **journal** — `journal.db`, `documents.sqlite`, `operations.sqlite`, each
+  captured through the SQLite backup API while writers continue, so committed
+  WAL content is included and the live `.sqlite` file is never copied alone;
+- **migration manifests** — `state/migrations/`;
+- **config/version** — `config/version.json` and, when `--config` is given, the
+  configuration directory;
+- **search index** and **model artifacts** — optional, marked `reproducible`;
+- **secrets** — only with `--secret`; stored under `secrets/`, marked
+  `sensitive: true`, and never copied into the `vault/` tree.
+
+`--vault-only` is an explicit, distinct export that contains only current note
+content. Import it with `local-restore --vault-only`; the CLI prints that
+history and receipts are absent, and `verify-local-backup` never reports a
+vault-only import as historical recovery.
+
+`node dist/cli.js local-restore --backup DIR [--vault-only] [--vault V] [--state S]`
+
+A full restore into an empty directory recovers current content, revision
+history, and operation receipts; it refuses a vault-only backup, and refuses a
+non-empty destination. `node dist/cli.js verify-local-backup --manifest FILE
+[--root DIR | --vault V --state S --config C --secrets X]` validates every
+category checksum and reports which of current content, history, receipts, and
+index are recoverable. `rebuild-index` refuses when `journal.db` is missing or
+damaged while managed notes exist, so a rebuild never repairs durable state.
+
 ## Verify and restore
 
 `scripts/restore.sh BACKUP NEW_ROOT [--check] [--acknowledge] [--project NAME] [--port N]`
@@ -195,6 +250,15 @@ docker compose exec brain node dist/cli.js verify-backup \
 ```
 
 ## Index rebuild (not a restore)
+
+`node dist/cli.js rebuild-index [--vault V] [--state S]`
+
+The local V2 rebuild builds a fresh FTS index into a staging file, validates the
+document count and a fingerprint over `(path, etag)`, then atomically replaces
+`index/search.sqlite` after closing the previous handle. On any failure it
+retains the previous valid index, removes the staging file, and reports
+degradation on stderr with a non-zero exit. It never touches `history/`,
+`journal.db`, or approval provenance.
 
 `scripts/rebuild.sh [--acknowledge] [--accept-operational-loss] [--full] [--embeddings] [--search] [--project NAME]`
 

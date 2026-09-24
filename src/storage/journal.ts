@@ -181,6 +181,14 @@ export interface ApprovalProvenanceRecord {
   payload_hash: string;
 }
 
+export interface DurableStateSummary {
+  operations: number;
+  feedback: number;
+  projects: number;
+  labels: number;
+  approvals: number;
+}
+
 export interface AuditEvent {
   request_id: string;
   tool: string;
@@ -2043,6 +2051,23 @@ export class Journal {
       )
       .get() as { present: number };
     return row.present === 1;
+  }
+
+  durableStateSummary(): DurableStateSummary {
+    this.assertOpen();
+    const count = (table: string): number => {
+      const row = this.database
+        .prepare(`SELECT COUNT(*) AS count FROM ${table}`)
+        .get() as { count: number };
+      return row.count;
+    };
+    return {
+      operations: count('operations'),
+      feedback: count('feedback_records'),
+      projects: count('projects_v2'),
+      labels: count('retrieval_labels'),
+      approvals: count('operation_approvals')
+    };
   }
 
   acknowledgeOperationalLoss(): void {

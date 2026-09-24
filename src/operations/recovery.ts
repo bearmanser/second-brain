@@ -1,8 +1,41 @@
 import { BrainError } from '../contracts/errors.js';
 import type { BrainDeps, RecoveryReport } from '../core/mutation.js';
 import { verifyBearer } from '../security/authenticate.js';
+import {
+  classifyRecoveryInput,
+  type RecoveryClassification,
+  type RecoveryInputPresence
+} from './local-rebuild.js';
 
+export {
+  classifyRecoveryInput,
+  type RecoveryClassification,
+  type RecoveryInputPresence
+} from './local-rebuild.js';
 export type { RecoveryOperationReport, RecoveryOutcome, RecoveryReport } from '../core/mutation.js';
+
+export function requireDurableRecovery(classification: RecoveryClassification): void {
+  if (!classification.history_recoverable || !classification.idempotency_recoverable) {
+    throw new BrainError({
+      code: 'RECOVERY_REQUIRED',
+      message:
+        'full recovery requires both durable history and the operation journal; ' +
+        'a vault-only import cannot recover history or receipts'
+    });
+  }
+}
+
+export function summariseRecoveryInput(classification: RecoveryClassification): string {
+  return (
+    `recovery input: current ${classification.current_content_recoverable}, ` +
+    `history ${classification.history_recoverable}, receipts ${classification.idempotency_recoverable}, ` +
+    `index ${classification.index_rebuildable}`
+  );
+}
+
+export function describeRecoveryInput(presence: RecoveryInputPresence): RecoveryClassification {
+  return classifyRecoveryInput(presence);
+}
 
 export const RECOVERY_MODE = 'recover';
 
