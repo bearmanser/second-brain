@@ -169,11 +169,13 @@ export class ProjectRegistry implements ProjectRegistryPort {
     const existing = this.projects.get(id);
     if (existing !== undefined) {
       if (
-        existing.display_name !== displayName ||
         existing.relative_root !== relativeRoot ||
         existing.repository_identity !== repositoryIdentity
       ) {
         throw conflict(`project ${id} is already registered with different metadata`);
+      }
+      if (existing.display_name !== displayName) {
+        this.projects.set(id, { ...existing, display_name: displayName });
       }
       return;
     }

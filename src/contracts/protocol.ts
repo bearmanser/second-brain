@@ -19,6 +19,16 @@ import {
 } from './content.js';
 
 const text = z.string().trim().min(1).max(8000);
+const projectDisplayName = z
+  .string()
+  .trim()
+  .min(1)
+  .max(200)
+  .refine(
+    (value) =>
+      !/[\u0000-\u001f\u007f]/.test(value) && !value.includes('/') && !value.includes('\\'),
+    { message: 'project display name is malformed' }
+  );
 const expectedHeadsSchema = z
   .array(z.strictObject({ revision_id: uuidSchema, etag: etagSchema }))
   .min(1)
@@ -77,7 +87,8 @@ export const captureRequestSchema = z
 export const projectEnsureRequestSchema = z
   .strictObject({
     idempotency_key: uuidSchema,
-    remote_url: remoteUrlSchema
+    remote_url: remoteUrlSchema,
+    display_name: projectDisplayName.optional()
   })
   .refine(withinInputBodyLimit, { message: 'input body exceeds the 256 KiB limit' });
 

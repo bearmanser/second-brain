@@ -65,6 +65,25 @@ const splitFrontmatter = (raw: string): Record<string, unknown> => {
 
 const toPosix = (value: string): string => value.split(sep).join('/');
 
+function projectPathSegments(projectPath: string): string[] {
+  if (
+    typeof projectPath !== 'string' ||
+    !projectPath.startsWith('/app/data/Projects/') ||
+    projectPath.includes('\\')
+  ) {
+    throw invalidInput('fake backend received an unexpected project path');
+  }
+  const segments = projectPath.slice('/app/data/'.length).split('/');
+  if (
+    segments[0] !== 'Projects' ||
+    segments.length < 2 ||
+    segments.some((segment) => segment.length === 0 || segment === '.' || segment === '..')
+  ) {
+    throw invalidInput('fake backend received an unexpected project path');
+  }
+  return segments;
+}
+
 export class FakeBackend implements BackendPort {
   readonly root: string;
   private readonly configuredProjects: string[];
@@ -134,19 +153,15 @@ export class FakeBackend implements BackendPort {
       throw unavailable('fake backend could not create the project');
     }
     if (this.configuredProjects.includes(project)) return { created: false };
-    if (projectPath !== `/app/data/Projects/${project}`) {
-      throw invalidInput('fake backend received an unexpected project path');
-    }
-    mkdirSync(join(this.root, 'Projects', project), { recursive: true });
+    const segments = projectPathSegments(projectPath);
+    mkdirSync(join(this.root, ...segments), { recursive: true });
     this.configuredProjects.push(project);
     return { created: true };
   }
 
   async verifyProject(project: string, projectPath: string): Promise<boolean> {
     this.record();
-    if (projectPath !== `/app/data/Projects/${project}`) {
-      throw invalidInput('fake backend received an unexpected project path');
-    }
+    projectPathSegments(projectPath);
     return this.configuredProjects.includes(project);
   }
 

@@ -85,6 +85,7 @@ export interface CaptureRequest extends ProjectSelector {
 export interface ProjectEnsureRequest {
   idempotency_key: string;
   remote_url: string;
+  display_name?: string;
 }
 
 export interface ProjectEnsureResult {

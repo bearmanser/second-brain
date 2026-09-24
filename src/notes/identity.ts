@@ -61,3 +61,13 @@ export function hashRaw(raw: string): string {
 export function makeEtag(revisionId: string, rawHash: string): string {
   return createHash('sha256').update(`${revisionId}:${rawHash}`).digest('hex');
 }
+
+export const legacyNotePaths = Object.freeze({
+  slugify,
+  slugifyPath,
+  storageTitle,
+  revisionDirectory,
+  revisionFileName,
+  permalinkFor,
+  relativePathFor
+});

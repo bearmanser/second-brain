@@ -254,7 +254,7 @@ test('the published tool contract is pinned', () => {
         "output": "0db1da61ddcc5a1c8600781e90507114dbc22afc41437edea448d32dbe1924d5",
       },
       {
-        "input": "cc6a684a8e3ef79221529b2b197a0d67cdcb20ac2eb795036a3164b80ab2c5a0",
+        "input": "bab96ef550ee128f67bf979e6be07349c1923bcac7051613b1ae7678b36c0e23",
         "name": "brain_project_ensure",
         "output": "40731a03c5b473df298d1b772af2e3e25338b72086c13d09d0f270e23b54b1d8",
       },

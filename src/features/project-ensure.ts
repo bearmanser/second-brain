@@ -9,6 +9,7 @@ import type {
   ProjectEnsureResult,
   ProjectProvisioningPlan
 } from '../core/types.js';
+import { PROJECTS_ROOT, allocateProjectRoot, collisionKey, safeBasename } from '../notes/paths.js';
 import {
   normalizeRepositoryIdentity,
   scopeCandidateForRepository,
@@ -70,19 +71,63 @@ function chooseProjectId(identity: string, deps: BrainDeps): string {
   return suffixed;
 }
 
+interface PlannedProjectIdentity {
+  projectId: string;
+  displayName: string;
+  relativeRoot: string;
+}
+
+function occupiedProjectRoots(deps: BrainDeps): string[] {
+  const roots: string[] = [];
+  for (const scope of deps.scopeRegistry.all()) roots.push(scope.relative_root);
+  for (const project of deps.journal.listProjects()) roots.push(project.project.relative_root);
+  return roots;
+}
+
+function readableDisplayName(identity: string, occupied: string[]): string {
+  const segments = identity.split('/');
+  const basename = segments.at(-1) ?? identity;
+  const occupiedKeys = new Set(occupied.map((root) => collisionKey(root)));
+  if (!occupiedKeys.has(collisionKey(`${PROJECTS_ROOT}/${safeBasename(basename)}`))) {
+    return basename;
+  }
+  const owner = segments.at(-2);
+  if (owner !== undefined && owner.length > 0) return `${owner} ${basename}`;
+  return basename;
+}
+
+function plannedProjectIdentity(
+  identity: string,
+  requestedDisplayName: string | undefined,
+  deps: BrainDeps
+): PlannedProjectIdentity {
+  const projectId = chooseProjectId(identity, deps);
+  const existing = deps.journal.getProjectByIdentity(identity);
+  if (existing !== undefined) {
+    return {
+      projectId,
+      displayName: existing.project.display_name,
+      relativeRoot: existing.project.relative_root
+    };
+  }
+  const occupied = occupiedProjectRoots(deps);
+  const displayName = requestedDisplayName ?? readableDisplayName(identity, occupied);
+  return { projectId, displayName, relativeRoot: allocateProjectRoot(displayName, occupied) };
+}
+
 function planFor(
   identity: string,
-  projectId: string,
+  identityPlan: PlannedProjectIdentity,
   actorId: string,
   operationId: string
 ): ProjectProvisioningPlan {
   return {
     repository_identity: identity,
-    project_id: projectId,
-    display_name: projectId,
-    relative_root: `Projects/${projectId}`,
-    backend_project: projectId,
-    backend_relative_root: `Projects/${projectId}`,
+    project_id: identityPlan.projectId,
+    display_name: identityPlan.displayName,
+    relative_root: identityPlan.relativeRoot,
+    backend_project: identityPlan.projectId,
+    backend_relative_root: identityPlan.relativeRoot,
     created_by_actor_id: actorId,
     creation_operation_id: operationId
   };
@@ -256,7 +301,7 @@ export async function ensureProject(
     const identity = normalizeRepositoryIdentity(parsed.data.remote_url);
     consumeLimit(parsed.data, deps);
     const result = await deps.mutations.serialize(async () => {
-      const projectId = chooseProjectId(identity, deps);
+      const identityPlan = plannedProjectIdentity(identity, parsed.data.display_name, deps);
       if (
         deps.journal.getProjectByIdentity(identity) === undefined &&
         deps.journal.countProjects() >= deps.config.limits.dynamic_projects_max
@@ -267,7 +312,7 @@ export async function ensureProject(
         principal_id: ctx.actor.id,
         idempotency_key: parsed.data.idempotency_key,
         tool: TOOL,
-        scope: projectId,
+        scope: identityPlan.projectId,
         payload_hash: digest(identity),
         payload_json: JSON.stringify({ repository_identity: identity })
       });
@@ -284,7 +329,7 @@ export async function ensureProject(
       const record = reservation.record;
       const plan =
         record.plan_json === undefined
-          ? planFor(identity, projectId, ctx.actor.id, record.operation_id)
+          ? planFor(identity, identityPlan, ctx.actor.id, record.operation_id)
           : parsePlan(record);
       if (record.plan_json === undefined) deps.journal.saveProjectPlan(record.operation_id, plan);
       if (record.state === 'prepared') deps.journal.mark(record.operation_id, 'submitted');
