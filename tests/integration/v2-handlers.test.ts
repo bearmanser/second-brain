@@ -370,6 +370,59 @@ test('capture, approve, revise, move and adopt replay stably and reject differen
   }
 });
 
+test('adoption assigns an id while preserving the plain note body and properties', async () => {
+  const ground = await openGround();
+  const c = ctx();
+  try {
+    const raw = [
+      '---',
+      'tags:',
+      '  - legacy-tag',
+      'aliases:',
+      '  - Legacy alias',
+      'cssclasses:',
+      '  - custom-class',
+      'rating: 5',
+      '---',
+      '',
+      '# Plain properties',
+      '',
+      'preserved body line one',
+      'preserved body line two',
+      ''
+    ].join('\n');
+    await mkdir(join(ground.vaultRoot, 'Knowledge'), { recursive: true });
+    await writeFile(join(ground.vaultRoot, 'Knowledge/Adopt me.md'), raw);
+    const adopted = (await reviewLocal(
+      c,
+      {
+        operation: {
+          action: 'adopt',
+          idempotency_key: randomUUID(),
+          path: 'Knowledge/Adopt me.md',
+          expected_etag: createHash('sha256').update(raw).digest('hex'),
+          rationale: 'adopt and preserve'
+        }
+      },
+      ground.deps
+    )) as { id: string; revision_id: string };
+    await refresh(ground);
+    const read = await readLocal(c, { id: adopted.id }, ground.deps);
+    const parsed = parseDocument(read.markdown, 'Knowledge/Adopt me.md');
+    expect(parsed.id).toBe(adopted.id);
+    expect(read.source.id).toBe(adopted.id);
+    expect(read.source.revision_id).toBe(adopted.revision_id);
+    expect(parsed.body).toBe(
+      '\n# Plain properties\n\npreserved body line one\npreserved body line two\n'
+    );
+    expect(parsed.tags).toEqual(['legacy-tag']);
+    expect(parsed.aliases).toEqual(['Legacy alias']);
+    expect(parsed.properties).toEqual({ cssclasses: ['custom-class'], rating: 5 });
+  } finally {
+    await ground.dispose();
+  }
+});
+
 test('project ensure is durable, idempotent, and replays its original receipt', async () => {
   const ground = await openGround();
   const c = ctx();
@@ -377,16 +430,26 @@ test('project ensure is durable, idempotent, and replays its original receipt', 
     const key = randomUUID();
     const first = await projectEnsureLocal(
       c,
-      { idempotency_key: key, remote_url: 'https://github.com/example/handlers.git' },
+      {
+        idempotency_key: key,
+        remote_url: 'https://github.com/example/handlers.git',
+        display_name: 'Readable handlers project'
+      },
       ground.deps
     );
     expect(first.created).toBe(true);
     expect((await statusLocal(c, { operation_id: first.operation_id }, ground.deps)).operation?.operation_id)
       .toBe(first.operation_id);
+    const projectStatus = await statusLocal(c, { project: first.scope }, ground.deps);
+    expect(projectStatus.projects?.[0]?.display_name).toBe('Readable handlers project');
     await restartGround(ground);
     const replay = await projectEnsureLocal(
       c,
-      { idempotency_key: key, remote_url: 'https://github.com/example/handlers.git' },
+      {
+        idempotency_key: key,
+        remote_url: 'https://github.com/example/handlers.git',
+        display_name: 'Readable handlers project'
+      },
       ground.deps
     );
     expect(replay.operation_id).toBe(first.operation_id);
