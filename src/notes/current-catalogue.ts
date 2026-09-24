@@ -187,6 +187,7 @@ function noteLink(reference: LinkReference): boolean {
 export class CurrentCatalogue {
   private readonly entries = new Map<string, StoredCurrent>();
   private readonly histories = new Map<string, CurrentHistory>();
+  private readonly conflicts = new Map<string, CurrentSource[]>();
   readonly revisions: RevisionStore | undefined;
   readonly idSource: IdSource;
   private readonly clock: Clock;
@@ -232,6 +233,22 @@ export class CurrentCatalogue {
 
   rawFor(path: string): string | undefined {
     return this.entries.get(path)?.raw;
+  }
+
+  clearConflicts(): void {
+    this.conflicts.clear();
+  }
+
+  recordConflict(id: string, sources: readonly CurrentSource[]): void {
+    this.conflicts.set(id, sources.map((source) => ({ ...source })));
+  }
+
+  conflictsFor(id: string): CurrentSource[] {
+    return (this.conflicts.get(id) ?? []).map((source) => ({ ...source }));
+  }
+
+  conflictIds(): string[] {
+    return [...this.conflicts.keys()].sort();
   }
 
   upsert(entry: CurrentIndexEntry): void {
@@ -445,6 +462,7 @@ export async function reconcileCurrentVault(
   const observedPaths = new Set(observed.map((item) => item.path));
 
   const duplicateIds = new Map<string, string[]>();
+  catalogue.clearConflicts();
   const identityIds = [...new Set([...previousIdentityPaths.keys(), ...nextIdentityPaths.keys()])].sort();
   for (const id of identityIds) {
     const beforePaths = previousIdentityPaths.get(id) ?? [];
@@ -460,6 +478,24 @@ export async function reconcileCurrentVault(
     const pathList = [...new Set([...beforePaths, ...afterPaths])].sort();
     duplicateIds.set(id, pathList);
     report.duplicate_ids.push({ id, paths: pathList });
+    catalogue.recordConflict(
+      id,
+      observed
+        .filter((item) => item.document.id === id)
+        .map((item) => ({
+          path: item.path,
+          hash: item.raw_hash,
+          etag: item.raw_hash,
+          title: item.document.title,
+          type: item.document.type,
+          status: item.document.status,
+          aliases: [...item.document.aliases],
+          tags: [...item.document.tags],
+          observed_at: new Date().toISOString(),
+          id,
+          ...(item.document.project === undefined ? {} : { project: item.document.project })
+        }))
+    );
   }
 
   const previousIdentities = previous

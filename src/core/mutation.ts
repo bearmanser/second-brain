@@ -42,6 +42,29 @@ import type {
   DocumentStoreReadResult,
   DocumentStoreRevisionRead
 } from '../storage/document-store.js';
+import type { LocalOperationJournal, LocalOperationRecord } from '../storage/journal.js';
+import type { RevisionStore } from '../storage/revision-store.js';
+import { collectRenameSnapshots, planRename, type RenamePlan, type RenameReceipt } from '../notes/rename.js';
+import { allocateNotePath, safeBasename } from '../notes/paths.js';
+import type {
+  CaptureRequest,
+  LocalAllocatedIdentity,
+  LocalConflictHead,
+  LocalDocumentEffect,
+  LocalExpectedHead,
+  LocalMutationCoordinatorPort,
+  LocalObservedSource,
+  LocalObservedState,
+  LocalOperationIntent,
+  LocalOperationPlan,
+  LocalOperationReceipt,
+  LocalOperationStatus,
+  LocalPendingWrite,
+  LocalPlannedOperation,
+  LocalReadCondition,
+  LocalReadSet,
+  LocalRecoveryReport
+} from './types.js';
 
 const POLL_INTERVAL_MS = 20;
 const UNCERTAIN_WRITE_CODES = ['BACKEND_UNAVAILABLE', 'EMBEDDINGS_UNAVAILABLE', 'BACKEND_PROTOCOL_ERROR'] as const;
@@ -1285,5 +1308,645 @@ export class MutationCoordinator {
     }
     this.recoveryBlockers.delete(record.operation_id);
     return this.operationReport(record, { outcome: 'failed', reason, warnings });
+  }
+}
+
+export interface LocalDocumentExecutor {
+  put(input: DocumentStorePutInput): Promise<DocumentStorePutResult>;
+  readPath(path: string): Promise<DocumentStoreReadResult>;
+  readRevision(id: string, revisionId: string): Promise<DocumentStoreRevisionRead>;
+  applyRename(plan: RenamePlan): Promise<RenameReceipt>;
+}
+
+export interface LocalObservedCatalogueEntry {
+  id?: string;
+  path: string;
+  hash: string;
+  etag: string;
+  revision_id?: string;
+}
+
+export interface LocalObservedCatalogue {
+  all(): readonly LocalObservedCatalogueEntry[];
+  conflictsFor?(id: string): readonly LocalObservedCatalogueEntry[];
+}
+
+export interface LocalProjectLookup {
+  getProjectByIdentity(repositoryIdentity: string):
+    | { project: { id: string }; updated_at: string }
+    | undefined;
+}
+
+export interface LocalMutationCoordinatorDeps {
+  operations: LocalOperationJournal;
+  documents: LocalDocumentExecutor;
+  catalogue: LocalObservedCatalogue;
+  vaultRoot: string;
+  clock: Clock;
+  ids: IdSource;
+  projects?: LocalProjectLookup;
+  revisions?: RevisionStore;
+}
+
+function localConflict(message: string): BrainError {
+  return new BrainError({ code: 'CONFLICT', message });
+}
+
+function localInvalid(message: string): BrainError {
+  return new BrainError({ code: 'INVALID_INPUT', message });
+}
+
+function localRecovery(message: string, cause?: unknown): BrainError {
+  return new BrainError({ code: 'RECOVERY_REQUIRED', message, cause });
+}
+
+function canonicalRequest(intent: LocalOperationIntent): { hash: string; json: string } {
+  const json = JSON.stringify(
+    canonicalize({ tool: intent.tool, action: intent.action, payload: intent.payload })
+  );
+  return { hash: createHash('sha256').update(json, 'utf8').digest('hex'), json };
+}
+
+function preconditionsOf(intent: LocalOperationIntent): {
+  id?: string;
+  path?: string;
+  target_path?: string;
+} {
+  const preconditions = intent.preconditions as { id?: unknown; path?: unknown; target_path?: unknown };
+  return {
+    ...(typeof preconditions.id === 'string' ? { id: preconditions.id } : {}),
+    ...(typeof preconditions.path === 'string' ? { path: preconditions.path } : {}),
+    ...(typeof preconditions.target_path === 'string' ? { target_path: preconditions.target_path } : {})
+  };
+}
+
+export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
+  private readonly deps: LocalMutationCoordinatorDeps;
+  private tail: Promise<unknown> = Promise.resolve();
+
+  constructor(deps: LocalMutationCoordinatorDeps) {
+    this.deps = deps;
+  }
+
+  run(intent: LocalOperationIntent, plan: LocalOperationPlan): Promise<LocalOperationReceipt> {
+    return this.withLock(() => this.runSerialized(intent, plan));
+  }
+
+  status(operation_id: string): LocalOperationStatus | undefined {
+    const record = this.deps.operations.findById(operation_id);
+    if (record === undefined) return undefined;
+    const status: LocalOperationStatus = {
+      operation_id: record.operation_id,
+      tool: record.tool,
+      action: record.action,
+      project_id: record.project_id,
+      state: record.state
+    };
+    if (record.receipt_json !== null) {
+      status.receipt = JSON.parse(record.receipt_json) as LocalOperationReceipt;
+    }
+    return status;
+  }
+
+  recover(): Promise<LocalRecoveryReport> {
+    return this.withLock(async () => {
+      const pending = this.deps.operations.listIncomplete();
+      const blocking: string[] = [];
+      let finalized = 0;
+      let conflicted = 0;
+      let recovered = 0;
+      let stillPending = 0;
+      for (const record of pending) {
+        if (record.plan_json === null) {
+          this.deps.operations.update(record.operation_id, {
+            state: 'recovery_required',
+            updated_at: this.now()
+          });
+          blocking.push(record.operation_id);
+          stillPending += 1;
+          continue;
+        }
+        const plan = JSON.parse(record.plan_json) as LocalPlannedOperation;
+        try {
+          await this.executePlan(record, plan);
+          finalized += 1;
+          recovered += 1;
+        } catch (error) {
+          if (isBrainError(error) && error.code === 'CONFLICT') {
+            this.deps.operations.update(record.operation_id, {
+              state: 'conflicted',
+              updated_at: this.now()
+            });
+            conflicted += 1;
+          } else {
+            this.deps.operations.update(record.operation_id, {
+              state: 'recovery_required',
+              updated_at: this.now()
+            });
+            blocking.push(record.operation_id);
+            stillPending += 1;
+          }
+        }
+      }
+      return {
+        inspected: pending.length,
+        finalized,
+        conflicted,
+        recovered,
+        pending: stillPending,
+        blocking_operations: blocking
+      };
+    });
+  }
+
+  private async runSerialized(
+    intent: LocalOperationIntent,
+    plan: LocalOperationPlan
+  ): Promise<LocalOperationReceipt> {
+    const request = canonicalRequest(intent);
+    const existing = this.deps.operations.findByKey(intent.idempotency_key);
+    if (existing !== undefined) return this.replay(intent, existing, request.hash);
+    const now = this.now();
+    const reserved = this.deps.operations.reserve({
+      operation_id: this.deps.ids.next(),
+      idempotency_key: intent.idempotency_key,
+      tool: intent.tool,
+      action: intent.action,
+      project_id: intent.project_id,
+      payload_hash: request.hash,
+      payload_json: request.json,
+      created_at: now,
+      updated_at: now
+    });
+    if (reserved.kind === 'replay') return this.replay(intent, reserved.record, request.hash);
+    const record = reserved.record;
+    const observed = await this.observe(intent);
+    const identity = this.allocate(record, intent, observed);
+    const planned = await plan(identity, observed);
+    this.assertPlanReadSet(planned);
+    this.deps.operations.update(record.operation_id, {
+      plan_json: JSON.stringify(planned),
+      updated_at: this.now()
+    });
+    await this.persistObservedHeads(planned, observed);
+    try {
+      await this.recheckPlan(planned);
+    } catch (error) {
+      if (isBrainError(error) && error.code === 'CONFLICT') {
+        this.deps.operations.update(record.operation_id, {
+          state: 'conflicted',
+          updated_at: this.now()
+        });
+      }
+      throw error;
+    }
+    return this.executePlan(record, planned);
+  }
+
+  private async replay(
+    intent: LocalOperationIntent,
+    record: LocalOperationRecord,
+    payloadHash: string
+  ): Promise<LocalOperationReceipt> {
+    if (record.payload_hash !== payloadHash || record.tool !== intent.tool) {
+      throw new BrainError({
+        code: 'IDEMPOTENCY_CONFLICT',
+        message: `idempotency key ${intent.idempotency_key} was used for a different request`
+      });
+    }
+    if (record.state === 'conflicted') {
+      throw localConflict(`operation ${record.operation_id} ended in conflict and cannot be retried`);
+    }
+    if (record.state === 'recovery_required') {
+      throw localRecovery(`operation ${record.operation_id} requires recovery`);
+    }
+    if (record.receipt_json !== null && record.state === 'finalized') {
+      return JSON.parse(record.receipt_json) as LocalOperationReceipt;
+    }
+    if (record.plan_json === null) {
+      throw localRecovery(`operation ${record.operation_id} has no durable plan yet`);
+    }
+    const plan = JSON.parse(record.plan_json) as LocalPlannedOperation;
+    return this.executePlan(record, plan);
+  }
+
+  private async observe(intent: LocalOperationIntent): Promise<LocalObservedState> {
+    const sources: LocalObservedSource[] = [];
+    const heads: LocalConflictHead[] = [];
+    const seen = new Set<string>();
+    const read = async (path: string): Promise<void> => {
+      if (seen.has(path)) return;
+      seen.add(path);
+      const file = await this.readPathOrUndefined(path);
+      if (file === undefined) return;
+      sources.push({
+        path,
+        raw: file.raw,
+        etag: file.etag,
+        ...(file.id === undefined ? {} : { id: file.id }),
+        ...(file.revision_id === undefined ? {} : { revision_id: file.revision_id })
+      });
+    };
+    const preconditions = preconditionsOf(intent);
+    if (preconditions.id !== undefined) {
+      const matches = this.observedEntries(preconditions.id);
+      for (const match of matches) {
+        await read(match.path);
+        heads.push({
+          id: preconditions.id,
+          path: match.path,
+          revision_id: match.revision_id ?? match.hash,
+          etag: match.etag,
+          parents: []
+        });
+      }
+    }
+    if (preconditions.path !== undefined) await read(preconditions.path);
+    return { sources, heads };
+  }
+
+  private allocate(
+    record: LocalOperationRecord,
+    intent: LocalOperationIntent,
+    observed: LocalObservedState
+  ): LocalAllocatedIdentity {
+    const base = {
+      operation_id: record.operation_id,
+      timestamp: record.created_at,
+      storage_operation_ids: [] as string[]
+    };
+    if (intent.tool === 'brain_project_ensure') return { kind: 'project_ensure', ...base };
+    if (intent.tool === 'brain_feedback') {
+      return { kind: 'feedback', feedback_id: this.deps.ids.next(), ...base };
+    }
+    const preconditions = preconditionsOf(intent);
+    const note_id = preconditions.id ?? this.deps.ids.next();
+    const revision_id = this.deps.ids.next();
+    const observedPath = observed.sources.find((source) => source.id === note_id)?.path;
+    const path =
+      preconditions.target_path ??
+      preconditions.path ??
+      observedPath ??
+      this.allocateCapturePath(intent);
+    return { kind: 'note', note_id, revision_id, path: path as string, ...base };
+  }
+
+  private allocateCapturePath(intent: LocalOperationIntent): string {
+    if (intent.tool !== 'brain_capture') {
+      throw localInvalid('a note identity requires a persisted path');
+    }
+    const payload = intent.payload as CaptureRequest;
+    return allocateNotePath({
+      directory: 'Inbox',
+      title: payload.note.title,
+      occupied: this.deps.catalogue.all().map((entry) => entry.path)
+    });
+  }
+
+  private assertPlanReadSet(plan: LocalPlannedOperation): void {
+    const readSet: readonly LocalReadCondition[] = plan.read_set;
+    if (!Array.isArray(readSet) || readSet.length === 0) {
+      throw localInvalid('an operation plan must persist a nonempty read set');
+    }
+    const coversPath = (path: string): boolean =>
+      readSet.some(
+        (condition) =>
+          (condition.kind === 'path' && condition.path === path) ||
+          (condition.kind === 'note' &&
+            condition.expected.kind === 'present' &&
+            condition.expected.path === path)
+      );
+    if (plan.kind === 'note') {
+      for (const effect of plan.effects) {
+        if (effect.kind === 'write') {
+          if (!coversPath(effect.write.path)) {
+            throw localInvalid(`the read set does not cover write target ${effect.write.path}`);
+          }
+        } else if (effect.kind === 'adopt') {
+          if (!coversPath(effect.path)) {
+            throw localInvalid(`the read set does not cover adoption target ${effect.path}`);
+          }
+        } else {
+          if (!coversPath(effect.from_path) || !coversPath(effect.to_path)) {
+            throw localInvalid(
+              `the read set does not cover the move ${effect.from_path} -> ${effect.to_path}`
+            );
+          }
+        }
+      }
+      if (
+        plan.heads.length > 0 &&
+        !readSet.some(
+          (condition) => condition.kind === 'heads' && condition.id === plan.heads[0].id
+        )
+      ) {
+        throw localInvalid('a conflict-resolution plan must persist its expected conflict heads');
+      }
+    } else if (plan.kind === 'project_ensure') {
+      if (
+        !readSet.some(
+          (condition) =>
+            condition.kind === 'project' &&
+            condition.repository_identity === plan.repository_identity
+        )
+      ) {
+        throw localInvalid('a project-ensure plan must persist its project precondition');
+      }
+    } else if (
+      !readSet.some(
+        (condition) =>
+          condition.kind === 'note' &&
+          condition.id === plan.id &&
+          condition.expected.kind === 'present' &&
+          condition.expected.revision_id === plan.revision_id
+      )
+    ) {
+      throw localInvalid('a feedback plan must persist its revision precondition');
+    }
+  }
+
+  private async recheckPlan(plan: LocalPlannedOperation): Promise<void> {
+    for (const condition of plan.read_set) {
+      if (condition.kind === 'path') {
+        const current = await this.readPathOrUndefined(condition.path);
+        if (condition.expected.kind === 'absent') {
+          if (current !== undefined) throw localConflict(`path ${condition.path} is no longer vacant`);
+          continue;
+        }
+        if (
+          current === undefined ||
+          current.etag !== condition.expected.etag ||
+          (condition.expected.id !== undefined && current.id !== condition.expected.id) ||
+          (condition.expected.revision_id !== undefined &&
+            current.revision_id !== condition.expected.revision_id)
+        ) {
+          throw localConflict(`path ${condition.path} changed since the operation was planned`);
+        }
+        continue;
+      }
+      if (condition.kind === 'note') {
+        const matches = this.deps.catalogue.all().filter((entry) => entry.id === condition.id);
+        const expected = condition.expected;
+        if (expected.kind === 'absent') {
+          if (matches.length > 0) throw localConflict(`note ${condition.id} already exists`);
+          continue;
+        }
+        const match = matches.find((entry) => entry.path === expected.path);
+        if (
+          match === undefined ||
+          match.etag !== expected.etag ||
+          (match.revision_id ?? match.hash) !== expected.revision_id
+        ) {
+          throw localConflict(`note ${condition.id} changed since the operation was planned`);
+        }
+        continue;
+      }
+      if (condition.kind === 'heads') {
+        await this.verifyConflictHeads(condition.id, condition.expected_heads);
+        continue;
+      }
+      const project = this.deps.projects?.getProjectByIdentity(condition.repository_identity);
+      if (condition.expected.kind === 'absent') {
+        if (project !== undefined) {
+          throw localConflict(`project ${condition.repository_identity} already exists`);
+        }
+        continue;
+      }
+      if (
+        project === undefined ||
+        project.project.id !== condition.expected.project_id ||
+        project.updated_at !== condition.expected.version
+      ) {
+        throw localConflict(
+          `project ${condition.repository_identity} changed since the operation was planned`
+        );
+      }
+    }
+  }
+
+  async enumerateConflictHeads(id: string): Promise<LocalConflictHead[]> {
+    return this.observedEntries(id).map((entry) => ({
+      id,
+      path: entry.path,
+      revision_id: entry.revision_id ?? entry.hash,
+      etag: entry.etag,
+      parents: []
+    }));
+  }
+
+  private observedEntries(id: string): LocalObservedCatalogueEntry[] {
+    const byPath = new Map<string, LocalObservedCatalogueEntry>();
+    for (const entry of this.deps.catalogue.all()) {
+      if (entry.id === id) byPath.set(entry.path, entry);
+    }
+    for (const entry of this.deps.catalogue.conflictsFor?.(id) ?? []) {
+      byPath.set(entry.path, entry);
+    }
+    return [...byPath.values()].sort((left, right) =>
+      left.path < right.path ? -1 : left.path > right.path ? 1 : 0
+    );
+  }
+
+  async verifyConflictHeads(id: string, expected: readonly LocalExpectedHead[]): Promise<void> {
+    const expectedIds = new Set<string>();
+    for (const head of expected) {
+      if (expectedIds.has(head.revision_id)) {
+        throw localConflict('the expected conflict heads contain a duplicate revision');
+      }
+      expectedIds.add(head.revision_id);
+    }
+    const matches = this.observedEntries(id);
+    if (matches.length !== expected.length) {
+      throw localConflict(`note ${id} does not have the exact complete set of conflict heads`);
+    }
+    const etags = new Map<string, string>();
+    for (const match of matches) {
+      const revisionId = match.revision_id ?? match.hash;
+      if (etags.has(revisionId)) {
+        throw localConflict(`note ${id} has a duplicate conflict revision`);
+      }
+      etags.set(revisionId, match.etag);
+    }
+    if (matches.length > 1) {
+      const uniqueEtags = new Set(matches.map((match) => match.etag));
+      if (uniqueEtags.size !== matches.length) {
+        throw localConflict(`note ${id} has a copied duplicate id, which is an identity conflict`);
+      }
+    }
+    for (const head of expected) {
+      const actual = etags.get(head.revision_id);
+      if (actual === undefined) {
+        throw localConflict(`expected conflict head ${head.revision_id} is missing`);
+      }
+      if (actual !== head.etag) {
+        throw localConflict(`expected conflict head ${head.revision_id} is stale`);
+      }
+    }
+  }
+
+  private async persistObservedHeads(
+    plan: LocalPlannedOperation,
+    observed: LocalObservedState
+  ): Promise<void> {
+    if (plan.kind !== 'note' || plan.heads.length === 0 || this.deps.revisions === undefined) return;
+    for (const head of plan.heads) {
+      const source = observed.sources.find((entry) => entry.path === head.path);
+      if (source === undefined) continue;
+      try {
+        await this.deps.revisions.persistRevision(head.id, head.revision_id, source.raw);
+      } catch (error) {
+        throw localRecovery(`conflict head ${head.revision_id} could not be preserved`, error);
+      }
+    }
+  }
+
+  private async executePlan(
+    record: LocalOperationRecord,
+    plan: LocalPlannedOperation
+  ): Promise<LocalOperationReceipt> {
+    let last: DocumentStorePutResult | undefined;
+    let moveReceipt: RenameReceipt | undefined;
+    if (plan.kind === 'note') {
+      for (const [index, effect] of plan.effects.entries()) {
+        if (effect.kind === 'write' || effect.kind === 'adopt') {
+          last = await this.putEffect(record, effect.write, plan, index);
+          continue;
+        }
+        moveReceipt = await this.moveEffect(record, effect, index);
+        if (effect.write !== undefined) {
+          last = await this.putEffect(record, effect.write, plan, index + 1000);
+        }
+      }
+    }
+    const storageKey = `${record.idempotency_key}:local`;
+    if (plan.kind === 'project_ensure') {
+      const receipt: LocalOperationReceipt = {
+        kind: 'project_ensure',
+        operation_id: record.operation_id,
+        repository_identity: plan.repository_identity,
+        project_id: plan.project_id,
+        relative_root: plan.relative_root,
+        created: plan.created,
+        materialized: true,
+        warnings: []
+      };
+      this.finalize(record, receipt, storageKey);
+      return receipt;
+    }
+    if (plan.kind === 'feedback') {
+      const receipt: LocalOperationReceipt = {
+        kind: 'feedback',
+        operation_id: record.operation_id,
+        feedback_id: plan.feedback_id,
+        recorded: true
+      };
+      this.finalize(record, receipt, storageKey);
+      return receipt;
+    }
+    const targetPath = last?.path ?? moveReceipt?.to;
+    if (targetPath === undefined) throw localInvalid('a note operation produced no document effect');
+    const final = last ?? (await this.deps.documents.readPath(targetPath));
+    const id = final.id;
+    const revisionId = final.revision_id;
+    if (id === undefined || revisionId === undefined) {
+      throw localRecovery('a note operation did not produce a managed identity');
+    }
+    const receipt: LocalOperationReceipt = {
+      kind: 'note',
+      operation_id: record.operation_id,
+      id,
+      revision_id: revisionId,
+      path: targetPath,
+      etag: final.etag,
+      indexed: last?.indexed ?? (moveReceipt !== undefined && moveReceipt.indexed.length > 0),
+      warnings: []
+    };
+    this.finalize(record, receipt, storageKey);
+    return receipt;
+  }
+
+  private async putEffect(
+    record: LocalOperationRecord,
+    write: LocalPendingWrite,
+    plan: LocalPlannedOperation,
+    index: number
+  ): Promise<DocumentStorePutResult> {
+    const expectedEtag = this.expectedEtagFor(write.path, plan.read_set);
+    return this.deps.documents.put({
+      path: write.path,
+      raw: write.raw,
+      expectedEtag,
+      idempotencyKey: `${record.idempotency_key}:doc:${index}`,
+      source: record.tool
+    });
+  }
+
+  private async moveEffect(
+    record: LocalOperationRecord,
+    effect: Extract<LocalDocumentEffect, { kind: 'move' }>,
+    index: number
+  ): Promise<RenameReceipt> {
+    const files = await collectRenameSnapshots(this.deps.vaultRoot);
+    const renamePlan = planRename({
+      from: effect.from_path,
+      to: effect.to_path,
+      files,
+      idempotency_key: `${record.idempotency_key}:move:${index}`
+    });
+    if (renamePlan.conflicts.length > 0) {
+      throw localConflict(`move target ${effect.to_path} is unavailable`);
+    }
+    return this.deps.documents.applyRename(renamePlan);
+  }
+
+  private expectedEtagFor(path: string, readSet: LocalReadSet): string | null {
+    for (const condition of readSet) {
+      if (condition.kind === 'path' && condition.path === path) {
+        return condition.expected.kind === 'present' ? condition.expected.etag : null;
+      }
+      if (
+        condition.kind === 'note' &&
+        condition.expected.kind === 'present' &&
+        condition.expected.path === path
+      ) {
+        return condition.expected.etag;
+      }
+    }
+    throw localInvalid(`the read set does not record the expected etag for ${path}`);
+  }
+
+  private finalize(
+    record: LocalOperationRecord,
+    receipt: LocalOperationReceipt,
+    storageKey: string
+  ): void {
+    this.deps.operations.update(record.operation_id, {
+      state: 'finalized',
+      receipt_json: JSON.stringify(receipt),
+      storage_key: storageKey,
+      updated_at: this.now()
+    });
+  }
+
+  private async readPathOrUndefined(path: string): Promise<DocumentStoreReadResult | undefined> {
+    try {
+      return await this.deps.documents.readPath(path);
+    } catch (error) {
+      if (isBrainError(error) && error.code === 'NOT_FOUND') return undefined;
+      throw error;
+    }
+  }
+
+  private now(): string {
+    return this.deps.clock.now().toISOString();
+  }
+
+  private withLock<T>(work: () => Promise<T>): Promise<T> {
+    const result = this.tail.then(work, work);
+    this.tail = result.then(
+      () => undefined,
+      () => undefined
+    );
+    return result;
   }
 }

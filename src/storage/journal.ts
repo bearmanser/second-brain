@@ -3204,3 +3204,232 @@ export class LocalWriteJournal {
     if (this.closed) throw invalidInput('local document journal is closed');
   }
 }
+export const LOCAL_OPERATION_STATES = [
+  'pending',
+  'finalized',
+  'conflicted',
+  'recovery_required'
+] as const;
+
+export type LocalOperationJournalState = (typeof LOCAL_OPERATION_STATES)[number];
+
+export interface LocalOperationReservation {
+  operation_id: string;
+  idempotency_key: string;
+  tool: string;
+  action: string;
+  project_id: string | null;
+  payload_hash: string;
+  payload_json: string;
+}
+
+export interface LocalOperationRecord extends LocalOperationReservation {
+  plan_json: string | null;
+  state: LocalOperationJournalState;
+  storage_key: string | null;
+  receipt_json: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type LocalOperationReservationResult =
+  | { kind: 'new'; record: LocalOperationRecord }
+  | { kind: 'replay'; record: LocalOperationRecord };
+
+interface LocalOperationRow {
+  operation_id: string;
+  idempotency_key: string;
+  tool: string;
+  action: string;
+  project_id: string | null;
+  payload_hash: string;
+  payload_json: string;
+  plan_json: string | null;
+  state: string;
+  storage_key: string | null;
+  receipt_json: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+const LOCAL_OPERATION_SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS local_operations (
+     operation_id TEXT PRIMARY KEY,
+     idempotency_key TEXT NOT NULL UNIQUE,
+     tool TEXT NOT NULL,
+     action TEXT NOT NULL,
+     project_id TEXT,
+     payload_hash TEXT NOT NULL,
+     payload_json TEXT NOT NULL,
+     plan_json TEXT,
+     state TEXT NOT NULL,
+     storage_key TEXT,
+     receipt_json TEXT,
+     created_at TEXT NOT NULL,
+     updated_at TEXT NOT NULL
+   )`,
+  `CREATE INDEX IF NOT EXISTS local_operations_state_idx
+     ON local_operations (state, updated_at, operation_id)`
+];
+
+function requireLocalOperationState(value: string): LocalOperationJournalState {
+  if ((LOCAL_OPERATION_STATES as readonly string[]).includes(value)) {
+    return value as LocalOperationJournalState;
+  }
+  throw recoveryRequired('local operation has an unknown stored state');
+}
+
+function toLocalOperation(row: LocalOperationRow): LocalOperationRecord {
+  return {
+    operation_id: row.operation_id,
+    idempotency_key: row.idempotency_key,
+    tool: row.tool,
+    action: row.action,
+    project_id: row.project_id,
+    payload_hash: row.payload_hash,
+    payload_json: row.payload_json,
+    plan_json: row.plan_json,
+    state: requireLocalOperationState(row.state),
+    storage_key: row.storage_key,
+    receipt_json: row.receipt_json,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+export class LocalOperationJournal {
+  private readonly database: Database.Database;
+  private closed = false;
+
+  private constructor(database: Database.Database) {
+    this.database = database;
+  }
+
+  static open(path: string): LocalOperationJournal {
+    let database: Database.Database;
+    try {
+      database = new Database(path);
+    } catch (cause) {
+      throw recoveryRequired(`local operation journal at ${path} cannot be opened`, cause);
+    }
+    try {
+      database.pragma('foreign_keys = ON');
+      database.pragma('synchronous = FULL');
+      if (path !== ':memory:') database.pragma('journal_mode = WAL');
+      for (const statement of LOCAL_OPERATION_SCHEMA) database.exec(statement);
+    } catch (error) {
+      database.close();
+      if (isBrainError(error)) throw error;
+      throw recoveryRequired(`local operation journal at ${path} cannot be initialized`, error);
+    }
+    return new LocalOperationJournal(database);
+  }
+
+  reserve(
+    input: LocalOperationReservation & { created_at: string; updated_at: string }
+  ): LocalOperationReservationResult {
+    this.assertOpen();
+    const existing = this.findByKey(input.idempotency_key);
+    if (existing !== undefined) {
+      if (existing.payload_hash !== input.payload_hash || existing.tool !== input.tool) {
+        throw new BrainError({
+          code: 'IDEMPOTENCY_CONFLICT',
+          message: `idempotency key ${input.idempotency_key} was used for a different request`
+        });
+      }
+      return { kind: 'replay', record: existing };
+    }
+    this.database
+      .prepare(
+        `INSERT INTO local_operations (
+           operation_id, idempotency_key, tool, action, project_id,
+           payload_hash, payload_json, plan_json, state, storage_key,
+           receipt_json, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'pending', NULL, NULL, ?, ?)`
+      )
+      .run(
+        input.operation_id,
+        input.idempotency_key,
+        input.tool,
+        input.action,
+        input.project_id,
+        input.payload_hash,
+        input.payload_json,
+        input.created_at,
+        input.updated_at
+      );
+    const stored = this.findById(input.operation_id);
+    if (stored === undefined) {
+      throw recoveryRequired(`local operation ${input.operation_id} was not persisted`);
+    }
+    return { kind: 'new', record: stored };
+  }
+
+  update(
+    operation_id: string,
+    fields: Partial<
+      Pick<
+        LocalOperationRecord,
+        'plan_json' | 'state' | 'storage_key' | 'receipt_json' | 'updated_at'
+      >
+    >
+  ): LocalOperationRecord {
+    this.assertOpen();
+    const current = this.findById(operation_id);
+    if (current === undefined) throw notFound(operation_id);
+    const next = { ...current, ...fields };
+    this.database
+      .prepare(
+        `UPDATE local_operations
+           SET plan_json = ?, state = ?, storage_key = ?, receipt_json = ?, updated_at = ?
+           WHERE operation_id = ?`
+      )
+      .run(
+        next.plan_json,
+        next.state,
+        next.storage_key,
+        next.receipt_json,
+        next.updated_at,
+        operation_id
+      );
+    const stored = this.findById(operation_id);
+    if (stored === undefined) throw recoveryRequired(`local operation ${operation_id} disappeared`);
+    return stored;
+  }
+
+  findById(operation_id: string): LocalOperationRecord | undefined {
+    this.assertOpen();
+    const row = this.database
+      .prepare('SELECT * FROM local_operations WHERE operation_id = ?')
+      .get(operation_id) as LocalOperationRow | undefined;
+    return row === undefined ? undefined : toLocalOperation(row);
+  }
+
+  findByKey(idempotency_key: string): LocalOperationRecord | undefined {
+    this.assertOpen();
+    const row = this.database
+      .prepare('SELECT * FROM local_operations WHERE idempotency_key = ?')
+      .get(idempotency_key) as LocalOperationRow | undefined;
+    return row === undefined ? undefined : toLocalOperation(row);
+  }
+
+  listIncomplete(): LocalOperationRecord[] {
+    this.assertOpen();
+    const rows = this.database
+      .prepare(
+        "SELECT * FROM local_operations WHERE state NOT IN ('finalized', 'conflicted') ORDER BY updated_at ASC, operation_id ASC"
+      )
+      .all() as LocalOperationRow[];
+    return rows.map(toLocalOperation);
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.database.close();
+  }
+
+  private assertOpen(): void {
+    if (this.closed) throw invalidInput('local operation journal is closed');
+  }
+}
