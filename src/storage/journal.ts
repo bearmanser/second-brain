@@ -2437,3 +2437,373 @@ export class Journal {
     if (this.closed) throw invalidInput('operation journal is closed');
   }
 }
+
+export interface LocalWriteReservation {
+  operation_id: string;
+  idempotency_key: string;
+  tool: string;
+  path: string;
+  payload_hash: string;
+  source: string;
+  expected_etag: string | null;
+  id: string | null;
+  revision_id: string | null;
+}
+
+export type LocalWriteState =
+  | 'prepared'
+  | 'history_persisted'
+  | 'materialized'
+  | 'conflict'
+  | 'complete'
+  | 'failed';
+
+export interface LocalWriteRecord extends LocalWriteReservation {
+  preimage_hash: string | null;
+  revision_hash: string | null;
+  state: LocalWriteState;
+  indexed: boolean;
+  receipt_json: string | null;
+  updated_at: string;
+}
+
+export interface LocalDocumentRecord {
+  path: string;
+  id: string;
+  revision_id: string;
+  raw_hash: string;
+  etag: string;
+  updated_at: string;
+}
+
+export interface LocalIndexRecord {
+  path: string;
+  revision_id: string;
+  raw_hash: string;
+  enqueued_at: string;
+}
+
+export type LocalWriteReservationResult =
+  | { kind: 'new'; record: LocalWriteRecord }
+  | { kind: 'replay'; record: LocalWriteRecord };
+
+interface LocalWriteRow {
+  operation_id: string;
+  idempotency_key: string;
+  tool: string;
+  path: string;
+  payload_hash: string;
+  source: string;
+  expected_etag: string | null;
+  id: string | null;
+  revision_id: string | null;
+  preimage_hash: string | null;
+  revision_hash: string | null;
+  state: string;
+  indexed: number;
+  receipt_json: string | null;
+  updated_at: string;
+}
+
+interface LocalDocumentRow {
+  path: string;
+  id: string;
+  revision_id: string;
+  raw_hash: string;
+  etag: string;
+  updated_at: string;
+}
+
+interface LocalIndexRow {
+  path: string;
+  revision_id: string;
+  raw_hash: string;
+  enqueued_at: string;
+}
+
+const LOCAL_WRITE_STATES = [
+  'prepared',
+  'history_persisted',
+  'materialized',
+  'conflict',
+  'complete',
+  'failed'
+] as const satisfies readonly LocalWriteState[];
+
+function requireLocalWriteState(value: string): LocalWriteState {
+  if ((LOCAL_WRITE_STATES as readonly string[]).includes(value)) {
+    return value as LocalWriteState;
+  }
+  throw recoveryRequired('local write has an unknown stored state');
+}
+
+function toLocalWrite(row: LocalWriteRow): LocalWriteRecord {
+  return {
+    operation_id: row.operation_id,
+    idempotency_key: row.idempotency_key,
+    tool: row.tool,
+    path: row.path,
+    payload_hash: row.payload_hash,
+    source: row.source,
+    expected_etag: row.expected_etag,
+    id: row.id,
+    revision_id: row.revision_id,
+    preimage_hash: row.preimage_hash,
+    revision_hash: row.revision_hash,
+    state: requireLocalWriteState(row.state),
+    indexed: row.indexed === 1,
+    receipt_json: row.receipt_json,
+    updated_at: row.updated_at
+  };
+}
+
+function toLocalDocument(row: LocalDocumentRow): LocalDocumentRecord {
+  return {
+    path: row.path,
+    id: row.id,
+    revision_id: row.revision_id,
+    raw_hash: row.raw_hash,
+    etag: row.etag,
+    updated_at: row.updated_at
+  };
+}
+
+function toLocalIndex(row: LocalIndexRow): LocalIndexRecord {
+  return {
+    path: row.path,
+    revision_id: row.revision_id,
+    raw_hash: row.raw_hash,
+    enqueued_at: row.enqueued_at
+  };
+}
+
+const LOCAL_WRITE_SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS local_write_operations (
+     operation_id TEXT PRIMARY KEY,
+     idempotency_key TEXT NOT NULL UNIQUE,
+     tool TEXT NOT NULL,
+     path TEXT NOT NULL,
+     payload_hash TEXT NOT NULL,
+     source TEXT NOT NULL,
+     expected_etag TEXT,
+     id TEXT,
+     revision_id TEXT,
+     preimage_hash TEXT,
+     revision_hash TEXT,
+     state TEXT NOT NULL,
+     indexed INTEGER NOT NULL DEFAULT 0,
+     receipt_json TEXT,
+     updated_at TEXT NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS local_documents (
+     path TEXT PRIMARY KEY,
+     id TEXT NOT NULL UNIQUE,
+     revision_id TEXT NOT NULL,
+     raw_hash TEXT NOT NULL,
+     etag TEXT NOT NULL,
+     updated_at TEXT NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS local_index_queue (
+     path TEXT PRIMARY KEY,
+     revision_id TEXT NOT NULL,
+     raw_hash TEXT NOT NULL,
+     enqueued_at TEXT NOT NULL
+   )`
+];
+
+export class LocalWriteJournal {
+  private readonly database: Database.Database;
+  private closed = false;
+
+  private constructor(database: Database.Database) {
+    this.database = database;
+  }
+
+  static open(path: string): LocalWriteJournal {
+    let database: Database.Database;
+    try {
+      database = new Database(path);
+    } catch (cause) {
+      throw recoveryRequired(`local document journal at ${path} cannot be opened`, cause);
+    }
+    try {
+      database.pragma('foreign_keys = ON');
+      database.pragma('synchronous = FULL');
+      if (path !== ':memory:') database.pragma('journal_mode = WAL');
+      for (const statement of LOCAL_WRITE_SCHEMA) database.exec(statement);
+    } catch (error) {
+      database.close();
+      if (isBrainError(error)) throw error;
+      throw recoveryRequired(`local document journal at ${path} cannot be initialized`, error);
+    }
+    return new LocalWriteJournal(database);
+  }
+
+  reserve(input: LocalWriteReservation & { updated_at: string }): LocalWriteReservationResult {
+    this.assertOpen();
+    const existing = this.findByKey(input.idempotency_key);
+    if (existing !== undefined) {
+      if (existing.payload_hash !== input.payload_hash) {
+        throw new BrainError({
+          code: 'IDEMPOTENCY_CONFLICT',
+          message: `idempotency key ${input.idempotency_key} was used for a different request`
+        });
+      }
+      return { kind: 'replay', record: existing };
+    }
+    this.database
+      .prepare(
+        `INSERT INTO local_write_operations (
+           operation_id, idempotency_key, tool, path, payload_hash, source,
+           expected_etag, id, revision_id, state, indexed, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', 0, ?)`
+      )
+      .run(
+        input.operation_id,
+        input.idempotency_key,
+        input.tool,
+        input.path,
+        input.payload_hash,
+        input.source,
+        input.expected_etag,
+        input.id,
+        input.revision_id,
+        input.updated_at
+      );
+    const stored = this.findById(input.operation_id);
+    if (stored === undefined) throw recoveryRequired(`local write ${input.operation_id} was not persisted`);
+    return { kind: 'new', record: stored };
+  }
+
+  update(
+    operation_id: string,
+    fields: Partial<
+      Pick<
+        LocalWriteRecord,
+        'preimage_hash' | 'revision_hash' | 'state' | 'indexed' | 'receipt_json' | 'updated_at'
+      >
+    >
+  ): LocalWriteRecord {
+    this.assertOpen();
+    const current = this.findById(operation_id);
+    if (current === undefined) throw notFound(operation_id);
+    const next = { ...current, ...fields };
+    this.database
+      .prepare(
+        `UPDATE local_write_operations
+           SET preimage_hash = ?, revision_hash = ?, state = ?, indexed = ?,
+               receipt_json = ?, updated_at = ?
+           WHERE operation_id = ?`
+      )
+      .run(
+        next.preimage_hash,
+        next.revision_hash,
+        next.state,
+        next.indexed ? 1 : 0,
+        next.receipt_json,
+        next.updated_at,
+        operation_id
+      );
+    const stored = this.findById(operation_id);
+    if (stored === undefined) throw recoveryRequired(`local write ${operation_id} disappeared`);
+    return stored;
+  }
+
+  findByKey(idempotency_key: string): LocalWriteRecord | undefined {
+    this.assertOpen();
+    const row = this.database
+      .prepare('SELECT * FROM local_write_operations WHERE idempotency_key = ?')
+      .get(idempotency_key) as LocalWriteRow | undefined;
+    return row === undefined ? undefined : toLocalWrite(row);
+  }
+
+  findById(operation_id: string): LocalWriteRecord | undefined {
+    this.assertOpen();
+    const row = this.database
+      .prepare('SELECT * FROM local_write_operations WHERE operation_id = ?')
+      .get(operation_id) as LocalWriteRow | undefined;
+    return row === undefined ? undefined : toLocalWrite(row);
+  }
+
+  findByRevision(revision_id: string): LocalWriteRecord | undefined {
+    this.assertOpen();
+    const row = this.database
+      .prepare('SELECT * FROM local_write_operations WHERE revision_id = ? ORDER BY updated_at DESC LIMIT 1')
+      .get(revision_id) as LocalWriteRow | undefined;
+    return row === undefined ? undefined : toLocalWrite(row);
+  }
+
+  recordDocument(input: LocalDocumentRecord): void {
+    this.assertOpen();
+    this.database
+      .prepare(
+        `INSERT INTO local_documents (path, id, revision_id, raw_hash, etag, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(path) DO UPDATE SET
+           id = excluded.id,
+           revision_id = excluded.revision_id,
+           raw_hash = excluded.raw_hash,
+           etag = excluded.etag,
+           updated_at = excluded.updated_at`
+      )
+      .run(input.path, input.id, input.revision_id, input.raw_hash, input.etag, input.updated_at);
+  }
+
+  findDocumentByPath(path: string): LocalDocumentRecord | undefined {
+    this.assertOpen();
+    const row = this.database
+      .prepare('SELECT * FROM local_documents WHERE path = ?')
+      .get(path) as LocalDocumentRow | undefined;
+    return row === undefined ? undefined : toLocalDocument(row);
+  }
+
+  findDocumentById(id: string): LocalDocumentRecord | undefined {
+    this.assertOpen();
+    const row = this.database
+      .prepare('SELECT * FROM local_documents WHERE id = ?')
+      .get(id) as LocalDocumentRow | undefined;
+    return row === undefined ? undefined : toLocalDocument(row);
+  }
+
+  deleteDocument(path: string): void {
+    this.assertOpen();
+    this.database.prepare('DELETE FROM local_documents WHERE path = ?').run(path);
+  }
+
+  enqueueIndex(input: LocalIndexRecord): void {
+    this.assertOpen();
+    this.database
+      .prepare(
+        `INSERT INTO local_index_queue (path, revision_id, raw_hash, enqueued_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(path) DO UPDATE SET
+           revision_id = excluded.revision_id,
+           raw_hash = excluded.raw_hash,
+           enqueued_at = excluded.enqueued_at`
+      )
+      .run(input.path, input.revision_id, input.raw_hash, input.enqueued_at);
+  }
+
+  listIndex(): LocalIndexRecord[] {
+    this.assertOpen();
+    const rows = this.database
+      .prepare('SELECT * FROM local_index_queue ORDER BY enqueued_at ASC, path ASC')
+      .all() as LocalIndexRow[];
+    return rows.map(toLocalIndex);
+  }
+
+  dequeueIndex(path: string): void {
+    this.assertOpen();
+    this.database.prepare('DELETE FROM local_index_queue WHERE path = ?').run(path);
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.database.close();
+  }
+
+  private assertOpen(): void {
+    if (this.closed) throw invalidInput('local document journal is closed');
+  }
+}

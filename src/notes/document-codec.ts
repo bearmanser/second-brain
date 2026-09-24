@@ -629,29 +629,105 @@ function overlapCount(expected: Map<string, number>, present: Map<string, number
   return overlap;
 }
 
-function alignedLines(expected: ContentToken[], present: ContentToken[]): Set<number> {
-  const lengths: number[][] = Array.from({ length: expected.length + 1 }, () =>
-    Array<number>(present.length + 1).fill(0));
-  for (let i = expected.length - 1; i >= 0; i -= 1) {
-    for (let j = present.length - 1; j >= 0; j -= 1) {
-      lengths[i][j] = expected[i].text === present[j].text
-        ? 1 + lengths[i + 1][j + 1]
-        : Math.max(lengths[i + 1][j], lengths[i][j + 1]);
+export const MANAGED_SECTION_MAX_ALIGNMENT_CELLS = 1_000_000;
+
+function lcsPrefix(
+  expected: ContentToken[],
+  expectedStart: number,
+  expectedEnd: number,
+  present: ContentToken[],
+  presentStart: number,
+  presentEnd: number
+): number[] {
+  const width = presentEnd - presentStart;
+  let previous = new Array<number>(width + 1).fill(0);
+  let current = new Array<number>(width + 1).fill(0);
+  for (let i = expectedStart; i < expectedEnd; i += 1) {
+    current[0] = 0;
+    const text = expected[i].text;
+    for (let j = 1; j <= width; j += 1) {
+      current[j] = text === present[presentStart + j - 1].text
+        ? previous[j - 1] + 1
+        : Math.max(previous[j], current[j - 1]);
+    }
+    const swap = previous;
+    previous = current;
+    current = swap;
+  }
+  return previous.slice();
+}
+
+function lcsSuffix(
+  expected: ContentToken[],
+  expectedStart: number,
+  expectedEnd: number,
+  present: ContentToken[],
+  presentStart: number,
+  presentEnd: number
+): number[] {
+  const width = presentEnd - presentStart;
+  let previous = new Array<number>(width + 1).fill(0);
+  let current = new Array<number>(width + 1).fill(0);
+  for (let i = expectedEnd - 1; i >= expectedStart; i -= 1) {
+    current[0] = 0;
+    const text = expected[i].text;
+    for (let t = 1; t <= width; t += 1) {
+      current[t] = text === present[presentEnd - t].text
+        ? previous[t - 1] + 1
+        : Math.max(previous[t], current[t - 1]);
+    }
+    const swap = previous;
+    previous = current;
+    current = swap;
+  }
+  const result = new Array<number>(width + 1);
+  for (let k = 0; k <= width; k += 1) result[k] = previous[width - k];
+  return result;
+}
+
+function collectAligned(
+  expected: ContentToken[],
+  expectedStart: number,
+  expectedEnd: number,
+  present: ContentToken[],
+  presentStart: number,
+  presentEnd: number,
+  out: Array<[number, number]>
+): void {
+  if (expectedStart >= expectedEnd || presentStart >= presentEnd) return;
+  if (expectedEnd - expectedStart === 1) {
+    const text = expected[expectedStart].text;
+    for (let j = presentStart; j < presentEnd; j += 1) {
+      if (present[j].text === text) {
+        out.push([expectedStart, j]);
+        return;
+      }
+    }
+    return;
+  }
+  const middle = (expectedStart + expectedEnd) >> 1;
+  const left = lcsPrefix(expected, expectedStart, middle, present, presentStart, presentEnd);
+  const right = lcsSuffix(expected, middle, expectedEnd, present, presentStart, presentEnd);
+  let split = 0;
+  let best = -1;
+  for (let k = 0; k <= presentEnd - presentStart; k += 1) {
+    const score = left[k] + right[k];
+    if (score > best) {
+      best = score;
+      split = k;
     }
   }
+  collectAligned(expected, expectedStart, middle, present, presentStart, presentStart + split, out);
+  collectAligned(expected, middle, expectedEnd, present, presentStart + split, presentEnd, out);
+}
+
+function alignedLines(expected: ContentToken[], present: ContentToken[]): Set<number> | undefined {
+  if (expected.length * present.length > MANAGED_SECTION_MAX_ALIGNMENT_CELLS) return undefined;
+  const matches: Array<[number, number]> = [];
+  collectAligned(expected, 0, expected.length, present, 0, present.length, matches);
   const removed = new Set<number>();
-  let i = 0;
-  let j = 0;
-  while (i < expected.length && j < present.length) {
-    if (expected[i].text === present[j].text) {
-      for (const line of present[j].lines) removed.add(line);
-      i += 1;
-      j += 1;
-    } else if (lengths[i + 1][j] > lengths[i][j + 1]) {
-      i += 1;
-    } else {
-      j += 1;
-    }
+  for (const [, presentIndex] of matches) {
+    for (const line of present[presentIndex].lines) removed.add(line);
   }
   return removed;
 }
@@ -685,9 +761,12 @@ function subtractGenerated(
     let chosen = -1;
     let bestOverlap = -1;
     let bestDistance = Infinity;
+    let ambiguous = false;
+    let candidates = 0;
     for (let index = lastMatched + 1; index < nextBound; index += 1) {
       const candidate = blocks[index];
       if (candidate.title !== section.title) continue;
+      candidates += 1;
       const overlap = overlapCount(expected, counts[index]);
       const distance = Math.abs(candidate.start - section.start);
       if (overlap > bestOverlap || (overlap === bestOverlap && distance < bestDistance)) {
@@ -697,7 +776,13 @@ function subtractGenerated(
       }
     }
     if (chosen < 0) continue;
-    generated.set(chosen, alignedLines(expectedTokens, tokens[chosen]));
+    if (bestOverlap === 0 && candidates > 1) {
+      ambiguous = true;
+    }
+    if (ambiguous) continue;
+    const aligned = alignedLines(expectedTokens, tokens[chosen]);
+    if (aligned === undefined) continue;
+    generated.set(chosen, aligned);
     lastMatched = chosen;
   }
   const generalLines: string[] = [];

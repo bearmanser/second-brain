@@ -36,6 +36,12 @@ import type {
   ReservationResult
 } from '../storage/journal.js';
 import { recoverProjectOperation } from '../features/project-ensure.js';
+import type {
+  DocumentStorePutInput,
+  DocumentStorePutResult,
+  DocumentStoreReadResult,
+  DocumentStoreRevisionRead
+} from '../storage/document-store.js';
 
 const POLL_INTERVAL_MS = 20;
 const UNCERTAIN_WRITE_CODES = ['BACKEND_UNAVAILABLE', 'EMBEDDINGS_UNAVAILABLE', 'BACKEND_PROTOCOL_ERROR'] as const;
@@ -143,6 +149,17 @@ export interface MutationDeps {
   journal: MutationJournal;
   clock: Clock;
   ids: IdSource;
+  localStore?: LocalStoreAdapter;
+}
+
+export interface LocalStoreAdapter {
+  put(input: DocumentStorePutInput): Promise<DocumentStorePutResult>;
+  readPath(path: string): Promise<DocumentStoreReadResult>;
+  readRevision(id: string, revisionId: string): Promise<DocumentStoreRevisionRead>;
+}
+
+export function localStoreAdapter(store: LocalStoreAdapter): LocalStoreAdapter {
+  return store;
 }
 
 interface LocatedMaterialization {
@@ -565,6 +582,18 @@ export class MutationCoordinator {
 
   async serialize<T>(work: () => Promise<T>): Promise<T> {
     return this.withLock(work);
+  }
+
+  async localWrite(
+    ctx: AuthenticatedContext,
+    input: DocumentStorePutInput
+  ): Promise<DocumentStorePutResult> {
+    const adapter = this.deps.localStore;
+    if (adapter === undefined) {
+      throw recoveryRequired('no local document store is configured');
+    }
+    if (ctx.signal.aborted) throw cancelled();
+    return this.serialize(() => adapter.put(input));
   }
 
   private withLock<T>(work: () => Promise<T>): Promise<T> {

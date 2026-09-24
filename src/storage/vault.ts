@@ -111,6 +111,66 @@ export function hasBrainMarker(raw: string): boolean {
   return MARKER_PATTERN.test(lines.slice(1, close).join('\n'));
 }
 
+export function vaultNoteSegments(relativePath: string): string[] {
+  if (typeof relativePath !== 'string' || relativePath.length === 0) {
+    throw invalidInput('a vault path must be a non-empty string');
+  }
+  if (relativePath.includes('\0')) throw invalidInput('a vault path contains a null byte');
+  if (relativePath.startsWith('/') || relativePath.startsWith('\\')) {
+    throw invalidInput('a vault path must be relative');
+  }
+  if (relativePath.includes('\\')) throw invalidInput('a vault path must use forward slashes');
+  const segments = relativePath.split('/');
+  if (segments.some((segment) => segment.length === 0)) {
+    throw invalidInput('a vault path must not contain empty segments');
+  }
+  for (const segment of segments) {
+    if (segment === '.' || segment === '..') throw invalidInput('path traversal is not allowed');
+    if (segment.startsWith('.')) throw invalidInput('hidden path segments are not allowed');
+    if (/[\u0000-\u001f\u007f]/u.test(segment)) {
+      throw invalidInput('a vault path contains a control character');
+    }
+  }
+  const leaf = segments[segments.length - 1];
+  if (!leaf.endsWith('.md')) throw invalidInput('only Markdown documents can be addressed');
+  return segments;
+}
+
+export async function listVaultFilePaths(root: string): Promise<string[]> {
+  const rootPath = resolve(root);
+  const results: string[] = [];
+  const walk = async (directory: string, prefix: string): Promise<void> => {
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if (hasErrno(error, 'ENOENT')) return;
+      throw recoveryRequired(`vault directory ${directory} cannot be listed`, error);
+    }
+    entries.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue;
+      const absolute = join(directory, entry.name);
+      const relativePath = prefix.length === 0 ? entry.name : `${prefix}/${entry.name}`;
+      let info;
+      try {
+        info = await lstat(absolute);
+      } catch {
+        continue;
+      }
+      if (info.isSymbolicLink()) continue;
+      if (info.isDirectory()) {
+        await walk(absolute, relativePath);
+        continue;
+      }
+      if (info.isFile()) results.push(relativePath);
+    }
+  };
+  await walk(rootPath, '');
+  results.sort();
+  return results;
+}
+
 export interface ByteReader {
   read(
     buffer: Buffer,

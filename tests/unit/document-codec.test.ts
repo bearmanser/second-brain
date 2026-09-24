@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { expect, test } from 'vitest';
 import {
+  MANAGED_SECTION_MAX_ALIGNMENT_CELLS,
   documentFromNote,
   parseDocument,
   parseSources,
@@ -931,4 +932,100 @@ test('a revision removes the generated skeleton when a human edit replaced manag
   expect(again.body).not.toContain('Generated context.');
   expect(again.body).toContain('Updated context.');
   expect(again.body).toContain('Human edited context.');
+});
+
+test('a large managed section degrades to preserve-not-delete within a bounded budget', () => {
+  const lines = Array.from({ length: 1300 }, (_unused, index) => `generated line ${index}`);
+  const previous: NoteInput = {
+    title: 'Large managed decision',
+    tags: [],
+    related_ids: [],
+    content: { kind: 'decision', context: lines.join('\n'), decision: 'D.', rationale: 'R.' },
+    evidence: []
+  };
+  expect(lines.length * lines.length).toBeGreaterThan(MANAGED_SECTION_MAX_ALIGNMENT_CELLS);
+  const base = documentFromNote(previous, { path: 'Large managed decision.md' });
+  const edited = parseDocument(
+    renderDocument({
+      ...base,
+      body: base.body.replace('generated line 0\n', 'generated line 0\n\nHuman sentinel paragraph.\n')
+    }),
+    base.path
+  );
+  const started = Date.now();
+  const revised = reviseDocument(
+    edited,
+    {
+      ...previous,
+      content: { kind: 'decision', context: 'Replacement context.', decision: 'D2.', rationale: 'R2.' }
+    },
+    { previous }
+  );
+  const elapsed = Date.now() - started;
+  expect(elapsed).toBeLessThan(2000);
+  expect(revised.body).toContain('Human sentinel paragraph.');
+  expect(revised.body).toContain('generated line 1299');
+  expect(revised.body).toContain('Replacement context.');
+});
+
+test('a human same-name heading survives when attribution is ambiguous', () => {
+  const previous: NoteInput = {
+    title: 'Managed decision',
+    tags: [],
+    related_ids: [],
+    evidence: [],
+    content: { kind: 'decision', context: 'Generated context.', decision: 'D.', rationale: 'R.' }
+  };
+  const base = documentFromNote(previous, { path: 'Managed decision.md' });
+  const human = '## Context\n\nHuman-only context.\n\n';
+  const edited = parseDocument(
+    renderDocument({
+      ...base,
+      body: base.body.replace(
+        '## Context\n\nGenerated context.',
+        `${human}## Context\n\nHuman edited context.`
+      )
+    }),
+    base.path
+  );
+  const revised = reviseDocument(
+    edited,
+    {
+      ...previous,
+      content: { kind: 'decision', context: 'Updated context.', decision: 'D2.', rationale: 'R2.' }
+    },
+    { previous }
+  );
+  expect(revised.body).toContain(human.trimEnd());
+  expect(revised.body).toContain('Human edited context.');
+  expect(revised.body).toContain('Updated context.');
+  expect(revised.body.match(/^## Context$/gm)?.length ?? 0).toBeGreaterThanOrEqual(2);
+});
+
+test('unresolvable attribution never deletes a base heading', () => {
+  const previous: NoteInput = {
+    title: 'Managed note',
+    tags: [],
+    related_ids: [],
+    evidence: [],
+    content: { kind: 'note', summary: 'Generated summary.', body_markdown: 'Body.' }
+  };
+  const base = documentFromNote(previous, { path: 'Managed note.md' });
+  const human = '## Summary\n\nPurely human summary.\n\n';
+  const edited = parseDocument(
+    renderDocument({
+      ...base,
+      body: `${base.body}\n${human}## Summary\n\nAlso human.\n`
+    }),
+    base.path
+  );
+  const revised = reviseDocument(
+    edited,
+    { ...previous, content: { kind: 'note', summary: 'Replacement summary.', body_markdown: 'Body.' } },
+    { previous }
+  );
+  expect(revised.body).toContain('Purely human summary.');
+  expect(revised.body).toContain('Also human.');
+  expect(revised.body).toContain('Replacement summary.');
+  expect(revised.body.match(/^## Summary$/gm)?.length ?? 0).toBeGreaterThanOrEqual(2);
 });
