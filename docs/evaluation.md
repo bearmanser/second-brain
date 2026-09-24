@@ -535,21 +535,24 @@ same eligible current-document universe and reports the four modes:
 | `legacy_baseline` | Frozen aggregate from `docs/evaluation/vault-v2-baseline.md` (run `retrieval-2026-09-23T20:13:15.669Z-98b9adf0`, recall@5 0.9286, precision@5 0.8536, mean 44.8 ms). V2 candidate Recall@50, nDCG@10, MRR, RSS, and fallback rate were not measured on that pre-V2 run and are reported `null`, never invented. |
 | `local_text` | The lexical/exact candidate pool. |
 | `local_text_graph` | Candidate pool merged with the bounded graph expansion (bound 10), with graph-expanded recall reported separately. |
-| `laya_reranked` | The live model-backed run is **NOT RUN** without prepared Laya artifacts; the reported metrics are the lexical fallback ordering with fallback rate 1. |
+| `laya_reranked` | Available only when an actual model-produced ranking is supplied. Without prepared Laya artifacts the mode is **NOT RUN**; any lexical fallback ordering is reported separately under `fallback_order` and is never labelled available or model-backed. |
 
 Legacy revision paths and revision identifiers are mapped to logical IDs with
-`legacyLogicalId` before scoring, and `dedupeLogicalIds` removes repeats. Each
+`legacyLogicalId` before scoring and deduping: `buildCrossModeReport` accepts a
+`logical_ids` mapping and applies it to each candidate, graph candidate,
+direct-answer id, and universe id, and `dedupeLogicalIds` removes repeats. Each
 mode reports candidate recall@50, nDCG@10, MRR (direct-answer queries),
 latency p50/p95, harness-process RSS, and fallback rate overall and per query
 slice. On the committed fixture: `local_text` recall@50 0.9252 / nDCG@10
 0.9252 / MRR 0.9159; `local_text_graph` recall@50 1.0 / nDCG@10 0.9724 / MRR
-0.9533 / graph recall@10 0.0748; `laya_reranked` fallback rate 1.0.
+0.9533 / graph recall@10 0.0748; `laya_reranked` is NOT RUN and its lexical
+fallback order is reported separately with fallback rate 1.0.
 
 **Operable label authoring (Finding 2).** No eighth MCP tool was added. The
 existing `feedback` CLI family gained `feedback label` and `feedback void`:
 
 ```sh
-node dist/cli.js feedback label --state <dir> --query-id <id> --source-type human_reviewed \
+node dist/cli.js feedback label --state <dir> --vault <dir> --query-id <id> --source-type human_reviewed \
   --label 2 --source-hash <sha256> --path Notes/Example.md --notes "direct support"
 node dist/cli.js feedback void --state <dir> --label-id <id>
 node dist/cli.js feedback export --state <dir> --output <path> --split-seed 20260923
@@ -559,8 +562,11 @@ node dist/cli.js feedback export --state <dir> --output <path> --split-seed 2026
 (`StaleLabelError`), never approves `agent_proposed` usage, is idempotent for an
 identical judgment (`created: false`), and rejects a conflicting judgment for the
 same trace/query/source (`ConflictingLabelError`). `feedback void` is the
-removal path the export rules require. Freshness is verified against the live
-vault file (`--path` with `--vault`) or an explicit `--current-hash`.
+removal path the export rules require. Freshness is computed from the live
+vault file: `--path` is required and `--vault` selects the vault root (or the
+configured mount), the resolved path must stay inside the vault, the file must
+be readable, and the computed `sha256` must match `--source-hash`. There is no
+independent operator-supplied current-hash input.
 
 **Trace population (Finding 3).** `recallLocalTraced` returns a trace with
 `query_id` (stable hash of the normalized query/filters), `question_id` and
@@ -582,7 +588,7 @@ content digest and the manifest hash even when the counts are identical.
 CLI passes `candidatesByQuery` so the unjudged count is real; the JSONL dataset
 parser is shared in `src/retrieval/evaluation-dataset.ts` by both the CLI and
 the evaluator; the fixture test validates `source-hashes.json` against
-`dataset.jsonl`; and `labelRetrieval` now returns an honest
-`{ recorded, created }` receipt via `authorRetrievalLabel`. Migration `011`
-adds the nullable `retrieval_labels.notes` column without editing migration 010.
+`dataset.jsonl`; and the label authoring boundary `authorRetrievalLabel`
+returns an honest `{ recorded, created }` receipt. Migration `011` adds the
+nullable `retrieval_labels.notes` column without editing migration 010.
 

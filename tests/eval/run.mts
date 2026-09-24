@@ -380,10 +380,7 @@ export interface LocalComparisonRunOutput {
   report: ReturnType<typeof buildCrossModeReport>;
 }
 
-function comparisonObservations(
-  query: LocalEvaluationQuery,
-  fallbackLaya: boolean
-): CrossModeObservation[] {
+function comparisonObservations(query: LocalEvaluationQuery): CrossModeObservation[] {
   const textRanked = dedupeLogicalIds(query.candidates);
   const graphRanked = dedupeLogicalIds(query.graph_candidates ?? []);
   const merged = dedupeLogicalIds([...textRanked, ...graphRanked]);
@@ -405,17 +402,15 @@ function comparisonObservations(
     {
       mode: 'laya_reranked',
       ranked: textRanked,
-      available: true,
-      fallback: fallbackLaya,
+      available: false,
+      fallback: true,
+      model_backed: false,
       ...(latency === undefined ? {} : { latency_ms: latency })
     }
   ];
 }
 
-async function runLocalComparison(
-  args: Map<string, string>,
-  modelAvailable: boolean
-): Promise<LocalComparisonRunOutput> {
+async function runLocalComparison(args: Map<string, string>): Promise<LocalComparisonRunOutput> {
   const datasetPath = args.get('dataset');
   if (datasetPath === undefined) throw new Error('--dataset is required for --compare');
   const dataset = await readEvaluationDataset(datasetPath);
@@ -426,10 +421,9 @@ async function runLocalComparison(
     eligible: dedupeLogicalIds([...query.candidates, ...(query.graph_candidates ?? [])]),
     ...(query.direct_answer === undefined ? {} : { direct_answer: query.direct_answer }),
     ...(query.no_answer === true ? { no_answer: true } : {}),
-    modes: comparisonObservations(query, !modelAvailable)
+    modes: comparisonObservations(query)
   }));
   const report = buildCrossModeReport(queries, {
-    model_artifacts_available: modelAvailable,
     rss_bytes: process.memoryUsage().rss
   });
   const output: LocalComparisonRunOutput = {
@@ -472,6 +466,14 @@ function formatComparisonSummary(output: LocalComparisonRunOutput): string {
         `p95 ${String(entry.latency_p95_ms)} ms; rss ${String(entry.rss_bytes_peak)}`
     );
   }
+  for (const [mode, entry] of Object.entries(report.fallback_order).sort()) {
+    if (entry === undefined) continue;
+    lines.push(
+      `${mode} fallback order (not a model run): recall@50 ${String(entry.candidate_recall_at_50)}; ` +
+        `nDCG@10 ${String(entry.ndcg_at_10)}; MRR ${String(entry.mrr)}; fallback ${entry.fallback_rate}; ` +
+        `p50 ${String(entry.latency_p50_ms)} ms`
+    );
+  }
   for (const [mode, slices] of Object.entries(report.by_slice)) {
     for (const [slice, entry] of Object.entries(slices).sort(([left], [right]) => (left < right ? -1 : 1))) {
       lines.push(
@@ -490,7 +492,7 @@ export async function main(argv: string[]): Promise<number> {
   const args = parseArgs(argv);
   if (invocation.action === 'retrieval') {
     if (args.get('compare') === 'true' || invocation.mode === 'compare') {
-      const output = await runLocalComparison(args, args.get('model-artifacts') === 'true');
+      const output = await runLocalComparison(args);
       process.stdout.write(`${formatComparisonSummary(output)}\n`);
       return 0;
     }

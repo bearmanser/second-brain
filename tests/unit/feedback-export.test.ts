@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -447,16 +447,25 @@ test('include-text is fail-closed per row when text is unavailable', async () =>
 });
 
 test('feedback label and void round-trip through the CLI over a temporary state volume', async () => {
-  const state = mkdtempSync(join(tmpdir(), 'feedback-state-'));
-  temporaryDirectories.push(state);
+  const root = mkdtempSync(join(tmpdir(), 'feedback-state-'));
+  temporaryDirectories.push(root);
+  const state = join(root, 'state');
+  const vault = join(root, 'vault');
+  mkdirSync(state, { recursive: true });
+  mkdirSync(join(vault, 'Notes'), { recursive: true });
+  const noteRelative = 'Notes/Trace.md';
+  const noteRaw = '# Trace\n\nsource text\n';
+  writeFileSync(join(vault, noteRelative), noteRaw);
+  const hash = createHash('sha256').update(noteRaw, 'utf8').digest('hex');
   const output = join(state, 'laya-training.jsonl');
   const voidedOutput = join(state, 'voided.jsonl');
-  const hash = 'a'.repeat(64);
   const labelArgs = [
     'feedback',
     'label',
     '--state',
     state,
+    '--vault',
+    vault,
     '--trace-id',
     'trace-e2e',
     '--query-id',
@@ -467,8 +476,8 @@ test('feedback label and void round-trip through the CLI over a temporary state 
     '2',
     '--source-hash',
     hash,
-    '--current-hash',
-    hash,
+    '--path',
+    noteRelative,
     '--logical-id',
     'note-a',
     '--question-version',
@@ -498,31 +507,70 @@ test('feedback label and void round-trip through the CLI over a temporary state 
   expect(rows(voidedOutput)).toHaveLength(0);
 });
 
-test('the CLI label boundary rejects a stale source hash', async () => {
-  const state = mkdtempSync(join(tmpdir(), 'feedback-stale-'));
-  temporaryDirectories.push(state);
+function labelVaultFixture(): { root: string; state: string; vault: string; hash: string; noteRelative: string } {
+  const root = mkdtempSync(join(tmpdir(), 'feedback-fresh-'));
+  temporaryDirectories.push(root);
+  const state = join(root, 'state');
+  const vault = join(root, 'vault');
+  mkdirSync(join(vault, 'Notes'), { recursive: true });
+  mkdirSync(state, { recursive: true });
+  const noteRelative = 'Notes/Fresh.md';
+  const raw = '# Fresh\n\nfresh source\n';
+  writeFileSync(join(vault, noteRelative), raw);
+  return {
+    root,
+    state,
+    vault,
+    hash: createHash('sha256').update(raw, 'utf8').digest('hex'),
+    noteRelative
+  };
+}
+
+function labelArguments(
+  fixture: { state: string; vault: string; noteRelative: string },
+  sourceHash: string,
+  path: string,
+  queryId: string
+): string[] {
+  return [
+    'feedback',
+    'label',
+    '--state',
+    fixture.state,
+    '--vault',
+    fixture.vault,
+    '--query-id',
+    queryId,
+    '--source-type',
+    'human_reviewed',
+    '--label',
+    '1',
+    '--source-hash',
+    sourceHash,
+    '--path',
+    path,
+    '--logical-id',
+    'note-fresh'
+  ];
+}
+
+test('a fresh label succeeds from a live vault path and a stale source hash is rejected', async () => {
+  const fixture = labelVaultFixture();
+  expect(
+    await runCli(labelArguments(fixture, fixture.hash, fixture.noteRelative, 'q-fresh'), {})
+  ).toBe(0);
   await expect(
-    runCli(
-      [
-        'feedback',
-        'label',
-        '--state',
-        state,
-        '--query-id',
-        'q-stale',
-        '--source-type',
-        'human_reviewed',
-        '--label',
-        '1',
-        '--source-hash',
-        'a'.repeat(64),
-        '--current-hash',
-        'b'.repeat(64),
-        '--logical-id',
-        'note-b'
-      ],
-      {}
-    )
+    runCli(labelArguments(fixture, 'a'.repeat(64), fixture.noteRelative, 'q-stale'), {})
+  ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+});
+
+test('labeling fails closed when the source file is missing or outside the vault', async () => {
+  const fixture = labelVaultFixture();
+  await expect(
+    runCli(labelArguments(fixture, fixture.hash, 'Notes/Missing.md', 'q-missing'), {})
+  ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+  await expect(
+    runCli(labelArguments(fixture, fixture.hash, '../escape.md', 'q-outside'), {})
   ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
 });
 

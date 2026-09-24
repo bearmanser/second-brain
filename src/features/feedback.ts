@@ -23,10 +23,6 @@ export { AUDIT_FIELDS, FEEDBACK_REASON_MAX_LENGTH } from '../storage/journal.js'
 
 import type { LocalHandlerDeps } from '../core/types.js';
 import {
-  authorRetrievalLabel,
-  type RetrievalLabelInput
-} from '../retrieval/feedback-export.js';
-import {
   currentByReferenceDeps,
   notFound as localNotFound,
   reconcileDeps,
@@ -299,36 +295,5 @@ export async function feedbackLocal(
     }
     const stored = deps.journal.recordFeedback(writeFor(scopeForPathDeps(deps, source.path)));
     return { feedback_id: stored.entry.feedback_id, recorded: true };
-  });
-}
-
-export interface RetrievalLabelResult {
-  label_id: string;
-  recorded: boolean;
-  created: boolean;
-}
-
-export async function labelRetrieval(
-  ctx: AuthenticatedContext,
-  input: RetrievalLabelInput,
-  deps: LocalHandlerDeps
-): Promise<RetrievalLabelResult> {
-  if (ctx.signal.aborted) throw cancelled();
-  await reconcileDeps(deps);
-  if (input.logical_id === undefined && input.path === undefined) {
-    throw invalidInput('a retrieval label requires a logical id or a path');
-  }
-  const source =
-    input.logical_id !== undefined
-      ? currentByReferenceDeps(deps, { id: input.logical_id })
-      : currentByReferenceDeps(deps, { path: input.path as string });
-  return authorRetrievalLabel(deps.journal, {
-    ...input,
-    ...(source.id === undefined ? {} : { logical_id: source.id }),
-    path: source.path,
-    current: {
-      source_hash: source.hash,
-      ...(source.revision_id === undefined ? {} : { revision_id: source.revision_id })
-    }
   });
 }

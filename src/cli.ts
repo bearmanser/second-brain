@@ -714,35 +714,23 @@ async function runFeedbackLabel(parsed: ParsedArguments, env: NodeJS.ProcessEnv)
   }
   const logicalId = flagString(parsed.flags, 'logical-id');
   const path = flagString(parsed.flags, 'path');
-  if (logicalId === undefined && path === undefined) {
-    throw invalidInput('feedback label requires --logical-id or --path');
+  if (path === undefined) {
+    throw invalidInput('feedback label requires --path to verify the current source version');
   }
   const revisionId = flagString(parsed.flags, 'revision-id');
-  const currentHashFlag = flagString(parsed.flags, 'current-hash');
-  const currentRevisionId = flagString(parsed.flags, 'current-revision-id');
-  let currentSourceHash: string;
-  if (currentHashFlag !== undefined) {
-    if (!/^[a-f0-9]{64}$/i.test(currentHashFlag)) {
-      throw invalidInput('feedback label --current-hash must be a 64 character hexadecimal digest');
-    }
-    currentSourceHash = currentHashFlag.toLowerCase();
-  } else if (path !== undefined) {
-    const vault = feedbackVault(parsed, env);
-    const absoluteVault = resolve(vault);
-    const absolutePath = resolve(absoluteVault, path);
-    if (absolutePath !== absoluteVault && !absolutePath.startsWith(`${absoluteVault}${sep}`)) {
-      throw invalidInput('feedback label --path must stay inside the vault');
-    }
-    let raw: Buffer;
-    try {
-      raw = await readFile(absolutePath);
-    } catch {
-      throw invalidInput(`feedback label cannot read the source at ${path}`);
-    }
-    currentSourceHash = createHash('sha256').update(raw).digest('hex');
-  } else {
-    throw invalidInput('feedback label requires --current-hash or --path to verify freshness');
+  const vault = feedbackVault(parsed, env);
+  const absoluteVault = resolve(vault);
+  const absolutePath = resolve(absoluteVault, path);
+  if (absolutePath !== absoluteVault && !absolutePath.startsWith(`${absoluteVault}${sep}`)) {
+    throw invalidInput('feedback label --path must stay inside the vault');
   }
+  let raw: Buffer;
+  try {
+    raw = await readFile(absolutePath);
+  } catch {
+    throw invalidInput(`feedback label cannot read the source at ${path}`);
+  }
+  const currentSourceHash = createHash('sha256').update(raw).digest('hex');
   const candidatePosition = flagNumber(parsed.flags, 'candidate-position');
   const state = feedbackState(parsed, env);
   const lock = InstanceLock.acquire(state);
@@ -784,10 +772,7 @@ async function runFeedbackLabel(parsed: ParsedArguments, env: NodeJS.ProcessEnv)
         ? {}
         : { source_family: flagString(parsed.flags, 'source-family') as string }),
       ...(flagBoolean(parsed.flags, 'approve') ? { approved: true } : {}),
-      current: {
-        source_hash: currentSourceHash,
-        ...(currentRevisionId === undefined ? {} : { revision_id: currentRevisionId })
-      }
+      current: { source_hash: currentSourceHash }
     });
     process.stdout.write(
       `feedback label: ${result.created ? 'created' : 'replay'} ${result.label_id}\n`

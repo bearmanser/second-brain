@@ -351,6 +351,7 @@ export interface ModeMetrics extends LocalSliceMetrics {
 export interface CrossModeReport {
   universe: { queries: number; documents: number };
   modes: Record<EvaluationMode, ModeMetrics>;
+  fallback_order: Partial<Record<EvaluationMode, ModeMetrics>>;
   by_slice: Record<EvaluationMode, Record<string, LocalSliceMetrics>>;
   legacy_baseline: FrozenLegacyBaseline;
   not_run: EvaluationMode[];
@@ -358,8 +359,13 @@ export interface CrossModeReport {
 }
 
 export interface CrossModeOptions {
-  model_artifacts_available?: boolean;
   rss_bytes?: number;
+  logical_ids?: ReadonlyMap<string, string>;
+}
+
+function mapLogicalId(id: string, mapping: ReadonlyMap<string, string> | undefined): string {
+  if (mapping === undefined) return id;
+  return legacyLogicalId({ revision_id: id, path: id }, mapping) ?? id;
 }
 
 function unavailableMode(): ModeMetrics {
@@ -382,19 +388,43 @@ function unavailableMode(): ModeMetrics {
   };
 }
 
-function observationToQuery(query: CrossModeQuery, observation: CrossModeObservation): LocalEvaluationQuery {
+function observationToQuery(
+  query: CrossModeQuery,
+  observation: CrossModeObservation,
+  mapping: ReadonlyMap<string, string> | undefined
+): LocalEvaluationQuery {
   return {
     query_id: query.query_id,
     slice: query.slice,
-    candidates: dedupeLogicalIds(observation.ranked),
+    candidates: dedupeLogicalIds(observation.ranked.map((id) => mapLogicalId(id, mapping))),
     ...(observation.graph_ranked === undefined
       ? {}
-      : { graph_candidates: dedupeLogicalIds(observation.graph_ranked) }),
+      : { graph_candidates: dedupeLogicalIds(observation.graph_ranked.map((id) => mapLogicalId(id, mapping))) }),
     labels: query.labels,
-    ...(query.direct_answer === undefined ? {} : { direct_answer: query.direct_answer }),
+    ...(query.direct_answer === undefined ? {} : { direct_answer: mapLogicalId(query.direct_answer, mapping) }),
     ...(query.no_answer === true ? { no_answer: true } : {}),
     ...(observation.fallback === true ? { fallback: true } : {}),
     ...(observation.latency_ms === undefined ? {} : { latency_ms: observation.latency_ms })
+  };
+}
+
+function modeMetricsFor(
+  observations: readonly { query: CrossModeQuery; observation: CrossModeObservation }[],
+  rssBytes: number | undefined,
+  mapping: ReadonlyMap<string, string> | undefined
+): ModeMetrics {
+  const evaluations = observations.map(({ query, observation }) =>
+    observationToQuery(query, observation, mapping)
+  );
+  const summary = summariseLocalRetrieval(evaluations);
+  const rssValues = observations
+    .map(({ observation }) => observation.rss_bytes)
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+  return {
+    ...summary,
+    available: true,
+    model_backed: observations.some(({ observation }) => observation.model_backed === true),
+    rss_bytes_peak: rssValues.length === 0 ? (rssBytes ?? null) : Math.max(...rssValues)
   };
 }
 
@@ -402,15 +432,16 @@ export function buildCrossModeReport(
   queries: readonly CrossModeQuery[],
   options: CrossModeOptions = {}
 ): CrossModeReport {
-  const modelAvailable = options.model_artifacts_available === true;
   const modes = {} as Record<EvaluationMode, ModeMetrics>;
+  const fallbackOrder: Partial<Record<EvaluationMode, ModeMetrics>> = {};
   const bySlice = {} as Record<EvaluationMode, Record<string, LocalSliceMetrics>>;
   const documents = new Set<string>();
+  const mapping = options.logical_ids;
   for (const query of queries) {
-    for (const id of query.eligible) documents.add(id);
+    for (const id of query.eligible) documents.add(mapLogicalId(id, mapping));
     for (const observation of query.modes) {
-      for (const id of observation.ranked) documents.add(id);
-      for (const id of observation.graph_ranked ?? []) documents.add(id);
+      for (const id of observation.ranked) documents.add(mapLogicalId(id, mapping));
+      for (const id of observation.graph_ranked ?? []) documents.add(mapLogicalId(id, mapping));
     }
   }
   for (const mode of EVALUATION_MODES) {
@@ -419,45 +450,57 @@ export function buildCrossModeReport(
       bySlice[mode] = {};
       continue;
     }
-    const availableObservations = queries.flatMap((query) => {
+    const raw = queries.flatMap((query) => {
       const observation = query.modes.find((entry) => entry.mode === mode);
-      return observation === undefined || !observation.available
-        ? []
-        : [{ query, observation }];
+      return observation === undefined ? [] : [{ query, observation }];
     });
-    if (availableObservations.length === 0) {
+    const selected = raw.filter(({ observation }) => observation.available);
+    const modelBacked = selected.filter(
+      ({ observation }) => mode !== 'laya_reranked' || observation.model_backed === true
+    );
+    const fallback = raw.filter(({ observation }) => observation.fallback === true);
+    if (modelBacked.length === 0) {
       modes[mode] = unavailableMode();
       bySlice[mode] = {};
-      continue;
+    } else {
+      modes[mode] = modeMetricsFor(modelBacked, options.rss_bytes, mapping);
+      bySlice[mode] = summariseLocalRetrieval(
+        modelBacked.map(({ query, observation }) => observationToQuery(query, observation, mapping))
+      ).by_slice;
     }
-    const evaluations = availableObservations.map(({ query, observation }) =>
-      observationToQuery(query, observation)
-    );
-    const summary = summariseLocalRetrieval(evaluations);
-    const rssValues = availableObservations
-      .map(({ observation }) => observation.rss_bytes)
-      .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
-    modes[mode] = {
-      ...summary,
-      available: true,
-      model_backed: availableObservations.some(({ observation }) => observation.model_backed === true),
-      rss_bytes_peak: rssValues.length === 0 ? (options.rss_bytes ?? null) : Math.max(...rssValues)
-    };
-    bySlice[mode] = summary.by_slice;
+    if (fallback.length > 0) {
+      fallbackOrder[mode] = modeMetricsFor(fallback, options.rss_bytes, mapping);
+    }
   }
+  const notRun: EvaluationMode[] = [];
+  if (modes.laya_reranked.available !== true) {
+    notRun.push('laya_reranked');
+    const notes = [
+      'laya_reranked model-backed measurement is NOT RUN: no model-produced ranking was supplied; any fallback ordering is reported under fallback_order and is not a model result'
+    ];
+    return finalizeCrossModeReport(queries, options, modes, fallbackOrder, bySlice, documents, notRun, notes);
+  }
+  return finalizeCrossModeReport(queries, options, modes, fallbackOrder, bySlice, documents, notRun, []);
+}
+
+function finalizeCrossModeReport(
+  queries: readonly CrossModeQuery[],
+  _options: CrossModeOptions,
+  modes: Record<EvaluationMode, ModeMetrics>,
+  fallbackOrder: Partial<Record<EvaluationMode, ModeMetrics>>,
+  bySlice: Record<EvaluationMode, Record<string, LocalSliceMetrics>>,
+  documents: ReadonlySet<string>,
+  notRun: EvaluationMode[],
+  extraNotes: string[]
+): CrossModeReport {
   const notes = [
     `legacy baseline is the frozen aggregate recorded in ${LEGACY_BASELINE_SOURCE}; V2 candidate Recall@50, nDCG@10, MRR, RSS, and fallback rate were not measured on that pre-V2 run`
   ];
-  const notRun: EvaluationMode[] = [];
-  if (!modelAvailable) {
-    notRun.push('laya_reranked');
-    notes.push(
-      'laya_reranked model-backed measurement is NOT RUN: no prepared Laya model artifacts; the reported laya_reranked metrics are the lexical fallback ordering with fallback rate 1'
-    );
-  }
+  notes.push(...extraNotes);
   return {
     universe: { queries: queries.length, documents: documents.size },
     modes,
+    fallback_order: fallbackOrder,
     by_slice: bySlice,
     legacy_baseline: FROZEN_LEGACY_BASELINE,
     not_run: notRun,

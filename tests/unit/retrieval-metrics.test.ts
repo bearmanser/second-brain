@@ -198,7 +198,6 @@ function comparisonQueries(): CrossModeQuery[] {
 
 test('the cross-mode harness reports every mode on the frozen eligible universe', () => {
   const report = buildCrossModeReport(comparisonQueries(), {
-    model_artifacts_available: false,
     rss_bytes: 123456
   });
   expect(report.universe).toEqual({ queries: 2, documents: 3 });
@@ -216,8 +215,9 @@ test('the cross-mode harness reports every mode on the frozen eligible universe'
   expect(report.modes.local_text_graph.candidate_recall_at_50).toBeCloseTo(1);
   expect(report.modes.local_text_graph.graph_recall_at_50).toBeCloseTo(0);
   expect(report.modes.local_text_graph.graph_recall_bound).toBe(10);
-  expect(report.modes.laya_reranked.fallback_rate).toBeCloseTo(1);
-  expect(report.modes.laya_reranked.model_backed).toBe(false);
+  expect(report.modes.laya_reranked.available).toBe(false);
+  expect(report.fallback_order.laya_reranked?.fallback_rate).toBeCloseTo(1);
+  expect(report.fallback_order.laya_reranked?.model_backed).toBe(false);
   expect(report.modes.local_text.rss_bytes_peak).toBe(123456);
   expect(report.modes.local_text.latency_p50_ms).toBe(10);
   expect(report.modes.local_text.latency_p95_ms).toBe(20);
@@ -225,4 +225,46 @@ test('the cross-mode harness reports every mode on the frozen eligible universe'
   expect(report.by_slice.local_text.english?.queries).toBe(1);
   expect(report.by_slice.local_text['no-answer']?.measurable_recall).toBe(0);
   expect(RERANK_QUESTION_ID).toBe('note_relevance');
+});
+
+test('a lexical observation flagged available cannot be reported as a model-backed reranked mode', () => {
+  const queries: CrossModeQuery[] = [
+    {
+      query_id: 'q1',
+      slice: 'english',
+      labels: new Map<string, 0 | 1 | 2>([['doc-a', 2]]),
+      eligible: ['doc-a'],
+      direct_answer: 'doc-a',
+      modes: [
+        { mode: 'local_text', ranked: ['doc-a'], available: true },
+        { mode: 'laya_reranked', ranked: ['doc-a'], available: true, model_backed: false }
+      ]
+    }
+  ];
+  const report = buildCrossModeReport(queries);
+  expect(report.modes.laya_reranked.available).toBe(false);
+  expect(report.modes.laya_reranked.candidate_recall_at_50).toBeNull();
+  expect(report.not_run).toContain('laya_reranked');
+});
+
+test('the harness maps legacy revision paths to logical ids before scoring', () => {
+  const queries: CrossModeQuery[] = [
+    {
+      query_id: 'q1',
+      slice: 'legacy',
+      labels: new Map<string, 0 | 1 | 2>([['logical-1', 2]]),
+      eligible: ['History/One.md'],
+      direct_answer: 'History/One.md',
+      modes: [
+        { mode: 'local_text', ranked: ['History/One.md', 'logical-1'], available: true },
+        { mode: 'local_text_graph', ranked: ['History/One.md'], graph_ranked: ['logical-1'], available: true }
+      ]
+    }
+  ];
+  const report = buildCrossModeReport(queries, {
+    logical_ids: new Map([['History/One.md', 'logical-1']])
+  });
+  expect(report.universe.documents).toBe(1);
+  expect(report.modes.local_text.candidate_recall_at_50).toBeCloseTo(1);
+  expect(report.modes.local_text_graph.graph_recall_at_50).toBeCloseTo(1);
 });
