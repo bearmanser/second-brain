@@ -254,3 +254,31 @@ Verification under Node 24 / npm 10:
   `--maxWorkers=4`) before Vitest emitted any file result. This broad command
   includes E2E tests beyond the required verification gates; its result is
   not claimed green.
+
+# Fix round 3: complete blocker path enumeration
+
+The round-2 report's claim that every blocker printed its path was too broad:
+unusable/missing project mappings, unsafe target allocation, and the no-matching
+head fallback constructed blockers without source paths. All blocker constructors
+now carry actual affected source file paths. A project-wide allocation failure
+lists all candidate source files for that scope; per-note mapping and target
+failures list every source revision of that note. The blocker constructor's type
+requires `path` or `paths`, and manifest validation refuses blockers lacking a
+nonempty reason or affected path in the source fingerprint, including rehashed
+manifests supplied by callers. Malformed path-field types are also rejected,
+even when another field supplies a valid path. Default refusal and
+partial-success CLI reporting now receive complete path-and-reason data
+without changing their rendering.
+
+Both existing reporting tests now require at least one path per blocker and
+assert every path and reason appears in the refusal or CLI output. They use a
+disposable vault with an unusable project display name, a remaining migratable
+note, and the existing fork. Further checks cover absent project mapping and
+a rehashed incomplete blocker. The strengthened reporting tests failed on the
+old implementation and passed after the plan fix.
+
+Verification under Node 24/npm 10:
+
+- `./node_modules/.bin/vitest run tests/unit/vault-v2-plan.test.ts tests/integration/vault-v2-migration.test.ts`: 34/34 passed.
+- `npm run verify`: typecheck, 544/544 unit/contract tests, and build passed.
+- `npm run test:integration`: 462/462 passed.

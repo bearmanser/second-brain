@@ -5,7 +5,7 @@ import { expect, test } from 'vitest';
 import fixtureJson from '../fixtures/vault-v2/manifest-cases.json' with { type: 'json' };
 import { inventoryTree } from '../../src/operations/vault-v2/inventory.js';
 import { applyVaultMigration, resumeVaultMigration } from '../../src/operations/vault-v2/apply.js';
-import { planVaultMigration, buildMigrationBackupReceipt } from '../../src/operations/vault-v2/plan.js';
+import { planVaultMigration, buildMigrationBackupReceipt, manifestDigest } from '../../src/operations/vault-v2/plan.js';
 import { rollbackVaultMigration } from '../../src/operations/vault-v2/rollback.js';
 import { verifyVaultMigration } from '../../src/operations/vault-v2/verify.js';
 import { parseDocument } from '../../src/notes/document-codec.js';
@@ -26,6 +26,8 @@ const UUID_SEGMENT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 const PREFERENCE_ID = '7d4e5f60-8192-4da3-8e1f-2a3b4c5d6e7f';
 const PREFERENCE_PATH =
   'Projects/freellmapi/Preferences/7d4e5f60-8192-4da3-8e1f-2a3b4c5d6e7f/Prefer local notes r8e5f6071-92a3-4eb4-9f2a-3b4c5d6e7f80.md';
+const NOTE_PATH =
+  'Projects/freellmapi/Notes/9f607182-a3b4-4fc5-803b-4c5d6e7f8091/Læring fra feilsøking ra0718293-b4c5-40d6-914c-5d6e7f8091a2.md';
 
 async function materialize(vault: string): Promise<void> {
   for (const entry of fixture.files) {
@@ -63,6 +65,21 @@ async function sandboxPlan() {
     vault: s.vault,
     state: s.state,
     projectNames: PROJECT_NAMES,
+    clock: FIXED_CLOCK
+  });
+  const backup = await makeBackup(s.vault, s.state, plan);
+  return { s, plan, backup };
+}
+
+async function sandboxPlanWithUnmappableProject() {
+  const s = await vaultSandbox();
+  await materialize(s.vault);
+  const original = await readFile(join(s.vault, PREFERENCE_PATH), 'utf8');
+  await writeFile(join(s.vault, PREFERENCE_PATH), original.replace('brain_scope: freellmapi', 'brain_scope: personal'));
+  const plan = await planVaultMigration({
+    vault: s.vault,
+    state: s.state,
+    projectNames: { freellmapi: '///', personal: 'Personal' },
     clock: FIXED_CLOCK
   });
   const backup = await makeBackup(s.vault, s.state, plan);
@@ -213,10 +230,14 @@ test('apply refuses changed inputs', async () => {
 });
 
 test('apply refuses blockers by default and enumerates them for opt-in partial migration', async () => {
-  const { s, plan, backup } = await sandboxPlan();
+  const { s, plan, backup } = await sandboxPlanWithUnmappableProject();
   try {
     const fork = plan.blockers.find((entry) => entry.kind === 'fork');
     expect(fork?.id).toBe('0b8f1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d');
+    const projectBlockers = plan.blockers.filter((entry) => entry.kind === 'unmappable_project');
+    expect(projectBlockers).toHaveLength(2);
+    for (const entry of projectBlockers) expect(entry.paths).toContain(NOTE_PATH);
+    expect(plan.moves.map((entry) => entry.head_source_path)).toEqual([PREFERENCE_PATH]);
 
     let refusal = '';
     try {
@@ -228,7 +249,9 @@ test('apply refuses blockers by default and enumerates them for opt-in partial m
     expect(refusal).not.toBe('');
     for (const entry of plan.blockers) {
       expect(refusal).toContain(entry.reason);
-      for (const path of entry.paths ?? (entry.path ? [entry.path] : [])) expect(refusal).toContain(path);
+      const paths = entry.paths ?? (entry.path ? [entry.path] : []);
+      expect(paths.length).toBeGreaterThan(0);
+      for (const path of paths) expect(refusal).toContain(path);
     }
 
     const result = await applyVaultMigration(plan, options(backup));
@@ -248,7 +271,7 @@ test('apply refuses blockers by default and enumerates them for opt-in partial m
 });
 
 test('CLI partial apply prints every blocked path and reason', async () => {
-  const { s, plan, backup } = await sandboxPlan();
+  const { s, plan, backup } = await sandboxPlanWithUnmappableProject();
   const manifest = join(dirname(s.vault), 'manifest.json');
   const receipt = join(dirname(s.vault), 'receipt.json');
   const chunks: string[] = [];
@@ -261,12 +284,35 @@ test('CLI partial apply prints every blocked path and reason', async () => {
     process.stdout.write = ((chunk: string) => { chunks.push(String(chunk)); return true; }) as typeof process.stdout.write;
     expect(await runCli(['vault-v2', 'apply', '--manifest', manifest, '--backup-receipt', receipt, '--backup-root', backup.root, '--maintenance', '--partial'], { BRAIN_CONFIG: config })).toBe(0);
     const output = chunks.join('');
+    expect(plan.blockers.filter((entry) => entry.kind === 'unmappable_project')).toHaveLength(2);
     for (const entry of plan.blockers) {
       expect(output).toContain(entry.reason);
-      for (const path of entry.paths ?? (entry.path ? [entry.path] : [])) expect(output).toContain(path);
+      const paths = entry.paths ?? (entry.path ? [entry.path] : []);
+      expect(paths.length).toBeGreaterThan(0);
+      for (const path of paths) expect(output).toContain(path);
     }
   } finally {
     process.stdout.write = original;
+    await s.dispose();
+  }
+});
+
+test('apply rejects a rehashed manifest whose blocker lacks a source path or reason', async () => {
+  const { s, plan, backup } = await sandboxPlan();
+  try {
+    for (const missing of ['paths', 'reason'] as const) {
+      const incomplete = structuredClone(plan);
+      if (missing === 'paths') delete incomplete.blockers[0].paths;
+      else incomplete.blockers[0].reason = '';
+      incomplete.manifest_sha256 = manifestDigest(incomplete);
+      await expect(applyVaultMigration(incomplete, options(backup))).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+    }
+    const malformed = structuredClone(plan);
+    malformed.blockers[0].path = malformed.blockers[0].paths?.[0];
+    malformed.blockers[0].paths = 'not-a-list' as unknown as string[];
+    malformed.manifest_sha256 = manifestDigest(malformed);
+    await expect(applyVaultMigration(malformed, options(backup))).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+  } finally {
     await s.dispose();
   }
 });
@@ -283,6 +329,8 @@ test('apply refuses a manifest that has only blocked notes', async () => {
     });
     expect(plan.moves).toHaveLength(0);
     expect(plan.blockers.length).toBeGreaterThan(0);
+    expect(plan.blockers.find((entry) => entry.kind === 'unmappable_project' && entry.id === PREFERENCE_ID)?.paths).toContain(PREFERENCE_PATH);
+    expect(plan.blockers.some((entry) => entry.kind === 'unmappable_project' && entry.paths?.includes(NOTE_PATH))).toBe(true);
     await expect(
       applyVaultMigration(plan, {
         maintenance: true,

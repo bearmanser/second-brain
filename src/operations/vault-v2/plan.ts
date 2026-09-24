@@ -685,7 +685,11 @@ interface ParsedManagedFile {
   revision: StoredRevision;
 }
 
-function blocker(kind: MigrationBlockerKind, reason: string, extra: Partial<MigrationBlocker> = {}): MigrationBlocker {
+function blocker(
+  kind: MigrationBlockerKind,
+  reason: string,
+  extra: Partial<MigrationBlocker> & ({ path: string } | { paths: string[] })
+): MigrationBlocker {
   return { kind, reason, ...extra };
 }
 
@@ -1084,7 +1088,10 @@ export async function planVaultMigration(input: PlanVaultMigrationInput): Promis
       (item) => item.revision.revision_id === resolution.head.revision.revision_id
     );
     if (head === undefined) {
-      blockers.push(blocker('fork', `note ${id} has no matching head file`, { id }));
+      blockers.push(blocker('fork', `note ${id} has no matching head file`, {
+        id,
+        paths: group.map((item) => item.path).sort()
+      }));
       for (const item of group) blockedPaths.add(item.path);
       continue;
     }
@@ -1103,7 +1110,13 @@ export async function planVaultMigration(input: PlanVaultMigrationInput): Promis
       projectRoots.set(scope, root);
       occupiedRoots.push(root);
     } catch {
-      blockers.push(blocker('unmappable_project', `project display name for ${scope} is unusable`, { scope }));
+      blockers.push(blocker('unmappable_project', `project display name for ${scope} is unusable`, {
+        scope,
+        paths: candidates
+          .filter((candidate) => candidate.head.revision.scope === scope)
+          .flatMap((candidate) => candidate.group.map((item) => item.path))
+          .sort()
+      }));
     }
   }
 
@@ -1114,7 +1127,8 @@ export async function planVaultMigration(input: PlanVaultMigrationInput): Promis
       blockers.push(
         blocker('unmappable_project', `no project display name is configured for scope ${scope}`, {
           id: candidate.id,
-          scope
+          scope,
+          paths: candidate.group.map((item) => item.path).sort()
         })
       );
       for (const item of candidate.group) blockedPaths.add(item.path);
@@ -1140,7 +1154,8 @@ export async function planVaultMigration(input: PlanVaultMigrationInput): Promis
       blockers.push(
         blocker('unsafe_target', `a readable path could not be allocated for ${candidate.id}`, {
           id: candidate.id,
-          scope: head.scope
+          scope: head.scope,
+          paths: candidate.group.map((item) => item.path).sort()
         })
       );
       continue;
@@ -1294,6 +1309,25 @@ export function assertManifest(value: unknown): MigrationManifest {
   const expected = manifestDigest(manifest);
   if (typeof manifest.manifest_sha256 !== 'string' || manifest.manifest_sha256 !== expected) {
     throw conflict('the migration manifest failed its integrity check');
+  }
+  const sourcePaths = new Set(manifest.source_fingerprint.vault.map((file) => file.path));
+  for (const entry of manifest.blockers) {
+    if (entry === null || typeof entry !== 'object' || typeof entry.reason !== 'string' || entry.reason.trim().length === 0) {
+      throw invalidInput('a migration blocker must have a reason');
+    }
+    if (
+      (entry.path !== undefined && typeof entry.path !== 'string') ||
+      (entry.paths !== undefined && !Array.isArray(entry.paths))
+    ) {
+      throw invalidInput('a migration blocker has malformed source paths');
+    }
+    const paths = [
+      ...(Array.isArray(entry.paths) ? entry.paths : []),
+      ...(entry.path === undefined ? [] : [entry.path])
+    ];
+    if (paths.length === 0 || paths.some((path) => typeof path !== 'string' || !sourcePaths.has(path))) {
+      throw invalidInput('a migration blocker must name its affected source paths');
+    }
   }
   for (const move of manifest.moves) {
     if (typeof move.current_sha256 !== 'string' || !SHA256_PATTERN.test(move.current_sha256)) {
