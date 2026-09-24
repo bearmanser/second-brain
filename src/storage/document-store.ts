@@ -296,7 +296,9 @@ export interface RenameFaults {
   beforeEditReplace?(path: string): void | Promise<void>;
   afterEditInodeCheck?(path: string): void | Promise<void>;
   afterEditInstall?(path: string): void | Promise<void>;
+  afterEditVerified?(path: string): void | Promise<void>;
   beforeSourceRevisionPersist?(): void | Promise<void>;
+  afterSourceRevisionPersist?(): void | Promise<void>;
   afterEdit?(path: string): void | Promise<void>;
   afterRecords?(): void | Promise<void>;
 }
@@ -992,7 +994,19 @@ class LocalDocumentStore implements DocumentStore {
       await this.runRenameFault('afterValidate', 'the move could not be validated');
 
       let current = startPath;
+      const reachedStep = steps.findIndex((step) => step.to_path === startPath);
       for (const step of steps) {
+        if (step.ordinal <= reachedStep) {
+          if (step.state !== 'complete') {
+            this.journal.updateMoveStep(
+              record.operation_id,
+              step.ordinal,
+              'complete',
+              this.clock.now().toISOString()
+            );
+          }
+          continue;
+        }
         const fromSeg = renameSegments(step.from_path);
         const toSeg = renameSegments(step.to_path);
         const atFrom = await this.readMoveBytes(step.from_path);
@@ -1114,7 +1128,7 @@ class LocalDocumentStore implements DocumentStore {
         updated_at: this.clock.now().toISOString()
       });
 
-      const indexed = await this.updateMoveRecords(manifest, editRows);
+      const indexed = await this.updateMoveRecords(record.operation_id, manifest, editRows);
       this.journal.updateMove(record.operation_id, {
         state: 'records_updated',
         updated_at: this.clock.now().toISOString()
@@ -1167,6 +1181,7 @@ class LocalDocumentStore implements DocumentStore {
   }
 
   private async updateMoveRecords(
+    operationId: string,
     manifest: MoveManifest,
     editRows: readonly LocalMoveFileRecord[]
   ): Promise<string[]> {
@@ -1181,8 +1196,9 @@ class LocalDocumentStore implements DocumentStore {
       let revisionId = prior.revision_id;
       if (finalSource.hash !== prior.raw_hash) {
         await this.runRenameFault('beforeSourceRevisionPersist', 'the moved revision could not be persisted');
-        revisionId = this.ids.next();
+        revisionId = operationId;
         await this.revisions.persistRevision(prior.id, revisionId, finalSource.raw);
+        await this.runRenameFault('afterSourceRevisionPersist', 'the moved revision could not be recorded');
       }
       this.journal.moveDocument({
         path: manifest.to,
@@ -1514,6 +1530,7 @@ class LocalDocumentStore implements DocumentStore {
     let stagedDirectory: string | undefined;
     let staged: string | undefined;
     let preserveStaged = false;
+    let pinnedHandle: FileHandle | undefined;
     try {
       await this.runRenameFault(
         'beforeEditReplace',
@@ -1530,6 +1547,7 @@ class LocalDocumentStore implements DocumentStore {
         }
         throw wrapIo('the reference rewrite could not be pinned', error);
       }
+      pinnedHandle = await open(backup, constants.O_RDONLY | constants.O_NOFOLLOW);
       const backupLeaf = backup.slice(backup.lastIndexOf('/') + 1);
       const backupSegments = [...segments.slice(0, -1), backupLeaf];
       const pinned = await readNoteFile(this.vaultRoot, backupSegments, { requireUtf8: false });
@@ -1581,15 +1599,50 @@ class LocalDocumentStore implements DocumentStore {
         this.markMoveConflict(operation_id);
         throw conflict(`file ${actualPath} diverged during the rewrite`);
       }
+      await this.runRenameFault('afterEditVerified', 'the reference rewrite could not be cleaned up', actualPath);
     } finally {
       await rm(tempPath, { force: true }).catch(() => undefined);
-      if (staged !== undefined && !preserveStaged) {
-        await rm(staged, { force: true }).catch(() => undefined);
-        if (stagedDirectory !== undefined) await rmdir(stagedDirectory).catch(() => undefined);
+      try {
+        if (backup !== undefined) {
+          if (pinnedHandle === undefined ||
+            !await this.matchesPinnedMovePreimage(pinnedHandle, backup, edit.expected_hash) ||
+            (staged !== undefined && !await this.matchesPinnedMovePreimage(pinnedHandle, staged, edit.expected_hash))) {
+            this.markMoveConflict(operation_id);
+            throw conflict(`file ${actualPath} changed on its staged inode during the rewrite`);
+          }
+          if (staged !== undefined && !preserveStaged) {
+            await rm(staged);
+            if (stagedDirectory !== undefined) await rmdir(stagedDirectory);
+          }
+          if (!await this.matchesPinnedMovePreimage(pinnedHandle, backup, edit.expected_hash)) {
+            this.markMoveConflict(operation_id);
+            throw conflict(`file ${actualPath} changed on its pinned inode during cleanup`);
+          }
+          await rm(backup);
+        }
+      } finally {
+        await pinnedHandle?.close();
       }
-      if (backup !== undefined) {
-        await rm(backup, { force: true }).catch(() => undefined);
-      }
+    }
+  }
+
+  private async matchesPinnedMovePreimage(
+    handle: FileHandle,
+    path: string,
+    expectedHash: string
+  ): Promise<boolean> {
+    try {
+      const [pinned, linked] = await Promise.all([handle.stat(), lstat(path)]);
+      if (!pinned.isFile() || !linked.isFile() ||
+        pinned.dev !== linked.dev || pinned.ino !== linked.ino) return false;
+      const bytes = await readBoundedBytes(handle, MOVE_MAX_BYTES);
+      if (bytes.kind === 'overflow' || sha256(bytes.buffer) !== expectedHash) return false;
+      const after = await handle.stat();
+      return after.size === bytes.buffer.length &&
+        after.dev === pinned.dev && after.ino === pinned.ino;
+    } catch (error) {
+      if (hasErrno(error, 'ENOENT')) return false;
+      throw error;
     }
   }
 

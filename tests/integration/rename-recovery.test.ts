@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { expect, test } from 'vitest';
@@ -409,6 +409,41 @@ test('a case-only rename interrupted after its temporary step recovers', async (
   }
 });
 
+test('a case-only move interrupted after rewriting its source resumes from the final path', async () => {
+  const s = await vaultSandbox();
+  let fired = false;
+  const first = await openDocumentStore({ ...s, faults: { rename: {
+    afterEdit: (path) => {
+      if (path !== 'Knowledge/Sub/Laya.md' || fired) return;
+      fired = true;
+      throw new Error('stop after rewriting moved source');
+    }
+  } } });
+  let id = '';
+  let previousRevision = '';
+  try {
+    const created = await first.put({ path: 'Knowledge/Sub/Laya.md', raw: '# Laya\n\n[[Knowledge/Sub/Laya]]\n', expectedEtag: null, idempotencyKey: 'case-edit-create', source: 'test' });
+    id = created.id;
+    previousRevision = created.revision_id;
+    const plan = await planMove(s.vault, 'Knowledge/Sub/Laya.md', 'Knowledge/Sub/laya.md', 'case-edit-resume');
+    expect(plan.moves).toHaveLength(2);
+    expect(plan.edits.some(edit => edit.path === plan.from)).toBe(true);
+    await expect(first.applyRename(plan)).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(fired).toBe(true);
+    expect(await readFile(join(s.vault, 'Knowledge/Sub/laya.md'), 'utf8')).toContain('[[Knowledge/Sub/laya]]');
+    await expect(readFile(join(s.vault, plan.moves[0].to))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(readFile(join(s.vault, plan.from))).rejects.toMatchObject({ code: 'ENOENT' });
+  } finally { await first.close(); }
+  const second = await openDocumentStore(s);
+  try {
+    const moved = await second.readPath('Knowledge/Sub/laya.md');
+    expect(moved.id).toBe(id);
+    expect(moved.revision_id).not.toBe(previousRevision);
+    expect((await second.readRevision(id, moved.revision_id!)).raw).toBe(moved.raw);
+    await expect(second.readPath('Knowledge/Sub/Laya.md')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  } finally { await second.close(); await s.dispose(); }
+});
+
 test('a divergent backlink prevents a verified receipt', async () => {
   const s = await vaultSandbox();
   let mutated = false;
@@ -645,6 +680,47 @@ test('a backlink replaced after installation is never rolled back over human byt
   } finally { await store.close(); await s.dispose(); }
 });
 
+test('an open writer changing the staged backlink after installation retains its inode and conflicts', async () => {
+  const s = await vaultSandbox();
+  const before = '[[Knowledge/Laya]]\n';
+  const human = 'human wrote to the old inode\n';
+  let writer: Awaited<ReturnType<typeof open>> | undefined;
+  let fired = false;
+  const store = await openDocumentStore({ ...s, faults: { rename: {
+    afterEditVerified: async (path) => {
+      if (path !== 'Home.md' || fired) return;
+      fired = true;
+      await writer!.truncate(0);
+      await writer!.writeFile(human);
+    }
+  } } });
+  try {
+    await mkdir(join(s.vault, 'Knowledge'));
+    await writeFile(join(s.vault, 'Knowledge/Laya.md'), '# Laya\n');
+    await writeFile(join(s.vault, 'Home.md'), before);
+    writer = await open(join(s.vault, 'Home.md'), 'r+');
+    const inode = (await writer.stat()).ino;
+    const plan = await planMove(s.vault, 'Knowledge/Laya.md', 'Personal/Laya.md', 'open-backlink-writer');
+    await expect(store.applyRename(plan)).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(fired).toBe(true);
+    expect(await readFile(join(s.vault, 'Home.md'), 'utf8')).toBe('[[Personal/Laya]]\n');
+    const entries = await readdir(s.vault, { recursive: true });
+    const retained = entries.filter(entry => entry.includes('.move-stage-') || entry.includes('.move-backup-'));
+    expect(retained.length).toBeGreaterThan(0);
+    const oldInode = await writer.stat();
+    expect(oldInode.ino).toBe(inode);
+    expect(oldInode.nlink).toBeGreaterThan(0);
+    const saved = await Promise.all(retained.map(async path => {
+      try { return await readFile(join(s.vault, path), 'utf8'); } catch { return ''; }
+    }));
+    expect(saved).toContain(human);
+  } finally {
+    await writer?.close();
+    await store.close();
+    await s.dispose();
+  }
+});
+
 test('a source edit interrupted after rewriting recovers and retains the revised history', async () => {
   const s = await vaultSandbox();
   let fired = false;
@@ -679,24 +755,40 @@ test('a source edit interrupted after rewriting recovers and retains the revised
   } finally { await second.close(); await s.dispose(); }
 });
 
-test('an interrupted revision persist keeps the old source record for recovery', async () => {
+test('an interruption after source revision persistence keeps the old record and recovers the new revision', async () => {
   const s = await vaultSandbox();
   let fired = false;
+  let boundaryVerified = false;
+  let persistedRevision = '';
   const first = await openDocumentStore({ ...s, faults: { rename: {
-    beforeSourceRevisionPersist: () => {
+    afterSourceRevisionPersist: async () => {
       if (fired) return;
       fired = true;
-      throw new Error('stop before revision persist');
+      const revisions = (await readdir(join(s.state, 'history', id, 'revisions'))).filter(name => name.endsWith('.md'));
+      expect(revisions).toHaveLength(2);
+      persistedRevision = revisions.find(name => name !== `${oldRevision}.md`)?.replace(/\.md$/, '') ?? '';
+      expect(persistedRevision).not.toBe('');
+      const db = new Database(join(s.state, 'documents.sqlite'), { readonly: true });
+      try {
+        expect((db.prepare('SELECT id FROM local_documents WHERE path = ?').get('Knowledge/Sub/Laya.md') as { id: string } | undefined)?.id).toBe(id);
+        expect(db.prepare('SELECT id FROM local_documents WHERE path = ?').get('Archive/Laya.md')).toBeUndefined();
+      } finally { db.close(); }
+      boundaryVerified = true;
+      throw new Error('stop after revision persist');
     }
   } } });
   let id = '';
+  let oldRevision = '';
   try {
     const created = await first.put({ path: 'Knowledge/Sub/Laya.md', raw: '# Laya\n\n[Other](../Other.md)\n', expectedEtag: null, idempotencyKey: 'record-create', source: 'test' });
     id = created.id;
+    oldRevision = created.revision_id;
+    await first.readRevision(id, oldRevision);
     await writeFile(join(s.vault, 'Knowledge/Other.md'), '# Other\n');
     const plan = await planMove(s.vault, 'Knowledge/Sub/Laya.md', 'Archive/Laya.md', 'record-interrupted');
     await expect(first.applyRename(plan)).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
     expect(fired).toBe(true);
+    expect(boundaryVerified).toBe(true);
     const db = new Database(join(s.state, 'documents.sqlite'), { readonly: true });
     try {
       const row = db.prepare('SELECT id FROM local_documents WHERE path = ?').get('Knowledge/Sub/Laya.md') as { id: string } | undefined;
@@ -708,7 +800,10 @@ test('an interrupted revision persist keeps the old source record for recovery',
     const moved = await second.readPath('Archive/Laya.md');
     expect(moved.id).toBe(id);
     expect(moved.revision_id).toBeDefined();
+    expect(moved.revision_id).not.toBe(oldRevision);
+    expect(moved.revision_id).toBe(persistedRevision);
     expect((await second.readRevision(id, moved.revision_id!)).raw).toBe(moved.raw);
+    await second.readRevision(id, oldRevision);
   } finally { await second.close(); await s.dispose(); }
 });
 
