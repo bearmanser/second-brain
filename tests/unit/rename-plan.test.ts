@@ -191,6 +191,19 @@ test('a base formula that embeds a resolvable link is reported, not rewritten', 
   expect(plan.unresolved.some(entry => entry.path === 'Views/Laya.base')).toBe(true);
 });
 
+test('a base formula with a stem wikilink reports its resolved reference for manual attention', () => {
+  const raw = 'formulas:\n  linked: \'file.hasLink("[[Laya]]")\'\n';
+  const plan = planRename({
+    from: 'Knowledge/Laya.md',
+    to: 'Knowledge/Laya classifier.md',
+    files: [snapshot('Views/Links.base', raw), snapshot('Knowledge/Laya.md', '# Laya\n')]
+  });
+  expect(plan.edits.find(edit => edit.path === 'Views/Links.base')).toBeUndefined();
+  expect(plan.unresolved).toContainEqual({
+    path: 'Views/Links.base', target: 'Laya', reason: 'unsupported'
+  });
+});
+
 test('a base with no supported reference is left byte-for-byte untouched', () => {
   const baseRaw = [
     'filters:',

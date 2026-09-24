@@ -2521,7 +2521,7 @@ export interface LocalMoveFileRecord {
   expected_hash: string;
   new_hash: string | null;
   new_raw: string | null;
-  preimage_raw: string;
+  preimage_raw: string | Buffer;
   state: 'pending' | 'applied';
   updated_at: string;
 }
@@ -2593,7 +2593,7 @@ interface LocalMoveFileRow {
   expected_hash: string;
   new_hash: string | null;
   new_raw: string | null;
-  preimage_raw: string;
+  preimage_raw: string | Buffer;
   state: string;
   updated_at: string;
 }
@@ -2977,6 +2977,15 @@ export class LocalWriteJournal {
   deleteDocument(path: string): void {
     this.assertOpen();
     this.database.prepare('DELETE FROM local_documents WHERE path = ?').run(path);
+  }
+
+  moveDocument(input: LocalDocumentRecord, from: string): void {
+    this.assertOpen();
+    const apply = this.database.transaction((): void => {
+      this.database.prepare('DELETE FROM local_documents WHERE path = ?').run(from);
+      this.recordDocument(input);
+    });
+    apply.immediate();
   }
 
   enqueueIndex(input: LocalIndexRecord): void {

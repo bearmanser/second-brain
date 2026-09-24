@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { expect, test } from 'vitest';
@@ -500,6 +500,13 @@ test('a binary attachment move preserves bytes and rewrites embeds', async () =>
       idempotency_key: 'move-binary'
     });
     await store.applyRename(plan);
+    const database = new Database(join(s.state, 'documents.sqlite'), { readonly: true });
+    try {
+      const row = database.prepare("SELECT preimage_raw FROM local_move_files WHERE role = 'source' AND path = ?").get('Attachments/diagram.png') as { preimage_raw: string | Buffer };
+      expect(Buffer.from(row.preimage_raw)).toEqual(bytes);
+    } finally {
+      database.close();
+    }
     expect(await readFile(join(s.vault, 'Attachments/diagram final.png'))).toEqual(bytes);
     await expect(readFile(join(s.vault, 'Attachments/diagram.png'))).rejects.toMatchObject({
       code: 'ENOENT'
@@ -590,4 +597,178 @@ test('planning includes obsidian bookmarks read-only', async () => {
     await store.close();
     await s.dispose();
   }
+});
+
+test('a backlink replaced after its inode check is not overwritten', async () => {
+  const s = await vaultSandbox();
+  const human = 'human replacement [[Knowledge/Laya]]\n';
+  let fired = false;
+  const store = await openDocumentStore({ ...s, faults: { rename: {
+    afterEditInodeCheck: async (path) => {
+      if (path !== 'Home.md' || fired) return;
+      fired = true;
+      await writeFile(join(s.vault, 'Human.md'), human);
+      await rename(join(s.vault, 'Human.md'), join(s.vault, 'Home.md'));
+    }
+  } } });
+  try {
+    await mkdir(join(s.vault, 'Knowledge'));
+    await writeFile(join(s.vault, 'Knowledge/Laya.md'), '# Laya\n');
+    await writeFile(join(s.vault, 'Home.md'), '[[Knowledge/Laya]]\n');
+    const plan = await planMove(s.vault, 'Knowledge/Laya.md', 'Personal/Laya.md', 'race-backlink');
+    await expect(store.applyRename(plan)).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(fired).toBe(true);
+    expect(await readFile(join(s.vault, 'Home.md'), 'utf8')).toBe(human);
+  } finally { await store.close(); await s.dispose(); }
+});
+
+test('a backlink replaced after installation is never rolled back over human bytes', async () => {
+  const s = await vaultSandbox();
+  const human = 'human after installation\n';
+  let fired = false;
+  const store = await openDocumentStore({ ...s, faults: { rename: {
+    afterEditInstall: async (path) => {
+      if (path !== 'Home.md' || fired) return;
+      fired = true;
+      await writeFile(join(s.vault, 'Human.md'), human);
+      await rename(join(s.vault, 'Human.md'), join(s.vault, 'Home.md'));
+    }
+  } } });
+  try {
+    await mkdir(join(s.vault, 'Knowledge'));
+    await writeFile(join(s.vault, 'Knowledge/Laya.md'), '# Laya\n');
+    await writeFile(join(s.vault, 'Home.md'), '[[Knowledge/Laya]]\n');
+    const plan = await planMove(s.vault, 'Knowledge/Laya.md', 'Personal/Laya.md', 'post-backlink');
+    await expect(store.applyRename(plan)).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(fired).toBe(true);
+    expect(await readFile(join(s.vault, 'Home.md'), 'utf8')).toBe(human);
+  } finally { await store.close(); await s.dispose(); }
+});
+
+test('a source edit interrupted after rewriting recovers and retains the revised history', async () => {
+  const s = await vaultSandbox();
+  let fired = false;
+  const first = await openDocumentStore({ ...s, faults: { rename: {
+    afterEdit: (path) => {
+      if (path === 'Knowledge/Sub/Laya.md' && !fired) {
+        fired = true;
+        throw new Error('stop after source edit');
+      }
+    }
+  } } });
+  let id = '';
+  let originalRevision = '';
+  try {
+    const created = await first.put({ path: 'Knowledge/Sub/Laya.md', raw: '# Laya\n\n[Other](../Other.md)\n', expectedEtag: null, idempotencyKey: 'source-edit-create', source: 'test' });
+    id = created.id;
+    originalRevision = created.revision_id;
+    await writeFile(join(s.vault, 'Knowledge/Other.md'), '# Other\n');
+    const plan = await planMove(s.vault, 'Knowledge/Sub/Laya.md', 'Archive/Laya.md', 'source-edit-interrupted');
+    await expect(first.applyRename(plan)).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(fired).toBe(true);
+    expect(await readFile(join(s.vault, 'Archive/Laya.md'), 'utf8')).toContain('[Other](../Knowledge/Other.md)');
+  } finally { await first.close(); }
+  const second = await openDocumentStore(s);
+  try {
+    const moved = await second.readPath('Archive/Laya.md');
+    expect(moved.id).toBe(id);
+    expect(moved.revision_id).toBeDefined();
+    expect(moved.revision_id).not.toBe(originalRevision);
+    expect((await second.readRevision(id, moved.revision_id!)).raw).toBe(moved.raw);
+    await expect(second.readPath('Knowledge/Sub/Laya.md')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  } finally { await second.close(); await s.dispose(); }
+});
+
+test('an interrupted revision persist keeps the old source record for recovery', async () => {
+  const s = await vaultSandbox();
+  let fired = false;
+  const first = await openDocumentStore({ ...s, faults: { rename: {
+    beforeSourceRevisionPersist: () => {
+      if (fired) return;
+      fired = true;
+      throw new Error('stop before revision persist');
+    }
+  } } });
+  let id = '';
+  try {
+    const created = await first.put({ path: 'Knowledge/Sub/Laya.md', raw: '# Laya\n\n[Other](../Other.md)\n', expectedEtag: null, idempotencyKey: 'record-create', source: 'test' });
+    id = created.id;
+    await writeFile(join(s.vault, 'Knowledge/Other.md'), '# Other\n');
+    const plan = await planMove(s.vault, 'Knowledge/Sub/Laya.md', 'Archive/Laya.md', 'record-interrupted');
+    await expect(first.applyRename(plan)).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(fired).toBe(true);
+    const db = new Database(join(s.state, 'documents.sqlite'), { readonly: true });
+    try {
+      const row = db.prepare('SELECT id FROM local_documents WHERE path = ?').get('Knowledge/Sub/Laya.md') as { id: string } | undefined;
+      expect(row?.id).toBe(id);
+    } finally { db.close(); }
+  } finally { await first.close(); }
+  const second = await openDocumentStore(s);
+  try {
+    const moved = await second.readPath('Archive/Laya.md');
+    expect(moved.id).toBe(id);
+    expect(moved.revision_id).toBeDefined();
+    expect((await second.readRevision(id, moved.revision_id!)).raw).toBe(moved.raw);
+  } finally { await second.close(); await s.dispose(); }
+});
+
+test('a source edited after link creation stops recovery without a verified receipt', async () => {
+  const s = await vaultSandbox();
+  const changed = '# Human changed source\n';
+  let fired = false;
+  const first = await openDocumentStore({ ...s, faults: { rename: {
+    afterMoveLink: async () => {
+      if (fired) return;
+      fired = true;
+      await writeFile(join(s.vault, 'Human.md'), changed);
+      await rename(join(s.vault, 'Human.md'), join(s.vault, 'Knowledge/Laya.md'));
+      throw new Error('stop with divergent old path');
+    }
+  } } });
+  try {
+    await mkdir(join(s.vault, 'Knowledge'));
+    await writeFile(join(s.vault, 'Knowledge/Laya.md'), '# Laya\n');
+    const plan = await planMove(s.vault, 'Knowledge/Laya.md', 'Personal/Laya.md', 'source-duplicate');
+    await expect(first.applyRename(plan)).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(fired).toBe(true);
+  } finally { await first.close(); }
+  const second = await openDocumentStore(s);
+  try {
+    expect(await readFile(join(s.vault, 'Knowledge/Laya.md'), 'utf8')).toBe(changed);
+    expect(await readFile(join(s.vault, 'Personal/Laya.md'), 'utf8')).toBe('# Laya\n');
+    const db = new Database(join(s.state, 'documents.sqlite'), { readonly: true });
+    try {
+      const row = db.prepare('SELECT state, receipt_json FROM local_move_operations WHERE idempotency_key = ?').get('source-duplicate') as { state: string; receipt_json: string | null };
+      expect(row.state).toBe('conflict');
+      expect(row.receipt_json).toBeNull();
+    } finally { db.close(); }
+  } finally { await second.close(); await s.dispose(); }
+});
+
+test('an interrupted source staging cannot yield a verified receipt with hidden source bytes', async () => {
+  const s = await vaultSandbox();
+  let fired = false;
+  const first = await openDocumentStore({ ...s, faults: { rename: {
+    afterMoveStage: () => {
+      fired = true;
+      throw new Error('stop after staging source');
+    }
+  } } });
+  try {
+    await mkdir(join(s.vault, 'Knowledge'));
+    await writeFile(join(s.vault, 'Knowledge/Laya.md'), '# Laya\n');
+    const plan = await planMove(s.vault, 'Knowledge/Laya.md', 'Personal/Laya.md', 'stage-interrupted');
+    await expect(first.applyRename(plan)).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(fired).toBe(true);
+  } finally { await first.close(); }
+  const second = await openDocumentStore(s);
+  try {
+    const db = new Database(join(s.state, 'documents.sqlite'), { readonly: true });
+    try {
+      const row = db.prepare('SELECT state, receipt_json FROM local_move_operations WHERE idempotency_key = ?').get('stage-interrupted') as { state: string; receipt_json: string | null };
+      expect(row.state).toBe('conflict');
+      expect(row.receipt_json).toBeNull();
+    } finally { db.close(); }
+    expect(await readFile(join(s.vault, 'Personal/Laya.md'), 'utf8')).toBe('# Laya\n');
+  } finally { await second.close(); await s.dispose(); }
 });

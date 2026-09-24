@@ -354,11 +354,12 @@ function planBase(
     }
     if (value.includes(from) || value.includes(fromStem)) {
       unresolved.push({ path: sourcePath, target: from, reason: 'unsupported' });
-      return;
     }
     for (const reference of extractLinks(value)) {
       const outcome = resolveLink(reference, sourcePath, catalogue);
-      if (outcome.state === 'ambiguous' || outcome.state === 'unresolved') {
+      if (outcome.state === 'resolved' && outcome.path === from) {
+        unresolved.push({ path: sourcePath, target: reference.target, reason: 'unsupported' });
+      } else if (outcome.state === 'ambiguous' || outcome.state === 'unresolved') {
         unresolved.push({
           path: sourcePath,
           target: reference.target,
