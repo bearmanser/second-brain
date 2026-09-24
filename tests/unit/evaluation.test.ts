@@ -21,7 +21,7 @@ import {
   type CorpusLike,
   type RetrievalLike
 } from '../eval/plan.mjs';
-import { startHttpHarness } from '../support/harness.js';
+import { startLegacyHttpHarness } from '../support/harness.js';
 import { modelTextFromEvents } from '../eval/instruction.mjs';
 import { parseAgentEvents } from '../eval/agent.mjs';
 
@@ -70,7 +70,7 @@ test('scores an empty positive label set by whether anything leaked', () => {
 });
 
 test('the SDK initialization response carries the gateway guidance', async () => {
-  const harness = await startHttpHarness();
+  const harness = await startLegacyHttpHarness();
   try {
     const client = await harness.connect(harness.token, 'second-brain-eval-instructions');
     try {

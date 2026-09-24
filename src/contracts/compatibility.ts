@@ -1,5 +1,6 @@
 import { BrainError } from './errors.js';
 import type { RecallMode } from '../core/types.js';
+import type { ProjectFilter } from '../projects/registry.js';
 
 export const LEGACY_WARNING_HYBRID_DEPRECATED = 'hybrid_deprecated';
 export const LEGACY_WARNING_INCLUDE_SHARED_DEPRECATED = 'include_shared_deprecated';
@@ -42,10 +43,35 @@ export interface ProjectLookup {
 }
 
 export interface NormalizedRecallScope {
-  filter: { mode: 'all' } | { mode: 'project'; identifier: string };
+  filter: ProjectFilter;
   include_shared: boolean;
   selected_shared: boolean;
   warnings: string[];
+}
+
+export interface NormalizedRecallRequest {
+  filter: ProjectFilter;
+  include_shared: boolean;
+  selected_shared: boolean;
+  requested_mode: RecallMode;
+  mode: ExecutedRecallMode;
+  warnings: string[];
+}
+
+export function normalizeRecallRequest(
+  input: LegacyRecallInput & { mode?: RecallMode },
+  lookup: ProjectLookup
+): NormalizedRecallRequest {
+  const scope = normalizeRecallScope(input, lookup);
+  const mode = normalizeRecallMode(input.mode);
+  return {
+    filter: scope.filter,
+    include_shared: scope.include_shared,
+    selected_shared: scope.selected_shared,
+    requested_mode: mode.requested,
+    mode: mode.executed,
+    warnings: [...scope.warnings, ...mode.warnings]
+  };
 }
 
 export function unknownLegacyScope(identifier: string): BrainError {

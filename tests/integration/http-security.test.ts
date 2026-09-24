@@ -2,7 +2,7 @@ import { request as httpRequest, type IncomingHttpHeaders } from 'node:http';
 import { expect, test } from 'vitest';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { INPUT_BODY_MAX_BYTES } from '../../src/core/limits.js';
-import { startHttpHarness, type HttpHarness } from '../support/harness.js';
+import { startLegacyHttpHarness, type HttpHarness } from '../support/harness.js';
 
 interface RawResult {
   status: number;
@@ -58,7 +58,7 @@ function authenticated(h: HttpHarness, extra: Record<string, string> = {}): Reco
 }
 
 test('a request without a bearer credential is rejected', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   try {
     const response = await raw(h, {
       headers: {
@@ -76,7 +76,7 @@ test('a request without a bearer credential is rejected', async () => {
 });
 
 test('an incorrect bearer credential is rejected', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   try {
     const response = await raw(h, {
       headers: authenticated(h, { authorization: 'Bearer not-the-right-token' }),
@@ -89,7 +89,7 @@ test('an incorrect bearer credential is rejected', async () => {
 });
 
 test('a malformed authorization header is rejected', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   try {
     const response = await raw(h, {
       headers: authenticated(h, { authorization: 'Basic dXNlcjpwYXNz' }),
@@ -102,7 +102,7 @@ test('a malformed authorization header is rejected', async () => {
 });
 
 test('an unauthenticated GET is authenticated before the method is considered', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   try {
     const response = await raw(h, { method: 'GET' });
     expect(response.status).toBe(401);
@@ -112,7 +112,7 @@ test('an unauthenticated GET is authenticated before the method is considered', 
 });
 
 test('GET streaming is rejected with a stateless method response', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   try {
     const response = await raw(h, {
       method: 'GET',
@@ -126,7 +126,7 @@ test('GET streaming is rejected with a stateless method response', async () => {
 });
 
 test('DELETE session termination is rejected with a stateless method response', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   try {
     const response = await raw(h, {
       method: 'DELETE',
@@ -140,7 +140,7 @@ test('DELETE session termination is rejected with a stateless method response', 
 });
 
 test('the pinned client accepts the stateless DELETE rejection', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   try {
     const transport = new StreamableHTTPClientTransport(new URL(h.url), {
       sessionId: 'stateless-session',
@@ -153,7 +153,7 @@ test('the pinned client accepts the stateless DELETE rejection', async () => {
 });
 
 test('a legacy SSE endpoint is not published', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   try {
     const response = await raw(h, {
       method: 'GET',
@@ -167,7 +167,7 @@ test('a legacy SSE endpoint is not published', async () => {
 });
 
 test('an unsupported content type is rejected before dispatch', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   try {
     const response = await raw(h, {
       headers: authenticated(h, { 'content-type': 'text/plain' }),
@@ -180,7 +180,7 @@ test('an unsupported content type is rejected before dispatch', async () => {
 });
 
 test('malformed JSON is rejected as a parse error', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   try {
     const response = await raw(h, { headers: authenticated(h), body: '{"jsonrpc":' });
     expect(response.status).toBe(400);
@@ -191,7 +191,7 @@ test('malformed JSON is rejected as a parse error', async () => {
 });
 
 test('malformed JSON-RPC is rejected by the protocol layer', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   try {
     const response = await raw(h, {
       headers: authenticated(h),
@@ -205,7 +205,7 @@ test('malformed JSON-RPC is rejected by the protocol layer', async () => {
 });
 
 test('an oversized request body is rejected at the input limit', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   try {
     const padding = 'x'.repeat(INPUT_BODY_MAX_BYTES + 1024);
     const response = await raw(h, {
@@ -219,7 +219,7 @@ test('an oversized request body is rejected at the input limit', async () => {
 });
 
 test('an oversized streaming body is rejected before the sender finishes', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   try {
     const outcome = await new Promise<{ status: number; elapsed: number }>((resolve, reject) => {
       const started = Date.now();
@@ -256,7 +256,7 @@ test('an oversized streaming body is rejected before the sender finishes', async
 });
 
 test('a POST without the SSE accept type is rejected by the SDK transport', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   try {
     const response = await raw(h, {
       headers: authenticated(h, { accept: 'application/json' }),
@@ -269,7 +269,7 @@ test('a POST without the SSE accept type is rejected by the SDK transport', asyn
 });
 
 test('a malicious Host header is rejected', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   try {
     const response = await raw(h, {
       headers: authenticated(h, { host: 'evil.example' }),
@@ -282,7 +282,7 @@ test('a malicious Host header is rejected', async () => {
 });
 
 test('a Host header with prohibited authority syntax is rejected', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const malformed = [
     'attacker@localhost',
     'localhost/path',
@@ -304,7 +304,7 @@ test('a Host header with prohibited authority syntax is rejected', async () => {
 });
 
 test('a Host header with an invalid port is rejected', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const malformed = [
     'localhost:',
     'localhost:+80',
@@ -328,7 +328,7 @@ test('a Host header with an invalid port is rejected', async () => {
 });
 
 test('a Host header carrying a port is matched by hostname', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   try {
     const response = await raw(h, {
       headers: authenticated(h, { host: `127.0.0.1:${h.port}` }),
@@ -341,7 +341,7 @@ test('a Host header carrying a port is matched by hostname', async () => {
 });
 
 test('an Origin with userinfo or a path is rejected', async () => {
-  const h = await startHttpHarness({ allowed_origins: ['https://allowed.example'] });
+  const h = await startLegacyHttpHarness({ allowed_origins: ['https://allowed.example'] });
   const malformed = [
     'https://user:secret@allowed.example',
     'https://allowed.example/path',
@@ -362,7 +362,7 @@ test('an Origin with userinfo or a path is rejected', async () => {
 });
 
 test('an unapproved Origin header is rejected', async () => {
-  const h = await startHttpHarness({ allowed_origins: ['https://allowed.example'] });
+  const h = await startLegacyHttpHarness({ allowed_origins: ['https://allowed.example'] });
   try {
     const response = await raw(h, {
       headers: authenticated(h, { origin: 'https://evil.example' }),
@@ -375,7 +375,7 @@ test('an unapproved Origin header is rejected', async () => {
 });
 
 test('an approved Origin is allowed and no wildcard CORS header is installed', async () => {
-  const h = await startHttpHarness({ allowed_origins: ['https://allowed.example'] });
+  const h = await startLegacyHttpHarness({ allowed_origins: ['https://allowed.example'] });
   try {
     const response = await raw(h, {
       headers: authenticated(h, { origin: 'https://allowed.example' }),
@@ -390,7 +390,7 @@ test('an approved Origin is allowed and no wildcard CORS header is installed', a
 });
 
 test('an absent Origin is allowed for non-browser MCP clients', async () => {
-  const h = await startHttpHarness({ allowed_origins: ['https://allowed.example'] });
+  const h = await startLegacyHttpHarness({ allowed_origins: ['https://allowed.example'] });
   try {
     const response = await raw(h, { headers: authenticated(h), body: rpc });
     expect(response.status).toBe(200);

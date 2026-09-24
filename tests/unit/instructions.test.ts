@@ -4,7 +4,7 @@ import { countReferenceTokens } from '../../src/retrieval/budget.js';
 import { lessonFixture } from '../fixtures/content.js';
 import { workerContext } from '../fixtures/principals.js';
 import { capture } from '../../src/features/capture.js';
-import { createHarness } from '../support/harness.js';
+import { createLegacyHarness } from '../support/harness.js';
 
 const key = '00000000-0000-4000-8000-0000000000aa';
 
@@ -29,7 +29,7 @@ test('instructions are built from static prose, not from user notes', async () =
   const first = buildInstructions();
   expect(buildInstructions()).toBe(first);
 
-  const harness = await createHarness();
+  const harness = await createLegacyHarness();
   try {
     harness.backend.fail_once = 'before_write';
     await capture(

@@ -11,13 +11,19 @@ import {
   cursorSchema,
   etagSchema,
   noteInputSchema,
+  notePathSchema,
+  noteReferenceSchema,
   projectIdentifierSchema,
   remoteUrlSchema,
   scopeIdSchema,
   titleSchema,
   uuidSchema,
-  withinInputBodyLimit
+  withinInputBodyLimit,
+  type NoteReferenceInput
 } from './content.js';
+
+export { noteReferenceSchema };
+export type { NoteReferenceInput };
 
 const text = z.string().trim().min(1).max(8000);
 const projectDisplayName = z
@@ -80,7 +86,7 @@ export const reviewMoveOperation = z.strictObject({
   action: z.literal('move'),
   idempotency_key: uuidSchema,
   id: uuidSchema,
-  target_path: z.string().trim().min(1).max(1024),
+  target_path: notePathSchema,
   expected_etag: etagSchema,
   rationale: text
 });
@@ -88,18 +94,10 @@ export const reviewMoveOperation = z.strictObject({
 export const reviewAdoptOperation = z.strictObject({
   action: z.literal('adopt'),
   idempotency_key: uuidSchema,
-  path: z.string().trim().min(1).max(1024),
+  path: notePathSchema,
   expected_etag: etagSchema,
   rationale: text
 });
-
-export const noteReferenceSchema = z.union([
-  z.strictObject({ id: uuidSchema }),
-  z.strictObject({ path: z.string().trim().min(1).max(1024) }),
-  z.strictObject({ title: titleSchema })
-]);
-
-export type NoteReferenceInput = z.infer<typeof noteReferenceSchema>;
 
 export const captureRequestSchema = z
   .strictObject({
@@ -141,7 +139,7 @@ export const readRequestSchema = z
     project: projectIdentifierSchema.optional(),
     scope: scopeIdSchema.optional(),
     id: uuidSchema.optional(),
-    path: z.string().trim().min(1).max(1024).optional(),
+    path: notePathSchema.optional(),
     title: titleSchema.optional(),
     revision_id: uuidSchema.optional(),
     cursor: cursorSchema.optional(),

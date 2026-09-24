@@ -8,7 +8,7 @@ import {
   SessionRegistry,
   createAuthenticatedHttpApp
 } from '../../src/mcp/http.js';
-import { startHttpHarness } from '../support/harness.js';
+import { startLegacyHttpHarness } from '../support/harness.js';
 
 const digest = (value: string): string =>
   createHash('sha256').update(value, 'utf8').digest('hex');
@@ -348,7 +348,7 @@ test('retained session state stays bounded under anonymous requests that never r
 
 test('the runtime exposes the token digest seam and rejects a malformed rotation', async () => {
   const initial = digest(token());
-  const harness = await startHttpHarness({ token_digest: initial });
+  const harness = await startLegacyHttpHarness({ token_digest: initial });
   try {
     expect(harness.runtime.tokenDigest).toBe(initial);
     const rotated = digest(token());
@@ -362,5 +362,5 @@ test('the runtime exposes the token digest seam and rejects a malformed rotation
 });
 
 test('a malformed configured token digest fails runtime startup', async () => {
-  await expect(startHttpHarness({ token_digest: 'not-a-digest' })).rejects.toThrow(/INVALID_INPUT/);
+  await expect(startLegacyHttpHarness({ token_digest: 'not-a-digest' })).rejects.toThrow(/INVALID_INPUT/);
 });

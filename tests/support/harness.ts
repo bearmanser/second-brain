@@ -65,7 +65,7 @@ import { Journal, type AuditEventRecord } from '../../src/storage/journal.js';
 import { FileVault } from '../../src/storage/vault.js';
 import { fixtureIds } from '../fixtures/content.js';
 import { scopeFixtures } from '../fixtures/principals.js';
-import { FakeBackend } from './fake-backend.js';
+import { FakeBackend, createLegacyBackend } from './fake-backend.js';
 import { FaultScheduler, wrapJournal, type FaultOptions, type FaultPoint } from './fault-scheduler.js';
 
 const MATERIALIZATION_TIMEOUT_MS = 200;
@@ -176,7 +176,7 @@ class MemoryHarnessImpl implements MemoryHarness {
       allowed_origins: [],
       result_delivery: 'structured'
     };
-    this.backend = new FakeBackend({
+    this.backend = createLegacyBackend({
       root: this.vaultRoot,
       projects: scopes.map((scope) => scope.backend_project)
     });
@@ -342,7 +342,7 @@ class MemoryHarnessImpl implements MemoryHarness {
   }
 }
 
-export async function createHarness(): Promise<MemoryHarness> {
+export async function createLegacyHarness(): Promise<MemoryHarness> {
   const root = await mkdtemp(join(tmpdir(), 'brain-harness-'));
   const harness = new MemoryHarnessImpl(root);
   await harness.start();
@@ -487,7 +487,7 @@ function recordingServices(
   };
 }
 
-export async function startHttpHarness(options: HttpHarnessOptions = {}): Promise<HttpHarness> {
+export async function startLegacyHttpHarness(options: HttpHarnessOptions = {}): Promise<HttpHarness> {
   const root = await mkdtemp(join(tmpdir(), 'brain-http-'));
   const vaultRoot = join(root, 'vault');
   const stateDir = join(root, 'state');
@@ -530,7 +530,7 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
     result_delivery: options.result_delivery ?? 'structured'
   };
 
-  const backend = new FakeBackend({
+  const backend = createLegacyBackend({
     root: vaultRoot,
     projects: scopeFixtures.map((scope) => scope.backend_project)
   });

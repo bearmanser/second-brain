@@ -14,7 +14,7 @@ import { countReferenceTokens } from '../../src/retrieval/budget.js';
 import { signCursorV2 } from '../../src/retrieval/cursor.js';
 import { lessonFixture } from '../fixtures/content.js';
 import { reviewerContext, scopeFixtures, workerContext } from '../fixtures/principals.js';
-import { createHarness, type MemoryHarness } from '../support/harness.js';
+import { createLegacyHarness, type MemoryHarness } from '../support/harness.js';
 
 const secretRoot = join(tmpdir(), 'brain-read-secret-tests');
 const FILLER = 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu ';
@@ -91,7 +91,7 @@ test('paginate keeps progress and never splits a code point', () => {
 });
 
 test('reads the current head with an etag and source reference', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   const head = await h.seed(lessonFixture);
   const file = await h.deps.vault.read('freellmapi', head.source.relative_path);
@@ -106,7 +106,7 @@ test('reads the current head with an etag and source reference', async () => {
 });
 
 test('reads a note from any registered project with the single token', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   await expect(
     read(workerContext, { scope: 'profile', id: randomUUID() }, h.deps)
@@ -118,7 +118,7 @@ test('reads a note from any registered project with the single token', async () 
 });
 
 test('returns NOT_FOUND for an unknown id', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   await expect(
     read(workerContext, { scope: 'freellmapi', id: randomUUID() }, h.deps)
@@ -127,7 +127,7 @@ test('returns NOT_FOUND for an unknown id', async () => {
 });
 
 test('pages a long note and returns the next cursor only when more remains', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   const head = await h.seed(longLesson(8000));
   const file = await h.deps.vault.read('freellmapi', head.source.relative_path);
@@ -154,7 +154,7 @@ test('pages a long note and returns the next cursor only when more remains', asy
 });
 
 test('splits multi-byte text only at code-point boundaries', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   const head = await h.seed(emojiLesson());
   const file = await h.deps.vault.read('freellmapi', head.source.relative_path);
@@ -181,7 +181,7 @@ test('splits multi-byte text only at code-point boundaries', async () => {
 });
 
 test('returns an old revision with a historical warning', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   const head = await h.seed(lessonFixture);
   const revised = (await review(
@@ -215,7 +215,7 @@ test('returns an old revision with a historical warning', async () => {
 });
 
 test('reports the historical warning on every page selected by an old revision', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   const head = await h.seed(longLesson(4000));
   (await review(
@@ -257,7 +257,7 @@ test('reports the historical warning on every page selected by an old revision',
 });
 
 test('returns NOT_FOUND when a selected historical revision disappeared', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   const head = await h.seed(longLesson(4000));
   (await review(
@@ -316,7 +316,7 @@ test('returns NOT_FOUND when a selected historical revision disappeared', async 
 });
 
 test('serves a manually-edited head with the manual_unreviewed warning', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   const head = await h.seed(lessonFixture, { status: 'active' });
   await h.externalEdit(head, (raw) => raw.replace('First-token latency', 'Manually edited latency'));
@@ -328,7 +328,7 @@ test('serves a manually-edited head with the manual_unreviewed warning', async (
 });
 
 test('allows an explicit parseable revision read from a two-head fork while ordinary read stays blocked', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'candidate' });
   const scope = scopeFixtures.find((candidate) => candidate.id === 'freellmapi');
   if (scope === undefined) throw new Error('missing scope');
@@ -363,7 +363,7 @@ test('allows an explicit parseable revision read from a two-head fork while ordi
 });
 
 test('refuses a malformed head', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   const head = await h.seed(lessonFixture);
   await h.externalEdit(head, (raw) => raw.replace('---\n', '---\nbroken: [unclosed\n'));
@@ -374,7 +374,7 @@ test('refuses a malformed head', async () => {
 });
 
 test('refuses to continue a page after the file changed', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   const head = await h.seed(longLesson(4000));
   const first = await read(
@@ -395,7 +395,7 @@ test('refuses to continue a page after the file changed', async () => {
 });
 
 test('returns NOT_FOUND when the source disappeared', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   const head = await h.seed(longLesson(4000));
   const first = await read(
@@ -419,7 +419,7 @@ test('returns NOT_FOUND when the source disappeared', async () => {
 });
 
 test('cursors are integrity tokens rather than caller credentials', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   const head = await h.seed(longLesson(4000));
   const first = await read(
@@ -438,7 +438,7 @@ test('cursors are integrity tokens rather than caller credentials', async () => 
 });
 
 test('rejects an expired cursor', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const secret = await installSecret(h);
   const head = await h.seed(longLesson(4000));
   const expired = signCursorV2(
@@ -460,7 +460,7 @@ test('rejects an expired cursor', async () => {
 });
 
 test('rejects truncated and tampered tokens', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   const head = await h.seed(longLesson(4000));
   const first = await read(
@@ -484,7 +484,7 @@ test('rejects truncated and tampered tokens', async () => {
 });
 
 test('a cursor carries no path and cannot redirect the read outside its scope', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const secret = await installSecret(h);
   const head = await h.seed(longLesson(4000));
   const seen: string[] = [];
@@ -547,7 +547,7 @@ test('a cursor carries no path and cannot redirect the read outside its scope', 
 });
 
 test('requires a unique valid head', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   const head = await h.seed(lessonFixture);
   const raw = await readFile(vaultAbsolute(h, head.source.relative_path), 'utf8');
@@ -568,7 +568,7 @@ test('requires a unique valid head', async () => {
 });
 
 test('returns UNSUPPORTED_SCHEMA without inventing a source reference', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   const id = randomUUID();
   const revisionId = randomUUID();
@@ -605,7 +605,7 @@ test('returns UNSUPPORTED_SCHEMA without inventing a source reference', async ()
 });
 
 test('fails closed when the cursor secret is not configured', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(longLesson(4000));
   await expect(
     read(workerContext, { scope: 'freellmapi', id: head.revision.id, budget_tokens: 256 }, h.deps)
@@ -614,7 +614,7 @@ test('fails closed when the cursor secret is not configured', async () => {
 });
 
 test('fails closed when the cursor secret is too short', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await mkdir(secretRoot, { recursive: true });
   const directory = await mkdtemp(join(secretRoot, 'short-'));
   const path = join(directory, 'cursor-key');
@@ -628,7 +628,7 @@ test('fails closed when the cursor secret is too short', async () => {
 });
 
 test('propagates a typed vault failure for a present selected source', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   const head = await h.seed(lessonFixture);
   const original = h.deps.vault.read.bind(h.deps.vault);
@@ -645,7 +645,7 @@ test('propagates a typed vault failure for a present selected source', async () 
 });
 
 test('returns CONFLICT when the selected file exists with destroyed identity metadata', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   const head = await h.seed(lessonFixture);
   await h.externalEdit(head, (raw) =>
@@ -665,7 +665,7 @@ test('returns CONFLICT when the selected file exists with destroyed identity met
 });
 
 test('does not let an unrelated unreadable file change the selected note result', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   const head = await h.seed(lessonFixture);
   const raw = await readFile(vaultAbsolute(h, head.source.relative_path), 'utf8');
@@ -685,7 +685,7 @@ test('does not let an unrelated unreadable file change the selected note result'
 });
 
 test('rejects an over-limit materialized document before pagination', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   const head = await h.seed(lessonFixture);
   const real = await h.deps.vault.read('freellmapi', head.source.relative_path);
@@ -707,7 +707,7 @@ test('rejects an over-limit materialized document before pagination', async () =
 });
 
 test('clamps an over-large requested budget to the documented maximum', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   const head = await h.seed(longLesson(8000));
   const result = await read(
@@ -721,7 +721,7 @@ test('clamps an over-large requested budget to the documented maximum', async ()
 });
 
 test('reads a 64 KiB document across pages within the limit', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await installSecret(h);
   const scope = scopeFixtures.find((entry) => entry.id === 'freellmapi');
   if (scope === undefined) throw new Error('freellmapi scope fixture missing');

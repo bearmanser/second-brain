@@ -8,7 +8,7 @@ import type {
 import { capture } from '../../src/features/capture.js';
 import { fixtureIds, lessonFixture } from '../fixtures/content.js';
 import { ownerContext, reviewerContext, workerContext } from '../fixtures/principals.js';
-import { createHarness } from '../support/harness.js';
+import { createLegacyHarness } from '../support/harness.js';
 
 const key = (n: number): string => `00000000-0000-4000-8000-${n.toString(16).padStart(12, '0')}`;
 
@@ -72,7 +72,7 @@ const lessonContent = (overrides: Partial<LessonContent> = {}): NoteContent => (
 });
 
 test('does not promote a valid capture just because evidence was provided', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const receipt = await capture(reviewerContext, {
     idempotency_key: '11111111-1111-4111-8111-111111111111',
     scope: 'freellmapi', note: lessonFixture
@@ -84,7 +84,7 @@ test('does not promote a valid capture just because evidence was provided', asyn
 });
 
 test('a pending project ensure does not block writes in an unrelated ready scope', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const operation = h.deps.journal.reserve({
     principal_id: workerContext.actor.id,
     idempotency_key: key(900),
@@ -107,7 +107,7 @@ test('a pending project ensure does not block writes in an unrelated ready scope
 });
 
 test('captures every note kind as a candidate without a universal lesson requirement', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   for (const [index, content] of kindContents.entries()) {
     const receipt = await capture(
       reviewerContext,
@@ -127,7 +127,7 @@ test('captures every note kind as a candidate without a universal lesson require
 });
 
 test('stores a candidate with no evidence', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const receipt = await capture(reviewerContext, {
     idempotency_key: key(10),
     scope: 'freellmapi',
@@ -141,7 +141,7 @@ test('stores a candidate with no evidence', async () => {
 });
 
 test('replays the same receipt for the same key and payload without a second note', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const request: CaptureRequest = {
     idempotency_key: key(11),
     scope: 'freellmapi',
@@ -157,7 +157,7 @@ test('replays the same receipt for the same key and payload without a second not
 });
 
 test('treats a normalized payload as the same payload for idempotency', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const crlf: NoteInput = {
     ...lessonFixture,
     title: 'Captured line endings',
@@ -177,7 +177,7 @@ test('treats a normalized payload as the same payload for idempotency', async ()
 });
 
 test('rejects a different payload under the same idempotency key', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await capture(reviewerContext, { idempotency_key: key(13), scope: 'freellmapi', note: lessonFixture }, h.deps);
   await expect(
     capture(reviewerContext, {
@@ -191,7 +191,7 @@ test('rejects a different payload under the same idempotency key', async () => {
 });
 
 test('stores similar but distinct claims and surfaces the other as a possible duplicate', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const first = await capture(reviewerContext, {
     idempotency_key: key(14),
     scope: 'freellmapi',
@@ -222,7 +222,7 @@ test('stores similar but distinct claims and surfaces the other as a possible du
 });
 
 test('resolves possible duplicates when search hits carry no gateway identity', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const first = await capture(reviewerContext, {
     idempotency_key: key(16),
     scope: 'freellmapi',
@@ -252,7 +252,7 @@ test('resolves possible duplicates when search hits carry no gateway identity', 
 });
 
 test('warns instead of assuming no duplicates when the similarity lookup fails', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   h.backend.fail_once = 'search_unavailable';
   const receipt = await capture(reviewerContext, {
     idempotency_key: key(18),
@@ -267,7 +267,7 @@ test('warns instead of assuming no duplicates when the similarity lookup fails',
 });
 
 test('accepts readable cross-project related notes and rejects unknown references', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const own = await h.seed(lessonFixture, { scope: 'freellmapi', status: 'active' });
   const shared = await h.seed(lessonFixture, { scope: 'shared', status: 'active' });
   const privateNote = await h.seed(lessonFixture, { scope: 'profile', status: 'active' });
@@ -292,7 +292,7 @@ test('accepts readable cross-project related notes and rejects unknown reference
 });
 
 test('rejects obvious credentials in captured text before writing', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const privateKey = [
     'Store this key for later.',
     '-----BEGIN PRIVATE KEY-----',
@@ -324,7 +324,7 @@ test('rejects obvious credentials in captured text before writing', async () => 
 });
 
 test('rejects oversized content and an oversized input body', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const longBody = 'y'.repeat(32001);
   await expect(
     capture(reviewerContext, {
@@ -355,7 +355,7 @@ test('rejects oversized content and an oversized input body', async () => {
 });
 
 test('stores an instruction-injection body as untrusted candidate data', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const injected: NoteInput = noteFor({
     kind: 'note',
     summary: 'Quoted text from an external source',
@@ -384,7 +384,7 @@ test('stores an instruction-injection body as untrusted candidate data', async (
 });
 
 test('rejects agent-supplied server-owned fields', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await expect(
     capture(reviewerContext, {
       idempotency_key: key(28),
@@ -407,7 +407,7 @@ test('rejects agent-supplied server-owned fields', async () => {
 });
 
 test('resolves the destination project before any backend write', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const receipt = await capture(
     workerContext,
     { idempotency_key: key(30), scope: 'profile', note: lessonFixture },
@@ -430,7 +430,7 @@ test('resolves the destination project before any backend write', async () => {
 });
 
 test('resolves a configured repository alias for the capture scope', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const receipt = await capture(ownerContext, {
     idempotency_key: key(32),
     scope: 'free-llm-api',
@@ -442,7 +442,7 @@ test('resolves a configured repository alias for the capture scope', async () =>
 });
 
 test('keeps the initial duplicate advisory on replay when search availability recovers', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const request: CaptureRequest = {
     idempotency_key: key(40),
     scope: 'freellmapi',
@@ -460,7 +460,7 @@ test('keeps the initial duplicate advisory on replay when search availability re
 });
 
 test('keeps the initial duplicate advisory on replay when new similar notes appear', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const request: CaptureRequest = {
     idempotency_key: key(41),
     scope: 'freellmapi',
@@ -483,7 +483,7 @@ test('keeps the initial duplicate advisory on replay when new similar notes appe
 });
 
 test('persists the advisory as durable diagnostic state across a restart', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const request: CaptureRequest = {
     idempotency_key: key(43),
     scope: 'freellmapi',
@@ -503,7 +503,7 @@ test('persists the advisory as durable diagnostic state across a restart', async
 });
 
 test('marks the duplicate lookup unavailable when a search hit cannot be resolved', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   h.backend.search = async () => ({
     hits: [
       {
@@ -532,7 +532,7 @@ test('marks the duplicate lookup unavailable when a search hit cannot be resolve
 });
 
 test('finds durable duplicate details and resolves related ids for the single token', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const seeded = await h.seed(lessonFixture, { scope: 'freellmapi', status: 'active' });
 
   const receipt = await capture(reviewerContext, {
@@ -553,7 +553,7 @@ test('finds durable duplicate details and resolves related ids for the single to
 });
 
 test('replay retains durable duplicate details for the single token', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const first = await capture(reviewerContext, {
     idempotency_key: key(50),
     scope: 'freellmapi',

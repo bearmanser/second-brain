@@ -17,8 +17,8 @@ import {
 import { migrateSchemaRevision, reconcileVault } from '../../src/notes/reconcile.js';
 import {
   createCandidateIntent,
-  createHarness,
-  startHttpHarness,
+  createLegacyHarness,
+  startLegacyHttpHarness,
   type MemoryHarness
 } from '../support/harness.js';
 import { lessonFixture } from '../fixtures/content.js';
@@ -38,7 +38,7 @@ afterEach(async () => {
 });
 
 async function openHarness(): Promise<MemoryHarness> {
-  const harness = await createHarness();
+  const harness = await createLegacyHarness();
   harnesses.push(harness);
   return harness;
 }
@@ -467,7 +467,7 @@ test('detailed ids report every scanned project with scoped counts', async () =>
 });
 
 test('an approval fingerprint without authenticated journal provenance is untrusted', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   try {
     const scope = h.config.scopes.find((candidate) => candidate.id === SCOPE);
     if (scope === undefined) throw new Error('missing scope');
@@ -541,7 +541,7 @@ test('changing a candidate status to active without approval remains candidate-e
 });
 
 test('a host edit is visible without a restart and periodic scans stay bounded', async () => {
-  const h = await startHttpHarness({ reconcile_interval_ms: 25 });
+  const h = await startLegacyHttpHarness({ reconcile_interval_ms: 25 });
   const worker = await h.connect(h.token, 'host-edit-worker');
   const reviewer = await h.connect(h.reviewerToken, 'host-edit-reviewer');
   const scans = (): number =>
@@ -633,7 +633,7 @@ test('startup fails when the initial full scan cannot enumerate the vault', asyn
       throw new BrainError({ code: 'NOT_FOUND', message: 'simulated vault read failure' });
     }
   };
-  await expect(startHttpHarness({ vault: failingVault })).rejects.toThrow(
+  await expect(startLegacyHttpHarness({ vault: failingVault })).rejects.toThrow(
     /simulated vault enumeration failure/
   );
 });

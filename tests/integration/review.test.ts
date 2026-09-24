@@ -18,7 +18,7 @@ import {
   reviewerContext,
   workerContext
 } from '../fixtures/principals.js';
-import { createHarness, type MemoryHarness } from '../support/harness.js';
+import { createLegacyHarness, type MemoryHarness } from '../support/harness.js';
 
 const SCOPE = 'freellmapi';
 
@@ -164,7 +164,7 @@ const reviewOnlyContext = reviewerContext;
 const scopedReviewerContext = ownerContext;
 
 test('any valid token may approve a candidate by naming a review action', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'candidate' });
   const receipt = asReceipt(await review(workerContext, {
     scope: 'freellmapi', operation: {
@@ -178,7 +178,7 @@ test('any valid token may approve a candidate by naming a review action', async 
 });
 
 test('lists candidates and conflicts for a readable scope only', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const candidate = await h.seed(noteWith(flexibleContent), { status: 'candidate' });
   const active = await h.seed(noteWith({ ...flexibleContent, summary: 'Active record' }), {
     status: 'active'
@@ -200,7 +200,7 @@ test('lists candidates and conflicts for a readable scope only', async () => {
 });
 
 test('exposes candidates from every registered project to the single token', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const profileCandidate = await h.seed(noteWith(preferenceContent), { scope: 'profile', status: 'candidate' });
   const visible = await h.seed(noteWith(flexibleContent), { status: 'candidate' });
 
@@ -218,7 +218,7 @@ test('exposes candidates from every registered project to the single token', asy
 });
 
 test('approves an evidenced candidate and records the approval fingerprint', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'candidate' });
   const before = await scopeFiles(h);
 
@@ -250,7 +250,7 @@ test('approves an evidenced candidate and records the approval fingerprint', asy
 });
 
 test('refuses to approve a lesson without non-hypothesis evidence', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(
     { ...lessonFixture, evidence: [{ kind: 'hypothesis', ref: 'h-1', description: 'An untested guess' }] },
     { status: 'candidate' }
@@ -273,7 +273,7 @@ test('refuses to approve a lesson without non-hypothesis evidence', async () => 
 });
 
 test('accepts flexible notes and sessions as useful records without a factual claim', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const flexible = await h.seed(noteWith(flexibleContent, { evidence: [] }), { status: 'candidate' });
   const session = await h.seed(noteWith(sessionContent, { evidence: [] }), { status: 'candidate' });
 
@@ -309,7 +309,7 @@ test('accepts flexible notes and sessions as useful records without a factual cl
 });
 
 test('rejects an approval whose etag no longer matches the head', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'candidate' });
   await h.externalEdit(head, (raw) =>
     raw.replace('Measure the direct and proxied request', 'Always measure the direct and proxied request')
@@ -334,7 +334,7 @@ test('rejects an approval whose etag no longer matches the head', async () => {
 });
 
 test('approves manually changed content and refreshes the approval fingerprint', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   await h.externalEdit(head, (raw) =>
     raw.replace('Measure the direct and proxied request', 'Always measure direct and proxied requests')
@@ -368,7 +368,7 @@ test('approves manually changed content and refreshes the approval fingerprint',
 });
 
 test('approves and revises a preference under the single token', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(noteWith(preferenceContent, { evidence: [] }), { status: 'candidate' });
 
   const approved = asReceipt(
@@ -406,7 +406,7 @@ test('approves and revises a preference under the single token', async () => {
 });
 
 test('revises an already-approved decision under the single token', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(noteWith(decisionContent, { evidence: [] }), { status: 'active' });
   const before = await scopeFiles(h);
 
@@ -430,7 +430,7 @@ test('revises an already-approved decision under the single token', async () => 
 });
 
 test('revises with supplied typed fields while preserving manual extras', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'candidate' });
 
   await h.externalEdit(head, (raw) =>
@@ -470,7 +470,7 @@ test('revises with supplied typed fields while preserving manual extras', async 
 });
 
 test('validates every related note before reserving an operation', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const target = await h.seed(lessonFixture, { status: 'candidate' });
   const crossProject = await h.seed(noteWith(flexibleContent), { scope: 'profile', status: 'active' });
   await expectCode(
@@ -513,7 +513,7 @@ test('validates every related note before reserving an operation', async () => {
 });
 
 test('archives a note without physically deleting its earlier revisions', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const before = await scopeFiles(h);
 
@@ -540,7 +540,7 @@ test('archives a note without physically deleting its earlier revisions', async 
 });
 
 test('supersedes an active source with a readable active replacement in the same scope', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const source = await h.seed(lessonFixture, { status: 'active' });
   const replacement = await h.seed(noteWith(lessonContentOf({ lesson: 'Replacement lesson.' })), {
     status: 'active'
@@ -571,7 +571,7 @@ test('supersedes an active source with a readable active replacement in the same
 });
 
 test('rejects a replacement note from a different scope', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const source = await h.seed(lessonFixture, { status: 'active' });
   const other = await h.seed(noteWith(lessonContentOf({ lesson: 'Shared replacement.' })), {
     scope: 'shared',
@@ -599,7 +599,7 @@ test('rejects a replacement note from a different scope', async () => {
 });
 
 test('rejects self-supersession', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   await expectCode(
     review(reviewerContext, {
@@ -619,7 +619,7 @@ test('rejects self-supersession', async () => {
 });
 
 test('rejects a supersession that would create a replacement cycle', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const first = await h.seed(lessonFixture, { status: 'active' });
   const second = await h.seed(noteWith(lessonContentOf({ lesson: 'Cycle candidate.' })), {
     status: 'active'
@@ -651,7 +651,7 @@ test('rejects a supersession that would create a replacement cycle', async () =>
 });
 
 test('replays the same receipt for an idempotent review and rejects a changed payload', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'candidate' });
   const operation = {
     action: 'approve' as const,
@@ -676,7 +676,7 @@ test('replays the same receipt for an idempotent review and rejects a changed pa
 });
 
 test('resolves a structurally valid revision fork with every head as a parent', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const root = await h.seed(lessonFixture, { status: 'candidate' });
   const copy = await duplicateRevisionFile(h, root, 'fork-valid');
   const rootHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, root.source.revision_id);
@@ -720,7 +720,7 @@ test('resolve rejects a nonexistent related note and accepts a cross-project lin
     { related: 'authorized', accepted: true }
   ];
   for (const item of cases) {
-    const h = await createHarness();
+    const h = await createLegacyHarness();
     const root = await h.seed(lessonFixture, { status: 'candidate' });
     const copy = await duplicateRevisionFile(h, root, `related-${item.related}`);
     const authorized = await h.seed(noteWith(flexibleContent), { scope: 'shared', status: 'active' });
@@ -759,7 +759,7 @@ test('resolve rejects a nonexistent related note and accepts a cross-project lin
 });
 
 test('rejects a partial conflict-head submission', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const root = await h.seed(lessonFixture, { status: 'candidate' });
   await duplicateRevisionFile(h, root, 'fork-partial');
   const rootHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, root.source.revision_id);
@@ -782,7 +782,7 @@ test('rejects a partial conflict-head submission', async () => {
 });
 
 test('resolves a preference fork under the single token', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const root = await h.seed(noteWith(preferenceContent, { evidence: [] }), { status: 'candidate' });
   const copy = await duplicateRevisionFile(h, root, 'fork-preference');
   const rootHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, root.source.revision_id);
@@ -811,7 +811,7 @@ test('resolves a preference fork under the single token', async () => {
 });
 
 test('refuses to resolve over a missing parent, changed parent hash, or unsupported schema', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const root = await h.seed(lessonFixture, { status: 'candidate' });
 
   const missing = await duplicateRevisionFile(h, root, 'fork-missing');
@@ -846,7 +846,7 @@ test('refuses to resolve over a missing parent, changed parent hash, or unsuppor
   );
   await h.close();
 
-  const hashCase = await createHarness();
+  const hashCase = await createLegacyHarness();
   const hashRoot = await hashCase.seed(lessonFixture, { status: 'candidate' });
   const changed = await duplicateRevisionFile(hashCase, hashRoot, 'fork-hash');
   const changedRaw = await readFile(changed.path, 'utf8');
@@ -884,7 +884,7 @@ test('refuses to resolve over a missing parent, changed parent hash, or unsuppor
   );
   await hashCase.close();
 
-  const schemaCase = await createHarness();
+  const schemaCase = await createLegacyHarness();
   const schemaRoot = await schemaCase.seed(lessonFixture, { status: 'candidate' });
   const unsupported = await duplicateRevisionFile(schemaCase, schemaRoot, 'fork-schema');
   const unsupportedRaw = await readFile(unsupported.path, 'utf8');
@@ -919,7 +919,7 @@ test('refuses to resolve over a missing parent, changed parent hash, or unsuppor
 });
 
 test('merges two notes in staged, separately keyed calls without deleting either', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const first = await h.seed(lessonFixture, { status: 'candidate' });
   const second = await h.seed(noteWith(lessonContentOf({ lesson: 'Second note lesson.' })), {
     status: 'candidate'
@@ -984,7 +984,7 @@ test('merges two notes in staged, separately keyed calls without deleting either
 });
 
 test('keeps both notes when the final merge step fails', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const first = await h.seed(lessonFixture, { status: 'candidate' });
   const second = await h.seed(noteWith(lessonContentOf({ lesson: 'Kept because the merge fails.' })), {
     status: 'candidate'
@@ -1031,7 +1031,7 @@ test('keeps both notes when the final merge step fails', async () => {
 });
 
 test('enforces non-hypothesis evidence for every factual kind', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const contents: NoteContent[] = [
     lessonContentOf(),
     { kind: 'fact', claim: 'The pinned backend reports 4.0.0b1.', applicability: 'This repository.' },
@@ -1068,7 +1068,7 @@ test('enforces non-hypothesis evidence for every factual kind', async () => {
 });
 
 test('rejects a review mutation without a rationale', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'candidate' });
   await expectCode(
     review(reviewerContext, {
@@ -1087,7 +1087,7 @@ test('rejects a review mutation without a rationale', async () => {
 });
 
 test('rejects a revise whose etag is stale', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'candidate' });
   await h.externalEdit(head, (raw) =>
     raw.replace('Measure the direct and proxied request', 'Always measure the direct and proxied request')
@@ -1112,7 +1112,7 @@ test('rejects a revise whose etag is stale', async () => {
 });
 
 test('a review-only principal can approve, archive, supersede, and resolve without write scope', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const candidate = await h.seed(lessonFixture, { status: 'candidate' });
   const approved = asReceipt(
     await review(reviewOnlyContext, {
@@ -1205,7 +1205,7 @@ test('a review-only principal can approve, archive, supersede, and resolve witho
 });
 
 test('approves notes in shared and profile projects under the single token', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const sharedNote = await h.seed(noteWith(lessonContentOf({ lesson: 'Shared scope lesson.' })), {
     scope: 'shared',
     status: 'candidate'
@@ -1245,7 +1245,7 @@ test('approves notes in shared and profile projects under the single token', asy
 });
 
 test('revises archived decisions and candidate descendants under the single token', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const archivedSource = await h.seed(noteWith(decisionContent, { evidence: [] }), { status: 'active' });
   asReceipt(
     await review(reviewerContext, {
@@ -1310,7 +1310,7 @@ test('revises archived decisions and candidate descendants under the single toke
 });
 
 test('resolves a fork of approved decisions under the single token', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const root = await h.seed(noteWith(decisionContent, { evidence: [] }), { status: 'active' });
   const copy = await duplicateRevisionFile(h, root, 'decision-fork');
   const rootHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, root.source.revision_id);
@@ -1337,7 +1337,7 @@ test('resolves a fork of approved decisions under the single token', async () =>
 });
 
 test('refuses to resolve a structural cycle', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const root = await h.seed(lessonFixture, { status: 'candidate' });
   asReceipt(
     await review(reviewerContext, {
@@ -1387,7 +1387,7 @@ test('refuses to resolve a structural cycle', async () => {
 });
 
 test('fails closed on malformed and duplicate revision identities', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const root = await h.seed(lessonFixture, { status: 'candidate' });
   const malformed = await duplicateRevisionFile(h, root, 'fork-malformed');
   const malformedRaw = await readFile(malformed.path, 'utf8');
@@ -1414,7 +1414,7 @@ test('fails closed on malformed and duplicate revision identities', async () => 
   );
   await h.close();
 
-  const dup = await createHarness();
+  const dup = await createLegacyHarness();
   const dupRoot = await dup.seed(lessonFixture, { status: 'candidate' });
   await duplicateIdentityFile(dup, dupRoot, 'fork-duplicate-identity');
   const dupRootHead = await dup.deps.catalogue.getRevision(SCOPE, dupRoot.source.id, dupRoot.source.revision_id);
@@ -1436,7 +1436,7 @@ test('fails closed on malformed and duplicate revision identities', async () => 
 });
 
 test('fails with RECOVERY_REQUIRED when a fork entry cannot be read under the lock', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const root = await h.seed(lessonFixture, { status: 'candidate' });
   await duplicateRevisionFile(h, root, 'fork-unreadable');
   const rootHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, root.source.revision_id);
@@ -1473,7 +1473,7 @@ test('fails with RECOVERY_REQUIRED when a fork entry cannot be read under the lo
 });
 
 test('normalizes a submitted unsupported head to RECOVERY_REQUIRED', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const root = await h.seed(lessonFixture, { status: 'candidate' });
   const unsupported = await duplicateRevisionFile(h, root, 'fork-unsupported-submitted');
   const raw = await readFile(unsupported.path, 'utf8');
@@ -1503,7 +1503,7 @@ test('normalizes a submitted unsupported head to RECOVERY_REQUIRED', async () =>
 });
 
 test('rejects duplicate, extra, and stale conflict-head submissions', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const root = await h.seed(lessonFixture, { status: 'candidate' });
   const copy = await duplicateRevisionFile(h, root, 'fork-sets');
   const rootHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, root.source.revision_id);
@@ -1577,7 +1577,7 @@ test('rejects duplicate, extra, and stale conflict-head submissions', async () =
 });
 
 test('rejects a resolve when a new fork head appeared after the caller read the fork', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const root = await h.seed(lessonFixture, { status: 'candidate' });
   const copy = await duplicateRevisionFile(h, root, 'fork-concurrent-a');
   const rootHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, root.source.revision_id);
@@ -1605,7 +1605,7 @@ test('rejects a resolve when a new fork head appeared after the caller read the 
 });
 
 test('rejects a supersession when the replacement became inactive before the locked check', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const source = await h.seed(lessonFixture, { status: 'active' });
   const replacement = await h.seed(noteWith(lessonContentOf({ lesson: 'Replacement goes inactive.' })), {
     status: 'active'
@@ -1642,7 +1642,7 @@ test('rejects a supersession when the replacement became inactive before the loc
 });
 
 test('releases the reservation when a review request is rejected before submission', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const root = await h.seed(lessonFixture, { status: 'candidate' });
   const copy = await duplicateRevisionFile(h, root, 'abort-fork');
   const rootHead = await h.deps.catalogue.getRevision(SCOPE, root.source.id, root.source.revision_id);
@@ -1704,7 +1704,7 @@ test('releases the reservation when a review request is rejected before submissi
 });
 
 test('rejects a supersession whose replacement chain contains a conflicted link', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const source = await h.seed(lessonFixture, { status: 'active' });
   const replacement = await h.seed(noteWith(lessonContentOf({ lesson: 'Chain head.' })), {
     status: 'active'
@@ -1736,7 +1736,7 @@ test('rejects a supersession whose replacement chain contains a conflicted link'
 });
 
 test('releases the reservation when a builder rejects a review request before submission', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(
     { ...lessonFixture, evidence: [{ kind: 'hypothesis', ref: 'h-1', description: 'An untested guess' }] },
     { status: 'candidate' }

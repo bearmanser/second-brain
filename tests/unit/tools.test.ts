@@ -46,7 +46,7 @@ import {
   reviewerContext,
   workerContext
 } from '../fixtures/principals.js';
-import { createHarness } from '../support/harness.js';
+import { createLegacyHarness } from '../support/harness.js';
 import type { Journal, OperationRecord } from '../../src/storage/journal.js';
 
 const key = (n: number): string => `00000000-0000-4000-8000-${n.toString(16).padStart(12, '0')}`;
@@ -244,7 +244,7 @@ test('the published tool contract is pinned', () => {
   expect(contract).toMatchInlineSnapshot(`
     [
       {
-        "input": "8cf96af973581c3f8fd6c954a45694b1ccf66b9de148d07299d0fef2aa1acc98",
+        "input": "1cfbef90a1b9cc2bc209d4db7becd104082d2dab90c8c330a48e402cb62ff7ae",
         "name": "brain_capture",
         "output": "57fce7c09c966db809d68ffe028e91904e9938860b97d457430451f4799dccc9",
       },
@@ -269,7 +269,7 @@ test('the published tool contract is pinned', () => {
         "output": "1bba962c7fe6f748ca285b4bd573dd3c64dd299b2d6470bce14dbff9055aa0a5",
       },
       {
-        "input": "de0d22351181adaa0c6469ddaa6a8813cab0bc49ff30bca7e5c30698e96e8b2a",
+        "input": "d8b155fb969fade8d4a8f55ccb69f5de76402a89506f1231efd9371e0185cee9",
         "name": "brain_review",
         "output": "4296f66f5b3aedc53103bae95c5571490de8f77b13c0e484461f168059f21504",
       },
@@ -902,7 +902,7 @@ test('INTERNAL_ERROR is a published BrainError code producing a fixed safe resul
 });
 
 test('status lists every registered project for the single token', async () => {
-  const harness = await createHarness();
+  const harness = await createLegacyHarness();
   try {
     const result = await status(workerContext, {}, harness.deps);
     expect(result.scopes).toEqual([
@@ -917,7 +917,7 @@ test('status lists every registered project for the single token', async () => {
 });
 
 test('status publishes version metadata and exposes schemas only on request', async () => {
-  const harness = await createHarness();
+  const harness = await createLegacyHarness();
   try {
     const result = await status(workerContext, {}, harness.deps);
     expect(result.version).toBe(APPLICATION_VERSION);
@@ -943,7 +943,7 @@ test('status publishes version metadata and exposes schemas only on request', as
 });
 
 test('status narrows to a requested project and rejects an unknown one', async () => {
-  const harness = await createHarness();
+  const harness = await createLegacyHarness();
   try {
     const narrowed = await status(workerContext, { scope: 'freellmapi' }, harness.deps);
     expect(narrowed.scopes.map((scope) => scope.id)).toEqual(['freellmapi']);
@@ -958,7 +958,7 @@ test('status narrows to a requested project and rejects an unknown one', async (
 });
 
 test('status counts every pending operation in the brain', async () => {
-  const harness = await createHarness();
+  const harness = await createLegacyHarness();
   try {
     harness.deps.journal.reserve({
       principal_id: SYSTEM_ACTOR.id,
@@ -976,7 +976,7 @@ test('status counts every pending operation in the brain', async () => {
 });
 
 test('status returns an operation to any authenticated caller', async () => {
-  const harness = await createHarness();
+  const harness = await createLegacyHarness();
   try {
     const receipt = await capture(
       workerContext,
@@ -1001,7 +1001,7 @@ test('status returns an operation to any authenticated caller', async () => {
 });
 
 test('status reports a pending operation and a recovering gateway', async () => {
-  const harness = await createHarness();
+  const harness = await createLegacyHarness();
   try {
     harness.backend.fail_once = 'before_write';
     const receipt = await capture(
@@ -1021,7 +1021,7 @@ test('status reports a pending operation and a recovering gateway', async () => 
 });
 
 test('status degrades instead of failing when the backend is down', async () => {
-  const harness = await createHarness();
+  const harness = await createLegacyHarness();
   try {
     await harness.backend.close();
     const result = await status(workerContext, {}, harness.deps);
@@ -1037,7 +1037,7 @@ test('status degrades instead of failing when the backend is down', async () => 
 });
 
 test('status rejects malformed input with a stable code', async () => {
-  const harness = await createHarness();
+  const harness = await createLegacyHarness();
   try {
     await expect(
       status(workerContext, { operation_id: 'not-a-uuid' } as unknown as Record<string, never>, harness.deps)
@@ -1096,7 +1096,7 @@ function planJsonWithoutOperationId(): string {
 }
 
 test('status validates plan identity and returns the receipt when it is consistent', async () => {
-  const harness = await createHarness();
+  const harness = await createLegacyHarness();
   try {
     const consistent = recordWith({
       receipt_json: JSON.stringify(receiptSample),
@@ -1116,7 +1116,7 @@ test('status validates plan identity and returns the receipt when it is consiste
 });
 
 test('status rejects corrupt or inconsistent persisted records with RECOVERY_REQUIRED', async () => {
-  const harness = await createHarness();
+  const harness = await createLegacyHarness();
   try {
     const cases: OperationRecord[] = [
       recordWith({ receipt_json: '{not json' }),

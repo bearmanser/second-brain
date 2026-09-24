@@ -16,7 +16,7 @@ import { redactError } from '../../src/security/redact.js';
 import type { FeedbackRequest, RecallResult, RetrievalEventInputV2 } from '../../src/core/types.js';
 import { lessonFixture } from '../fixtures/content.js';
 import { reviewerContext, workerContext } from '../fixtures/principals.js';
-import { createHarness, type MemoryHarness } from '../support/harness.js';
+import { createLegacyHarness, type MemoryHarness } from '../support/harness.js';
 
 const QUERY_MARKER = 'First-token latency looked worse';
 const NOTE_MARKER = 'Measure the direct and proxied request';
@@ -72,7 +72,7 @@ function recordRetrieval(
 }
 
 test('repeated usefulness feedback does not create repeated evidence', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const request = {
     idempotency_key: '33333333-3333-4333-8333-333333333333',
@@ -90,7 +90,7 @@ test('repeated usefulness feedback does not create repeated evidence', async () 
 });
 
 test('projects unresolved feedback onto the exact revision across restart and not onto a revision', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   await feedback(
     reviewerContext,
@@ -143,7 +143,7 @@ test('projects unresolved feedback onto the exact revision across restart and no
 });
 
 test('rejects the same key with a different verdict', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const request = requestFor(head);
   await feedback(reviewerContext, request, h.deps);
@@ -155,7 +155,7 @@ test('rejects the same key with a different verdict', async () => {
 });
 
 test('replays a pre-004 feedback row that has no payload digest', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const feedbackId = uuid();
   const key = uuid();
@@ -228,7 +228,7 @@ test('replays a pre-004 feedback row that has no payload digest', async () => {
 });
 
 test('accepts a retrieval reference that belongs to the caller and returned the revision', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const retrieval = recordRetrieval(h, {
     returned_ids: [{ scope: 'freellmapi', id: head.source.id, revision_id: head.source.revision_id }],
@@ -246,7 +246,7 @@ test('accepts a retrieval reference that belongs to the caller and returned the 
 });
 
 test('accepts a retrieval reference regardless of the recorded actor', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const retrieval = recordRetrieval(h, {
     returned_ids: [{ scope: 'freellmapi', id: head.source.id, revision_id: head.source.revision_id }],
@@ -262,7 +262,7 @@ test('accepts a retrieval reference regardless of the recorded actor', async () 
 });
 
 test('rejects a retrieval reference that did not return the target revision', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const retrieval = recordRetrieval(h, {
     returned_ids: [{ scope: 'freellmapi', id: head.source.id, revision_id: uuid() }],
@@ -275,7 +275,7 @@ test('rejects a retrieval reference that did not return the target revision', as
 });
 
 test('rejects a retrieval reference recorded for another project', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const retrieval = recordRetrieval(h, {
     filter: { mode: 'project', identifier: 'shared' },
@@ -291,7 +291,7 @@ test('rejects a retrieval reference recorded for another project', async () => {
 });
 
 test('treats reasons that differ only after the storage bound as different payloads', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const base = requestFor(head);
   await feedback(
@@ -309,7 +309,7 @@ test('treats reasons that differ only after the storage bound as different paylo
 });
 
 test('replays an exact retry after its retrieval metadata has been pruned', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const retrieval = recordRetrieval(h, {
     returned_ids: [{ scope: 'freellmapi', id: head.source.id, revision_id: head.source.revision_id }],
@@ -327,7 +327,7 @@ test('replays an exact retry after its retrieval metadata has been pruned', asyn
 });
 
 test('rejects a feedback request that names a stale revision', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   await expect(
     feedback(reviewerContext, requestFor(head, { revision_id: uuid() }), h.deps)
@@ -336,7 +336,7 @@ test('rejects a feedback request that names a stale revision', async () => {
 });
 
 test('records feedback against a note in another project', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active', scope: 'profile' });
   const result = await feedback(
     reviewerContext,
@@ -348,7 +348,7 @@ test('records feedback against a note in another project', async () => {
 });
 
 test('validates every related note and rejects an unknown one', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const related = await h.seed({ ...lessonFixture, title: 'Related lesson' }, { status: 'active' });
   const accepted = await feedback(
@@ -376,7 +376,7 @@ test('validates every related note and rejects an unknown one', async () => {
 });
 
 test('records an unresolved warning without archiving, rewriting, or boosting the note', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const result = await feedback(
     reviewerContext,
@@ -394,7 +394,7 @@ test('records an unresolved warning without archiving, rewriting, or boosting th
 });
 
 test('bounds a long feedback reason in private state', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const result = await feedback(
     reviewerContext,
@@ -407,7 +407,7 @@ test('bounds a long feedback reason in private state', async () => {
 });
 
 test('rejects an obvious credential in the feedback reason', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   await expect(
     feedback(reviewerContext, requestFor(head, { reason: `api_key=${ASSIGNMENT_SECRET}` }), h.deps)
@@ -416,7 +416,7 @@ test('rejects an obvious credential in the feedback reason', async () => {
 });
 
 test('does not persist or log credentials carried by a thrown backend error', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const logged: string[] = [];
   const spies = (['log', 'info', 'warn', 'error', 'debug'] as const).map((method) =>
@@ -449,7 +449,7 @@ test('does not persist or log credentials carried by a thrown backend error', as
 });
 
 test('never persists the recall query in retrieval metadata', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const result = await recall(
     reviewerContext,
@@ -484,7 +484,7 @@ test('never persists the recall query in retrieval metadata', async () => {
 });
 
 test('keeps feedback replay across token rotation without logging tokens', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const retrieval = recordRetrieval(h, {
     returned_ids: [{ scope: 'freellmapi', id: head.source.id, revision_id: head.source.revision_id }],
@@ -504,7 +504,7 @@ test('keeps feedback replay across token rotation without logging tokens', async
 });
 
 test('normal logs never contain the query, note, token, or evidence marker', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const logged: string[] = [];
   const spies = (['log', 'info', 'warn', 'error', 'debug'] as const).map((method) =>
@@ -550,7 +550,7 @@ test('normal logs never contain the query, note, token, or evidence marker', asy
 });
 
 test('prunes retrieval metadata after thirty days but keeps the feedback record', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const retrieval = recordRetrieval(h, {
     retrieval_id: uuid(),
@@ -572,7 +572,7 @@ test('prunes retrieval metadata after thirty days but keeps the feedback record'
 });
 
 test('prunes audit events after thirty days at the cutoff and keeps feedback until an explicit purge', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const now = new Date();
   const cutoff = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
@@ -610,7 +610,7 @@ test('prunes audit events after thirty days at the cutoff and keeps feedback unt
 });
 
 test('rejects feedback against a pruned retrieval reference', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const retrieval = recordRetrieval(h, {
     returned_ids: [{ scope: 'freellmapi', id: head.source.id, revision_id: head.source.revision_id }],
@@ -625,7 +625,7 @@ test('rejects feedback against a pruned retrieval reference', async () => {
 });
 
 test('records retrieval metadata through a real recall result', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const result: RecallResult = await recall(
     reviewerContext,

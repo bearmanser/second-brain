@@ -18,7 +18,7 @@ import { read } from '../../src/features/read.js';
 import { recall } from '../../src/features/recall.js';
 import { review } from '../../src/features/review.js';
 import { status } from '../../src/features/status.js';
-import { createHarness, type MemoryHarness } from '../support/harness.js';
+import { createLegacyHarness, type MemoryHarness } from '../support/harness.js';
 
 function roleFreeContext(): AuthenticatedContext {
   return {
@@ -65,7 +65,7 @@ async function forkInVault(h: MemoryHarness, scope: string, relativePath: string
 }
 
 test('one role-free context runs the whole lifecycle including a former profile note', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const ctx = roleFreeContext();
     const captured = await capture(
@@ -214,7 +214,7 @@ test('one role-free context runs the whole lifecycle including a former profile 
 });
 
 test('one role-free context resolves a genuine revision fork', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const ctx = roleFreeContext();
     const captured = await capture(
@@ -256,7 +256,7 @@ test('one role-free context resolves a genuine revision fork', async () => {
 });
 
 test('project creation adds organization without a permission grant', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const ctx = roleFreeContext();
     const result = await ensureProject(
@@ -280,7 +280,7 @@ test('project creation adds organization without a permission grant', async () =
 });
 
 test('status resolves a project alias before comparing pending work', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     h.deps.journal.reserve({
       principal_id: SYSTEM_ACTOR.id,
@@ -299,7 +299,7 @@ test('status resolves a project alias before comparing pending work', async () =
 });
 
 test('status projects a historical permission-bearing project receipt', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const ctx = roleFreeContext();
     const reserved = h.deps.journal.reserve({
@@ -344,7 +344,7 @@ test('status projects a historical permission-bearing project receipt', async ()
 });
 
 test('a project filter narrows retrieval without denying access to another project', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const ctx = roleFreeContext();
     await h.seed(noteFor(flexible('freellmapi filtered marker'), 'freellmapi marker'), {
@@ -370,7 +370,7 @@ test('a project filter narrows retrieval without denying access to another proje
 });
 
 test('status resolves a repository identity before comparing pending work', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const ensured = await ensureProject(
       roleFreeContext(),
@@ -398,7 +398,7 @@ test('status resolves a repository identity before comparing pending work', asyn
 });
 
 test('status rejects a stored project receipt for a different operation', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const reserved = h.deps.journal.reserve({
       principal_id: SYSTEM_ACTOR.id,

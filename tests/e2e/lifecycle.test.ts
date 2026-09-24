@@ -8,7 +8,7 @@ import { lessonFixture } from '../fixtures/content.js';
 import { reviewerContext } from '../fixtures/principals.js';
 import {
   createCandidateIntent,
-  createHarness,
+  createLegacyHarness,
   makeBackupFixture,
   startDockerHarness,
   type DockerHarness,
@@ -362,7 +362,7 @@ describe('release-candidate lifecycle (real Docker gateway)', () => {
 
 describe('lifecycle recovery and restore verification', () => {
   test('an absent pre-write failure settles without ever being blindly resubmitted', async () => {
-    const h: MemoryHarness = await createHarness();
+    const h: MemoryHarness = await createLegacyHarness();
     try {
       h.backend.fail_once = 'before_write';
       const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
@@ -391,7 +391,7 @@ describe('lifecycle recovery and restore verification', () => {
   }, 120_000);
 
   test('a persisted but unacknowledged write is finalized by recovery exactly once', async () => {
-    const h: MemoryHarness = await createHarness();
+    const h: MemoryHarness = await createLegacyHarness();
     try {
       h.backend.fail_once = 'after_write';
       const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });

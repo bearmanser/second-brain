@@ -22,9 +22,9 @@ import { SYSTEM_ACTOR } from '../../src/core/types.js';
 import {
   armFault,
   createCandidateIntent,
-  createHarness,
+  createLegacyHarness,
   makeBackupFixture,
-  startHttpHarness,
+  startLegacyHttpHarness,
   type MemoryHarness
 } from '../support/harness.js';
 
@@ -81,7 +81,7 @@ test('recovers an interrupted write at every journal transition', async () => {
   ];
 
   for (const scenario of scenarios) {
-    const h = await createHarness();
+    const h = await createLegacyHarness();
     const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
     if (scenario.point === 'mark') armFault(h, 'mark', { state: scenario.state });
     else armFault(h, scenario.point);
@@ -120,7 +120,7 @@ test('recovers an interrupted write at every journal transition', async () => {
 });
 
 test('fails a conclusively absent write without replaying the backend create', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   h.backend.fail_once = 'before_write';
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   const first = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
@@ -142,7 +142,7 @@ test('fails a conclusively absent write without replaying the backend create', a
 });
 
 test('restarting Basic Memory finalizes a late Markdown materialization without resubmitting', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   h.backend.fail_once = 'before_write';
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   const first = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
@@ -165,7 +165,7 @@ test('restarting Basic Memory finalizes a late Markdown materialization without 
 });
 
 test('an unresolved write blocks new mutations while reads continue', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const readable = await h.seed(lessonFixture, { status: 'active' });
   h.backend.fail_once = 'before_write';
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
@@ -196,7 +196,7 @@ test('an unresolved write blocks new mutations while reads continue', async () =
 });
 
 test('rebuilding the catalogue from Markdown excludes archived and superseded heads', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const active = await h.seed(lessonFixture, { status: 'active' });
   const archived = await h.seed(lessonFixture, { status: 'archived' });
   const superseded = await h.seed(lessonFixture, { status: 'superseded' });
@@ -232,7 +232,7 @@ test('rebuilding the catalogue from Markdown excludes archived and superseded he
 });
 
 test('marks unrecoverable operations as definitively failed', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const ghost = h.deps.journal.reserve({
     principal_id: SYSTEM_ACTOR.id,
     idempotency_key: randomUUID(),
@@ -274,7 +274,7 @@ test('marks unrecoverable operations as definitively failed', async () => {
 });
 
 test('does not report failed when the terminal journal transition fails', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const ghost = h.deps.journal.reserve({
     principal_id: SYSTEM_ACTOR.id,
     idempotency_key: randomUUID(),
@@ -309,7 +309,7 @@ test('does not report failed when the terminal journal transition fails', async 
 });
 
 test('keeps a blocker when both the terminal transition and its verification fail', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const ghost = h.deps.journal.reserve({
     principal_id: SYSTEM_ACTOR.id,
     idempotency_key: randomUUID(),
@@ -408,7 +408,7 @@ function captureArguments(idempotency_key: string): Record<string, unknown> {
 }
 
 test('brain_status exposes recovering health, blocked writes, and available reads', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const owner = await h.connect(h.ownerToken, 'owner-recovery');
   try {
     const first = await owner.callTool({

@@ -5,12 +5,12 @@ import {
   parseLegacyProvisioningPlan,
   projectEnsureReceipt
 } from '../../src/storage/legacy-project-adapter.js';
-import { createHarness } from '../support/harness.js';
+import { createLegacyHarness } from '../support/harness.js';
 
 const OPERATION_ID = '00000000-0000-4000-8000-0000000000d1';
 
 test('converts a persisted project binding into the transitional legacy scope', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const journal = Journal.open(':memory:');
   try {
     journal.reserveProject({

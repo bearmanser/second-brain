@@ -8,7 +8,7 @@ import { legacyNotePaths } from '../../src/notes/identity.js';
 import { allocateNotePath, allocateProjectRoot, collisionKey, safeBasename } from '../../src/notes/paths.js';
 import { ProjectRegistry } from '../../src/projects/registry.js';
 import { workerContext } from '../fixtures/principals.js';
-import { createHarness } from '../support/harness.js';
+import { createLegacyHarness } from '../support/harness.js';
 
 const request = (remote_url: string, display_name?: string) => ({
   idempotency_key: randomUUID(),
@@ -269,7 +269,7 @@ test('project registry treats display names as editable metadata, not identity',
 });
 
 test('project ensure persists a readable display name and its vault root', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const result = await ensureProject(
       workerContext,
@@ -290,7 +290,7 @@ test('project ensure persists a readable display name and its vault root', async
 });
 
 test('project ensure accepts a human display name', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const result = await ensureProject(
       workerContext,
@@ -310,7 +310,7 @@ test('project ensure accepts a human display name', async () => {
 });
 
 test('a changed display name never creates a second project for one remote', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const remote = 'https://github.com/example/stable.git';
     const first = await ensureProject(workerContext, request(remote, 'First Label'), h.deps);
@@ -327,7 +327,7 @@ test('a changed display name never creates a second project for one remote', asy
 });
 
 test('project ensure qualifies a colliding basename with the repository owner', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     await ensureProject(workerContext, request('https://github.com/alice/shared-api.git'), h.deps);
     const second = await ensureProject(
@@ -348,7 +348,7 @@ test('project ensure qualifies a colliding basename with the repository owner', 
 });
 
 test('project ensure never adopts an existing unregistered Projects directory', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const vault = h.deps.config.mounts.vault;
     const humanRoot = join(vault, 'Projects', 'human-made');
@@ -369,7 +369,7 @@ test('project ensure never adopts an existing unregistered Projects directory', 
 });
 
 test('project ensure fails closed when the Projects inventory cannot be read', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const vault = h.deps.config.mounts.vault;
     const projectsPath = join(vault, 'Projects');
@@ -388,7 +388,7 @@ test('project ensure fails closed when the Projects inventory cannot be read', a
 });
 
 test('project ensure refuses allocation for a dangling Projects symlink', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const vault = h.deps.config.mounts.vault;
     await symlink(join(vault, 'missing-target'), join(vault, 'Projects'));
@@ -405,7 +405,7 @@ test('project ensure refuses allocation for a dangling Projects symlink', async 
 });
 
 test('project ensure refuses allocation when the vault root is missing', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const vault = h.deps.config.mounts.vault;
     await rm(vault, { recursive: true, force: true });

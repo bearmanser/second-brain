@@ -1,7 +1,14 @@
-import type { NoteContent } from '../contracts/content.js';
+import type { NoteContent, DocumentType } from '../contracts/content.js';
 import type { Project, ProjectFilter } from '../projects/registry.js';
+import type { BrainConfig } from '../config/schema.js';
+import type { CurrentCatalogue, CurrentVault } from '../notes/current-catalogue.js';
+import type { RerankWorker } from '../retrieval/reranker.js';
+import type { Journal } from '../storage/journal.js';
+import type { DocumentStore } from '../storage/document-store.js';
+import type { SearchIndex } from '../storage/search-index.js';
 
 export type { NoteContent } from '../contracts/content.js';
+export type { DocumentType } from '../contracts/content.js';
 export type {
   Project,
   ProjectAlias,
@@ -75,6 +82,8 @@ export interface NoteInput {
   content: NoteContent;
   evidence: Evidence[];
   related_ids: string[];
+  type?: DocumentType;
+  source?: string;
 }
 
 export interface ProjectSelector {
@@ -307,6 +316,19 @@ export interface AuthenticatedContext {
   readonly actor: SystemActor;
   readonly request_id: string;
   readonly signal: AbortSignal;
+}
+
+export interface LocalHandlerDeps {
+  config: BrainConfig;
+  documents: DocumentStore;
+  catalogue: CurrentCatalogue;
+  index: SearchIndex;
+  journal: Journal;
+  vault: CurrentVault;
+  vaultRoot: string;
+  clock: Clock;
+  ids: IdSource;
+  worker?: RerankWorker;
 }
 
 export interface Clock {

@@ -21,7 +21,7 @@ import { reviewerContext, scopeFixtures } from '../fixtures/principals.js';
 import {
   armFault,
   createCandidateIntent,
-  createHarness,
+  createLegacyHarness,
   type MemoryHarness
 } from '../support/harness.js';
 
@@ -95,7 +95,7 @@ function installExpectedPathRace(
 }
 
 test('reconciles a materialized revision after a lost response', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   h.backend.fail_once = 'after_write';
   const request = createCandidateIntent(lessonFixture);
   const first = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
@@ -108,7 +108,7 @@ test('reconciles a materialized revision after a lost response', async () => {
 });
 
 test('resolves the destination project before reserving any operation', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const missing: AuthenticatedContext = {
     actor: SYSTEM_ACTOR,
     request_id: randomUUID(),
@@ -127,7 +127,7 @@ test('resolves the destination project before reserving any operation', async ()
 });
 
 test('rejects a revision whose builder forges an allocated identity', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   const forged: RevisionBuilder = (identities, heads) => ({
     ...request.build(identities, heads),
@@ -141,7 +141,7 @@ test('rejects a revision whose builder forges an allocated identity', async () =
 });
 
 test('fails before reserve without recording an operation', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   armFault(h, 'reserve');
   await expect(
@@ -156,7 +156,7 @@ test('fails before reserve without recording an operation', async () => {
 });
 
 test('recovers an operation that failed after reserve but before submission', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   armFault(h, 'save_plan');
   await expect(
@@ -171,7 +171,7 @@ test('recovers an operation that failed after reserve but before submission', as
 });
 
 test('recovers an operation that failed before submission', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   armFault(h, 'mark', { state: 'submitted' });
   await expect(
@@ -185,7 +185,7 @@ test('recovers an operation that failed before submission', async () => {
 });
 
 test('reconciles a lost write that failed after materialization', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   h.backend.fail_once = 'after_write';
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   const receipt = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
@@ -198,7 +198,7 @@ test('reconciles a lost write that failed after materialization', async () => {
 });
 
 test('finalizes a materialized operation when receipt persistence fails', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   armFault(h, 'mark', { state: 'complete' });
   const first = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
@@ -214,7 +214,7 @@ test('finalizes a materialized operation when receipt persistence fails', async 
 });
 
 test('stores a verified revision and reports indexing separately', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   h.backend.fail_once = 'search_unavailable';
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   const receipt = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
@@ -226,7 +226,7 @@ test('stores a verified revision and reports indexing separately', async () => {
 });
 
 test('treats a disk-full plan failure as recoverable and writes nothing', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   const full = Object.assign(new Error('SQLITE_FULL: database or disk is full'), {
     code: 'SQLITE_FULL'
@@ -243,7 +243,7 @@ test('treats a disk-full plan failure as recoverable and writes nothing', async 
 });
 
 test('conflicts when the expected head etag changed before submission', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const request = createCandidateIntent(lessonFixture, {
     idempotency_key: randomUUID(),
@@ -258,7 +258,7 @@ test('conflicts when the expected head etag changed before submission', async ()
 });
 
 test('serializes two agents that update the same expected etag', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const expected = [{ id: head.source.id, etag: head.source.etag }];
   const left = createCandidateIntent(lessonFixture, {
@@ -284,7 +284,7 @@ test('serializes two agents that update the same expected etag', async () => {
 });
 
 test('keeps same-key concurrent requests idempotent with one backend write', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const request = createCandidateIntent(lessonFixture);
   const [first, second] = await Promise.all([
     h.deps.mutations.commit(reviewerContext, request.intent, request.build),
@@ -298,7 +298,7 @@ test('keeps same-key concurrent requests idempotent with one backend write', asy
 });
 
 test('stores a different-key submission of the same note without overwriting', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const first = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   const second = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   const a = await h.deps.mutations.commit(reviewerContext, first.intent, first.build);
@@ -310,7 +310,7 @@ test('stores a different-key submission of the same note without overwriting', a
 });
 
 test('rejects a missing parent without writing', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const request = createCandidateIntent(lessonFixture, {
     idempotency_key: randomUUID(),
     expected_heads: [{ id: randomUUID(), etag: 'a'.repeat(64) }]
@@ -323,7 +323,7 @@ test('rejects a missing parent without writing', async () => {
 });
 
 test('retains both files when a manual edit races materialization', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const head = await h.seed(lessonFixture, { status: 'active' });
   const request = createCandidateIntent(lessonFixture, {
     idempotency_key: randomUUID(),
@@ -344,7 +344,7 @@ test('retains both files when a manual edit races materialization', async () => 
 });
 
 test('resolves a revision fork without deleting either retained revision', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const root = await h.seed(lessonFixture, { status: 'active' });
   const scope = scopeFixtures[0];
   const base = root.revision;
@@ -393,7 +393,7 @@ test('resolves a revision fork without deleting either retained revision', async
 });
 
 test('performs no write when the caller cancels before reservation', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const controller = new AbortController();
   controller.abort();
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
@@ -406,7 +406,7 @@ test('performs no write when the caller cancels before reservation', async () =>
 });
 
 test('retains data when the caller cancels after submission', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const controller = new AbortController();
   h.backend.on_create = () => {
     controller.abort();
@@ -425,13 +425,13 @@ test('retains data when the caller cancels after submission', async () => {
 });
 
 test('a second gateway writer sharing the state directory fails its instance lock', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   expect(() => InstanceLock.acquire(h.deps.config.mounts.state)).toThrow(/CONFLICT/);
   await h.close();
 });
 
 test('a second gateway writer sharing the same vault fails its instance lock', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   expect(() =>
     InstanceLock.acquire(h.deps.config.mounts.vault, '.brain-instance.lock')
   ).toThrow(/CONFLICT/);
@@ -439,7 +439,7 @@ test('a second gateway writer sharing the same vault fails its instance lock', a
 });
 
 test('releases the instance locks when the gateway closes', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const stateDir = h.deps.config.mounts.state;
   const vaultDir = h.deps.config.mounts.vault;
   await h.close();
@@ -463,7 +463,7 @@ test('reclaims a lock whose PID was reused by a different process lifetime', asy
 });
 
 test('reuses deterministic identities across a save-plan fault', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   const seen: AllocatedIdentity[] = [];
   const spy: RevisionBuilder = (identities, heads) => {
@@ -485,7 +485,7 @@ test('reuses deterministic identities across a save-plan fault', async () => {
 });
 
 test('polls the materialization window before resending a submitted operation', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   h.backend.fail_once = 'before_write';
   const first = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
@@ -516,7 +516,7 @@ test('polls the materialization window before resending a submitted operation', 
 });
 
 test('refreshes a terminal receipt when indexing becomes available', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   h.backend.fail_once = 'search_unavailable';
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   const first = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
@@ -532,7 +532,7 @@ test('refreshes a terminal receipt when indexing becomes available', async () =>
 });
 
 test('rethrows an unexpected backend create error and leaves durable state', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   h.backend.on_create = () => {
     throw new Error('unexpected adapter failure');
   };
@@ -549,7 +549,7 @@ test('rethrows an unexpected backend create error and leaves durable state', asy
 });
 
 test('does not report stored for a tampered approval fingerprint', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   h.backend.on_create = async (write) => {
     const absolute = planPath(h, write);
     const raw = await readFile(absolute, 'utf8');
@@ -573,7 +573,7 @@ test('does not report stored for a tampered approval fingerprint', async () => {
 });
 
 test('does not report stored when the materialised logical id differs', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   h.backend.on_create = async (write) => {
     const absolute = planPath(h, write);
     const raw = await readFile(absolute, 'utf8');
@@ -587,7 +587,7 @@ test('does not report stored when the materialised logical id differs', async ()
 });
 
 test('reports a conflict when two files claim the same revision identity', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   h.backend.on_create = async (write) => {
     const source = planPath(h, write);
     const raw = await readFile(source, 'utf8');
@@ -605,7 +605,7 @@ test('reports a conflict when two files claim the same revision identity', async
 });
 
 test('never reports stored for a foreign revision id', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   h.backend.on_create = async (write) => {
     const absolute = planPath(h, write);
     const raw = await readFile(absolute, 'utf8');
@@ -624,7 +624,7 @@ test('never reports stored for a foreign revision id', async () => {
 });
 
 test('stays pending when the vault cannot be enumerated during materialization', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const originalList = h.deps.vault.list.bind(h.deps.vault);
   let listingUnavailable = false;
   h.deps.vault.list = async (scope) => {
@@ -644,7 +644,7 @@ test('stays pending when the vault cannot be enumerated during materialization',
 });
 
 test('does not resend when the vault cannot be enumerated during a submitted replay', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   h.backend.fail_once = 'before_write';
   const first = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
@@ -660,7 +660,7 @@ test('does not resend when the vault cannot be enumerated during a submitted rep
 });
 
 test('keeps a newly submitted operation blocking during its materialization window', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   const record = h.deps.journal.reserve({
     principal_id: SYSTEM_ACTOR.id,
@@ -692,7 +692,7 @@ test('keeps a newly submitted operation blocking during its materialization wind
 });
 
 test('settled recovery fails an absent write without resubmitting an identical retry', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   h.backend.fail_once = 'before_write';
   const first = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
@@ -723,7 +723,7 @@ test('settled recovery fails an absent write without resubmitting an identical r
 });
 
 test('running recovery finalizes a late materialization without resubmitting it', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   h.backend.fail_once = 'before_write';
   const first = await h.deps.mutations.commit(reviewerContext, request.intent, request.build);
@@ -743,7 +743,7 @@ test('running recovery finalizes a late materialization without resubmitting it'
 });
 
 test('detects a materialization that appears at the expected path during enumeration', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await h.seed(lessonFixture, { status: 'candidate' });
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   let expectedRelative: string | undefined;
@@ -759,7 +759,7 @@ test('detects a materialization that appears at the expected path during enumera
 });
 
 test('does not resend when a materialization appears at the expected path during enumeration', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   await h.seed(lessonFixture, { status: 'candidate' });
   const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
   h.backend.fail_once = 'before_write';
@@ -783,7 +783,7 @@ test('does not resend when a materialization appears at the expected path during
 });
 
 test('persists the intent advisory and replays it without folding it into the digest', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   const first = createCandidateIntent(lessonFixture, { idempotency_key: fixtureIds.idempotencyKey });
   const firstReceipt = await h.deps.mutations.commit(
     reviewerContext,

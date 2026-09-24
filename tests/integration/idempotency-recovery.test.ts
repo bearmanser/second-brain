@@ -3,7 +3,7 @@ import Database from 'better-sqlite3';
 import { expect, test } from 'vitest';
 import { createRuntime } from '../../src/runtime.js';
 import { FakeBackend } from '../support/fake-backend.js';
-import { startHttpHarness } from '../support/harness.js';
+import { startLegacyHttpHarness } from '../support/harness.js';
 
 const KEY = '00000000-0000-4000-8000-000000000131';
 const CONTROL_KEY = '00000000-0000-4000-8000-000000000132';
@@ -36,7 +36,7 @@ function insertLegacyPending(database: Database.Database, id: string, key: strin
 }
 
 test('startup submits a unique planned project but never writes an ambiguous planned legacy group', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   await h.runtime.close();
   const database = new Database(join(h.config.mounts.state, 'journal.db'));
   try {

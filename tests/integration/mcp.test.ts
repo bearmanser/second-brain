@@ -14,7 +14,7 @@ import { FakeBackend } from '../support/fake-backend.js';
 import Database from 'better-sqlite3';
 import { join } from 'node:path';
 import { Journal } from '../../src/storage/journal.js';
-import { startHttpHarness } from '../support/harness.js';
+import { startLegacyHttpHarness } from '../support/harness.js';
 
 const TOOL_NAMES = [
   'brain_capture',
@@ -65,7 +65,7 @@ const captureArgs = (key: string): Record<string, unknown> => ({
 });
 
 test('delivers initialization instructions before a tool is invoked', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const client = new Client({ name: 'brain-contract-test', version: '1.0.0' });
   try {
     await client.connect(
@@ -83,7 +83,7 @@ test('delivers initialization instructions before a tool is invoked', async () =
 });
 
 test('lists the seven tools and completes a status call with structured content', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const client = await h.connect(h.token);
   try {
     const tools = (await client.listTools()).tools;
@@ -124,7 +124,7 @@ test('lists the seven tools and completes a status call with structured content'
 });
 
 test('ensures a repository scope and uses it immediately with the single token', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const client = await h.connect(h.token, 'runtime-client');
   try {
     const remote = 'https://github.com/example/runtime-project.git';
@@ -180,7 +180,7 @@ test('ensures a repository scope and uses it immediately with the single token',
 });
 
 test('sanitizes secret-bearing repository remotes in MCP errors and diagnostics', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const client = await h.connect(h.token);
   const secret = 'never-log-this-secret';
   try {
@@ -198,7 +198,7 @@ test('sanitizes secret-bearing repository remotes in MCP errors and diagnostics'
 });
 
 test('status reports provisioning state to every authenticated caller', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const first = await h.connect(h.token);
   const second = await h.connect(h.token);
   try {
@@ -221,7 +221,7 @@ test('status reports provisioning state to every authenticated caller', async ()
 });
 
 test('text-json delivery serializes the complete result once in the text block', async () => {
-  const h = await startHttpHarness({ result_delivery: 'text-json' });
+  const h = await startLegacyHttpHarness({ result_delivery: 'text-json' });
   const client = await h.connect(h.token);
   try {
     const result = await call(client, 'brain_status', {});
@@ -239,7 +239,7 @@ test('text-json delivery serializes the complete result once in the text block',
 test.each(['structured', 'text-json'] as const)(
   '%s delivery keeps the full MCP read envelope inside the requested budget',
   async (delivery) => {
-    const h = await startHttpHarness({ result_delivery: delivery });
+    const h = await startLegacyHttpHarness({ result_delivery: delivery });
     const client = await h.connect(h.token, `read-budget-${delivery}`);
     try {
       const content = lessonFixture.content.kind === 'lesson' ? lessonFixture.content : undefined;
@@ -272,7 +272,7 @@ test.each(['structured', 'text-json'] as const)(
 );
 
 test('text-json delivery paginates a compressible read beneath the aggregate byte cap', async () => {
-  const h = await startHttpHarness({ result_delivery: 'text-json' });
+  const h = await startLegacyHttpHarness({ result_delivery: 'text-json' });
   const client = await h.connect(h.token, 'read-byte-budget');
   try {
     const content = lessonFixture.content.kind === 'lesson' ? lessonFixture.content : undefined;
@@ -309,7 +309,7 @@ test('text-json delivery paginates a compressible read beneath the aggregate byt
 test.each(['structured', 'text-json'] as const)(
   '%s delivery keeps the full MCP recall envelope inside the requested budget',
   async (delivery) => {
-    const h = await startHttpHarness({ result_delivery: delivery });
+    const h = await startLegacyHttpHarness({ result_delivery: delivery });
     const worker = await h.connect(h.token, `recall-budget-worker-${delivery}`);
     const reviewer = await h.connect(h.token, `recall-budget-reviewer-${delivery}`);
     try {
@@ -343,7 +343,7 @@ test.each(['structured', 'text-json'] as const)(
 );
 
 test('an unknown project returns a structured, retryability-tagged tool error', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const client = await h.connect(h.token);
   try {
     const result = await call(client, 'brain_status', { project: 'unknown-project' });
@@ -360,7 +360,7 @@ test('an unknown project returns a structured, retryability-tagged tool error', 
 });
 
 test('schema-invalid arguments are rejected before any service call', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const client = await h.connect(h.token);
   try {
     const result = await call(client, 'brain_recall', { scope: 'freellmapi' });
@@ -375,7 +375,7 @@ test('schema-invalid arguments are rejected before any service call', async () =
 });
 
 test('read and both review result branches survive output validation', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const worker = await h.connect(h.token, 'read-worker');
   const reviewer = await h.connect(h.token, 'review-approver');
   try {
@@ -416,7 +416,7 @@ test('read and both review result branches survive output validation', async () 
 });
 
 test('the published review schema encodes the result union', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const client = await h.connect(h.token);
   try {
     const review = (await client.listTools()).tools.find((tool) => tool.name === 'brain_review');
@@ -449,7 +449,7 @@ test('the published review schema encodes the result union', async () => {
 });
 
 test('concurrent clients share one identity and key namespace', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const first = await h.connect(h.token, 'client-one');
   const second = await h.connect(h.token, 'client-two');
   try {
@@ -482,7 +482,7 @@ test('concurrent clients share one identity and key namespace', async () => {
 });
 
 test('runtime token rotation invalidates the previous token', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const before = await h.connect(h.token, 'before-rotation');
   expect((await before.listTools()).tools).toHaveLength(7);
   await before.close();
@@ -516,7 +516,7 @@ test('runtime token rotation invalidates the previous token', async () => {
 });
 
 test('recall records a content-free retrieval event', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const client = await h.connect(h.token);
   try {
     await call(client, 'brain_capture', captureArgs(randomUUID()));
@@ -538,7 +538,7 @@ test('recall records a content-free retrieval event', async () => {
 });
 
 test('a raw backend tool is not exposed and never reaches the backend', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const client = await h.connect(h.token);
   try {
     const names = (await client.listTools()).tools.map((tool) => tool.name);
@@ -558,7 +558,7 @@ test('a raw backend tool is not exposed and never reaches the backend', async ()
 });
 
 test('a client can reconnect and continue calling tools', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const first = await h.connect(h.token, 'first-connection');
   await call(first, 'brain_status', {});
   await first.close();
@@ -575,7 +575,7 @@ test('a client can reconnect and continue calling tools', async () => {
 });
 
 test('a write blocked past the drain deadline keeps the lock until it completes', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const client = await h.connect(h.token, 'blocked-write');
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
@@ -629,7 +629,7 @@ test('a write blocked past the drain deadline keeps the lock until it completes'
 });
 
 test('normal runtime startup refuses an existing vault after its journal is lost', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const client = await h.connect(h.token, 'lost-journal-seed');
   try {
     const captured = await call(client, 'brain_capture', captureArgs(randomUUID()));
@@ -654,7 +654,7 @@ test('normal runtime startup refuses an existing vault after its journal is lost
 });
 
 test('normal runtime startup detects lost state when only a dynamic project remains', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const client = await h.connect(h.token, 'lost-dynamic-state-seed');
   try {
     const ensured = await call(client, 'brain_project_ensure', {
@@ -686,7 +686,7 @@ test('normal runtime startup detects lost state when only a dynamic project rema
 });
 
 test('startup quarantines one broken dynamic scope while unrelated scopes remain available', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const client = await h.connect(h.token, 'broken-dynamic-scope-seed');
   let scope = '';
   try {
@@ -721,7 +721,7 @@ test('startup quarantines one broken dynamic scope while unrelated scopes remain
 });
 
 test('startup quarantines a missing project binding without blocking another project', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const client = await h.connect(h.token);
   let scope = '';
   try {
@@ -767,7 +767,7 @@ test('startup quarantines a missing project binding without blocking another pro
 });
 
 test('runtime features use independent project ID, name, vault root and backend binding', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   await h.runtime.close();
   const journal = Journal.open(join(h.config.mounts.state, 'journal.db'), { requireExisting: true });
   try {
@@ -825,7 +825,7 @@ test('runtime features use independent project ID, name, vault root and backend 
 });
 
 test('enforces the configured shared read-concurrency limit', async () => {
-  const h = await startHttpHarness({ concurrent_reads: 2 });
+  const h = await startLegacyHttpHarness({ concurrent_reads: 2 });
   const clients = await Promise.all(
     Array.from({ length: 6 }, (_, index) => h.connect(h.token, `bounded-read-${index}`))
   );
@@ -861,7 +861,7 @@ test('enforces the configured shared read-concurrency limit', async () => {
 });
 
 test('public MCP backend errors redact every rejected credential family', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const client = await h.connect(h.token, 'credential-error-redaction');
   const secrets = [
     '-----BEGIN PRIVATE KEY-----\nabc123\n-----END PRIVATE KEY-----',
@@ -889,7 +889,7 @@ test('public MCP backend errors redact every rejected credential family', async 
 });
 
 test('note, query, and token markers never reach diagnostics or audit', async () => {
-  const h = await startHttpHarness();
+  const h = await startLegacyHttpHarness();
   const client = await h.connect(h.token);
   try {
     const noteMarker = 'note-marker-7c1d';

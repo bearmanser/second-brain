@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { startHttpHarness } from '../support/harness.js';
+import { startLegacyHttpHarness } from '../support/harness.js';
 import { makeLexicalSearch } from './lexical-backend.mjs';
 import { seedCorpus, httpSeedProvider, type CorpusFile, type SeedRegistry } from './seed.mjs';
 import { REPO_ROOT, readJson, writeJson } from './io.mjs';
@@ -290,7 +290,7 @@ async function runOne(
   corpus: CorpusFile,
   opencodeVersion: string
 ): Promise<PilotRunRecord> {
-  const harness = await startHttpHarness({ result_delivery: 'text-json' });
+  const harness = await startLegacyHttpHarness({ result_delivery: 'text-json' });
   const workDir = await mkdtemp(join(tmpdir(), 'brain-agent-'));
   try {
     harness.backend.search = makeLexicalSearch(harness.backend.root);

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { RecallRequest } from '../../src/core/types.js';
-import { startDockerHarness, startHttpHarness } from '../support/harness.js';
+import { startDockerHarness, startLegacyHttpHarness } from '../support/harness.js';
 import { scoreRetrieval, summariseRetrieval, type ScoredRetrievalCase } from './analyse.mjs';
 import { makeLexicalSearch } from './lexical-backend.mjs';
 import {
@@ -129,7 +129,7 @@ export async function runRetrieval(
     provider = dockerSeedProvider(docker);
     closeTarget = () => docker.close();
   } else {
-    const http = await startHttpHarness();
+    const http = await startLegacyHttpHarness();
     http.backend.search = makeLexicalSearch(http.backend.root);
     provider = httpSeedProvider(http);
     closeTarget = () => http.close();

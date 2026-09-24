@@ -16,6 +16,10 @@ export interface FakeBackendOptions {
   projects?: readonly string[];
 }
 
+export function createLegacyBackend(options: FakeBackendOptions): FakeBackend {
+  return new FakeBackend(options);
+}
+
 interface MaterialisedNote {
   relative_path: string;
   permalink: string;

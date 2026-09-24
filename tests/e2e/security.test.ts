@@ -11,9 +11,9 @@ import { reviewerContext } from '../fixtures/principals.js';
 import { recoverPending } from '../../src/operations/recovery.js';
 import {
   createCandidateIntent,
-  createHarness,
+  createLegacyHarness,
   startDockerHarness,
-  startHttpHarness,
+  startLegacyHttpHarness,
   type DockerHarness,
   type HttpHarness,
   type MemoryHarness
@@ -296,7 +296,7 @@ describe('release-candidate security (real Docker gateway)', () => {
 
 describe('adversarial backend and concurrency behaviour', () => {
   test('a poison note triggers exactly one create call and no server-side fetch', async () => {
-    const h: HttpHarness = await startHttpHarness();
+    const h: HttpHarness = await startLegacyHttpHarness();
     try {
       let fetchAttempts = 0;
       (h.backend as unknown as Record<string, unknown>).fetch = (): void => {
@@ -339,7 +339,7 @@ describe('adversarial backend and concurrency behaviour', () => {
   }, 120_000);
 
   test('an unexpected backend fault is a bounded typed error, not a stack trace', async () => {
-    const h: HttpHarness = await startHttpHarness();
+    const h: HttpHarness = await startLegacyHttpHarness();
     try {
       h.backend.search = async (): Promise<{ hits: BackendHit[]; has_more: boolean }> => {
         throw new Error('raw backend exploded at /root/secret/backend.ts:12');
@@ -363,7 +363,7 @@ describe('adversarial backend and concurrency behaviour', () => {
   }, 120_000);
 
   test('mixed-principal concurrent requests preserve each authorization boundary', async () => {
-    const h: HttpHarness = await startHttpHarness();
+    const h: HttpHarness = await startLegacyHttpHarness();
     try {
       const worker = await h.connect(h.token, 'concurrency-worker');
       const reviewer = await h.connect(h.reviewerToken, 'concurrency-reviewer');
@@ -499,7 +499,7 @@ describe('adversarial backend and concurrency behaviour', () => {
   }, 120_000);
 
   test('a pending mutation is a durable success with explicit availability flags', async () => {
-    const h: HttpHarness = await startHttpHarness();
+    const h: HttpHarness = await startLegacyHttpHarness();
     try {
       h.backend.fail_once = 'before_write';
       const client = await h.connect(h.reviewerToken, 'pending-receipt');
@@ -544,7 +544,7 @@ describe('adversarial backend and concurrency behaviour', () => {
   }, 120_000);
 
   test('embedding degradation is an explicit degraded result or a typed failure', async () => {
-    const h: HttpHarness = await startHttpHarness();
+    const h: HttpHarness = await startLegacyHttpHarness();
     try {
       const seeder = await h.connect(h.reviewerToken, 'degraded-seed');
       try {
@@ -619,7 +619,7 @@ describe('adversarial backend and concurrency behaviour', () => {
   }, 120_000);
 
   test('a lost write acknowledgment keeps one note and replays the same receipt', async () => {
-    const h: MemoryHarness = await createHarness();
+    const h: MemoryHarness = await createLegacyHarness();
     try {
       h.backend.fail_once = 'after_write';
       const request = createCandidateIntent(lessonFixture, { idempotency_key: randomUUID() });
@@ -646,7 +646,7 @@ describe('adversarial backend and concurrency behaviour', () => {
   }, 120_000);
 
   test('duplicate revision identities are quarantined and excluded from recall', async () => {
-    const h: MemoryHarness = await createHarness();
+    const h: MemoryHarness = await createLegacyHarness();
     try {
       const head = await h.seed(lessonFixture, { status: 'active' });
       const original = await h.deps.vault.read('freellmapi', head.source.relative_path);
@@ -670,7 +670,7 @@ describe('adversarial backend and concurrency behaviour', () => {
   }, 120_000);
 
   test('a revision with a missing parent is quarantined and excluded from recall', async () => {
-    const h: MemoryHarness = await createHarness();
+    const h: MemoryHarness = await createLegacyHarness();
     try {
       const head = await h.seed(lessonFixture, { status: 'active' });
       const original = await h.deps.vault.read('freellmapi', head.source.relative_path);
@@ -703,7 +703,7 @@ describe('adversarial backend and concurrency behaviour', () => {
   }, 120_000);
 
   test('a symlink inside the vault is ignored and never followed', async () => {
-    const h: MemoryHarness = await createHarness();
+    const h: MemoryHarness = await createLegacyHarness();
     try {
       const scope = h.deps.config.scopes.find((candidate) => candidate.id === 'freellmapi');
       expect(scope).toBeDefined();

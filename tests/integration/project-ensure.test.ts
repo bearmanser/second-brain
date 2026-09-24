@@ -5,13 +5,13 @@ import { ensureProject } from '../../src/features/project-ensure.js';
 import type { ProjectProvisioningPlan } from '../../src/core/types.js';
 import { scopeWithCollisionSuffix } from '../../src/projects/identity.js';
 import { ownerContext, reviewerContext, workerContext } from '../fixtures/principals.js';
-import { armFault, createHarness } from '../support/harness.js';
+import { armFault, createLegacyHarness } from '../support/harness.js';
 
 const request = (remote_url: string, idempotency_key = randomUUID()) => ({ idempotency_key, remote_url });
 const keyFor = (remote: string): string => `github.com/example/${remote.replace(/\.git$/, '')}`;
 
 test('provisions a ready project without a permission grant', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const result = await ensureProject(workerContext, request('https://github.com/example/project-a.git'), h.deps);
     expect(result).toMatchObject({ created: true, backend_ready: true, materialized: true });
@@ -27,7 +27,7 @@ test('provisions a ready project without a permission grant', async () => {
 });
 
 test('replays a completed ensure without a second backend call', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const input = request('https://github.com/bearmanser/second-brain.git');
     const first = await ensureProject(reviewerContext, input, h.deps);
@@ -41,7 +41,7 @@ test('replays a completed ensure without a second backend call', async () => {
 });
 
 test('concurrent SSH and HTTPS spellings create one project', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const before = h.backend.call_count;
     const [https, ssh] = await Promise.all([
@@ -59,7 +59,7 @@ test('concurrent SSH and HTTPS spellings create one project', async () => {
 });
 
 test('uses deterministic suffixes for static collisions', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const identity = 'github.com/example/freellmapi';
     const result = await ensureProject(workerContext, request(`https://${identity}.git`), h.deps);
@@ -70,7 +70,7 @@ test('uses deterministic suffixes for static collisions', async () => {
 });
 
 test('enforces the global provisioning rate and persisted project-count limits', async () => {
-  const capped = await createHarness();
+  const capped = await createLegacyHarness();
   try {
     capped.deps.config.limits.dynamic_projects_max = 1;
     await ensureProject(ownerContext, request('https://github.com/example/first.git'), capped.deps);
@@ -81,7 +81,7 @@ test('enforces the global provisioning rate and persisted project-count limits',
     await capped.close();
   }
 
-  const global = await createHarness();
+  const global = await createLegacyHarness();
   try {
     global.deps.config.limits.project_provision_global_per_minute = 3;
     for (let index = 0; index < 3; index += 1) {
@@ -95,7 +95,7 @@ test('enforces the global provisioning rate and persisted project-count limits',
 });
 
 test('resumes a submitted project after backend availability returns', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const input = request('https://github.com/example/recover-backend.git');
     h.backend.ensure_project_fail_once = true;
@@ -113,7 +113,7 @@ test('resumes a submitted project after backend availability returns', async () 
 });
 
 test('marks a mismatched backend mapping for explicit recovery', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     h.backend.ensureProject = async () => {
       throw new BrainError({ code: 'BACKEND_PROTOCOL_ERROR', message: 'backend project response did not match' });
@@ -134,7 +134,7 @@ test('marks a mismatched backend mapping for explicit recovery', async () => {
 });
 
 test('quarantines a ready project that disappears before another request', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const remote = 'https://github.com/example/drifted-ready.git';
     const created = await ensureProject(workerContext, request(remote), h.deps);
@@ -156,7 +156,7 @@ test('quarantines a ready project that disappears before another request', async
 });
 
 test('repairs a recovery-required project through evidence-driven recovery', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const remote = 'https://github.com/example/repairable.git';
     const originalEnsure = h.backend.ensureProject.bind(h.backend);
@@ -181,7 +181,7 @@ test('repairs a recovery-required project through evidence-driven recovery', asy
 });
 
 test('recovers a ready project whose receipt commit was interrupted', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const input = request('https://github.com/example/recover-receipt.git');
     armFault(h, 'mark', { state: 'complete' });
@@ -197,7 +197,7 @@ test('recovers a ready project whose receipt commit was interrupted', async () =
 });
 
 test('reloads ready project mappings after restart', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const created = await ensureProject(reviewerContext, request('https://github.com/example/restarted.git'), h.deps);
     await h.restart();
@@ -211,7 +211,7 @@ test('reloads ready project mappings after restart', async () => {
 });
 
 test('rejects reuse of one idempotency key for another normalized repository', async () => {
-  const h = await createHarness();
+  const h = await createLegacyHarness();
   try {
     const key = randomUUID();
     await ensureProject(workerContext, request('https://github.com/example/alpha.git', key), h.deps);
@@ -225,7 +225,7 @@ test('rejects reuse of one idempotency key for another normalized repository', a
 test.each(['can_write', 'can_review'] as const)(
   'recovery blocks a V1 project plan missing only grant.%s',
   async (missing) => {
-    const h = await createHarness();
+    const h = await createLegacyHarness();
     try {
       const invalidProject = `invalid-legacy-${missing.replace('_', '-')}`;
       const operations = new Map<string, string>();
