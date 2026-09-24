@@ -46,6 +46,7 @@ import { recoverPending } from './operations/recovery.js';
 import { ScopeRegistry } from './projects/scope-registry.js';
 import { BasicMemoryBackend } from './storage/basic-memory.js';
 import { Journal } from './storage/journal.js';
+import { openRevisionStore, type RevisionStore } from './storage/revision-store.js';
 import { FileVault } from './storage/vault.js';
 import { InstanceLock, MutationCoordinator, type BrainDeps } from './core/mutation.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -76,6 +77,7 @@ export interface BrainRuntime {
   readonly closed: boolean;
   readonly shutdownPending: boolean;
   readonly shutdownSignal: AbortSignal;
+  readonly currentCatalogue: CurrentCatalogue | undefined;
   trackOperation<T>(work: Promise<T>): Promise<T>;
   rotateTokenDigest(digest: string): void;
   dispatch(
@@ -267,7 +269,7 @@ class BrainRuntimeImpl implements BrainRuntime {
   private pruneTimer: NodeJS.Timeout | undefined;
   private reconcileTimer: NodeJS.Timeout | undefined;
   private reconciling = false;
-  private currentCatalogue: CurrentCatalogue | undefined;
+  private currentIndex: CurrentCatalogue | undefined;
   private currentObserver: CurrentVaultObserver | undefined;
   private readonly readLimiter: ReadLimiter;
 
@@ -282,6 +284,10 @@ class BrainRuntimeImpl implements BrainRuntime {
 
   get shutdownSignal(): AbortSignal {
     return this.shutdown.signal;
+  }
+
+  get currentCatalogue(): CurrentCatalogue | undefined {
+    return this.currentIndex;
   }
 
   async start(): Promise<void> {
@@ -594,8 +600,15 @@ class BrainRuntimeImpl implements BrainRuntime {
     if (typeof vault.listMarkdown !== 'function' || typeof vault.readMarkdown !== 'function') {
       return;
     }
-    const current = CurrentCatalogue.open();
-    this.currentCatalogue = current;
+    let revisions: RevisionStore;
+    try {
+      revisions = await openRevisionStore(this.config.mounts.state);
+    } catch (error) {
+      this.log(internalDiagnostic(error));
+      return;
+    }
+    const current = CurrentCatalogue.open({ revisions, ids: this.ids });
+    this.currentIndex = current;
     const observer = observeCurrentVault({
       root: this.config.mounts.vault,
       vault: vault as CurrentVault,
@@ -716,8 +729,8 @@ class BrainRuntimeImpl implements BrainRuntime {
     this.ready = false;
     await this.currentObserver?.close().catch(() => undefined);
     this.currentObserver = undefined;
-    this.currentCatalogue?.close();
-    this.currentCatalogue = undefined;
+    this.currentIndex?.close();
+    this.currentIndex = undefined;
     await this.backend?.close().catch(() => undefined);
     this.backend = undefined;
     this.catalogue?.close();

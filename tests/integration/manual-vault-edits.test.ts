@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { afterEach, expect, test } from 'vitest';
 import {
@@ -12,6 +12,7 @@ import { openDocumentStore } from '../../src/storage/document-store.js';
 import { openRevisionStore, type RevisionStore } from '../../src/storage/revision-store.js';
 import { FileVault } from '../../src/storage/vault.js';
 import { vaultSandbox } from '../helpers/vault-sandbox.js';
+import { startHttpHarness } from '../support/harness.js';
 
 interface Fixture {
   vault: string;
@@ -107,7 +108,6 @@ test('an external rename preserves the managed ID and its history', async () => 
   expect(before?.revision_id).toBeDefined();
 
   await mkdir(join(f.vault, 'Knowledge'), { recursive: true });
-  const { rename } = await import('node:fs/promises');
   await rename(join(f.vault, 'Knowledge/Before.md'), join(f.vault, 'Knowledge/After.md'));
 
   const report = await reconcileCurrentVault({ vault: f.fileVault, catalogue: f.catalogue });
@@ -461,4 +461,208 @@ test('reconciliation can be cancelled before it starts', async () => {
   await expect(
     reconcileCurrentVault({ vault: f.fileVault, catalogue: f.catalogue, signal: controller.signal })
   ).rejects.toMatchObject({ code: 'CANCELLED' });
+});
+
+test('content changes are detected even when the mtime is restored', async () => {
+  const f = await fixture();
+  const id = randomUUID();
+  const path = 'Knowledge/Mtime.md';
+  await writeVault(f.vault, path, managedNote(id, 'Mtime', { body: '# Mtime\n\nOne.\n' }));
+  await reconcileCurrentVault({ vault: f.fileVault, catalogue: f.catalogue });
+  const before = f.catalogue.getById(id);
+  const stat = await lstat(join(f.vault, path));
+
+  await writeVault(f.vault, path, managedNote(id, 'Mtime', { body: '# Mtime\n\nTwo.\n' }));
+  await utimes(join(f.vault, path), stat.atime, stat.mtime);
+
+  const report = await reconcileCurrentVault({ vault: f.fileVault, catalogue: f.catalogue });
+  expect(report.changed).toHaveLength(1);
+  expect(f.catalogue.getById(id)?.hash).not.toBe(before?.hash);
+});
+
+test('a rename that also edits bytes persists the prior and new revisions', async () => {
+  const f = await fixture();
+  const id = randomUUID();
+  await writeVault(
+    f.vault,
+    'Knowledge/Before.md',
+    managedNote(id, 'Note', { body: '# Note\n\nOld body.\n' })
+  );
+  await reconcileCurrentVault({ vault: f.fileVault, catalogue: f.catalogue });
+  const before = f.catalogue.getById(id);
+  expect(before?.revision_id).toBeDefined();
+
+  await writeVault(
+    f.vault,
+    'Knowledge/After.md',
+    managedNote(id, 'Note', { body: '# Note\n\nNew body.\n' })
+  );
+  await rm(join(f.vault, 'Knowledge/Before.md'));
+
+  const report = await reconcileCurrentVault({ vault: f.fileVault, catalogue: f.catalogue });
+  expect(report.moved).toEqual([{ id, from: 'Knowledge/Before.md', to: 'Knowledge/After.md' }]);
+  const after = f.catalogue.getById(id);
+  expect(after?.path).toBe('Knowledge/After.md');
+  expect(after?.hash).not.toBe(before?.hash);
+  expect(after?.revision_id).not.toBe(before?.revision_id);
+  expect((await f.revisions.readRevision(id, before?.revision_id ?? '')).raw).toContain('Old body.');
+  expect((await f.revisions.readRevision(id, after?.revision_id ?? '')).raw).toContain('New body.');
+  await f.revisions.verifyPreimage(id, before?.hash ?? '');
+});
+
+test('chained external moves preserve every managed identity', async () => {
+  const f = await fixture();
+  const first = randomUUID();
+  const second = randomUUID();
+  await writeVault(f.vault, 'Knowledge/A.md', managedNote(first, 'A'));
+  await writeVault(f.vault, 'Knowledge/B.md', managedNote(second, 'B'));
+  await reconcileCurrentVault({ vault: f.fileVault, catalogue: f.catalogue });
+
+  await rename(join(f.vault, 'Knowledge/A.md'), join(f.vault, 'Knowledge/A-tmp.md'));
+  await rename(join(f.vault, 'Knowledge/B.md'), join(f.vault, 'Knowledge/C.md'));
+  await rename(join(f.vault, 'Knowledge/A-tmp.md'), join(f.vault, 'Knowledge/B.md'));
+
+  const report = await reconcileCurrentVault({ vault: f.fileVault, catalogue: f.catalogue });
+  expect(report.moved).toEqual(
+    expect.arrayContaining([
+      { id: first, from: 'Knowledge/A.md', to: 'Knowledge/B.md' },
+      { id: second, from: 'Knowledge/B.md', to: 'Knowledge/C.md' }
+    ])
+  );
+  expect(f.catalogue.getById(first)?.path).toBe('Knowledge/B.md');
+  expect(f.catalogue.getById(second)?.path).toBe('Knowledge/C.md');
+  expect(f.catalogue.getByPath('Knowledge/A.md')).toBeUndefined();
+});
+
+test('a swapped pair of external renames keeps both identities', async () => {
+  const f = await fixture();
+  const first = randomUUID();
+  const second = randomUUID();
+  await writeVault(f.vault, 'Knowledge/A.md', managedNote(first, 'A'));
+  await writeVault(f.vault, 'Knowledge/B.md', managedNote(second, 'B'));
+  await reconcileCurrentVault({ vault: f.fileVault, catalogue: f.catalogue });
+
+  await rename(join(f.vault, 'Knowledge/A.md'), join(f.vault, 'Knowledge/A-tmp.md'));
+  await rename(join(f.vault, 'Knowledge/B.md'), join(f.vault, 'Knowledge/A.md'));
+  await rename(join(f.vault, 'Knowledge/A-tmp.md'), join(f.vault, 'Knowledge/B.md'));
+
+  const report = await reconcileCurrentVault({ vault: f.fileVault, catalogue: f.catalogue });
+  expect(report.moved).toEqual(
+    expect.arrayContaining([
+      { id: first, from: 'Knowledge/A.md', to: 'Knowledge/B.md' },
+      { id: second, from: 'Knowledge/B.md', to: 'Knowledge/A.md' }
+    ])
+  );
+  expect(f.catalogue.getById(first)?.path).toBe('Knowledge/B.md');
+  expect(f.catalogue.getById(second)?.path).toBe('Knowledge/A.md');
+});
+
+test('removing the id from frontmatter leaves no phantom managed identity', async () => {
+  const f = await fixture();
+  const id = randomUUID();
+  const raw = managedNote(id, 'Plain');
+  await writeVault(f.vault, 'Knowledge/Plain.md', raw);
+  await reconcileCurrentVault({ vault: f.fileVault, catalogue: f.catalogue });
+  const before = f.catalogue.getById(id);
+  expect(before?.revision_id).toBeDefined();
+
+  const withoutId = raw
+    .split('\n')
+    .filter((line) => !line.startsWith('id:'))
+    .join('\n');
+  await writeVault(f.vault, 'Knowledge/Plain.md', withoutId);
+
+  const report = await reconcileCurrentVault({ vault: f.fileVault, catalogue: f.catalogue });
+  expect(report.changed).toEqual([
+    { path: 'Knowledge/Plain.md', previous_etag: before?.etag, etag: hash(withoutId) }
+  ]);
+  const entry = f.catalogue.getByPath('Knowledge/Plain.md');
+  expect(entry?.id).toBeUndefined();
+  expect(entry?.revision_id).toBeUndefined();
+  expect(f.catalogue.getById(id)).toBeUndefined();
+  expect(f.catalogue.historyFor(id)?.revision_id).toBe(before?.revision_id);
+  expect((await f.revisions.readRevision(id, before?.revision_id ?? '')).raw).toBe(raw);
+});
+
+test('a refresh never returns an unverified stale source', async () => {
+  const f = await fixture();
+  const id = randomUUID();
+  const original = managedNote(id, 'Stale');
+  await writeVault(f.vault, 'Knowledge/Stale.md', original);
+  await reconcileCurrentVault({ vault: f.fileVault, catalogue: f.catalogue });
+  const before = f.catalogue.getById(id);
+
+  await writeVault(f.vault, 'Knowledge/Copy.md', original);
+  await writeVault(f.vault, 'Knowledge/Stale.md', managedNote(id, 'Stale', { body: '# Stale\n\nEdited.\n' }));
+
+  const result = await readCurrentSource({
+    vault: f.fileVault,
+    catalogue: f.catalogue,
+    reference: { id }
+  });
+  expect(result.state).toBe('stale');
+  expect(result.state === 'stale' ? result.source.hash : undefined).toBe(before?.hash);
+  expect(f.catalogue.getByPath('Knowledge/Copy.md')).toBeUndefined();
+});
+
+test('aborting the observer signal releases its watcher and timers', async () => {
+  const f = await fixture();
+  const controller = new AbortController();
+  const reports: number[] = [];
+  const observer = observeCurrentVault({
+    root: f.vault,
+    vault: f.fileVault,
+    catalogue: f.catalogue,
+    signal: controller.signal,
+    debounce_ms: 5,
+    interval_ms: 20,
+    onReconcile: (report) => reports.push(report.scanned)
+  });
+  await observer.reconcileNow();
+  controller.abort();
+  expect(observer.closed).toBe(true);
+
+  const count = reports.length;
+  await writeVault(f.vault, 'Knowledge/After abort.md', '# After abort\n');
+  await sleep(150);
+  expect(reports.length).toBe(count);
+  await expect(observer.reconcileNow()).resolves.toBeUndefined();
+});
+
+test('the runtime retains durable history across a restart', async () => {
+  const h = await startHttpHarness({ reconcile_interval_ms: 30 });
+  const id = randomUUID();
+  const relative = 'Knowledge/Durable.md';
+  try {
+    await writeVault(h.config.mounts.vault, relative, managedNote(id, 'Durable', { body: '# Durable\n\nFirst.\n' }));
+    const catalogue = h.runtime.currentCatalogue;
+    expect(catalogue).toBeDefined();
+    const firstDeadline = Date.now() + 5000;
+    while (catalogue?.getById(id) === undefined && Date.now() < firstDeadline) await sleep(20);
+    const first = catalogue?.getById(id);
+    expect(first?.revision_id).toBeDefined();
+
+    await writeVault(h.config.mounts.vault, relative, managedNote(id, 'Durable', { body: '# Durable\n\nSecond.\n' }));
+    const secondDeadline = Date.now() + 5000;
+    while (
+      catalogue?.getById(id)?.revision_id === first?.revision_id &&
+      Date.now() < secondDeadline
+    ) {
+      await sleep(20);
+    }
+    const second = catalogue?.getById(id);
+    expect(second?.revision_id).not.toBe(first?.revision_id);
+
+    await rm(join(h.config.mounts.vault, relative));
+    const removalDeadline = Date.now() + 5000;
+    while (catalogue?.getById(id) !== undefined && Date.now() < removalDeadline) await sleep(20);
+    expect(catalogue?.getById(id)).toBeUndefined();
+
+    const fresh = await openRevisionStore(h.config.mounts.state);
+    expect((await fresh.readRevision(id, first?.revision_id ?? '')).raw).toContain('First.');
+    expect((await fresh.readRevision(id, second?.revision_id ?? '')).raw).toContain('Second.');
+    await fresh.verifyPreimage(id, first?.hash ?? '');
+  } finally {
+    await h.close();
+  }
 });

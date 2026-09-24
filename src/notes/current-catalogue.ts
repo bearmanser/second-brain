@@ -238,7 +238,7 @@ export class CurrentCatalogue {
     }
     const existing = this.entries.get(entry.path);
     const metadata = readFallback(entry.raw, entry.path);
-    const id = entry.id ?? metadata.id ?? existing?.source.id;
+    const id = entry.id ?? metadata.id;
     const source: CurrentSource = {
       path: entry.path,
       hash: entry.etag,
@@ -253,7 +253,9 @@ export class CurrentCatalogue {
           ? existing.source.observed_at
           : this.clock.now().toISOString(),
       ...(id === undefined ? {} : { id }),
-      ...(entry.revision_id === undefined ? {} : { revision_id: entry.revision_id }),
+      ...(id === undefined || entry.revision_id === undefined
+        ? {}
+        : { revision_id: entry.revision_id }),
       ...(metadata.project === undefined ? {} : { project: metadata.project })
     };
     this.entries.set(entry.path, { source, raw: entry.raw });
@@ -446,32 +448,59 @@ export async function reconcileCurrentVault(
     .map((item) => ({ id: item.document.id, path: item.path }));
 
   const movedFrom = new Set<string>();
+  const moveDestinations = new Set<string>();
   const movesByTo = new Map<string, { id: string; from: string; to: string }>();
   for (const match of matchCurrentIdentity(previousIdentities, nextIdentities)) {
     if ('to' in match) movesByTo.set(match.to, match);
   }
 
+  interface PendingMove {
+    match: { id: string; from: string; to: string };
+    item: ObservedDocument;
+    source: CurrentSource;
+  }
+  const pendingMoves: PendingMove[] = [];
   for (const item of observed) {
-    if (signal?.aborted) throw cancelled();
     const id = item.document.id;
     if (id !== undefined && duplicateIds.has(id)) continue;
     const move = movesByTo.get(item.path);
-    if (move !== undefined) {
-      const source = previousByPath.get(move.from);
-      if (source !== undefined) {
-        catalogue.remove(move.from);
-        catalogue.upsert({
-          path: item.path,
-          raw: item.raw,
-          etag: item.raw_hash,
-          ...(id === undefined ? {} : { id }),
-          ...(source.revision_id === undefined ? {} : { revision_id: source.revision_id })
-        });
-        movedFrom.add(move.from);
-        report.moved.push({ id: move.id, from: move.from, to: item.path });
-        continue;
-      }
+    if (move === undefined) continue;
+    const source = previousByPath.get(move.from);
+    if (source === undefined) continue;
+    pendingMoves.push({ match: move, item, source });
+    moveDestinations.add(item.path);
+  }
+
+  const movePriorRaw = new Map<string, string | undefined>();
+  for (const pending of pendingMoves) {
+    movePriorRaw.set(pending.match.from, catalogue.rawFor(pending.match.from));
+    catalogue.remove(pending.match.from);
+    movedFrom.add(pending.match.from);
+  }
+
+  for (const pending of pendingMoves) {
+    if (signal?.aborted) throw cancelled();
+    const { match, item, source } = pending;
+    let revisionId = source.revision_id;
+    if (source.id !== undefined && source.hash !== item.raw_hash) {
+      await catalogue.persistSnapshot(source.id, movePriorRaw.get(match.from));
+      revisionId = await catalogue.persistRevision(source.id, item.raw);
     }
+    catalogue.upsert({
+      path: item.path,
+      raw: item.raw,
+      etag: item.raw_hash,
+      ...(source.id === undefined ? {} : { id: source.id }),
+      ...(revisionId === undefined ? {} : { revision_id: revisionId })
+    });
+    report.moved.push({ id: match.id, from: match.from, to: item.path });
+  }
+
+  for (const item of observed) {
+    if (signal?.aborted) throw cancelled();
+    if (moveDestinations.has(item.path)) continue;
+    const id = item.document.id;
+    if (id !== undefined && duplicateIds.has(id)) continue;
 
     const prior = previousByPath.get(item.path);
     if (prior === undefined) {
@@ -490,7 +519,7 @@ export async function reconcileCurrentVault(
 
     if (prior.hash === item.raw_hash) continue;
 
-    let revisionId = prior.revision_id;
+    let revisionId: string | undefined;
     if (id !== undefined && id === prior.id) {
       await catalogue.persistSnapshot(id, catalogue.rawFor(prior.path));
       revisionId = await catalogue.persistRevision(id, item.raw);
@@ -609,7 +638,16 @@ export async function readCurrentSource(
     const again = locate();
     if (again === undefined) return { state: 'missing' };
     if ('conflict' in again) return { state: 'conflict', paths: again.conflict };
-    return { state: 'refreshed', source: again };
+    let verified: { raw: string; raw_hash: string } | undefined;
+    try {
+      verified = await vault.readMarkdown(again.path);
+    } catch {
+      verified = undefined;
+    }
+    if (verified !== undefined && verified.raw_hash === again.hash) {
+      return { state: 'refreshed', source: again };
+    }
+    return { state: 'stale', source: again };
   }
   return read === undefined ? { state: 'missing' } : { state: 'stale', source };
 }
@@ -634,14 +672,32 @@ export interface CurrentVaultObserver {
 export function observeCurrentVault(options: ObserveCurrentVaultOptions): CurrentVaultObserver {
   const debounceMs = options.debounce_ms ?? CURRENT_VAULT_DEBOUNCE_MS;
   const intervalMs = options.interval_ms ?? CURRENT_VAULT_RESCAN_INTERVAL_MS;
+  let closed = false;
+  let running = false;
+  let debounceTimer: NodeJS.Timeout | undefined;
+  let intervalTimer: NodeJS.Timeout | undefined;
+  let watcher: FSWatcher | undefined;
+
   const report = (error: unknown): void => {
     if (closed) return;
     options.onError?.(error);
   };
-  let closed = false;
-  let running = false;
-  let debounceTimer: NodeJS.Timeout | undefined;
-  let watcher: FSWatcher | undefined;
+
+  const close = async (): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    options.signal?.removeEventListener('abort', onAbort);
+    if (debounceTimer !== undefined) clearTimeout(debounceTimer);
+    if (intervalTimer !== undefined) clearInterval(intervalTimer);
+    try {
+      watcher?.close();
+    } catch {
+      watcher = undefined;
+    }
+  };
+  function onAbort(): void {
+    void close();
+  }
 
   const run = async (): Promise<ReconcileCurrentVaultReport | undefined> => {
     if (closed || running) return undefined;
@@ -673,34 +729,28 @@ export function observeCurrentVault(options: ObserveCurrentVaultOptions): Curren
     debounceTimer.unref?.();
   };
 
-  try {
-    watcher = watchFiles(options.root, { recursive: true }, () => schedule());
-    watcher.on('error', report);
-    watcher.unref?.();
-  } catch (error) {
-    report(error);
+  options.signal?.addEventListener('abort', onAbort, { once: true });
+  if (options.signal?.aborted) {
+    void close();
+  } else {
+    try {
+      watcher = watchFiles(options.root, { recursive: true }, () => schedule());
+      watcher.on('error', report);
+      watcher.unref?.();
+    } catch (error) {
+      report(error);
+    }
+    intervalTimer = setInterval(() => {
+      void run();
+    }, intervalMs);
+    intervalTimer.unref?.();
   }
-
-  const interval = setInterval(() => {
-    void run();
-  }, intervalMs);
-  interval.unref?.();
 
   return {
     get closed(): boolean {
       return closed;
     },
     reconcileNow: run,
-    async close(): Promise<void> {
-      if (closed) return;
-      closed = true;
-      if (debounceTimer !== undefined) clearTimeout(debounceTimer);
-      clearInterval(interval);
-      try {
-        watcher?.close();
-      } catch {
-        watcher = undefined;
-      }
-    }
+    close
   };
 }
