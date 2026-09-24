@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { loadTokenDigest } from './config/load.js';
@@ -28,6 +29,11 @@ import {
   requireRecoveryAuthorization,
   summariseRecovery
 } from './operations/recovery.js';
+import { applyVaultMigration, resumeVaultMigration } from './operations/vault-v2/apply.js';
+import { planVaultMigration } from './operations/vault-v2/plan.js';
+import { buildInspectionReport, renderInspectionReport } from './operations/vault-v2/report.js';
+import { rollbackVaultMigration } from './operations/vault-v2/rollback.js';
+import { verifyVaultMigration } from './operations/vault-v2/verify.js';
 import { ScopeRegistry } from './projects/scope-registry.js';
 import { generateBearerToken } from './security/authenticate.js';
 import { BasicMemoryBackend } from './storage/basic-memory.js';
@@ -45,7 +51,8 @@ export type CliCommand =
   | 'validate-archive'
   | 'validate-store-links'
   | 'verify-backup'
-  | 'auth';
+  | 'auth'
+  | 'vault-v2';
 
 export const CLI_COMMANDS: readonly CliCommand[] = [
   'serve',
@@ -58,7 +65,8 @@ export const CLI_COMMANDS: readonly CliCommand[] = [
   'validate-archive',
   'validate-store-links',
   'verify-backup',
-  'auth'
+  'auth',
+  'vault-v2'
 ];
 
 export interface ParsedArguments {
@@ -72,7 +80,7 @@ const systemIds: IdSource = { next: () => randomUUID() };
 
 const USAGE = [
   'usage: node dist/cli.js <command> [options]',
-  'commands: serve | setup | health | recover | recover-state | rebuild-catalogue | backup-manifest | validate-archive | validate-store-links | verify-backup | auth'
+  'commands: serve | setup | health | recover | recover-state | rebuild-catalogue | backup-manifest | validate-archive | validate-store-links | verify-backup | auth | vault-v2'
 ].join('\n');
 
 function invalidInput(message: string): BrainError {
@@ -447,6 +455,89 @@ async function runAuth(parsed: ParsedArguments): Promise<number> {
   throw invalidInput(`auth requires a subcommand\n${USAGE}`);
 }
 
+async function readJsonFile(path: string, label: string): Promise<unknown> {
+  let raw: string;
+  try {
+    raw = await readFile(path, 'utf8');
+  } catch {
+    throw invalidInput(`${label} cannot be read: ${path}`);
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw invalidInput(`${label} is not valid JSON: ${path}`);
+  }
+}
+
+async function runVaultV2(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promise<number> {
+  const subcommand = parsed.positionals[0];
+  const config = resolveConfig(env);
+  const vault = flagString(parsed.flags, 'vault') ?? config.mounts.vault;
+  const state = flagString(parsed.flags, 'state') ?? config.mounts.state;
+  const projectNames = flagPairs(parsed.flags, 'projects');
+  const clock: Clock = systemClock;
+  if (subcommand === 'inspect') {
+    const report = flagString(parsed.flags, 'report');
+    if (report === undefined) throw invalidInput('vault-v2 inspect requires --report');
+    const plan = await planVaultMigration({ vault, state, projectNames, clock });
+    const inspection = buildInspectionReport(plan);
+    await writeFile(report, `${JSON.stringify(inspection, null, 2)}\n`, 'utf8');
+    process.stdout.write(renderInspectionReport(inspection));
+    return 0;
+  }
+  if (subcommand === 'plan') {
+    const output = flagString(parsed.flags, 'output');
+    if (output === undefined) throw invalidInput('vault-v2 plan requires --output');
+    const plan = await planVaultMigration({ vault, state, projectNames, clock });
+    await writeFile(output, `${JSON.stringify(plan, null, 2)}\n`, 'utf8');
+    process.stdout.write(
+      `vault-v2 manifest ${plan.manifest_sha256}: ${plan.moves.length} moves, ` +
+        `${plan.history_copies.length} history copies, ${plan.blockers.length} blockers\n`
+    );
+    return 0;
+  }
+  if (subcommand === 'apply' || subcommand === 'resume') {
+    const manifestPath = flagString(parsed.flags, 'manifest');
+    if (manifestPath === undefined) throw invalidInput(`vault-v2 ${subcommand} requires --manifest`);
+    const maintenance = flagBoolean(parsed.flags, 'maintenance');
+    const receiptPath = flagString(parsed.flags, 'backup-receipt');
+    const manifest = await readJsonFile(manifestPath, 'manifest');
+    const backupReceipt = receiptPath === undefined ? undefined : await readJsonFile(receiptPath, 'backup receipt');
+    const result =
+      subcommand === 'apply'
+        ? await applyVaultMigration(manifest, { maintenance, backupReceipt, clock })
+        : await resumeVaultMigration(manifest, { maintenance, backupReceipt, clock });
+    process.stdout.write(`vault-v2 ${result.status}: ${result.manifest_sha256}\n`);
+    return 0;
+  }
+  if (subcommand === 'verify') {
+    const manifestPath = flagString(parsed.flags, 'manifest');
+    if (manifestPath === undefined) throw invalidInput('vault-v2 verify requires --manifest');
+    const report = await verifyVaultMigration(await readJsonFile(manifestPath, 'manifest'));
+    process.stdout.write(`vault-v2 verify ok=${report.ok} ${JSON.stringify(report.counts)}\n`);
+    for (const failure of report.hash_failures) {
+      process.stdout.write(`  failure ${failure.kind} ${failure.path}\n`);
+    }
+    for (const link of report.dangling_links) {
+      process.stdout.write(`  dangling ${link.path} -> ${link.target}\n`);
+    }
+    for (const path of report.uuid_paths) process.stdout.write(`  uuid path ${path}\n`);
+    return report.ok ? 0 : 1;
+  }
+  if (subcommand === 'rollback') {
+    const manifestPath = flagString(parsed.flags, 'manifest');
+    if (manifestPath === undefined) throw invalidInput('vault-v2 rollback requires --manifest');
+    const maintenance = flagBoolean(parsed.flags, 'maintenance');
+    const result = await rollbackVaultMigration(await readJsonFile(manifestPath, 'manifest'), {
+      maintenance,
+      clock
+    });
+    process.stdout.write(`vault-v2 rollback ${result.status}\n`);
+    return 0;
+  }
+  throw invalidInput(`vault-v2 requires a subcommand\n${USAGE}`);
+}
+
 export async function runCli(
   argv: readonly string[],
   env: NodeJS.ProcessEnv = process.env
@@ -479,6 +570,8 @@ export async function runCli(
       return runVerifyBackup(parsed);
     case 'auth':
       return runAuth(parsed);
+    case 'vault-v2':
+      return runVaultV2(parsed, env);
   }
 }
 
