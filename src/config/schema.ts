@@ -119,6 +119,37 @@ const DEFAULT_LIMITS = {
   dynamic_projects_max: DYNAMIC_PROJECTS_MAX
 };
 
+export const LAYA_BATCH_SIZE_MAX = 8;
+export const LAYA_QUEUE_BATCHES_MAX = 4;
+export const LAYA_TIMEOUT_MS_MAX = 4000;
+export const LAYA_THREADS_MAX = 64;
+export const LAYA_DEFAULT_LOCK_FILE = 'config/laya-model.lock.json';
+export const LAYA_MODEL_SUBDIRECTORY = 'models/laya/runtime';
+
+const executablePath = mountPath.refine((value) => /^[A-Za-z0-9_./+-]+$/.test(value), {
+  message: 'python must be an executable name or path without spaces or shell syntax'
+});
+
+export const layaConfigSchema = z.strictObject({
+  enabled: z.boolean().default(false),
+  python: executablePath.default('python3'),
+  model_dir: mountPath.optional(),
+  lock_file: mountPath.optional(),
+  batch_size: z.int().min(1).max(LAYA_BATCH_SIZE_MAX).default(LAYA_BATCH_SIZE_MAX),
+  queue_batches: z.int().min(1).max(LAYA_QUEUE_BATCHES_MAX).default(LAYA_QUEUE_BATCHES_MAX),
+  timeout_ms: z.int().min(100).max(LAYA_TIMEOUT_MS_MAX).default(LAYA_TIMEOUT_MS_MAX),
+  threads: z.int().min(1).max(LAYA_THREADS_MAX).default(2)
+});
+
+const DEFAULT_LAYA = {
+  enabled: false,
+  python: 'python3',
+  batch_size: LAYA_BATCH_SIZE_MAX,
+  queue_batches: LAYA_QUEUE_BATCHES_MAX,
+  timeout_ms: LAYA_TIMEOUT_MS_MAX,
+  threads: 2
+};
+
 export const brainConfigSchema = z.strictObject({
   endpoint: httpEndpoint,
   backend_endpoint: httpEndpoint,
@@ -129,7 +160,8 @@ export const brainConfigSchema = z.strictObject({
   limits: brainLimitsSchema.default(() => ({ ...DEFAULT_LIMITS })),
   allowed_hosts: z.array(safeName).min(1),
   allowed_origins: z.array(httpEndpoint).default([]),
-  result_delivery: z.enum(RESULT_DELIVERY_MODES).default('structured')
+  result_delivery: z.enum(RESULT_DELIVERY_MODES).default('structured'),
+  laya: layaConfigSchema.default(() => ({ ...DEFAULT_LAYA }))
 });
 
 export interface BrainMounts {
@@ -149,6 +181,28 @@ export interface BrainLimits {
   dynamic_projects_max: number;
 }
 
+export interface LayaConfig {
+  enabled: boolean;
+  python: string;
+  model_dir?: string;
+  lock_file?: string;
+  batch_size: number;
+  queue_batches: number;
+  timeout_ms: number;
+  threads: number;
+}
+
+export interface LayaSettings {
+  enabled: boolean;
+  python: string;
+  model_dir: string;
+  lock_file: string;
+  batch_size: number;
+  queue_batches: number;
+  timeout_ms: number;
+  threads: number;
+}
+
 export interface BrainConfig {
   endpoint: string;
   backend_endpoint: string;
@@ -160,4 +214,5 @@ export interface BrainConfig {
   allowed_hosts: string[];
   allowed_origins: string[];
   result_delivery: ResultDelivery;
+  laya?: LayaConfig;
 }

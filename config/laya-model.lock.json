@@ -1,0 +1,161 @@
+{
+  "schema_version": 1,
+  "repository": "convaiinnovations/laya",
+  "requested_revision": "main",
+  "revision": "55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851",
+  "revision_last_modified": "2026-09-24T05:39:22.000Z",
+  "subfolder": "multilingual",
+  "license": {
+    "id": "apache-2.0",
+    "card_data": "apache-2.0",
+    "notice_files": [
+      "README.md"
+    ]
+  },
+  "sdk": {
+    "package": "laya",
+    "version": "0.3.11",
+    "requirements_lock_sha256": "9f9f72d5eddd1f9fc53a8cedc880fcc4a8eec8fc25734ae7c1462400e924dfc1"
+  },
+  "checkpoint": {
+    "config_path": "multilingual/rl_agent_config.json",
+    "config": {
+      "encoder": "jhu-clsp/mmBERT-base",
+      "head_layers": 2,
+      "max_len": 1024,
+      "head_max_len": 256,
+      "max_prefixes": 6,
+      "act_costs": {
+        "escalate": 0.5
+      },
+      "cost_wrong_act": 3.0,
+      "amp_dtype": "bf16",
+      "model_name": "rl-agent",
+      "temperature": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "temperature_by_options": {},
+      "training": {
+        "updates": 15987,
+        "epochs_completed": 4,
+        "hours": 4.97,
+        "world_size": 1,
+        "fine_tuned_from_checkpoint": false
+      }
+    },
+    "max_len": 1024,
+    "head_max_len": 256,
+    "encoder_model_type": "modernbert",
+    "encoder_vocab_size": 256000,
+    "encoder_max_position_embeddings": 8192
+  },
+  "tokenizer": {
+    "config_path": "multilingual/tokenizer/tokenizer_config.json",
+    "tokenizer_class": "PreTrainedTokenizerFast",
+    "mask_token": "<mask>",
+    "cls_token": "<bos>",
+    "sep_token": "<eos>",
+    "pad_token": "<pad>",
+    "model_max_length": 8192
+  },
+  "normalization": [
+    {
+      "path": "tokenizer/tokenizer_config.json",
+      "rules": [
+        "tokenizer_class_fast",
+        "extra_special_tokens_mapping"
+      ],
+      "applied": [],
+      "source_sha256": "6c6b2d8e3c84ce0e671c129cd6b374b235d6f9863042a5836358d00a89bbb5a1",
+      "runtime_sha256": "6c6b2d8e3c84ce0e671c129cd6b374b235d6f9863042a5836358d00a89bbb5a1"
+    }
+  ],
+  "source_files": [
+    {
+      "path": "README.md",
+      "role": "notice",
+      "size": 23187,
+      "git_blob_id": "ac11a565c217959d0cb062748a2f83e05da446a5",
+      "lfs": false,
+      "sha256": "00355613796b3f5860b0d5b20392381d26580ec242e04a1fd150c7f116858602"
+    },
+    {
+      "path": "multilingual/encoder/config.json",
+      "role": "checkpoint",
+      "size": 1938,
+      "git_blob_id": "0de0e2d30638873790cf962def52e2acf4db3eef",
+      "lfs": false,
+      "sha256": "83f6916d13ef0f556ac461f28308dc2bffa7ebeadee8ec9e2db5812020ea5bb4"
+    },
+    {
+      "path": "multilingual/model.safetensors",
+      "role": "checkpoint",
+      "size": 643835514,
+      "git_blob_id": "b99c8bea239c53f6f6bce734557dc6c403fa6b3e",
+      "lfs": true,
+      "sha256": "9d628fd971b700382ac6f65920a86f149777b2e748e0c955fb3b19695aa8f204"
+    },
+    {
+      "path": "multilingual/rl_agent_config.json",
+      "role": "checkpoint",
+      "size": 472,
+      "git_blob_id": "00e35f88bb731bb9126a914666ab1cdac8a204c8",
+      "lfs": false,
+      "sha256": "25061739243b617ad88d1219ba6f8a9c86c5881ca28df024fa2d9b3b2fcc30c6"
+    },
+    {
+      "path": "multilingual/tokenizer/tokenizer.json",
+      "role": "checkpoint",
+      "size": 34363188,
+      "git_blob_id": "56d765858ed38eaabd35cd90759cbb1f89b0baa4",
+      "lfs": true,
+      "sha256": "609d8f4c067cd3950f88594c5a802616cea245823836ef5848ee4fc40aab5b6f"
+    },
+    {
+      "path": "multilingual/tokenizer/tokenizer_config.json",
+      "role": "checkpoint",
+      "size": 524,
+      "git_blob_id": "c255ac0c8cb34a37d066cd0dafe313fd769d27ae",
+      "lfs": false,
+      "sha256": "6c6b2d8e3c84ce0e671c129cd6b374b235d6f9863042a5836358d00a89bbb5a1"
+    }
+  ],
+  "runtime": {
+    "directory": "runtime",
+    "files": [
+      {
+        "path": "encoder/config.json",
+        "source": "multilingual/encoder/config.json",
+        "size": 1938,
+        "sha256": "83f6916d13ef0f556ac461f28308dc2bffa7ebeadee8ec9e2db5812020ea5bb4"
+      },
+      {
+        "path": "model.safetensors",
+        "source": "multilingual/model.safetensors",
+        "size": 643835514,
+        "sha256": "9d628fd971b700382ac6f65920a86f149777b2e748e0c955fb3b19695aa8f204"
+      },
+      {
+        "path": "rl_agent_config.json",
+        "source": "multilingual/rl_agent_config.json",
+        "size": 472,
+        "sha256": "25061739243b617ad88d1219ba6f8a9c86c5881ca28df024fa2d9b3b2fcc30c6"
+      },
+      {
+        "path": "tokenizer/tokenizer.json",
+        "source": "multilingual/tokenizer/tokenizer.json",
+        "size": 34363188,
+        "sha256": "609d8f4c067cd3950f88594c5a802616cea245823836ef5848ee4fc40aab5b6f"
+      },
+      {
+        "path": "tokenizer/tokenizer_config.json",
+        "source": "multilingual/tokenizer/tokenizer_config.json",
+        "size": 524,
+        "sha256": "6c6b2d8e3c84ce0e671c129cd6b374b235d6f9863042a5836358d00a89bbb5a1"
+      }
+    ],
+    "fingerprint": "5fe18a52e296cdaf0378bb171ce859cccdda1c8b9525c9fd5e38a2a5bba76ff6"
+  }
+}

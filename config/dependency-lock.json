@@ -33,5 +33,46 @@
     "transport": "streamable-http",
     "mcpPath": "/mcp",
     "port": 8000
+  },
+  "laya": {
+    "python": "3.12",
+    "platform": "x86_64-manylinux_2_28",
+    "requirementsInput": "workers/laya/requirements.in",
+    "requirementsInputSha256": "0fa7a097c04b935553fe46a798f11a8614e43831196d392d019a1d7857920b74",
+    "requirementsLock": "workers/laya/requirements.lock",
+    "requirementsLockSha256": "9f9f72d5eddd1f9fc53a8cedc880fcc4a8eec8fc25734ae7c1462400e924dfc1",
+    "resolver": {
+      "tool": "uv",
+      "version": "0.12.18",
+      "command": "uv pip compile workers/laya/requirements.in --python-version 3.12 --python-platform x86_64-manylinux_2_28 --generate-hashes --emit-index-url --index-strategy unsafe-best-match -o workers/laya/requirements.lock",
+      "indexes": [
+        "https://pypi.org/simple",
+        "https://download.pytorch.org/whl/cpu"
+      ]
+    },
+    "install": "pip install --no-deps --require-hashes --only-binary=:all: -r workers/laya/requirements.lock",
+    "installVerifiedImage": "python@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9",
+    "packages": {
+      "laya": "0.3.11",
+      "torch": "2.14.0+cpu",
+      "transformers": "5.17.0",
+      "tokenizers": "0.23.2",
+      "safetensors": "0.8.0",
+      "huggingface-hub": "1.32.0",
+      "numpy": "2.5.3"
+    },
+    "model": {
+      "lock": "config/laya-model.lock.json",
+      "lockSha256": "8a2e177bc4c666f89f861a1977efa8507a332d7cd8edf8814d4dd1d964195f91",
+      "repository": "convaiinnovations/laya",
+      "subfolder": "multilingual",
+      "revision": "55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851",
+      "runtimeFingerprint": "5fe18a52e296cdaf0378bb171ce859cccdda1c8b9525c9fd5e38a2a5bba76ff6",
+      "license": "apache-2.0"
+    },
+    "questions": {
+      "file": "workers/laya/questions.json",
+      "questionVersion": "relevance-2026-09-23.1"
+    }
   }
 }
