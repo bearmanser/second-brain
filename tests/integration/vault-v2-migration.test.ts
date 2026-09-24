@@ -1,4 +1,5 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { link, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { expect, test } from 'vitest';
 import fixtureJson from '../fixtures/vault-v2/manifest-cases.json' with { type: 'json' };
@@ -8,6 +9,7 @@ import { planVaultMigration, buildMigrationBackupReceipt } from '../../src/opera
 import { rollbackVaultMigration } from '../../src/operations/vault-v2/rollback.js';
 import { verifyVaultMigration } from '../../src/operations/vault-v2/verify.js';
 import { parseDocument } from '../../src/notes/document-codec.js';
+import { runCli } from '../../src/cli.js';
 import { vaultSandbox } from '../helpers/vault-sandbox.js';
 
 interface ManifestFileFixture {
@@ -216,9 +218,18 @@ test('apply refuses blockers by default and enumerates them for opt-in partial m
     const fork = plan.blockers.find((entry) => entry.kind === 'fork');
     expect(fork?.id).toBe('0b8f1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d');
 
-    await expect(
-      applyVaultMigration(plan, options(backup, { partial: false }))
-    ).rejects.toMatchObject({ code: 'CONFLICT' });
+    let refusal = '';
+    try {
+      await applyVaultMigration(plan, options(backup, { partial: false }));
+    } catch (error) {
+      expect(error).toMatchObject({ code: 'CONFLICT' });
+      refusal = (error as Error).message;
+    }
+    expect(refusal).not.toBe('');
+    for (const entry of plan.blockers) {
+      expect(refusal).toContain(entry.reason);
+      for (const path of entry.paths ?? (entry.path ? [entry.path] : [])) expect(refusal).toContain(path);
+    }
 
     const result = await applyVaultMigration(plan, options(backup));
     expect(result.status).toBe('applied');
@@ -232,6 +243,30 @@ test('apply refuses blockers by default and enumerates them for opt-in partial m
       await readFile(join(s.vault, legacy));
     }
   } finally {
+    await s.dispose();
+  }
+});
+
+test('CLI partial apply prints every blocked path and reason', async () => {
+  const { s, plan, backup } = await sandboxPlan();
+  const manifest = join(dirname(s.vault), 'manifest.json');
+  const receipt = join(dirname(s.vault), 'receipt.json');
+  const chunks: string[] = [];
+  const original = process.stdout.write;
+  try {
+    await writeFile(manifest, JSON.stringify(plan));
+    await writeFile(receipt, JSON.stringify(backup.receipt));
+    const config = join(dirname(s.vault), 'config.yaml');
+    await writeFile(config, `endpoint: http://localhost:3000\nbackend_endpoint: http://localhost:3001\nport: 3000\nmounts:\n  vault: ${s.vault}\n  state: ${s.state}\nscopes:\n  - id: personal\n    backend_project: Personal\n    relative_root: Personal\n    repository_aliases: []\nallowed_hosts: [localhost]\n`);
+    process.stdout.write = ((chunk: string) => { chunks.push(String(chunk)); return true; }) as typeof process.stdout.write;
+    expect(await runCli(['vault-v2', 'apply', '--manifest', manifest, '--backup-receipt', receipt, '--backup-root', backup.root, '--maintenance', '--partial'], { BRAIN_CONFIG: config })).toBe(0);
+    const output = chunks.join('');
+    for (const entry of plan.blockers) {
+      expect(output).toContain(entry.reason);
+      for (const path of entry.paths ?? (entry.path ? [entry.path] : [])) expect(output).toContain(path);
+    }
+  } finally {
+    process.stdout.write = original;
     await s.dispose();
   }
 });
@@ -300,6 +335,90 @@ test('a fabricated or media-less backup receipt is rejected before apply', async
         clock: FIXED_CLOCK
       })
     ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+  } finally {
+    await s.dispose();
+  }
+});
+
+test('backup media cannot resolve through a symlink to the live vault', async () => {
+  const { s, plan, backup } = await sandboxPlan();
+  try {
+    const linked = join(dirname(s.vault), 'linked-backup');
+    await mkdir(linked);
+    await symlink(s.vault, join(linked, 'vault'));
+    await symlink(s.state, join(linked, 'state'));
+    await expect(applyVaultMigration(plan, options({ ...backup, root: linked }))).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    const changed = join(backup.root, 'vault', plan.source_fingerprint.vault[0].path);
+    await writeFile(changed, 'changed backup bytes');
+    await expect(applyVaultMigration(plan, options(backup))).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+    expect(await readFile(join(s.vault, plan.source_fingerprint.vault[0].path))).not.toEqual(Buffer.from('changed backup bytes'));
+  } finally {
+    await s.dispose();
+  }
+});
+
+test('backup media hardlinked to live bytes is not independent', async () => {
+  const { s, plan, backup } = await sandboxPlan();
+  try {
+    const file = plan.source_fingerprint.vault[0].path;
+    const destination = join(backup.root, 'vault', file);
+    await rm(destination);
+    await link(join(s.vault, file), destination);
+    await expect(applyVaultMigration(plan, options(backup))).rejects.toMatchObject({ code: 'RECOVERY_REQUIRED' });
+  } finally {
+    await s.dispose();
+  }
+});
+
+test('lock conflict is checked before reading stale journal or verifying backup', async () => {
+  const { s, plan, backup } = await sandboxPlan();
+  try {
+    await writeFile(join(s.state, 'gateway.lock'), `${JSON.stringify({ pid: process.pid, start_time: await processStartTime(process.pid) })}\n`);
+    await expect(applyVaultMigration(plan, options(backup, { backupRoot: undefined }))).rejects.toMatchObject({ code: 'CONFLICT' });
+    await expect(readFile(join(s.state, 'migrations', plan.manifest_sha256, 'journal.json'))).rejects.toThrow();
+  } finally {
+    await s.dispose();
+  }
+});
+
+test('a stale lock cannot be reclaimed while another contender owns takeover', async () => {
+  const { s, plan, backup } = await sandboxPlan();
+  try {
+    await writeFile(join(s.state, 'gateway.lock'), '{"pid":99999999}\n');
+    await mkdir(join(s.state, 'gateway.lock.recovery'));
+    await expect(applyVaultMigration(plan, options(backup))).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(await readFile(join(s.state, 'gateway.lock'), 'utf8')).toContain('99999999');
+  } finally {
+    await s.dispose();
+  }
+});
+
+test('simultaneous stale-lock contenders produce exactly one owner', async () => {
+  const s = await vaultSandbox();
+  try {
+    await writeFile(join(s.state, 'gateway.lock'), '{"pid":99999999}\n');
+    const ready = join(dirname(s.vault), 'ready');
+    const go = join(dirname(s.vault), 'go');
+    const script = `import { appendFileSync, existsSync } from 'node:fs'; import { InstanceLock } from './src/core/mutation.ts'; const [root,ready,go] = process.argv.slice(1); appendFileSync(ready,'r'); while(!existsSync(go)) await new Promise(r=>setTimeout(r,2)); try { const lock=InstanceLock.acquire(root); console.log('owner'); await new Promise(r=>setTimeout(r,80)); lock.release(); } catch { console.log('conflict'); }`;
+    const worker = () => new Promise<string>((resolve, reject) => {
+      const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script, s.state, ready, go], { cwd: process.cwd() });
+      let output = '';
+      let errors = '';
+      child.stdout.on('data', (chunk: Buffer) => { output += chunk.toString(); });
+      child.stderr.on('data', (chunk: Buffer) => { errors += chunk.toString(); });
+      child.on('error', reject);
+      child.on('close', (code) => code === 0 ? resolve(output.trim()) : reject(new Error(errors)));
+    });
+    const results = Array.from({ length: 4 }, () => worker());
+    for (let attempt = 0; attempt < 500; attempt++) {
+      if ((await readFile(ready, 'utf8').catch(() => '')).length === 4) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect((await readFile(ready, 'utf8')).length).toBe(4);
+    await writeFile(go, 'go');
+    const outcomes = await Promise.all(results);
+    expect(outcomes.filter((outcome) => outcome === 'owner')).toHaveLength(1);
+    expect(outcomes.filter((outcome) => outcome === 'conflict')).toHaveLength(3);
   } finally {
     await s.dispose();
   }
@@ -379,6 +498,38 @@ test('an unreadable revision blocks its logical note instead of migrating a part
   }
 });
 
+test('invalid UTF-8 managed sibling blocks the entire logical note', async () => {
+  const s = await vaultSandbox();
+  try {
+    await materialize(s.vault);
+    const sibling = 'Projects/freellmapi/Preferences/7d4e5f60-8192-4da3-8e1f-2a3b4c5d6e7f/invalid r11111111-1111-4111-8111-111111111111.md';
+    await writeFile(join(s.vault, sibling), Buffer.concat([
+      Buffer.from('---\nbrain_id: 7d4e5f60-8192-4da3-8e1f-2a3b4c5d6e7f\nbrain_schema_version: 1\n---\n'),
+      Buffer.from([0xff])
+    ]));
+    const plan = await planVaultMigration({ vault: s.vault, state: s.state, projectNames: PROJECT_NAMES });
+    expect(plan.moves.some((entry) => entry.logical_id === PREFERENCE_ID)).toBe(false);
+    expect(plan.blockers.find((entry) => entry.id === PREFERENCE_ID)?.paths).toEqual(expect.arrayContaining([PREFERENCE_PATH, sibling]));
+  } finally {
+    await s.dispose();
+  }
+});
+
+test('unapproved archived and superseded revisions become candidates', async () => {
+  for (const status of ['archived', 'superseded']) {
+    const s = await vaultSandbox();
+    try {
+      await materialize(s.vault);
+      const raw = await readFile(join(s.vault, PREFERENCE_PATH), 'utf8');
+      await writeFile(join(s.vault, PREFERENCE_PATH), raw.replace(/brain_status: \w+/, `brain_status: ${status}`).replace(/^brain_(?:approved_by|approval_[^:\n]+):[^\n]*\n/gm, ''));
+      const plan = await planVaultMigration({ vault: s.vault, state: s.state, projectNames: PROJECT_NAMES });
+      expect(plan.moves.find((entry) => entry.logical_id === PREFERENCE_ID)?.status).toBe('candidate');
+    } finally {
+      await s.dispose();
+    }
+  }
+});
+
 test('an invalid approval payload is materialized as an unreviewed candidate', async () => {
   const s = await vaultSandbox();
   try {
@@ -447,6 +598,68 @@ test('rollback preflights lost history before removing any migrated note', async
     for (const move of plan.moves) {
       await readFile(join(s.vault, move.current_path));
     }
+  } finally {
+    await s.dispose();
+  }
+});
+
+test('restarted rollback rechecks history and every already restored source', async () => {
+  for (const damage of ['history', 'restored']) {
+    const { s, plan, backup } = await sandboxPlan();
+    try {
+      await applyVaultMigration(plan, options(backup));
+      const copy = plan.history_copies[0];
+      const source = join(s.vault, copy.source_path);
+      await mkdir(dirname(source), { recursive: true });
+      await writeFile(source, await readFile(join(s.state, copy.destination_path)));
+      const journalPath = join(s.state, 'migrations', plan.manifest_sha256, 'journal.json');
+      const journal = JSON.parse(await readFile(journalPath, 'utf8'));
+      journal.rollback = { status: 'running', updated_at: FIXED_CLOCK.now().toISOString(), restored_sources: [copy.source_path], restored_rewrites: [], removed_current: [] };
+      await writeFile(journalPath, JSON.stringify(journal));
+      await writeFile(damage === 'history' ? join(s.state, copy.destination_path) : source, 'corrupted');
+      await expect(rollbackVaultMigration(plan, { maintenance: true })).rejects.toMatchObject({ code: damage === 'history' ? 'RECOVERY_REQUIRED' : 'CONFLICT' });
+      for (const move of plan.moves) await readFile(join(s.vault, move.current_path));
+    } finally {
+      await s.dispose();
+    }
+  }
+});
+
+test('restarted rollback refuses changed or removed preserved files before mutating', async () => {
+  for (const damage of ['changed', 'removed']) {
+    const { s, plan, backup } = await sandboxPlan();
+    try {
+      await applyVaultMigration(plan, options(backup));
+      const journalPath = join(s.state, 'migrations', plan.manifest_sha256, 'journal.json');
+      const journal = JSON.parse(await readFile(journalPath, 'utf8'));
+      journal.rollback = { status: 'running', updated_at: FIXED_CLOCK.now().toISOString(), restored_sources: [], restored_rewrites: [], removed_current: [] };
+      await writeFile(journalPath, JSON.stringify(journal));
+      const preserved = join(s.vault, plan.preserved_files[0].path);
+      if (damage === 'changed') await writeFile(preserved, 'edited');
+      else await rm(preserved);
+      await expect(rollbackVaultMigration(plan, { maintenance: true })).rejects.toMatchObject({ code: 'CONFLICT' });
+      for (const move of plan.moves) await readFile(join(s.vault, move.current_path));
+    } finally {
+      await s.dispose();
+    }
+  }
+});
+
+test('restarted rollback accepts a verified journaled restoration and completes', async () => {
+  const { s, plan, backup } = await sandboxPlan();
+  try {
+    const before = await inventoryTree(s.vault);
+    await applyVaultMigration(plan, options(backup));
+    const first = plan.history_copies[0];
+    const path = join(s.vault, first.source_path);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, await readFile(join(s.state, first.destination_path)));
+    const journalPath = join(s.state, 'migrations', plan.manifest_sha256, 'journal.json');
+    const journal = JSON.parse(await readFile(journalPath, 'utf8'));
+    journal.rollback = { status: 'running', updated_at: FIXED_CLOCK.now().toISOString(), restored_sources: [first.source_path], restored_rewrites: [], removed_current: [] };
+    await writeFile(journalPath, JSON.stringify(journal));
+    expect((await rollbackVaultMigration(plan, { maintenance: true })).status).toBe('rolled_back');
+    expect(await inventoryTree(s.vault)).toEqual(before);
   } finally {
     await s.dispose();
   }

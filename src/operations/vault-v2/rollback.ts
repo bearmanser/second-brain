@@ -62,16 +62,35 @@ async function preflightHistory(manifest: MigrationManifest): Promise<void> {
   }
 }
 
-async function preflightDestinations(manifest: MigrationManifest): Promise<void> {
+async function preflightDestinations(
+  manifest: MigrationManifest,
+  rollback: MigrationRollbackRecord | undefined
+): Promise<void> {
+  const restoredSources = new Set(rollback?.restored_sources ?? []);
+  for (const copy of manifest.history_copies) {
+    const actual = await hashFileAt(vaultAbsolutePath(manifest.vault_root, copy.source_path));
+    if (restoredSources.has(copy.source_path) && actual !== copy.source_sha256) {
+      throw conflict(`restored source ${copy.source_path} diverged before rollback resumed`);
+    }
+    if (!restoredSources.has(copy.source_path) && actual !== undefined && actual !== copy.source_sha256) {
+      throw conflict(`source ${copy.source_path} is occupied before rollback`);
+    }
+  }
   for (const move of manifest.moves) {
     const actual = await hashFileAt(vaultAbsolutePath(manifest.vault_root, move.current_path));
-    if (actual !== move.current_sha256) {
+    const expected = rollback?.removed_current.includes(move.current_path)
+      ? actual === undefined
+      : actual === move.current_sha256 || (rollback !== undefined && actual === undefined);
+    if (!expected) {
       throw conflict(`current note ${move.current_path} diverged before rollback`);
     }
   }
   for (const rewrite of manifest.rewrites) {
     const actual = await hashFileAt(vaultAbsolutePath(manifest.vault_root, rewrite.path));
-    if (actual !== rewrite.new_sha256) {
+    const expected = rollback?.restored_rewrites.includes(rewrite.path)
+      ? actual === sha256(rewrite.preimage_raw)
+      : actual === rewrite.new_sha256 || (rollback !== undefined && actual === sha256(rewrite.preimage_raw));
+    if (!expected) {
       throw conflict(`rewritten file ${rewrite.path} diverged before rollback`);
     }
   }
@@ -85,20 +104,46 @@ async function assertNoNewWrites(
     throw recoveryRequired('the migration journal has no post-migration inventory to compare');
   }
   const recorded = new Map(journal.post_migration_inventory.map((row) => [row.path, row.sha256]));
+  for (const path of journal.rollback?.restored_sources ?? []) {
+    const copy = manifest.history_copies.find((item) => item.source_path === path);
+    if (copy !== undefined) recorded.set(path, copy.source_sha256);
+  }
+  for (const path of journal.rollback?.restored_rewrites ?? []) {
+    const rewrite = manifest.rewrites.find((item) => item.path === path);
+    if (rewrite !== undefined) recorded.set(path, sha256(rewrite.preimage_raw));
+  }
+  for (const path of journal.rollback?.removed_current ?? []) recorded.delete(path);
+  const transitional = new Map<string, string | undefined>();
+  if (journal.rollback !== undefined) {
+    const nextSource = manifest.history_copies.find(
+      (copy) => !journal.rollback?.restored_sources.includes(copy.source_path)
+    );
+    const nextRewrite = manifest.rewrites.find(
+      (rewrite) => !journal.rollback?.restored_rewrites.includes(rewrite.path)
+    );
+    const nextMove = manifest.moves.find(
+      (move) => !journal.rollback?.removed_current.includes(move.current_path)
+    );
+    if (nextSource !== undefined) transitional.set(nextSource.source_path, nextSource.source_sha256);
+    else if (nextRewrite !== undefined) transitional.set(nextRewrite.path, sha256(nextRewrite.preimage_raw));
+    else if (nextMove !== undefined) transitional.set(nextMove.current_path, undefined);
+  }
   const current = await inventoryTree(manifest.vault_root);
   const divergences: string[] = [];
   const seen = new Set<string>();
   for (const row of current) {
     seen.add(row.path);
     const expected = recorded.get(row.path);
-    if (expected === undefined) {
+    if (expected === undefined && transitional.get(row.path) !== row.sha256) {
       divergences.push(`new file ${row.path}`);
-    } else if (expected !== row.sha256) {
+    } else if (expected !== undefined && expected !== row.sha256 && transitional.get(row.path) !== row.sha256) {
       divergences.push(`changed file ${row.path}`);
     }
   }
   for (const path of recorded.keys()) {
-    if (!seen.has(path)) divergences.push(`removed file ${path}`);
+    if (!seen.has(path) && !(transitional.has(path) && transitional.get(path) === undefined)) {
+      divergences.push(`removed file ${path}`);
+    }
   }
   if (divergences.length > 0) {
     throw conflict(`the migrated vault has diverged: ${divergences.sort().join('; ')}`);
@@ -124,29 +169,29 @@ export async function rollbackVaultMigration(
     throw invalidInput('rolling back a migration requires exclusive maintenance mode');
   }
   const now = (options.clock ?? { now: () => new Date() }).now().toISOString();
-  const journal = await readJournal(manifest.state_root, manifest.manifest_sha256);
-  if (journal === undefined) throw conflict('there is no migration journal to roll back');
-  if (journal.state === 'rolled_back') {
-    return {
-      status: 'noop',
-      manifest_sha256: manifest.manifest_sha256,
-      restored_sources: 0,
-      removed_current: 0,
-      restored_rewrites: 0,
-      divergences: []
-    };
-  }
-  if (journal.state !== 'complete') {
-    throw conflict('only a completed migration can be rolled back');
-  }
-
   const lock = InstanceLock.acquire(manifest.state_root, MAINTENANCE_LOCK_NAME);
   try {
+    const journal = await readJournal(manifest.state_root, manifest.manifest_sha256);
+    if (journal === undefined) throw conflict('there is no migration journal to roll back');
+    if (journal.state === 'rolled_back') {
+      return {
+        status: 'noop',
+        manifest_sha256: manifest.manifest_sha256,
+        restored_sources: 0,
+        removed_current: 0,
+        restored_rewrites: 0,
+        divergences: []
+      };
+    }
+    if (journal.state !== 'complete') {
+      throw conflict('only a completed migration can be rolled back');
+    }
+
+    await preflightHistory(manifest);
+    await preflightDestinations(manifest, journal.rollback);
+    await assertNoNewWrites(manifest, journal);
     let rollback = journal.rollback;
     if (rollback === undefined) {
-      await preflightHistory(manifest);
-      await preflightDestinations(manifest);
-      await assertNoNewWrites(manifest, journal);
       rollback = newRollback(now);
       journal.rollback = rollback;
       journal.updated_at = now;
@@ -159,6 +204,9 @@ export async function rollbackVaultMigration(
       const present = await hashFileAt(absolute);
       if (present === copy.source_sha256) {
         rollback.restored_sources.push(copy.source_path);
+        rollback.updated_at = now;
+        journal.updated_at = now;
+        await writeJournal(manifest.state_root, journal);
         continue;
       }
       if (present !== undefined) {
@@ -186,6 +234,9 @@ export async function rollbackVaultMigration(
       const current = await hashFileAt(absolute);
       if (current === sha256(rewrite.preimage_raw)) {
         rollback.restored_rewrites.push(rewrite.path);
+        rollback.updated_at = now;
+        journal.updated_at = now;
+        await writeJournal(manifest.state_root, journal);
         continue;
       }
       if (current !== rewrite.new_sha256) {
@@ -204,6 +255,9 @@ export async function rollbackVaultMigration(
       const current = await hashFileAt(absolute);
       if (current === undefined) {
         rollback.removed_current.push(move.current_path);
+        rollback.updated_at = now;
+        journal.updated_at = now;
+        await writeJournal(manifest.state_root, journal);
         continue;
       }
       if (current !== move.current_sha256) {

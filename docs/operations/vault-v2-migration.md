@@ -25,6 +25,9 @@ The backup media at `--backup-root` mirrors the source as `vault/<path>` and
 `state/<path>`. The backup receipt lists those paths with hashes computed from
 the backup itself; applying re-reads the backup media and refuses unless every
 recorded hash and size still matches the live source fingerprint.
+Symlinked backup directories and backup files hardlinked to the live source
+are refused: backup media must contain separate regular-file bytes. Keep the
+backup untouched until migration and rollback verification are complete.
 
 The vault and state directories come from the runtime configuration
 (`BRAIN_VAULT_DIR`, `BRAIN_STATE_DIR`) and can be overridden with `--vault` and
@@ -74,7 +77,10 @@ source fingerprint. A mismatch refuses the apply.
 
 Maintenance is enforced by the state-wide gateway lock, so the migration and
 the serving gateway cannot mutate concurrently; the lock is released when the
-command finishes.
+command finishes. Lock acquisition precedes journal, fingerprint, and backup
+preflight. Stale-lock reclamation uses an exclusive `gateway.lock.recovery`
+directory; if a process dies holding that claim, investigate the lock owner
+and remove the abandoned recovery directory manually before retrying.
 
 Migration steps are journaled, restartable, and idempotent:
 
@@ -118,4 +124,5 @@ and is reported instead of overwriting newer work. Only then does it restore
 legacy revisions and remove generated notes, journaling each stage so an
 interrupted rollback can restart without destroying data. Migration history is
 retained after rollback for diagnosis, and recovery never requires Basic Memory
-to remain online.
+to remain online. On restart, history and the adjusted vault inventory are
+checked again, including the recorded bytes of already-restored source files.

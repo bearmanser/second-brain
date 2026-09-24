@@ -29,7 +29,7 @@ import {
   requireRecoveryAuthorization,
   summariseRecovery
 } from './operations/recovery.js';
-import { applyVaultMigration, resumeVaultMigration } from './operations/vault-v2/apply.js';
+import { applyVaultMigration, formatMigrationBlockers, resumeVaultMigration } from './operations/vault-v2/apply.js';
 import { planVaultMigration } from './operations/vault-v2/plan.js';
 import { buildInspectionReport, renderInspectionReport } from './operations/vault-v2/report.js';
 import { rollbackVaultMigration } from './operations/vault-v2/rollback.js';
@@ -522,6 +522,9 @@ async function runVaultV2(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Prom
         ? await applyVaultMigration(manifest, { maintenance, backupReceipt, backupRoot, partial, clock })
         : await resumeVaultMigration(manifest, { maintenance, backupReceipt, backupRoot, partial, clock });
     process.stdout.write(`vault-v2 ${result.status}: ${result.manifest_sha256}\n`);
+    if (result.blocked.length > 0) {
+      process.stdout.write(`blocked items (${result.blocked.length}):\n${formatMigrationBlockers(result.blocked)}\n`);
+    }
     return 0;
   }
   if (subcommand === 'verify') {

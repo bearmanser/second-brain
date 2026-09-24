@@ -208,3 +208,49 @@ files stay byte-identical.
   preserves those files byte-identically.
 - The project hub itself is still created by Task 15; migration now omits the
   link until that hub exists instead of asserting it does.
+
+# Fix round 2
+
+Addressed Critical A, Critical 1–3, and Important 4, 5, 7, 8. The previously
+verified fixes for 6 and 9 remain covered by the existing tests.
+
+- The maintenance lock now precedes journal lookup, source fingerprinting,
+  backup verification, and any journal write. A competing apply cannot use a
+  stale no-journal observation to replace a completed journal. Rollback also
+  reads its journal under the lock.
+- Stale gateway-lock recovery is guarded by an exclusive recovery-directory
+  claim. Only its holder can check and remove the stale lock; concurrent
+  contenders conflict rather than unlinking a newly acquired lock. A crashed
+  recovery claim fails closed and needs operator investigation/removal.
+- Backup verification now fingerprints the backup tree with the no-follow,
+  descriptor-pinned inventory reader, rejects symlinks in any directory or
+  leaf, checks realpath separation, checks each receipt size/hash against the
+  actual backup bytes and the source fingerprint, and rejects media files
+  hardlinked to the live source. A changed backup does not alter the source.
+- Every rollback invocation preflights all history, migrated destinations,
+  already-journaled restorations, and the adjusted post-migration inventory.
+  A restart permits only the single next in-flight file to have completed
+  without a journal write; changed or removed preserved files still refuse
+  before mutation. Already-complete artifact branches persist their progress.
+- Default blocker refusal enumerates each reason and path; explicit partial
+  apply prints the same full blocked set through the CLI.
+- Every invalid-UTF-8 Markdown file is conservatively blocked, and recoverable
+  logical IDs bind an unreadable sibling to its entire note group.
+- Missing approval now demotes every lifecycle status, including archived and
+  superseded, to candidate while the raw revision remains in durable history.
+
+Regression tests cover lock-before-preflight, an occupied recovery claim and
+four simultaneous stale-lock contenders, symlinked/hardlinked/changed media,
+both blocker-reporting paths, invalid UTF-8 sibling, absent approval for
+archived/superseded, and restart rollback with corrupt history/restored bytes,
+preserved-file changes/removal, and successful verified continuation.
+
+Verification under Node 24 / npm 10:
+
+- `./node_modules/.bin/vitest run tests/unit/vault-v2-plan.test.ts tests/integration/vault-v2-migration.test.ts`: 33/33 passed.
+- `npm run verify`: typecheck, 544/544 unit/contract tests, build passed.
+- `npm run test:integration`: 461/461 passed after the restart-continuation test.
+- `npm test`: twice timed out (300s default concurrency and 360s with
+  `--maxWorkers=4`) before Vitest emitted any file result. This broad command
+  includes E2E tests beyond the required verification gates; its result is
+  not claimed green.

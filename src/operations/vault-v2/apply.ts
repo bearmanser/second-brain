@@ -90,6 +90,13 @@ function enumerateBlockers(manifest: MigrationManifest): MigrationBlocker[] {
   }));
 }
 
+export function formatMigrationBlockers(blocked: readonly MigrationBlocker[]): string {
+  return blocked.map((entry) => {
+    const paths = entry.paths ?? (entry.path === undefined ? [] : [entry.path]);
+    return `${entry.kind}: ${entry.reason}${paths.length === 0 ? '' : ` (${paths.join(', ')})`}`;
+  }).join('\n');
+}
+
 async function verifyRecordedState(
   manifest: MigrationManifest,
   current: MigrationManifest['source_fingerprint']
@@ -265,7 +272,7 @@ async function runMigration(
   }
   if (manifest.blockers.length > 0 && options.partial !== true) {
     throw conflict(
-      `the migration has ${manifest.blockers.length} blocked items; resolve them or opt in to partial migration`
+      `the migration has ${manifest.blockers.length} blocked items; resolve them or opt in to partial migration:\n${formatMigrationBlockers(manifest.blockers)}`
     );
   }
   if (manifest.moves.length === 0 && manifest.blockers.length > 0) {
@@ -276,50 +283,50 @@ async function runMigration(
   }
   const blocked = enumerateBlockers(manifest);
   const phases: MigrationPhase[] = [];
-  let journal = await readJournal(manifest.state_root, manifest.manifest_sha256);
-  if (journal !== undefined && journal.state === 'complete') {
-    for (const phase of MIGRATION_PHASES) {
-      if (phase === 'complete') continue;
-      await verifyJournalArtifacts(manifest, journal, phase);
-    }
-    await assertMigrated(manifest);
-    return {
-      status: 'noop',
-      manifest_sha256: manifest.manifest_sha256,
-      phases: [],
-      blocked,
-      counts: {
-        moves: manifest.moves.length,
-        history_copies: manifest.history_copies.length,
-        rewrites: manifest.rewrites.length,
-        source_files_removed: 0
-      }
-    };
-  }
-  if (mode === 'resume' && journal === undefined) {
-    throw conflict('there is no migration journal to resume');
-  }
-  if (mode === 'resume' && journal !== undefined && journal.state === 'rolled_back') {
-    throw conflict('the migration was rolled back and cannot be resumed');
-  }
-
-  const fingerprint = await fingerprintSource({
-    vault: manifest.vault_root,
-    state: manifest.state_root,
-    exclude: manifest.output_exclusions
-  });
-  if (journal === undefined) {
-    if (!sameFingerprint(manifest.source_fingerprint, fingerprint)) {
-      throw conflict('the source vault changed since the manifest was recorded');
-    }
-    await verifyRecordedState(manifest, fingerprint);
-    await verifyMigrationBackupReceipt(options.backupReceipt, fingerprint, options.backupRoot);
-  } else {
-    await verifyRecordedState(manifest, fingerprint);
-  }
-
   const lock = InstanceLock.acquire(manifest.state_root, MAINTENANCE_LOCK_NAME);
   try {
+    const journal = await readJournal(manifest.state_root, manifest.manifest_sha256);
+    if (journal !== undefined && journal.state === 'complete') {
+      for (const phase of MIGRATION_PHASES) {
+        if (phase === 'complete') continue;
+        await verifyJournalArtifacts(manifest, journal, phase);
+      }
+      await assertMigrated(manifest);
+      return {
+        status: 'noop',
+        manifest_sha256: manifest.manifest_sha256,
+        phases: [],
+        blocked,
+        counts: {
+          moves: manifest.moves.length,
+          history_copies: manifest.history_copies.length,
+          rewrites: manifest.rewrites.length,
+          source_files_removed: 0
+        }
+      };
+    }
+    if (mode === 'resume' && journal === undefined) {
+      throw conflict('there is no migration journal to resume');
+    }
+    if (mode === 'resume' && journal !== undefined && journal.state === 'rolled_back') {
+      throw conflict('the migration was rolled back and cannot be resumed');
+    }
+
+    const fingerprint = await fingerprintSource({
+      vault: manifest.vault_root,
+      state: manifest.state_root,
+      exclude: manifest.output_exclusions
+    });
+    if (journal === undefined) {
+      if (!sameFingerprint(manifest.source_fingerprint, fingerprint)) {
+        throw conflict('the source vault changed since the manifest was recorded');
+      }
+      await verifyRecordedState(manifest, fingerprint);
+      await verifyMigrationBackupReceipt(options.backupReceipt, fingerprint, options.backupRoot);
+    } else {
+      await verifyRecordedState(manifest, fingerprint);
+    }
+
     let active: MigrationJournal = journal ?? newJournal(manifest, now);
     if (journal === undefined) {
       await mkdir(journalDirectory(manifest.state_root, manifest.manifest_sha256), {
@@ -396,4 +403,3 @@ export function resumeVaultMigration(
 ): Promise<ApplyVaultMigrationResult> {
   return runMigration(manifest, options, 'resume');
 }
-

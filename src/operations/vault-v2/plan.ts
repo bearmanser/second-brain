@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
-import { lstat, mkdir, open, readFile, rename, rm, statfs } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, realpath, rename, rm, statfs } from 'node:fs/promises';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { BrainError, isBrainError } from '../../contracts/errors.js';
 import { DEFAULT_TYPE_FOR_KIND, type CurrentDocument } from '../../notes/document.js';
@@ -17,7 +17,6 @@ import { revisionLocation } from '../../storage/revision-store.js';
 import {
   buildManifest,
   validateManifest,
-  verifyManifest,
   type BackupManifest,
   type ManifestFile
 } from '../backup.js';
@@ -629,7 +628,36 @@ export async function verifyMigrationBackupReceipt(
   }
   assertBackupRootSeparation(fingerprint, backupRoot);
   try {
-    await verifyManifest(backupRoot, validated);
+    const [backupReal, vaultReal, stateReal] = await Promise.all([
+      realpath(backupRoot),
+      realpath(fingerprint.vault_root),
+      realpath(fingerprint.state_root)
+    ]);
+    if (
+      [vaultReal, stateReal].some(
+        (root) => isInsideOrEqual(root, backupReal) || isInsideOrEqual(backupReal, root)
+      )
+    ) {
+      throw recoveryRequired('the backup media resolves inside a live root');
+    }
+    const backupFiles = new Map((await inventoryTree(backupRoot)).map((file) => [file.path, file]));
+    for (const file of validated.files) {
+      const actual = backupFiles.get(file.path);
+      if (actual === undefined || actual.bytes !== file.size || actual.sha256 !== file.sha256) {
+        throw recoveryRequired(`the backup media differs from the receipt for ${file.path}`);
+      }
+      const sourceRoot = file.path.startsWith('vault/')
+        ? fingerprint.vault_root
+        : fingerprint.state_root;
+      const sourcePath = file.path.slice(file.path.indexOf('/') + 1);
+      const [media, source] = await Promise.all([
+        lstat(join(backupRoot, file.path)),
+        lstat(join(sourceRoot, sourcePath))
+      ]);
+      if (media.dev === source.dev && media.ino === source.ino) {
+        throw recoveryRequired(`the backup media shares live bytes for ${file.path}`);
+      }
+    }
   } catch (error) {
     throw recoveryRequired('the migration backup cannot be verified from its media', error);
   }
@@ -673,7 +701,7 @@ function projectProperty(projectRoot: string): string {
 
 export function effectiveLifecycle(revision: StoredRevision): Lifecycle {
   const approval = revision.approval;
-  if (approval === undefined) return revision.status === 'active' ? 'candidate' : revision.status;
+  if (approval === undefined) return 'candidate';
   if (approval.payload_hash !== payloadHash(revision)) return 'candidate';
   return revision.status;
 }
@@ -936,14 +964,28 @@ export async function planVaultMigration(input: PlanVaultMigrationInput): Promis
   const parsed: ParsedManagedFile[] = [];
   const blockedPaths = new Set<string>();
   const failures: { path: string; sha256: string; id?: string; kind: MigrationBlockerKind }[] = [];
-  const managedRows = fingerprint.vault.filter(
-    (row) => row.path.toLowerCase().endsWith('.md') && hasBrainMarker(texts.get(row.path) ?? '')
-  );
+  const managedRows: SourceFileFingerprint[] = [];
+  for (const row of fingerprint.vault) {
+    if (!row.path.toLowerCase().endsWith('.md')) continue;
+    const raw = texts.get(row.path);
+    if (raw !== undefined) {
+      if (hasBrainMarker(raw)) managedRows.push(row);
+      continue;
+    }
+    const bytes = await readBytesAt(vaultRoot, row.path);
+    const id = peekLogicalId(bytes.toString('latin1'));
+    managedRows.push(row);
+    failures.push({
+      path: row.path,
+      sha256: row.sha256,
+      kind: 'malformed',
+      ...(id === undefined ? {} : { id })
+    });
+    blockedPaths.add(row.path);
+  }
   for (const row of managedRows) {
     const raw = texts.get(row.path);
     if (raw === undefined) {
-      failures.push({ path: row.path, sha256: row.sha256, kind: 'malformed' });
-      blockedPaths.add(row.path);
       continue;
     }
     try {

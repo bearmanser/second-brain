@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, rmdirSync, unlinkSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { BrainError, isBrainError } from '../contracts/errors.js';
 import { MATERIALIZATION_TIMEOUT_MS } from './limits.js';
@@ -424,6 +424,20 @@ export class InstanceLock {
   }
 
   private static clearIfStale(lockPath: string): boolean {
+    const claimPath = `${lockPath}.recovery`;
+    try {
+      mkdirSync(claimPath, { mode: 0o700 });
+    } catch {
+      return false;
+    }
+    try {
+      return InstanceLock.clearClaimedStale(lockPath);
+    } finally {
+      rmdirSync(claimPath);
+    }
+  }
+
+  private static clearClaimedStale(lockPath: string): boolean {
     let raw: string;
     try {
       raw = readFileSync(lockPath, 'utf8');
