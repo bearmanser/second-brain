@@ -1,4 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
 import { expect, test } from 'vitest';
 import { ensureProject } from '../../src/features/project-ensure.js';
 import { legacyNotePaths } from '../../src/notes/identity.js';
@@ -100,6 +103,61 @@ test('project roots stay human readable inside the byte limits', () => {
   expect(root.startsWith('Projects/')).toBe(true);
   expect(Buffer.byteLength(root, 'utf8')).toBeLessThanOrEqual(220);
   expect(Buffer.byteLength(root.slice('Projects/'.length), 'utf8')).toBeLessThanOrEqual(100);
+});
+
+test('a deep directory with a collision is rejected instead of emitting an over-long path', () => {
+  const collisionDirectory = 'E'.repeat(213);
+  const base = allocateNotePath({ directory: collisionDirectory, title: 'Name', occupied: [] });
+  expect(Buffer.byteLength(base, 'utf8')).toBeLessThanOrEqual(220);
+  expect(() =>
+    allocateNotePath({ directory: collisionDirectory, title: 'Name', occupied: [base] })
+  ).toThrow(/INVALID_INPUT/);
+
+  const noRoom = 'D'.repeat(217);
+  expect(() => allocateNotePath({ directory: noRoom, title: 'x', occupied: [] })).toThrow(
+    /INVALID_INPUT/
+  );
+});
+
+test('a device-shaped truncation cannot emit a reserved Windows name', () => {
+  const directory = 'D'.repeat(213);
+  const path = allocateNotePath({ directory, title: 'CONfederation', occupied: [] });
+  expect(Buffer.byteLength(path, 'utf8')).toBeLessThanOrEqual(220);
+  const basename = path.slice(directory.length + 1);
+  const head = (basename.split('.')[0] ?? '').replace(/[. ]+$/u, '');
+  expect(/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/iu.test(head)).toBe(false);
+  expect(safeBasename('conference')).toBe('conference');
+});
+
+test('superscript device-number aliases are reserved names and directory segments', () => {
+  expect(safeBasename('COM\u00b9')).toBe('COM\u00b9_');
+  expect(safeBasename('LPT\u00b2.md')).toBe('LPT\u00b2_.md');
+  expect(safeBasename('com\u00b3')).toBe('com\u00b3_');
+  expect(allocateNotePath({ directory: 'Knowledge', title: 'COM\u00b9', occupied: [] })).toBe(
+    'Knowledge/COM\u00b9_.md'
+  );
+  expect(() =>
+    allocateNotePath({ directory: 'Knowledge/LPT\u00b2', title: 'X', occupied: [] })
+  ).toThrow(/INVALID_INPUT/);
+});
+
+test('unpaired surrogates are replaced consistently before fitting and collision checks', () => {
+  const name = safeBasename('broken \uD800 name');
+  expect(name).toBe('broken \uFFFD name');
+  expect(Buffer.from(name, 'utf8').toString('utf8')).toBe(name);
+  const path = allocateNotePath({ directory: 'Knowledge', title: 'x\uDFFF', occupied: [] });
+  expect(path).toBe('Knowledge/x\uFFFD.md');
+  expect(collisionKey(path)).toBe(collisionKey(Buffer.from(path, 'utf8').toString('utf8')));
+  expect(
+    allocateNotePath({
+      directory: 'Knowledge',
+      title: 'x\uD800',
+      occupied: ['Knowledge/x\uFFFD.md']
+    })
+  ).toBe('Knowledge/x\uFFFD (2).md');
+  expect(() =>
+    allocateNotePath({ directory: 'Knowledge/bad\uD800', title: 'x', occupied: [] })
+  ).toThrow(/INVALID_INPUT/);
 });
 
 test('rejects unsafe directory arguments before sanitizing the title', () => {
@@ -277,6 +335,27 @@ test('project ensure qualifies a colliding basename with the repository owner', 
       display_name: 'bob shared-api',
       relative_root: 'Projects/bob shared-api'
     });
+  } finally {
+    await h.close();
+  }
+});
+
+test('project ensure never adopts an existing unregistered Projects directory', async () => {
+  const h = await createHarness();
+  try {
+    const vault = h.deps.config.mounts.vault;
+    const humanRoot = join(vault, 'Projects', 'human-made');
+    await mkdir(humanRoot, { recursive: true });
+    const result = await ensureProject(
+      workerContext,
+      request('https://github.com/example/human-made.git'),
+      h.deps
+    );
+    const project = h.deps.journal.getProjectByIdentity('github.com/example/human-made')?.project;
+    expect(result.created).toBe(true);
+    expect(project?.relative_root).toBe('Projects/example human-made');
+    expect(existsSync(humanRoot)).toBe(true);
+    expect(existsSync(join(vault, project?.relative_root ?? 'missing'))).toBe(true);
   } finally {
     await h.close();
   }

@@ -6,13 +6,17 @@ export const PROJECTS_ROOT = 'Projects';
 export const NOTE_EXTENSION = '.md';
 
 const MAX_COLLISION_SUFFIX = 10_000;
+const REPLACEMENT_CHARACTER = '\uFFFD';
 
 const DISALLOWED_RUN = /[<>:"/\\|?*\u0000-\u001f\u007f#[\]^]+/gu;
 const CONTROL = /[\u0000-\u001f\u007f]/u;
 const TRAILING = /[. ]+$/u;
 const LEADING_DOTS = /^[. ]+/u;
-const WINDOWS_RESERVED_DEVICE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/iu;
+const WINDOWS_RESERVED_DEVICE =
+  /^(?:con|prn|aux|nul|com[1-9\u00b9\u00b2\u00b3]|lpt[1-9\u00b9\u00b2\u00b3])$/iu;
 const DIRECTORY_SEGMENT_FORBIDDEN = /[<>:"\\|?*\u0000-\u001f\u007f#[\]^]/u;
+const LONE_SURROGATE = /[\uD800-\uDFFF]/u;
+const LONE_SURROGATE_RUN = /[\uD800-\uDFFF]/gu;
 
 function invalidInput(message: string): BrainError {
   return new BrainError({ code: 'INVALID_INPUT', message });
@@ -24,6 +28,10 @@ function conflict(message: string): BrainError {
 
 export function collisionKey(path: string): string {
   return path.normalize('NFC').toLocaleLowerCase('en-US');
+}
+
+function replaceLoneSurrogates(value: string): string {
+  return value.replace(LONE_SURROGATE_RUN, REPLACEMENT_CHARACTER);
 }
 
 function truncateUtf8(value: string, maxBytes: number): string {
@@ -53,8 +61,24 @@ function avoidWindowsDevice(value: string): string {
   return `${rawHead}_${dot === -1 ? '' : value.slice(dot)}`;
 }
 
+function fittedStem(stem: string, maxBytes: number): string | undefined {
+  if (maxBytes < 1) return undefined;
+  let candidate = fitName(stem, maxBytes);
+  if (candidate.length === 0) candidate = fitName('Note', maxBytes);
+  if (candidate.length === 0) return undefined;
+  let safe = avoidWindowsDevice(candidate);
+  if (Buffer.byteLength(safe, 'utf8') <= maxBytes) return safe;
+  if (maxBytes < 2) return undefined;
+  const reduced = fitName(candidate, maxBytes - 1);
+  if (reduced.length === 0) return undefined;
+  safe = avoidWindowsDevice(reduced);
+  return Buffer.byteLength(safe, 'utf8') <= maxBytes ? safe : undefined;
+}
+
 function sanitizeName(value: string): string {
-  const replaced = value.normalize('NFC').replace(DISALLOWED_RUN, ' ');
+  const replaced = replaceLoneSurrogates(value)
+    .normalize('NFC')
+    .replace(DISALLOWED_RUN, ' ');
   const collapsed = replaced.replace(/\s+/gu, ' ').trim();
   const stripped = collapsed.replace(LEADING_DOTS, '').replace(TRAILING, '');
   return avoidWindowsDevice(stripped);
@@ -64,13 +88,15 @@ export function safeBasename(title: string): string {
   if (typeof title !== 'string') throw invalidInput('a note title must be a string');
   const cleaned = sanitizeName(title);
   if (cleaned.length === 0) return 'Note';
-  const fitted = fitName(cleaned, BASENAME_MAX_BYTES);
-  return fitted.length > 0 ? fitted : 'Note';
+  return fittedStem(cleaned, BASENAME_MAX_BYTES) ?? 'Note';
 }
 
 function assertSafeDirectory(directory: string): string {
   if (typeof directory !== 'string' || directory.length === 0) {
     throw invalidInput('a vault directory must be a non-empty relative path');
+  }
+  if (LONE_SURROGATE.test(directory)) {
+    throw invalidInput('a vault directory contains invalid UTF-16');
   }
   if (Buffer.byteLength(directory, 'utf8') > VAULT_PATH_MAX_BYTES) {
     throw invalidInput('a vault directory exceeds the vault path limit');
@@ -108,7 +134,9 @@ function normalizeOccupied(occupied: readonly string[]): Set<string> {
   const keys = new Set<string>();
   if (Array.isArray(occupied)) {
     for (const entry of occupied) {
-      if (typeof entry === 'string' && entry.length > 0) keys.add(collisionKey(entry));
+      if (typeof entry === 'string' && entry.length > 0) {
+        keys.add(collisionKey(replaceLoneSurrogates(entry)));
+      }
     }
   }
   return keys;
@@ -133,9 +161,9 @@ export function allocateNotePath(input: {
       BASENAME_MAX_BYTES - suffixBytes - NOTE_EXTENSION.length,
       VAULT_PATH_MAX_BYTES - fixed - suffixBytes
     );
-    let fitted = fitName(stem, maxStem);
-    if (fitted.length === 0) {
-      fitted = fitName('Note', Math.max(1, maxStem)) || 'Note';
+    const fitted = fittedStem(stem, maxStem);
+    if (fitted === undefined) {
+      throw invalidInput('the destination directory leaves no room for a valid note name');
     }
     const candidate = `${directory}/${fitted}${suffix}${NOTE_EXTENSION}`;
     if (!occupied.has(collisionKey(candidate))) return candidate;
@@ -161,9 +189,9 @@ export function allocateProjectRoot(displayName: string, occupied: string[]): st
       BASENAME_MAX_BYTES - suffixBytes,
       VAULT_PATH_MAX_BYTES - prefixBytes - suffixBytes
     );
-    let fitted = fitName(cleaned, maxSegment);
-    if (fitted.length === 0) {
-      fitted = fitName('Note', Math.max(1, maxSegment)) || 'Note';
+    const fitted = fittedStem(cleaned, maxSegment);
+    if (fitted === undefined) {
+      throw invalidInput('a project root cannot fit inside the vault path limit');
     }
     const candidate = `${prefix}${fitted}${suffix}`;
     if (!occupiedRoots.has(collisionKey(candidate))) return candidate;

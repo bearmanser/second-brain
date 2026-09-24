@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import { readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { BrainError, isBrainError } from '../contracts/errors.js';
 import { projectEnsureRequestSchema } from '../contracts/protocol.js';
 import type { BrainDeps, MutationDeps, RecoveryOperationReport } from '../core/mutation.js';
@@ -77,10 +79,21 @@ interface PlannedProjectIdentity {
   relativeRoot: string;
 }
 
+function vaultProjectRoots(deps: BrainDeps): string[] {
+  const projectsDirectory = join(deps.config.mounts.vault, PROJECTS_ROOT);
+  try {
+    const entries = readdirSync(projectsDirectory, { withFileTypes: true });
+    return entries.map((entry) => `${PROJECTS_ROOT}/${entry.name}`);
+  } catch {
+    return [];
+  }
+}
+
 function occupiedProjectRoots(deps: BrainDeps): string[] {
   const roots: string[] = [];
   for (const scope of deps.scopeRegistry.all()) roots.push(scope.relative_root);
   for (const project of deps.journal.listProjects()) roots.push(project.project.relative_root);
+  for (const root of vaultProjectRoots(deps)) roots.push(root);
   return roots;
 }
 
