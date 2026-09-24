@@ -269,29 +269,31 @@ export async function feedbackLocal(
     reason: request.reason,
     ...(warning === undefined ? {} : { warning })
   });
-  const known = deps.journal.idempotencyKeyProject(request.idempotency_key);
-  if (known !== undefined) {
-    const replay = deps.journal.replayFeedback(writeFor(known.project_id ?? 'brain'));
-    if (replay !== undefined) return { feedback_id: replay.entry.feedback_id, recorded: true };
-  }
-  const identifier = request.project ?? request.scope;
-  const selected = identifier === undefined ? undefined : deps.projects.resolve(identifier)?.id;
-  await reconcileDeps(deps);
-  const source = currentByReferenceDeps(deps, { id: request.id });
-  if (source.id === undefined) {
-    throw localNotFound(`note ${request.id} has no managed revision to record feedback against`);
-  }
-  if (selected !== undefined && scopeForPathDeps(deps, source.path) !== selected) {
-    throw new BrainError({ code: 'CONFLICT', message: `note ${request.id} is outside the selected project` });
-  }
-  try {
-    await deps.documents.readRevision(source.id, request.revision_id);
-  } catch (error) {
-    if (isBrainError(error) && error.code === 'NOT_FOUND') {
-      throw localNotFound(`revision ${request.revision_id} of note ${request.id} does not exist`);
+  return deps.mutations.runWithSharedKey(request.idempotency_key, async () => {
+    const known = deps.journal.idempotencyKeyProject(request.idempotency_key);
+    if (known !== undefined) {
+      const replay = deps.journal.replayFeedback(writeFor(known.project_id ?? 'brain'));
+      if (replay !== undefined) return { feedback_id: replay.entry.feedback_id, recorded: true };
     }
-    throw error;
-  }
-  const stored = deps.journal.recordFeedback(writeFor(scopeForPathDeps(deps, source.path)));
-  return { feedback_id: stored.entry.feedback_id, recorded: true };
+    const identifier = request.project ?? request.scope;
+    const selected = identifier === undefined ? undefined : deps.projects.resolve(identifier)?.id;
+    await reconcileDeps(deps);
+    const source = currentByReferenceDeps(deps, { id: request.id });
+    if (source.id === undefined) {
+      throw localNotFound(`note ${request.id} has no managed revision to record feedback against`);
+    }
+    if (selected !== undefined && scopeForPathDeps(deps, source.path) !== selected) {
+      throw new BrainError({ code: 'CONFLICT', message: `note ${request.id} is outside the selected project` });
+    }
+    try {
+      await deps.documents.readRevision(source.id, request.revision_id);
+    } catch (error) {
+      if (isBrainError(error) && error.code === 'NOT_FOUND') {
+        throw localNotFound(`revision ${request.revision_id} of note ${request.id} does not exist`);
+      }
+      throw error;
+    }
+    const stored = deps.journal.recordFeedback(writeFor(scopeForPathDeps(deps, source.path)));
+    return { feedback_id: stored.entry.feedback_id, recorded: true };
+  });
 }

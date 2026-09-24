@@ -1121,3 +1121,66 @@ test('revising a note whose body contains level-two headings leaves no stale gen
     expect(second).not.toContain('second summary');
   } finally { await ground.dispose(); }
 });
+
+test('feedback and coordinated operations share one idempotency namespace in both orders and across restart', async () => {
+  const ground = await openGround();
+  const c = ctx();
+  try {
+    const captured = await captureLocal(c, { idempotency_key: randomUUID(), note: note('Namespace note', 'first') }, ground.deps);
+    const historicalRevision = captured.revision_id as string;
+    await reviewLocal(c, { operation: { action: 'revise', idempotency_key: randomUUID(), id: captured.id,
+      expected_etag: captured.etag as string, rationale: 'advance', note: note('Namespace note', 'second') } }, ground.deps);
+    await refresh(ground);
+    expect(ground.catalogue.getById(captured.id)?.revision_id).not.toBe(historicalRevision);
+    const feedbackFor = (key: string, reason = 'historical was useful') => ({
+      idempotency_key: key, id: captured.id, revision_id: historicalRevision, verdict: 'useful' as const, reason
+    });
+
+    const captureKey = randomUUID();
+    const coordinated = await captureLocal(c, { idempotency_key: captureKey, note: note('Coordinated first', 'c') }, ground.deps);
+    const ensureKey = randomUUID();
+    const ensureRequest = { idempotency_key: ensureKey, remote_url: 'https://github.com/example/namespace.git' };
+    const ensured = await projectEnsureLocal(c, ensureRequest, ground.deps);
+    const reviewKey = randomUUID();
+    const approveRequest = { operation: { action: 'approve' as const, idempotency_key: reviewKey, id: coordinated.id,
+      expected_etag: coordinated.etag as string, rationale: 'approve coordinated' } };
+    const approved = await reviewLocal(c, approveRequest, ground.deps);
+
+    const feedbackKey = randomUUID();
+    const recorded = await feedbackLocal(c, feedbackFor(feedbackKey), ground.deps);
+    expect(ground.journal.getFeedback(recorded.feedback_id)?.revision_id).toBe(historicalRevision);
+
+    const assertCollisions = async (): Promise<void> => {
+      for (const key of [captureKey, ensureKey, reviewKey]) {
+        await expect(feedbackLocal(c, feedbackFor(key), ground.deps)).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+        expect(ground.journal.idempotencyKeyProject(key)).toBeUndefined();
+      }
+      await expect(captureLocal(c, { idempotency_key: feedbackKey, note: note('Coordinated second', 'x') }, ground.deps))
+        .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+      await expect(projectEnsureLocal(c, { ...ensureRequest, idempotency_key: feedbackKey }, ground.deps))
+        .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+      await expect(reviewLocal(c, { operation: { ...approveRequest.operation, idempotency_key: feedbackKey } }, ground.deps))
+        .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+      expect(ground.operations.findByKey(feedbackKey)).toBeUndefined();
+      const replay = await feedbackLocal(c, feedbackFor(feedbackKey), ground.deps);
+      expect(replay).toEqual(recorded);
+      expect(ground.journal.getFeedback(replay.feedback_id)?.revision_id).toBe(historicalRevision);
+      await expect(feedbackLocal(c, feedbackFor(feedbackKey, 'different reason'), ground.deps))
+        .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+      expect(await captureLocal(c, { idempotency_key: captureKey, note: note('Coordinated first', 'c') }, ground.deps))
+        .toEqual(coordinated);
+      expect(await projectEnsureLocal(c, ensureRequest, ground.deps)).toEqual(ensured);
+      expect(await reviewLocal(c, approveRequest, ground.deps)).toEqual(approved);
+    };
+    await assertCollisions();
+    await restartGround(ground);
+    await assertCollisions();
+
+    const lateKey = randomUUID();
+    const late = await feedbackLocal(c, feedbackFor(lateKey, 'late'), ground.deps);
+    await restartGround(ground);
+    await expect(captureLocal(c, { idempotency_key: lateKey, note: note('After restart', 'y') }, ground.deps))
+      .rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+    expect(await feedbackLocal(c, feedbackFor(lateKey, 'late'), ground.deps)).toEqual(late);
+  } finally { await ground.dispose(); }
+});

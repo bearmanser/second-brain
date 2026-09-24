@@ -334,6 +334,7 @@ export async function buildLocalHandlerDeps(
       clock: brain.clock,
       ids: brain.ids,
       revisions,
+      foreignKeys: { has: (key) => brain.journal.idempotencyKeyProject(key) !== undefined },
       projects: {
         getProjectByIdentity: (identity) => brain.journal.getProjectByIdentity(identity),
         reserveProject: (input) => brain.journal.reserveProject(input),

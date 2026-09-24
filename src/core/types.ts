@@ -615,6 +615,7 @@ export interface LocalMutationCoordinatorPort {
   verifyConflictHeads(id: string, expected: readonly LocalExpectedHead[]): Promise<void>;
   selectSurvivorPath(id: string, heads: readonly LocalConflictHead[]): Promise<string>;
   latestGeneratedNote(id: string): NoteInput | undefined;
+  runWithSharedKey<T>(idempotencyKey: string, work: () => Promise<T>): Promise<T>;
 }
 
 export interface ResolvedProject {

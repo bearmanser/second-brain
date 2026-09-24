@@ -1393,6 +1393,7 @@ export interface LocalMutationCoordinatorDeps {
   ids: IdSource;
   projects?: LocalProjectLookup;
   revisions?: RevisionStore;
+  foreignKeys?: { has(idempotencyKey: string): boolean };
 }
 
 function localConflict(message: string): BrainError {
@@ -1401,6 +1402,13 @@ function localConflict(message: string): BrainError {
 
 function localInvalid(message: string): BrainError {
   return new BrainError({ code: 'INVALID_INPUT', message });
+}
+
+function sharedKeyConflict(idempotencyKey: string): BrainError {
+  return new BrainError({
+    code: 'IDEMPOTENCY_CONFLICT',
+    message: `idempotency key ${idempotencyKey} was used for a different tool`
+  });
 }
 
 function localRecovery(message: string, cause?: unknown): BrainError {
@@ -1457,6 +1465,17 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
 
   runLazy(intent: LocalOperationIntent, prepare: () => Promise<LocalOperationPlan>): Promise<LocalOperationReceipt> {
     return this.withLock(() => this.runSerialized(intent, prepare));
+  }
+
+  runWithSharedKey<T>(idempotencyKey: string, work: () => Promise<T>): Promise<T> {
+    return this.withLock(async () => {
+      const existing = this.deps.operations.findByKey(idempotencyKey);
+      if (existing !== undefined) {
+        if (!this.releasable(existing)) throw sharedKeyConflict(idempotencyKey);
+        this.deps.operations.release(existing.operation_id);
+      }
+      return work();
+    });
   }
 
   status(operation_id: string): LocalOperationStatus | undefined {
@@ -1652,6 +1671,9 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
       return this.replay(replayed, existing, canonicalRequest(replayed).hash);
     }
     if (existing !== undefined) this.deps.operations.release(existing.operation_id);
+    if (this.deps.foreignKeys?.has(intent.idempotency_key) === true) {
+      throw sharedKeyConflict(intent.idempotency_key);
+    }
     const selected = intent.project_selection === undefined
       ? intent
       : { ...intent, project_id: intent.project_selection.resolve() } as LocalOperationIntent;
