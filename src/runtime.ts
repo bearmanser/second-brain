@@ -49,6 +49,18 @@ import { Journal } from './storage/journal.js';
 import { openRevisionStore, type RevisionStore } from './storage/revision-store.js';
 import { openSearchIndex, type SearchIndex } from './storage/search-index.js';
 import { FileVault } from './storage/vault.js';
+import { openDocumentStore, type DocumentIndex } from './storage/document-store.js';
+import type { RerankWorker } from './retrieval/reranker.js';
+import {
+  localCapture,
+  localFeedback,
+  localProjectEnsure,
+  localRead,
+  localRecall,
+  localReview,
+  localStatus,
+  type LocalBrain
+} from './features/local-brain.js';
 import { InstanceLock, MutationCoordinator, type BrainDeps } from './core/mutation.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
@@ -64,6 +76,7 @@ export interface RuntimeOptions {
   logger?: (line: string) => void;
   wrapServices?: (services: BrainServices, deps: BrainDeps) => BrainServices;
   token_digest: string;
+  local?: { worker?: RerankWorker };
 }
 
 export interface BrainRuntime {
@@ -95,6 +108,47 @@ const systemIds: IdSource = { next: () => randomUUID() };
 
 const silentLogger = (): void => undefined;
 
+class LocalOnlyBackend implements BackendPort {
+  async connect(): Promise<void> {
+    return;
+  }
+
+  async probe(): Promise<{ server_version: string; tools: string[] }> {
+    return { server_version: 'local', tools: [] };
+  }
+
+  registerScope(): void {
+    return;
+  }
+
+  async verifyProject(): Promise<boolean> {
+    return true;
+  }
+
+  async ensureProject(): Promise<{ created: boolean }> {
+    return { created: false };
+  }
+
+  async create(): Promise<{ permalink: string; relative_path?: string }> {
+    throw new BrainError({
+      code: 'BACKEND_UNAVAILABLE',
+      message: 'the local document store owns writes'
+    });
+  }
+
+  async search(): Promise<{ hits: never[]; has_more: boolean }> {
+    return { hits: [], has_more: false };
+  }
+
+  async isIndexed(): Promise<boolean> {
+    return true;
+  }
+
+  async close(): Promise<void> {
+    return;
+  }
+}
+
 function recoveryRequired(message: string, cause?: unknown): BrainError {
   return new BrainError({ code: 'RECOVERY_REQUIRED', message, cause });
 }
@@ -123,8 +177,42 @@ async function loadCursorSecret(config: BrainConfig): Promise<Uint8Array> {
 function buildServices(
   deps: BrainDeps,
   delivery: BrainServices['result_delivery'],
-  log: (line: string) => void
+  log: (line: string) => void,
+  local?: LocalBrain
 ): BrainServices {
+  if (local !== undefined) {
+    return {
+      result_delivery: delivery ?? 'structured',
+      reportDiagnostic: log,
+      capture: (ctx, request): Promise<MutationReceipt> => localCapture(ctx, request, local),
+      review: (ctx, request) => localReview(ctx, request, local),
+      read: (ctx, request): Promise<ReadResult> => localRead(ctx, request, local),
+      status: (ctx, request): Promise<StatusResult> => localStatus(ctx, request, local),
+      feedback: (ctx, request) => localFeedback(ctx, request, local),
+      projectEnsure: (ctx, request): Promise<ProjectEnsureResult> =>
+        localProjectEnsure(ctx, request, local),
+      recall: async (ctx, request): Promise<RecallResult> => {
+        const started = Date.now();
+        const result = await localRecall(ctx, request, local);
+        try {
+          deps.journal.recordRetrievalV2(
+            retrievalEventFromRecall(ctx, result, {
+              filter:
+                request.project === undefined && request.scope === undefined
+                  ? { mode: 'all' }
+                  : { mode: 'project', identifier: (request.project ?? request.scope) as string },
+              searched_project_ids: [],
+              primary_project_id: null,
+              duration_ms: Math.max(0, Date.now() - started)
+            })
+          );
+        } catch (error) {
+          log(internalDiagnostic(error));
+        }
+        return result;
+      }
+    };
+  }
   return {
     result_delivery: delivery ?? 'structured',
     reportDiagnostic: log,
@@ -273,6 +361,7 @@ class BrainRuntimeImpl implements BrainRuntime {
   private currentIndex: CurrentCatalogue | undefined;
   private currentObserver: CurrentVaultObserver | undefined;
   private searchIndex: SearchIndex | undefined;
+  private localBrain: LocalBrain | undefined;
   private readonly readLimiter: ReadLimiter;
 
   constructor(config: BrainConfig, options: RuntimeOptions) {
@@ -324,11 +413,13 @@ class BrainRuntimeImpl implements BrainRuntime {
       }
       const backend =
         this.options.backend ??
-        new BasicMemoryBackend({
-          url: this.config.backend_endpoint,
-          projects: scopeRegistry.all().map((scope) => scope.backend_project),
-          timeout_ms: this.config.limits.backend_timeout_ms
-        });
+        (this.useLocal()
+          ? new LocalOnlyBackend()
+          : new BasicMemoryBackend({
+              url: this.config.backend_endpoint,
+              projects: scopeRegistry.all().map((scope) => scope.backend_project),
+              timeout_ms: this.config.limits.backend_timeout_ms
+            }));
       this.backend = backend;
       await backend.connect();
       for (const scope of scopeRegistry.all()) backend.registerScope(scope);
@@ -413,9 +504,15 @@ class BrainRuntimeImpl implements BrainRuntime {
       });
       await this.startupReconcile();
       await this.startCurrentVault();
+      await this.openLocalBrain(journal);
       await loadCursorSecret(this.config);
 
-      const base = buildServices(deps, this.config.result_delivery, this.log);
+      const base = buildServices(
+        deps,
+        this.config.result_delivery,
+        this.log,
+        this.localBrain
+      );
       const wrapped = this.options.wrapServices?.(base, deps) ?? base;
       this.services = trackedServices(
         { ...base, ...wrapped },
@@ -656,6 +753,47 @@ class BrainRuntimeImpl implements BrainRuntime {
     }
   }
 
+  private useLocal(): boolean {
+    return this.options.local !== undefined || this.options.backend === undefined;
+  }
+
+  private async openLocalBrain(journal: Journal): Promise<void> {
+    if (!this.useLocal()) return;
+    const catalogue = this.currentIndex;
+    const index = this.searchIndex;
+    const vault = this.deps.vault as VaultPort & CurrentVault;
+    if (
+      catalogue === undefined ||
+      index === undefined ||
+      typeof vault.listMarkdown !== 'function' ||
+      typeof vault.readMarkdown !== 'function'
+    ) {
+      throw recoveryRequired('the local document store requires a readable vault');
+    }
+    const documents = await openDocumentStore({
+      vault: this.config.mounts.vault,
+      state: this.config.mounts.state,
+      index: index as unknown as DocumentIndex,
+      clock: this.clock,
+      ids: this.ids
+    });
+    this.localBrain = {
+      config: this.config,
+      clock: this.clock,
+      ids: this.ids,
+      documents,
+      catalogue,
+      index,
+      journal,
+      vault,
+      vaultRoot: this.config.mounts.vault,
+      ...(this.options.local?.worker === undefined ? {} : { worker: this.options.local.worker }),
+      close: async () => {
+        await documents.close();
+      }
+    };
+  }
+
   private logCurrentReconcile(report: ReconcileCurrentVaultReport): void {
     this.log(
       `current vault reconcile scanned ${report.scanned} files (${report.complete ? 'complete' : 'partial'}); ` +
@@ -753,6 +891,8 @@ class BrainRuntimeImpl implements BrainRuntime {
     this.ready = false;
     await this.currentObserver?.close().catch(() => undefined);
     this.currentObserver = undefined;
+    await this.localBrain?.close().catch(() => undefined);
+    this.localBrain = undefined;
     this.currentIndex?.close();
     this.currentIndex = undefined;
     this.searchIndex?.close();

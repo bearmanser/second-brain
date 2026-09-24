@@ -246,7 +246,7 @@ test('the published tool contract is pinned', () => {
       {
         "input": "8cf96af973581c3f8fd6c954a45694b1ccf66b9de148d07299d0fef2aa1acc98",
         "name": "brain_capture",
-        "output": "dc958acd644403bdc22f902b313d6d16640e38f6a8d4f0a5bf57eef1d2a15043",
+        "output": "57fce7c09c966db809d68ffe028e91904e9938860b97d457430451f4799dccc9",
       },
       {
         "input": "2e5e0114744f0da9c5c9b683d8400d42b07a79894b90f8721fb4cd491ee4bcb5",
@@ -256,27 +256,27 @@ test('the published tool contract is pinned', () => {
       {
         "input": "bab96ef550ee128f67bf979e6be07349c1923bcac7051613b1ae7678b36c0e23",
         "name": "brain_project_ensure",
-        "output": "40731a03c5b473df298d1b772af2e3e25338b72086c13d09d0f270e23b54b1d8",
+        "output": "6591c834431f34d8c3b17c024feeec42cd1db294e890230b80dfebff3104a0c1",
       },
       {
-        "input": "05e8e79e12cca928634f3e2adbf42fe15ac3a27360008921eda09412367c89f6",
+        "input": "78e53562be503059fd476f02cb7d4c8516e040414244e47cea64c55e4d21fdd2",
         "name": "brain_read",
-        "output": "9be233d055cc7a4b8911f780188c2a06e24178929005730793ca1ad19ecfa7f1",
+        "output": "dc422311704e5104ae8b579055802d36215ab8fb8171c3ecf8d53b3c8c1f99d8",
       },
       {
-        "input": "0bfa6cab591812643e43585e87249f467ee19aa3b307391e88840d502aa9b776",
+        "input": "eb9847690ed4c0878ad3043b40cbf6d3fd7b09a5ff455fc917465d359fcbcf1b",
         "name": "brain_recall",
-        "output": "011604281ab18429687866c85b1572b1d6a562eeaae3ce20ac24355664cebccc",
+        "output": "1bba962c7fe6f748ca285b4bd573dd3c64dd299b2d6470bce14dbff9055aa0a5",
       },
       {
-        "input": "0f634814942ffd8e42673cd140f080abf1d86cc172eccca2ee28289b8a5a8ddc",
+        "input": "de0d22351181adaa0c6469ddaa6a8813cab0bc49ff30bca7e5c30698e96e8b2a",
         "name": "brain_review",
-        "output": "60d762fba468702212a631676552e6f935ac16a8388d451433778457c53d1b73",
+        "output": "4296f66f5b3aedc53103bae95c5571490de8f77b13c0e484461f168059f21504",
       },
       {
         "input": "b08c7c6e06ed73a354cdcd37ef9fc28a5d454f4e7a7394270bc295db8a285579",
         "name": "brain_status",
-        "output": "f538313f968f049f2d0def1645642d21b371bce555da1d3ee2b30f6bd1f16f52",
+        "output": "a6189f5a3e6de53685a88144d4aec348570d045d7c173038fe0d1eb2882cbf71",
       },
     ]
   `);
@@ -326,8 +326,9 @@ test('representative tool schemas are pinned in full', () => {
         },
         "mode": {
           "enum": [
-            "hybrid",
             "text",
+            "reranked",
+            "hybrid",
           ],
           "type": "string",
         },
@@ -382,6 +383,21 @@ test('representative tool schemas are pinned in full', () => {
     {
       "additionalProperties": false,
       "properties": {
+        "features": {
+          "additionalProperties": false,
+          "properties": {
+            "fallback": {
+              "type": "boolean",
+            },
+            "reranking": {
+              "type": "boolean",
+            },
+            "text_search": {
+              "type": "boolean",
+            },
+          },
+          "type": "object",
+        },
         "health": {
           "additionalProperties": false,
           "properties": {
@@ -414,6 +430,40 @@ test('representative tool schemas are pinned in full', () => {
             "backend",
             "embeddings",
           ],
+          "type": "object",
+        },
+        "local": {
+          "additionalProperties": false,
+          "properties": {
+            "index": {
+              "additionalProperties": false,
+              "properties": {
+                "documents": {
+                  "type": "number",
+                },
+                "state": {
+                  "enum": [
+                    "ready",
+                    "unavailable",
+                  ],
+                  "type": "string",
+                },
+              },
+              "type": "object",
+            },
+            "worker": {
+              "additionalProperties": false,
+              "properties": {
+                "model_fingerprint": {
+                  "type": "string",
+                },
+                "state": {
+                  "type": "string",
+                },
+              },
+              "type": "object",
+            },
+          },
           "type": "object",
         },
         "operation": {
@@ -451,12 +501,20 @@ test('representative tool schemas are pinned in full', () => {
                   "items": {
                     "additionalProperties": false,
                     "properties": {
+                      "end_line": {
+                        "type": "number",
+                      },
                       "etag": {
                         "pattern": "^[a-f0-9]{64}$",
                         "type": "string",
                       },
+                      "heading": {
+                        "type": [
+                          "string",
+                          "null",
+                        ],
+                      },
                       "id": {
-                        "format": "uuid",
                         "type": "string",
                       },
                       "kind": {
@@ -475,12 +533,13 @@ test('representative tool schemas are pinned in full', () => {
                         "type": "string",
                       },
                       "revision_id": {
-                        "format": "uuid",
                         "type": "string",
                       },
                       "scope": {
-                        "pattern": "^[a-z][a-z0-9-]{0,63}$",
                         "type": "string",
+                      },
+                      "start_line": {
+                        "type": "number",
                       },
                       "status": {
                         "enum": [
@@ -503,7 +562,6 @@ test('representative tool schemas are pinned in full', () => {
                     },
                     "required": [
                       "id",
-                      "revision_id",
                       "scope",
                       "title",
                       "kind",
@@ -555,6 +613,12 @@ test('representative tool schemas are pinned in full', () => {
                   "format": "uuid",
                   "type": "string",
                 },
+                "project_id": {
+                  "type": "string",
+                },
+                "relative_root": {
+                  "type": "string",
+                },
                 "repository_identity": {
                   "type": "string",
                 },
@@ -589,6 +653,12 @@ test('representative tool schemas are pinned in full', () => {
           "items": {
             "additionalProperties": false,
             "properties": {
+              "display_name": {
+                "type": "string",
+              },
+              "relative_root": {
+                "type": "string",
+              },
               "scope": {
                 "pattern": "^[a-z][a-z0-9-]{0,63}$",
                 "type": "string",
@@ -610,8 +680,11 @@ test('representative tool schemas are pinned in full', () => {
           },
           "type": "array",
         },
+        "protocol": {
+          "const": 2,
+          "type": "number",
+        },
         "protocol_version": {
-          "const": "2025-11-25",
           "type": "string",
         },
         "schema_version": {

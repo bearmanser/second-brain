@@ -508,7 +508,8 @@ async function runRecall(
   const terms = searchTerms(searchText);
 
   let partial = false;
-  let mode: 'hybrid' | 'text' = request.mode ?? 'hybrid';
+  let mode: 'hybrid' | 'text' =
+    request.mode === 'reranked' ? 'hybrid' : request.mode ?? 'hybrid';
   const deadline = Date.now() + (deps.config.limits.backend_timeout_ms ?? BACKEND_TIMEOUT_MS);
 
   let accumulator = await collectProjects(ctx, scopes, searchText, kinds, mode, deps, deadline, 0);

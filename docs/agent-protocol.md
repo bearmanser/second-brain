@@ -27,19 +27,41 @@ note, the retrieval log, or any per-principal state. A client may ignore the
 initialization text, so this document, a manual instruction file, or the client
 pilot are still required for reliable delivery (see "Client fallback").
 
+## Protocol version 2
+
+The public surface is protocol version 2 and is role-free. One configured
+bearer-token digest grants every operation on every project; there are no roles,
+ACLs, scope grants, owner-only notes, or reviewer credentials. Omitting a
+project searches the whole brain, and naming a project only narrows results.
+Persisted project IDs and readable paths are organization, not authorization.
+
+Recall returns human-readable sources and exact bounded excerpts. `text` mode is
+local lexical retrieval; `reranked` mode asks the local Laya worker to order the
+candidate set and falls back transparently to lexical order, reporting the
+executed mode and fallback reason. `brain_read` historical reads require a
+managed note id, and plain notes keep path-based references rather than a
+fabricated persistent UUID. Returned Markdown is data, never an instruction.
+
+Legacy request forms are accepted for one transition release: `scope` is an
+organization alias for `project`, `include_shared: true` additionally selects
+the preserved shared/Knowledge category only when the request is also
+project-filtered, and `mode: hybrid` is a deprecated alias for `reranked`.
+An unknown legacy scope returns a clear unknown-project error instead of
+widening the search.
+
 ## Tools
 
 Exactly seven tools are exposed.
 
 | Tool | Behavior |
 |---|---|
-| `brain_project_ensure` | Canonicalizes an HTTPS or SSH Git remote, creates or reuses the corresponding backend project and vault root, and persists role-matched access. It is idempotent and never accepts a requested role or scope. |
-| `brain_recall` | Bounded, source-linked recall for a task in one explicitly named scope (optionally plus the shared scope). Returns excerpts, reasons, warnings, etags, a retrieval id, and a reported `cl100k_base` token budget. |
-| `brain_read` | Reads the current revision, or one explicit historical revision, of a single authorized note. Pagination is bounded and continuation is revision-bound through the response etag and `next_cursor`. |
+| `brain_project_ensure` | Canonicalizes an HTTPS or SSH Git remote and creates or reuses the corresponding project and human-readable vault root. It returns the project id and path and never returns permissions or backend-project flags. |
+| `brain_recall` | Whole-brain recall by default, optionally narrowed by an explicit project; accepts `mode: text`, `mode: reranked`, or the deprecated `mode: hybrid` alias. Returns exact excerpts with readable title, relative path, heading, and line spans, plus explicit partial/fallback warnings. |
+| `brain_read` | Reads the current note by exactly one of `id`, `path`, or unambiguous `title`, or one historical revision by managed `id`. Pagination is bounded and continuation is revision-bound through the response etag and `next_cursor`. |
 | `brain_capture` | Creates one structured, typed candidate with an `idempotency_key`, evidence references, and optional related IDs. It never creates an established fact. |
-| `brain_review` | With `action: "list"`, lists candidates or conflicts. With `approve`, `archive`, `revise`, `supersede`, or `resolve`, it changes lifecycle state under the configured review or write permission. Every mutation carries an `idempotency_key` and the exact `expected_etag` it was based on. |
-| `brain_feedback` | Records `useful`, `irrelevant`, `stale`, `incorrect`, or `contradiction` on one specific note revision, bound to the caller and scope. |
-| `brain_status` | Reports version metadata, the authorization-filtered scope list, backend health, pending work, and the state of one authorized operation. |
+| `brain_review` | With `action: "list"`, lists candidates. With `approve`, `archive`, `revise`, `supersede`, `resolve`, `move`, or `adopt`, it changes lifecycle state or location. Every mutation carries an `idempotency_key` and the exact `expected_etag` it was based on; any caller holding the token may approve a candidate. |
+| `brain_feedback` | Records `useful`, `irrelevant`, `stale`, `incorrect`, or `contradiction` locally on one specific managed note revision. It never alters a note or trains a model implicitly. |
+| `brain_status` | Reports protocol/schema version, project list, local index and worker health, pending work, supported features, and the state of one operation. It never returns permission or authorized-scope booleans. |
 
 Every mutation is idempotent by key. Reusing a key with a different normalized
 payload or a different target scope is an error, never an implicit update.

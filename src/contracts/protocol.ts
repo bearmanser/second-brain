@@ -14,6 +14,7 @@ import {
   projectIdentifierSchema,
   remoteUrlSchema,
   scopeIdSchema,
+  titleSchema,
   uuidSchema,
   withinInputBodyLimit
 } from './content.js';
@@ -84,6 +85,22 @@ export const reviewMoveOperation = z.strictObject({
   rationale: text
 });
 
+export const reviewAdoptOperation = z.strictObject({
+  action: z.literal('adopt'),
+  idempotency_key: uuidSchema,
+  path: z.string().trim().min(1).max(1024),
+  expected_etag: etagSchema,
+  rationale: text
+});
+
+export const noteReferenceSchema = z.union([
+  z.strictObject({ id: uuidSchema }),
+  z.strictObject({ path: z.string().trim().min(1).max(1024) }),
+  z.strictObject({ title: titleSchema })
+]);
+
+export type NoteReferenceInput = z.infer<typeof noteReferenceSchema>;
+
 export const captureRequestSchema = z
   .strictObject({
     idempotency_key: uuidSchema,
@@ -123,10 +140,20 @@ export const readRequestSchema = z
   .strictObject({
     project: projectIdentifierSchema.optional(),
     scope: scopeIdSchema.optional(),
-    id: uuidSchema,
+    id: uuidSchema.optional(),
+    path: z.string().trim().min(1).max(1024).optional(),
+    title: titleSchema.optional(),
     revision_id: uuidSchema.optional(),
     cursor: cursorSchema.optional(),
     budget_tokens: z.int().min(READ_BUDGET_TOKENS_MIN).max(READ_BUDGET_TOKENS_MAX).optional()
+  })
+  .refine(
+    (value) =>
+      [value.id, value.path, value.title].filter((selector) => selector !== undefined).length === 1,
+    { message: 'a read reference must have exactly one of id, path, or title' }
+  )
+  .refine((value) => value.revision_id === undefined || value.id !== undefined, {
+    message: 'a historical read requires a managed note id'
   })
   .refine(withinInputBodyLimit, { message: 'input body exceeds the 256 KiB limit' });
 
@@ -139,7 +166,9 @@ export const reviewRequestSchema = z
       reviewDecisionOperation,
       reviewReviseOperation,
       reviewSupersedeOperation,
-      reviewResolveOperation
+      reviewResolveOperation,
+      reviewMoveOperation,
+      reviewAdoptOperation
     ])
   })
   .refine(withinInputBodyLimit, { message: 'input body exceeds the 256 KiB limit' });

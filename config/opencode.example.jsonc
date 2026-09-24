@@ -1,5 +1,7 @@
 {
   // V2 client configuration for the second-brain MCP gateway.
+  // Protocol version 2 is role-free: one bearer token grants every operation.
+  // Use result_delivery: text-json for clients that cannot read structuredContent.
   // Verified against the installed CLI: opencode v2.0.10 (`opencode --version`).
   // V2 stores servers under `mcp.servers.<name>`; it does not accept a server
   // name directly under `mcp`. `codemode: false` exposes the MCP tools on the

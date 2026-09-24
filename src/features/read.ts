@@ -129,39 +129,40 @@ function decodeCursor(
 
 async function requireSelectedSource(
   scope: ScopeConfig,
-  request: ReadRequest,
+  id: string,
   revisionId: string | undefined,
   deps: BrainDeps
 ): Promise<void> {
-  const located = await deps.catalogue.locate(scope.id, request.id, revisionId);
+  const located = await deps.catalogue.locate(scope.id, id, revisionId);
   if (located === undefined) {
-    throw notFound(`note ${request.id} is not catalogued in scope ${scope.id}`);
+    throw notFound(`note ${id} is not catalogued in scope ${scope.id}`);
   }
   try {
     await deps.vault.read(scope.id, located.relative_path);
   } catch (error) {
     if (isBrainError(error) && error.code === 'NOT_FOUND') {
-      throw notFound(`note ${request.id} has no remaining source file in scope ${scope.id}`);
+      throw notFound(`note ${id} has no remaining source file in scope ${scope.id}`);
     }
     throw error;
   }
-  throw conflict(`note ${request.id} has a conflicting source in scope ${scope.id}`);
+  throw conflict(`note ${id} has a conflicting source in scope ${scope.id}`);
 }
 
 async function loadHead(
   scope: ScopeConfig,
-  request: ReadRequest,
+  id: string,
+  revisionId: string | undefined,
   cursor: CursorPayloadV2 | undefined,
   deps: BrainDeps
 ): Promise<Head> {
-  const revisionId = cursor?.revision_id ?? request.revision_id;
+  const selectedRevision = cursor?.revision_id ?? revisionId;
   try {
-    return revisionId === undefined
-      ? await deps.catalogue.get(scope.id, request.id)
-      : await deps.catalogue.getRevision(scope.id, request.id, revisionId);
+    return selectedRevision === undefined
+      ? await deps.catalogue.get(scope.id, id)
+      : await deps.catalogue.getRevision(scope.id, id, selectedRevision);
   } catch (error) {
     if (isBrainError(error) && error.code === 'CONFLICT') {
-      await requireSelectedSource(scope, request, revisionId, deps);
+      await requireSelectedSource(scope, id, selectedRevision, deps);
     }
     throw error;
   }
@@ -233,6 +234,10 @@ export async function read(
   if (ctx.signal.aborted) throw cancelled();
   const scope = deps.scopeRegistry.require(requiredProject(input));
   const request = parseRequest(input);
+  const id = request.id;
+  if (id === undefined) {
+    throw invalidInput('the legacy read path requires a managed note id');
+  }
   const now = deps.clock.now();
 
   if (ctx.signal.aborted) throw cancelled();
@@ -241,7 +246,7 @@ export async function read(
   if (request.cursor !== undefined) {
     const secret = loadCursorSecret(deps);
     cursor = decodeCursor(request.cursor, secret, now, deps);
-    if (cursor.scope !== scope.id || cursor.id !== request.id) {
+    if (cursor.scope !== scope.id || cursor.id !== id) {
       throw invalidInput('read cursor does not belong to the requested note');
     }
     if (request.revision_id !== undefined && request.revision_id !== cursor.revision_id) {
@@ -249,7 +254,7 @@ export async function read(
     }
   }
 
-  const head = await loadHead(scope, request, cursor, deps);
+  const head = await loadHead(scope, id, request.revision_id, cursor, deps);
   const explicitRevision = (cursor?.revision_id ?? request.revision_id) !== undefined;
   const inspectableFork =
     explicitRevision &&

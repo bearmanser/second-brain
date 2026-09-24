@@ -57,14 +57,17 @@ const etagOutputSchema = z.string().regex(ETAG_PATTERN);
 const stringListOutputSchema = z.array(z.string());
 
 const sourceRefOutputSchema = z.strictObject({
-  id: uuidOutputSchema,
-  revision_id: uuidOutputSchema,
-  scope: scopeIdOutputSchema,
+  id: z.string(),
+  revision_id: z.string().optional(),
+  scope: z.string(),
   title: z.string(),
   kind: z.enum(NOTE_KINDS),
   status: z.enum(LIFECYCLES),
   etag: etagOutputSchema,
   relative_path: z.string(),
+  heading: z.string().nullable().optional(),
+  start_line: z.number().optional(),
+  end_line: z.number().optional(),
   warnings: stringListOutputSchema
 });
 
@@ -100,7 +103,7 @@ const readOutputSchema = z.strictObject({
 
 const recallOutputSchema = z.strictObject({
   retrieval_id: uuidOutputSchema,
-  mode: z.enum(['hybrid', 'text']),
+  mode: z.enum(['text', 'reranked', 'hybrid']),
   partial: z.boolean(),
   warnings: stringListOutputSchema,
   budget: z.strictObject({
@@ -120,6 +123,8 @@ const projectEnsureOutputSchema = z.strictObject({
   operation_id: uuidOutputSchema,
   repository_identity: z.string(),
   scope: scopeIdOutputSchema,
+  project_id: z.string().optional(),
+  relative_root: z.string().optional(),
   created: z.boolean(),
   backend_ready: z.boolean(),
   materialized: z.boolean(),
@@ -130,6 +135,7 @@ const statusOutputSchema = z.strictObject({
   version: z.string(),
   protocol_version: z.string(),
   schema_version: z.literal(1),
+  protocol: z.literal(2).optional(),
   scopes: z.array(
     z.strictObject({
       id: scopeIdOutputSchema
@@ -140,12 +146,33 @@ const statusOutputSchema = z.strictObject({
     backend: z.enum(['ready', 'unavailable']),
     embeddings: z.enum(['ready', 'unavailable', 'unknown'])
   }),
+  local: z
+    .strictObject({
+      index: z.strictObject({
+        state: z.enum(['ready', 'unavailable']),
+        documents: z.number().optional()
+      }),
+      worker: z.strictObject({
+        state: z.string(),
+        model_fingerprint: z.string().optional()
+      })
+    })
+    .optional(),
+  features: z
+    .strictObject({
+      reranking: z.boolean(),
+      text_search: z.boolean(),
+      fallback: z.boolean()
+    })
+    .optional(),
   pending_operations: z.number(),
   projects: z
     .array(
       z.strictObject({
         scope: scopeIdOutputSchema,
-        state: z.enum(['provisioning', 'ready', 'recovery_required'])
+        state: z.enum(['provisioning', 'ready', 'recovery_required']),
+        display_name: z.string().optional(),
+        relative_root: z.string().optional()
       })
     )
     .optional(),

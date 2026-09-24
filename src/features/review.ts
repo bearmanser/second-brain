@@ -584,5 +584,8 @@ export async function review(
       return supersedeAction(ctx, scope, operation, deps);
     case 'resolve':
       return resolveAction(ctx, scope, operation, deps);
+    case 'move':
+    case 'adopt':
+      throw invalidInput('the legacy review path does not support move or adopt');
   }
 }

@@ -54,8 +54,13 @@ export const FEEDBACK_VERDICTS = [
 ] as const;
 export type FeedbackVerdict = (typeof FEEDBACK_VERDICTS)[number];
 
-export const RECALL_MODES = ['hybrid', 'text'] as const;
+export const RECALL_MODES = ['text', 'reranked', 'hybrid'] as const;
 export type RecallMode = (typeof RECALL_MODES)[number];
+
+export type NoteReference =
+  | {id: string; path?: never; title?: never}
+  | {path: string; id?: never; title?: never}
+  | {title: string; id?: never; path?: never};
 
 export interface Evidence {
   kind: EvidenceKind;
@@ -92,6 +97,8 @@ export interface ProjectEnsureResult {
   operation_id: string;
   repository_identity: string;
   scope: string;
+  project_id?: string;
+  relative_root?: string;
   created: boolean;
   backend_ready: boolean;
   materialized: boolean;
@@ -126,10 +133,20 @@ export interface RecallRequest extends ProjectSelector {
 }
 
 export interface ReadRequest extends ProjectSelector {
-  id: string;
+  id?: string;
+  path?: string;
+  title?: string;
   revision_id?: string;
   cursor?: string;
   budget_tokens?: number;
+}
+
+export interface ReviewAdoptOperation {
+  action: 'adopt';
+  idempotency_key: string;
+  path: string;
+  expected_etag: string;
+  rationale: string;
 }
 
 export interface ReviewRequest extends ProjectSelector {
@@ -165,7 +182,9 @@ export interface ReviewRequest extends ProjectSelector {
         expected_heads: { revision_id: string; etag: string }[];
         rationale: string;
         note: NoteInput;
-      };
+      }
+    | ReviewMoveOperation
+    | ReviewAdoptOperation;
 }
 
 export interface ReviewMoveOperation {
@@ -201,6 +220,9 @@ export interface SourceRef {
   status: Lifecycle;
   etag: string;
   relative_path: string;
+  heading?: string | null;
+  start_line?: number;
+  end_line?: number;
   warnings: string[];
 }
 
@@ -245,14 +267,24 @@ export interface StatusResult {
   version: string;
   protocol_version: string;
   schema_version: 1;
+  protocol?: 2;
   scopes: { id: string }[];
   health: {
     gateway: 'ready' | 'recovering' | 'degraded';
     backend: 'ready' | 'unavailable';
     embeddings: 'ready' | 'unavailable' | 'unknown';
   };
+  local?: {
+    index: { state: 'ready' | 'unavailable'; documents?: number };
+    worker: { state: string; model_fingerprint?: string };
+  };
+  features?: {
+    reranking: boolean;
+    text_search: boolean;
+    fallback: boolean;
+  };
   pending_operations: number;
-  projects?: { scope: string; state: RepositoryProjectState }[];
+  projects?: { scope: string; state: RepositoryProjectState; display_name?: string; relative_root?: string }[];
   operation?: MutationReceipt | ProjectEnsureResult;
   schemas?: Record<string, unknown>;
 }

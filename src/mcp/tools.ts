@@ -89,7 +89,6 @@ const sourceRefSchema: Record<string, unknown> = {
   additionalProperties: false,
   required: [
     'id',
-    'revision_id',
     'scope',
     'title',
     'kind',
@@ -99,14 +98,17 @@ const sourceRefSchema: Record<string, unknown> = {
     'warnings'
   ],
   properties: {
-    id: UUID,
-    revision_id: UUID,
-    scope: SCOPE,
+    id: STRING,
+    revision_id: STRING,
+    scope: STRING,
     title: STRING,
     kind: { type: 'string', enum: [...NOTE_KINDS] },
     status: { type: 'string', enum: [...LIFECYCLES] },
     etag: ETAG,
     relative_path: STRING,
+    heading: { type: ['string', 'null'] },
+    start_line: { type: 'number' },
+    end_line: { type: 'number' },
     warnings: STRING_ARRAY
   }
 };
@@ -174,7 +176,7 @@ const recallResultSchema: Record<string, unknown> = {
   required: ['retrieval_id', 'mode', 'partial', 'warnings', 'budget', 'items'],
   properties: {
     retrieval_id: UUID,
-    mode: { type: 'string', enum: ['hybrid', 'text'] },
+    mode: { type: 'string', enum: ['text', 'reranked', 'hybrid'] },
     partial: { type: 'boolean' },
     warnings: STRING_ARRAY,
     budget: {
@@ -217,6 +219,8 @@ const projectEnsureResultSchema: Record<string, unknown> = {
     operation_id: UUID,
     repository_identity: STRING,
     scope: SCOPE,
+    project_id: STRING,
+    relative_root: STRING,
     created: { type: 'boolean' },
     backend_ready: { type: 'boolean' },
     materialized: { type: 'boolean' },
@@ -237,8 +241,9 @@ const statusResultSchema: Record<string, unknown> = {
   ],
   properties: {
     version: STRING,
-    protocol_version: { type: 'string', const: PROTOCOL_VERSION },
+    protocol_version: { type: 'string' },
     schema_version: { type: 'number', const: SCHEMA_VERSION },
+    protocol: { type: 'number', const: 2 },
     scopes: {
       type: 'array',
       items: {
@@ -260,6 +265,37 @@ const statusResultSchema: Record<string, unknown> = {
         embeddings: { type: 'string', enum: ['ready', 'unavailable', 'unknown'] }
       }
     },
+    local: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        index: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            state: { type: 'string', enum: ['ready', 'unavailable'] },
+            documents: { type: 'number' }
+          }
+        },
+        worker: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            state: { type: 'string' },
+            model_fingerprint: STRING
+          }
+        }
+      }
+    },
+    features: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        reranking: { type: 'boolean' },
+        text_search: { type: 'boolean' },
+        fallback: { type: 'boolean' }
+      }
+    },
     pending_operations: { type: 'number' },
     projects: {
       type: 'array',
@@ -269,7 +305,9 @@ const statusResultSchema: Record<string, unknown> = {
         required: ['scope', 'state'],
         properties: {
           scope: SCOPE,
-          state: { type: 'string', enum: ['provisioning', 'ready', 'recovery_required'] }
+          state: { type: 'string', enum: ['provisioning', 'ready', 'recovery_required'] },
+          display_name: STRING,
+          relative_root: STRING
         }
       }
     },
@@ -294,15 +332,15 @@ const DESCRIPTIONS: Record<ToolName, string> = {
   brain_feedback:
     'Record useful, irrelevant, stale, incorrect, or contradictory feedback on one specific note revision.',
   brain_project_ensure:
-    'Idempotently provision the project scope for one canonical Git repository remote.',
+    'Idempotently provision or reuse the project for one canonical Git repository remote.',
   brain_read:
-    'Read the current revision or an explicit historical revision of one note with bounded pagination and an etag.',
+    'Read the current note by id, path, or unambiguous title, or one historical revision by managed id, with bounded pagination.',
   brain_recall:
     'Recall bounded, source-linked reference memory for a task across the whole brain or within an explicit project.',
   brain_review:
-    'List candidate or conflicted notes for review, or approve, revise, supersede, archive, or resolve one. Listing is read-only; the mutation actions change lifecycle state.',
+    'List candidate or conflicted notes for review, or approve, revise, supersede, archive, resolve, move, or adopt one. Listing is read-only; the mutation actions change lifecycle state.',
   brain_status:
-    'Report version metadata, organization scopes, backend health, and pending work.'
+    'Report protocol and schema version, local index and worker health, pending work, projects, and supported features.'
 };
 
 const ANNOTATIONS: Record<ToolName, ToolAnnotations> = {

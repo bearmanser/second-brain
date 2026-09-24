@@ -498,7 +498,8 @@ test('defines the Section C types with stable fixture values', () => {
 });
 
 test('BrainError carries a stable code, retryability, and optional operation id', () => {
-  expect(BRAIN_ERROR_CODES).toHaveLength(15);
+  expect(BRAIN_ERROR_CODES).toHaveLength(16);
+  expect(BRAIN_ERROR_CODES).toContain('AMBIGUOUS_REFERENCE');
   expect(BRAIN_ERROR_CODES).toContain('INTERNAL_ERROR');
   const internal = new BrainError({
     code: 'INTERNAL_ERROR',
