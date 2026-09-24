@@ -389,7 +389,14 @@ function formatLocalDatasetSummary(output: LocalDatasetRunOutput): string {
     `candidate recall@50 ${String(metrics.candidate_recall_at_50)}; graph recall@${metrics.graph_recall_bound} ${String(metrics.graph_recall_at_50)}`,
     `nDCG@10 ${String(metrics.ndcg_at_10)}; MRR ${String(metrics.mrr)}; unjudged ${metrics.unjudged_candidates}`,
     `no-answer queries ${metrics.no_answer_queries}; no-answer false positives ${metrics.no_answer_false_positives}`,
-    `fallback rate ${metrics.fallback_rate}; p50 ${String(metrics.latency_p50_ms)} ms; p95 ${String(metrics.latency_p95_ms)} ms`
+    `fallback rate ${metrics.fallback_rate}; p50 ${String(metrics.latency_p50_ms)} ms; p95 ${String(metrics.latency_p95_ms)} ms`,
+    ...Object.entries(metrics.by_slice)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .map(
+        ([slice, entry]) =>
+          `  slice ${slice}: queries ${entry.queries}; candidate recall@50 ${String(entry.candidate_recall_at_50)}; ` +
+          `nDCG@10 ${String(entry.ndcg_at_10)}; fallback ${entry.fallback_rate}`
+      )
   ].join('\n');
 }
 

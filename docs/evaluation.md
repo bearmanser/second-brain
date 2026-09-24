@@ -427,7 +427,8 @@ Metric semantics implemented in `src/retrieval/evaluation.ts`:
   negative.
 - No-answer false-positive behaviour is counted separately.
 - MRR is computed only for queries with a direct answer; latency p50/p95 and
-  the fallback rate are reported per run.
+  the fallback rate are reported per run, and every metric is also reported per
+  query slice (`by_slice`).
 
 `summary` output for the committed fixture (offline, no chat model):
 

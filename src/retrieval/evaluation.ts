@@ -125,6 +125,21 @@ export interface LocalEvaluationMetrics {
   fallback_rate: number;
   latency_p50_ms: number | null;
   latency_p95_ms: number | null;
+  by_slice: Record<string, LocalSliceMetrics>;
+}
+
+export interface LocalSliceMetrics {
+  queries: number;
+  measurable_recall: number;
+  candidate_recall_at_50: number | null;
+  graph_recall_at_50: number | null;
+  ndcg_at_10: number | null;
+  mrr: number | null;
+  unjudged_candidates: number;
+  no_answer_false_positives: number;
+  fallback_rate: number;
+  latency_p50_ms: number | null;
+  latency_p95_ms: number | null;
 }
 
 export const GRAPH_RECALL_BOUND = 10;
@@ -137,16 +152,13 @@ function relevantSet(labels: ReadonlyMap<string, 0 | 1 | 2>): Set<string> {
   return relevant;
 }
 
-export function summariseLocalRetrieval(
-  queries: readonly LocalEvaluationQuery[]
-): LocalEvaluationMetrics {
+function metricsFor(queries: readonly LocalEvaluationQuery[]): LocalSliceMetrics {
   const candidateRecall: (number | null)[] = [];
   const graphRecall: (number | null)[] = [];
   const ndcg: (number | null)[] = [];
   const mrr: (number | null)[] = [];
   let measurable = 0;
   let unjudged = 0;
-  let noAnswerQueries = 0;
   let noAnswerFalsePositives = 0;
   let fallback = 0;
   const latencies: number[] = [];
@@ -156,11 +168,14 @@ export function summariseLocalRetrieval(
     candidateRecall.push(recallAtK(relevant, query.candidates, CANDIDATE_RECALL_K));
     graphRecall.push(recallAtK(relevant, query.graph_candidates ?? [], GRAPH_RECALL_BOUND));
     ndcg.push(ndcgAtK(query.labels, query.candidates, GRADED_NDCG_K));
-    mrr.push(query.direct_answer === undefined ? null : mrrAtK(new Set([query.direct_answer]), query.candidates, GRADED_NDCG_K));
+    mrr.push(
+      query.direct_answer === undefined
+        ? null
+        : mrrAtK(new Set([query.direct_answer]), query.candidates, GRADED_NDCG_K)
+    );
     unjudged += unjudgedAtK(query.labels, query.candidates, CANDIDATE_RECALL_K);
-    if (query.no_answer === true) {
-      noAnswerQueries += 1;
-      if (noAnswerFalsePositive(query.candidates, CANDIDATE_RECALL_K)) noAnswerFalsePositives += 1;
+    if (query.no_answer === true && noAnswerFalsePositive(query.candidates, CANDIDATE_RECALL_K)) {
+      noAnswerFalsePositives += 1;
     }
     if (query.fallback === true) fallback += 1;
     if (typeof query.latency_ms === 'number' && Number.isFinite(query.latency_ms)) {
@@ -172,14 +187,29 @@ export function summariseLocalRetrieval(
     measurable_recall: measurable,
     candidate_recall_at_50: meanMetric(candidateRecall),
     graph_recall_at_50: meanMetric(graphRecall),
-    graph_recall_bound: GRAPH_RECALL_BOUND,
     ndcg_at_10: meanMetric(ndcg),
     mrr: meanMetric(mrr),
     unjudged_candidates: unjudged,
-    no_answer_queries: noAnswerQueries,
     no_answer_false_positives: noAnswerFalsePositives,
     fallback_rate: queries.length === 0 ? 0 : fallback / queries.length,
     latency_p50_ms: percentile(latencies, 0.5),
     latency_p95_ms: percentile(latencies, 0.95)
   };
+}
+
+export function summariseLocalRetrieval(
+  queries: readonly LocalEvaluationQuery[]
+): LocalEvaluationMetrics {
+  const slices = new Map<string, LocalEvaluationQuery[]>();
+  for (const query of queries) {
+    const slice = query.slice ?? 'unspecified';
+    const group = slices.get(slice) ?? [];
+    group.push(query);
+    slices.set(slice, group);
+  }
+  const bySlice: Record<string, LocalSliceMetrics> = {};
+  for (const [slice, group] of slices) bySlice[slice] = metricsFor(group);
+  const overall = metricsFor(queries);
+  const noAnswerQueries = queries.filter((query) => query.no_answer === true).length;
+  return { ...overall, no_answer_queries: noAnswerQueries, graph_recall_bound: GRAPH_RECALL_BOUND, by_slice: bySlice };
 }

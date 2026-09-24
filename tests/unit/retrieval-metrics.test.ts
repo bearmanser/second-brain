@@ -120,4 +120,8 @@ test('local retrieval summary keeps lexical and graph recall on their own bounds
   expect(metrics.fallback_rate).toBeCloseTo(1 / 3);
   expect(metrics.latency_p50_ms).toBe(20);
   expect(metrics.latency_p95_ms).toBe(30);
+  expect(metrics.by_slice.english?.queries).toBe(2);
+  expect(metrics.by_slice.english?.candidate_recall_at_50).toBeCloseTo(0.5);
+  expect(metrics.by_slice['no-answer']?.no_answer_false_positives).toBe(1);
+  expect(metrics.by_slice['no-answer']?.measurable_recall).toBe(0);
 });

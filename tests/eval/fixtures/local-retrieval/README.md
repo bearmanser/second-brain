@@ -22,7 +22,7 @@ parameters are tuned.
 | Slice | Count | What it exercises |
 |---|---|---|
 | `english-exact` | 15 | English exact identifiers and decisions |
-| `norwegian` | 10 | Norwegian queries, including `æ/ø/å` |
+| `norwegian` | 12 | Norwegian queries, including `æ/ø/å` |
 | `code-terms` | 10 | Function names, SQL/FTS5 terms, CLI flags |
 | `decision-reasons` | 10 | Why a decision was made |
 | `procedural` | 10 | Step-by-step "how do I" questions |
