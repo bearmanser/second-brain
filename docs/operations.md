@@ -46,13 +46,12 @@ duplicate `id`s.
 `GET /health` is the only unauthenticated route. It returns:
 
 ```json
-{ "status": "ok", "version": "1.0.0", "notes": 35 }
+{ "status": "ok" }
 ```
 
 Liveness probes should use it. The listener does not bind until the initial
-scan completes, so a reachable `/health` implies the index is built. Note that
-`status` is the literal string `"ok"`; success is indicated by the HTTP 200 and
-this body.
+scan completes, so a reachable `/health` implies the index is built. The body
+exposes nothing beyond this; success is indicated by the HTTP 200.
 
 ## Backup
 

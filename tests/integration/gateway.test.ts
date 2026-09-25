@@ -20,7 +20,7 @@ test('serves an unauthenticated health check', async () => {
   const gateway = await startTestGateway(join(root, 'vault'), join(root, 'state'));
   const response = await fetch(`http://127.0.0.1:${gateway.port}/health`);
   expect(response.status).toBe(200);
-  expect(await response.json()).toMatchObject({ status: 'ok', notes: 1 });
+  expect(await response.json()).toEqual({ status: 'ok' });
 });
 
 test('guards the MCP endpoint', async () => {

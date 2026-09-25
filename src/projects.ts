@@ -119,10 +119,15 @@ export class Projects {
 
     const base = sanitizeFileStem(identity.split('/').at(-1) ?? '');
     const sameName = projects.find((project) => project.name === base);
-    if (sameName !== undefined && sameName.repositories.length === 0) {
-      const previous = sameName.hasNote ? this.vault.read(sameName.notePath) : undefined;
-      this.vault.write(sameName.notePath, renderProjectNote(base, [identity], previous));
-      return { project: { ...sameName, repositories: [identity], hasNote: true }, created: false };
+    if (sameName !== undefined) {
+      if (!sameName.hasNote && this.vault.exists(sameName.notePath)) {
+        throw conflict(`Projects/${sameName.name}/${sameName.name}.md already exists and is not a project note`);
+      }
+      if (sameName.repositories.length === 0) {
+        const previous = sameName.hasNote ? this.vault.read(sameName.notePath) : undefined;
+        this.vault.write(sameName.notePath, renderProjectNote(base, [identity], previous));
+        return { project: { ...sameName, repositories: [identity], hasNote: true }, created: false };
+      }
     }
 
     const taken = new Set(projects.map((project) => project.name));

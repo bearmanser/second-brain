@@ -6,7 +6,7 @@ import { openBrain, type Brain } from './app.js';
 import { verifyBearer } from './auth.js';
 import type { Config } from './config.js';
 import { createMcpServer } from './mcp/tools.js';
-import { LIMITS, VERSION } from './types.js';
+import { LIMITS } from './types.js';
 
 export const MCP_PATH = '/mcp';
 const SESSION_ID_HEADER = 'mcp-session-id';
@@ -35,7 +35,7 @@ export function createApp(brain: Brain, config: Config): Express {
   const app = express();
   app.disable('x-powered-by');
   app.get('/health', (_req, res) => {
-    res.status(200).json({ status: 'ok', version: VERSION, notes: brain.index.all().length });
+    res.status(200).json({ status: 'ok' });
   });
 
   const guard = (req: Request, res: Response, next: () => void): void => {

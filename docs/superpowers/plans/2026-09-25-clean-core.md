@@ -3592,7 +3592,7 @@ test('serves an unauthenticated health check', async () => {
   const gateway = await startTestGateway(join(root, 'vault'), join(root, 'state'));
   const response = await fetch(`http://127.0.0.1:${gateway.port}/health`);
   expect(response.status).toBe(200);
-  expect(await response.json()).toMatchObject({ status: 'ok', notes: 1 });
+  expect(await response.json()).toEqual({ status: 'ok' });
 });
 
 test('guards the MCP endpoint', async () => {
@@ -3901,7 +3901,7 @@ import { openBrain, type Brain } from './app.js';
 import { verifyBearer } from './auth.js';
 import type { Config } from './config.js';
 import { createMcpServer } from './mcp/tools.js';
-import { LIMITS, VERSION } from './types.js';
+import { LIMITS } from './types.js';
 
 export const MCP_PATH = '/mcp';
 const SESSION_ID_HEADER = 'mcp-session-id';
@@ -3930,7 +3930,7 @@ export function createApp(brain: Brain, config: Config): Express {
   const app = express();
   app.disable('x-powered-by');
   app.get('/health', (_req, res) => {
-    res.status(200).json({ status: 'ok', version: VERSION, notes: brain.index.all().length });
+    res.status(200).json({ status: 'ok' });
   });
 
   const guard = (req: Request, res: Response, next: () => void): void => {

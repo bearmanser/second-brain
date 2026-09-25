@@ -72,6 +72,12 @@ test('ensure binds an unbound folder with the same name and keeps its note body'
   expect(projects.ensure('https://github.com/x/plain')).toMatchObject({ created: false, project: { hasNote: true } });
 });
 
+test('ensure refuses to overwrite a foreign file at the project-note path', () => {
+  const { projects, root } = setup({ 'Projects/foo/foo.md': '# Foo\n\nregular note\n' });
+  expect(() => projects.ensure('https://github.com/acme/foo')).toThrow(expect.objectContaining({ code: 'CONFLICT' }));
+  expect(readFileSync(join(root, 'Projects/foo/foo.md'), 'utf8')).toBe('# Foo\n\nregular note\n');
+});
+
 test('ensure adds a suffix when the same-named folder belongs to another remote', () => {
   const { projects } = setup({ 'Projects/api/api.md': projectNote(['github.com/one/api']) });
   expect(projects.ensure('https://github.com/two/api')).toMatchObject({ created: true, project: { name: 'api (2)' } });

@@ -239,7 +239,7 @@ The modules:
 | `src/vault/note-file.ts` | Parse and render frontmatter, H1 title, and body; preserve unknown keys | — |
 | `src/vault/vault.ts` | List, read, atomic write, move to `.trash/`, hash | — |
 | `src/projects.ts` | Discover projects, resolve name/key, ensure from a remote, normalize remotes | `projects/identity.ts`, `features/project-ensure.ts` normalization |
-| `src/index/chunker.ts` | Character-budgeted, heading-aware chunks; code fences are never split | `retrieval/chunker.ts` |
+| `src/index/chunker.ts` | Character-budgeted, heading-aware chunks. Code fences are never split at headings or blank lines; a fenced block longer than the character budget is split at the budget like any other over-long text, because the per-chunk character ceiling takes precedence | `retrieval/chunker.ts` |
 | `src/index/search-index.ts` | FTS5 schema, upsert/delete, BM25 candidates | `storage/search-index.ts`, `retrieval/query.ts` |
 | `src/index/sync.ts` | Vault-to-index scan and diff, `problems[]` | — |
 | `src/store.ts` | `brain.db` feedback and idempotency | — |
@@ -349,7 +349,7 @@ Invocation: `node dist/cli.js import --from <old-vault> --to <new-vault> --journ
 
 ## 10. Acceptance criteria
 
-1. `src` contains only the modules in §6. A case-insensitive search of `src/` and `tests/` for `laya`, `rerank`, `basic.memory`, `basic_memory`, `basicmemory`, `backend_`, `permalink`, `legacy`, `hybrid`, `brain_schema_version`, `revision_id`, `include_candidates`, and `brain_review` returns no matches, except inside `src/import.ts` and its tests before they are deleted.
+1. `src` contains only the modules in §6. A case-insensitive search of `src/` for `laya`, `rerank`, `basic.memory`, `basic_memory`, `basicmemory`, `backend_`, `permalink`, `legacy`, `hybrid`, `brain_schema_version`, `revision_id`, `include_candidates`, and `brain_review` returns no matches, except inside `src/import.ts` before it is deleted. Test fixtures are data and may legitimately contain these words (for example `Laya`, `Reranker`, and a `legacy` column name), so `tests/` is not part of this search.
 2. The MCP surface is exactly the eight tools in §4, with exactly the listed fields.
 3. The state directory contains only `index.db`, `brain.db`, and `brain.lock` (plus SQLite WAL and SHM files).
 4. Deleting `index.db` and restarting reproduces identical recall results.

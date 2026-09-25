@@ -75,3 +75,12 @@ A minimal `opencode.jsonc` that names the server and passes the header:
 Replace `<token>` with the raw token. If the gateway is reachable from a
 different host, widen `BRAIN_ALLOWED_HOSTS` accordingly and re-check the
 `BRAIN_ALLOWED_ORIGINS` setting before exposing it.
+
+## Container user
+
+The image runs as uid/gid `1000` and pre-creates `/vault` and
+`/var/lib/second-brain` with that ownership; a fresh named volume inherits it.
+Keep `BRAIN_UID`/`BRAIN_GID` at their `1000` default unless both the vault bind
+mount and the state volume are owned by the same alternate uid. Changing them
+to a different uid makes the process unable to write the state volume and it
+fails at startup — recreate the volume (or `chown` it to the new uid) first.
