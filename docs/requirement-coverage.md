@@ -6,6 +6,53 @@ implementation and verification evidence. It supersedes the task-number-only
 matrix in the plan's section E by naming the concrete checks. Every entry below
 was exercised by the automated suites unless marked otherwise.
 
+## Local V2 acceptance coverage (AC01-AC16)
+
+The authoritative acceptance matrix for the local V2 plan is AC01-AC16 in
+`.superpowers/sdd/2026-09-23-second-brain-local-retrieval-human-vault/plan.md`
+section 9. The table below records the owning tasks, the release evidence, and
+the observed outcome for the release verification performed on 2026-09-25
+(commit series ending at the release-verification commit). Full command,
+environment, and evidence detail is in
+`docs/release-gate/local-brain-v2/checklist.md`; the raw retrieval outputs are in
+`docs/release-gate/local-brain-v2/*.json`.
+
+| ID | Required outcome | Owning tasks | Verification evidence | Status |
+|---|---|---|---|---|
+| AC01 | One valid token can call every tool and access every project/category | 2, 3, 14, 19 | `tests/e2e/local-brain-v2-lifecycle.test.ts` (seven-tool matrix before and after rotation), `tests/integration/token-rotation.test.ts`, `tests/integration/single-brain-access.test.ts` | PASS |
+| AC02 | No live roles, ACLs, owner-only logic, or dynamic grants remain | 3, 14, 18 | `tests/integration/single-brain-access.test.ts`, `tests/unit/permissions.test.ts`, `tests/unit/legacy-credentials.test.ts`, `tests/e2e/single-container.test.ts` (compose/config review) | PASS |
+| AC03 | No UUID folder/filename is generated for current notes | 5, 10, 15 | `tests/integration/vault-v2-migration.test.ts`, `tests/unit/human-paths.test.ts`, `tests/e2e/local-brain-v2-lifecycle.test.ts` | PASS |
+| AC04 | Original logical IDs and historical revisions survive migration | 6, 10, 17 | `tests/integration/vault-v2-migration.test.ts`, `tests/integration/local-recovery.test.ts`, `tests/e2e/local-brain-v2-lifecycle.test.ts` (history directory and ID reads) | PASS |
+| AC05 | Manual notes/edits remain usable and stale writes do not overwrite them silently | 4, 6, 9, 14 | `tests/integration/manual-edits.test.ts`, `tests/integration/manual-vault-edits.test.ts`, `tests/e2e/local-brain-v2-lifecycle.test.ts` (manual edit + rename survive rebuild/restart) | PASS |
+| AC06 | Genuine links, anchors, embeds, aliases, and attachments survive moves | 7, 8, 10, 15 | `tests/unit/link-resolution.test.ts`, `tests/unit/obsidian-links.test.ts`, `tests/integration/vault-v2-migration.test.ts`, `tests/e2e/local-brain-v2-lifecycle.test.ts` (human note attachment link preserved) | PASS (Obsidian GUI re-check open under AC07) |
+| AC07 | Properties, templates, project pages, Bases, and daily organization are usable | 4, 15 | `tests/unit/obsidian-assets.test.ts`, `tests/integration/obsidian-install.test.ts`, `tests/e2e/local-brain-v2-lifecycle.test.ts` (properties/status preserved) | NOT RUN for the manual Obsidian GUI/version check (no display on the host) |
+| AC08 | Local FTS/property/link search is rebuildable and returns attributable excerpts | 9, 11, 14, 17 | `tests/integration/local-search.test.ts`, `tests/integration/local-rebuild.test.ts`, `tests/e2e/local-brain-v2-lifecycle.test.ts` (`rebuild-index` then unchanged content) | PASS |
+| AC09 | Laya runs locally with locked artifacts and real token limits | 12, 18 | `tests/integration/laya-local.test.ts` (gated), `tests/contract/laya-worker.test.ts`, `python3 -m unittest discover -s workers/laya/tests` | NOT RUN (no prepared model artifacts under `/var/lib/second-brain`) |
+| AC10 | Laya failure cannot block safe read/write or silently change search mode | 12, 13, 14 | `tests/integration/reranker-fallback.test.ts`, `tests/e2e/local-brain-v2-lifecycle.test.ts` (worker disabled; recall stays `text`) | PASS |
+| AC11 | Retrieval quality and resource targets are measured before cutover | 1, 11, 16, 19 | Committed fixture + cross-mode harness (`docs/release-gate/local-brain-v2/retrieval-*.json`); `tests/integration/local-search.test.ts` | PASS for the local candidate-recall gate on the synthetic fixture (candidate recall@50 0.9252, graph recall@10 0.0748, nDCG@10 0.9252, MRR 0.9159). NOT RUN for the reranking-specific latency/RSS gate. |
+| AC12 | Classifier outputs cannot grant access, auto-approve, or rewrite factual metadata | 3, 13, 16 | `tests/unit/classifier-policy.test.ts`, `tests/unit/feedback-export.test.ts`, `tests/integration/feedback.test.ts` | PASS |
+| AC13 | Feedback can produce a private, explicitly labeled, leakage-controlled dataset | 16 | `tests/unit/feedback-export.test.ts`, `tests/integration/feedback.test.ts`, `tests/integration/local-operation-coordination.test.ts` | PASS for the export logic and leakage controls. The live `feedback export` CLI run is NOT RUN on this host (no `/var/lib/second-brain/journal.db` or real dataset). |
+| AC14 | Migration has read-only planning, verified backup, safe resume, and rollback | 1, 10, 17, 19 | `tests/integration/vault-v2-migration.test.ts` (fault injection at every phase, rollback, verified backup), `tests/e2e/local-brain-v2-lifecycle.test.ts` (inspect → plan → verified apply → verify) | PASS |
+| AC15 | Production has one application container and no live Basic Memory requirement | 14, 18, 19 | `tests/e2e/single-container.test.ts`, `tests/e2e/offline-local-brain.test.ts`, `tests/e2e/local-brain-v2-lifecycle.test.ts` | PASS |
+| AC16 | Existing image/env/mount/client conventions remain operable | 14, 18, 19 | `tests/e2e/single-container.test.ts` (resolved Compose, env file, vault/state mounts), `tests/integration/mcp.test.ts`, `tests/unit/local-capabilities.test.ts` | PASS |
+
+Definition of done, per plan section 9: backend replacement is releasable only
+when AC01-AC08 and AC10-AC16 pass the applicable release checks. AC09 and the
+reranking-specific part of AC11 remain NOT RUN because the host has no prepared
+Laya model artifacts; the deployment therefore ships with reranking **disabled**
+(`search_mode: text`). AC07 also carries an explicit open manual Obsidian GUI
+check. See the open blockers in the release-gate checklist.
+
+---
+
+## Historical coverage (September 2026 Basic Memory design, superseded)
+
+The following `R01`-`R18` rows record the pre-V2 Basic Memory design. They are
+retained for provenance only. Rows that referenced the retired two-service
+suites (`tests/e2e/docker.test.ts`, `tests/e2e/security.test.ts`) are superseded
+by the AC01-AC16 matrix above and by the single-container suites.
+
+
 | Requirement | Implementation | Verification |
 |---|---|---|
 | **R01** One repository; two Compose services; only the gateway's MCP endpoint is published. | `compose.yaml` (services `brain`, `memory`); `config/brain.yaml`. | `tests/e2e/docker.test.ts`, `tests/e2e/security.test.ts` (loopback publishing, no backend port). |

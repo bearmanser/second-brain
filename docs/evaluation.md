@@ -592,3 +592,46 @@ the evaluator; the fixture test validates `source-hashes.json` against
 returns an honest `{ recorded, created }` receipt. Migration `011` adds the
 nullable `retrieval_labels.notes` column without editing migration 010.
 
+## Task 19 release evaluation
+
+Recorded on the execution host on 2026-09-25 (Node `v24.21.0`, Python `3.12.3`,
+Docker `29.3.0`; commit series ending at the release-verification commit). Every
+value below is observed output. Nothing is projected. Commands that could not
+run are **NOT RUN** with the exact blocker; none is reported as green.
+
+### Release evaluation commands
+
+| Command | Status | Observed result |
+|---|---|---|
+| `npm run eval:retrieval -- --backend local --mode text --dataset /var/lib/second-brain/evaluations/retrieval.jsonl` | **NOT RUN** | exit 1, `ENOENT` for the absent real dataset |
+| `npm run eval:retrieval -- --backend local --mode reranked --dataset /var/lib/second-brain/evaluations/retrieval.jsonl` | **NOT RUN** | exit 1, same absent dataset; no prepared model artifacts either |
+| `npm run eval:retrieval -- --backend local --mode text --dataset tests/eval/fixtures/local-retrieval/dataset.jsonl` | RUN (committed fixture) | candidate recall@50 0.9252, graph recall@10 0.0748, nDCG@10 0.9252, MRR 0.9159, unjudged 0, 12/12 no-answer empty, p50 10 ms / p95 15 ms |
+| `npm run eval:retrieval -- --backend local --mode reranked --dataset tests/eval/fixtures/local-retrieval/dataset.jsonl` | RUN (mode label only) | identical offline metrics; **no Laya worker loaded**, so this is not a reranking measurement |
+| `npm run eval:retrieval -- --backend local --compare true --dataset tests/eval/fixtures/local-retrieval/dataset.jsonl` | RUN (cross-mode harness) | `local_text` recall@50 0.9252 / nDCG@10 0.9252 / MRR 0.9159; `local_text_graph` recall@50 1.0 / nDCG@10 0.9724 / graph recall@10 0.0748; `laya_reranked` **NOT RUN** with fallback order reported separately |
+
+The committed fixture is `tests/eval/fixtures/local-retrieval/dataset.jsonl`
+(119 queries, eleven slices; `sha256`
+`125446ec549360e7ed7fbfc8019bd6fa1e7301955317f2a924a74f507158c822`). Raw metric
+output is committed under `docs/release-gate/local-brain-v2/`.
+
+### Laya integration
+
+`python3 -m unittest discover -s workers/laya/tests -p 'test_*.py'` passed 54
+tests (6 skipped). `npm run test:laya` **failed closed** with 11 setup failures
+because the configured model directory under `/var/lib/second-brain/models` does
+not exist; the worker never reports `ready`. This is the accepted task 12/16/18
+limitation. Laya therefore remains disabled and the deployment stays in
+`search_mode: text`; this release makes no enabled-Laya or reranking-quality
+claim.
+
+### Interpretation
+
+- The local candidate-recall gate is measured on a synthetic committed fixture,
+  not on real user notes. It supports the deterministic release gate (candidate
+  recall, no-answer behavior, per-slice reporting), not broad semantic-quality
+  claims.
+- The `reranked` label on the fixture run is a mode label only. The only honest
+  reranking statement is `laya_reranked: NOT RUN`.
+- The real-dataset commands and the manual Obsidian GUI check remain open
+  release blockers; see `docs/release-gate/local-brain-v2/checklist.md`.
+

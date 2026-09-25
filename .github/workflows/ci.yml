@@ -26,11 +26,14 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run verify
+      - name: python worker unit tests
+        run: python3 -m unittest discover -s workers/laya/tests -p 'test_*.py'
       - name: external-model-dependent tests
         run: |
           echo "NOT RUN: tests/eval/run.mts --mode instruction and --mode agent require an approved chat-model budget."
           echo "NOT RUN: the remote Streamable-HTTP MCP transport pilot requires a reachable client host."
-          echo "NOT RUN: offline Laya artifact checks need prepared model snapshots on a target CPU host."
+          echo "NOT RUN: npm run test:laya and offline Laya artifact checks need prepared model snapshots on a target CPU host; CI runs the model-free python worker unit tests instead."
+          echo "NOT RUN: npm run eval:retrieval --backend local --dataset /var/lib/second-brain/evaluations/retrieval.jsonl needs the real dataset; CI uses the committed tests/eval/fixtures/local-retrieval/dataset.jsonl fixture."
           echo "These are reported as NOT RUN, never as green."
 
   docker:
@@ -70,7 +73,7 @@ jobs:
           BRAIN_E2E_LIVE: '1'
         run: |
           set -o pipefail
-          echo "e2e coverage: tests/e2e/{single-container,offline-local-brain,recovery}.test.ts"
+          echo "e2e coverage: tests/e2e/{single-container,offline-local-brain,recovery,local-brain-v2-lifecycle}.test.ts"
           echo "retired two-service suites: tests/legacy/two-service/** (excluded by vitest.config.ts, never run in CI)"
           npm run test:e2e 2>&1 | tee "$GATE_LOGS/e2e.log"
       - name: upload gate transcripts (actions/upload-artifact v4.6.0)

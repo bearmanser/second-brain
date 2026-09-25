@@ -331,6 +331,47 @@ project to `ready`. Startup and every new-principal ensure re-verify persisted
 ready mappings against both the vault directory and Basic Memory. A broken
 dynamic scope is quarantined without hiding unrelated ready scopes.
 
+## Local V2 cutover runbook
+
+This is the exact ordering for replacing the pre-V2 (Basic Memory) deployment
+with the single-container local V2 runtime. The detailed migration command
+contract is in `docs/operations/vault-v2-migration.md`; the recorded release
+evidence is in `docs/release-gate/local-brain-v2/checklist.md`.
+
+```text
+Record current image, configuration, volume mapping, and rollback artifacts.
+Stop Obsidian and every agent/file-sync writer; enter maintenance.
+Create and verify a cold backup; do not proceed on a partial verification.
+Run migration inspect and plan; review every proposed path and blocker.
+Run apply with the recorded manifest and backup receipt.
+Verify migrated current files, all history hashes, links, projects, and receipts.
+Start the new image on the existing vault and state mounts.
+Run authenticated smoke tests and unauthenticated rejection checks.
+Open the vault in Obsidian and validate the native views and a sample of links.
+Enable reranking only when its measured gate passed; otherwise keep text mode.
+Release maintenance only after the backend-replacement gate passed.
+Retain the old backup/image/configuration; never delete them during cutover.
+```
+
+Command sketch (run inside the container or with the built CLI):
+
+```sh
+node dist/cli.js vault-v2 inspect --report /var/lib/second-brain/migrations/inspection.json
+node dist/cli.js vault-v2 plan --output /var/lib/second-brain/migrations/manifest.json
+node dist/cli.js vault-v2 apply --manifest /var/lib/second-brain/migrations/manifest.json \
+  --backup-receipt /var/lib/second-brain/migrations/backup.json \
+  --backup-root /var/lib/second-brain/backup --maintenance
+node dist/cli.js vault-v2 verify --manifest /var/lib/second-brain/migrations/manifest.json
+```
+
+If validation fails before writers resume, stop V2 and use the verified
+migration rollback or a full cold restore with the matching old image/config. If
+new writes have occurred, stop writers, take another backup, and reconcile
+divergence before rollback. Never restore the old journal or files on top of new
+work. A fresh local V2 deployment with no prior operational history must
+initialize the journal explicitly (`rebuild-catalogue --accept-operational-loss`)
+and is labelled lossy; that is not full operational recovery.
+
 ## Logs and status
 
 ```sh
