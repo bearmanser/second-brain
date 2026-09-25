@@ -91,7 +91,7 @@ search_fallback_only: false
 laya:
   enabled: false
   python: python3
-  threads: 2
+  threads: 4
   batch_size: 8
   queue_batches: 4
   timeout_ms: 20000

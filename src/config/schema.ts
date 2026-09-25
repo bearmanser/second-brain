@@ -126,6 +126,7 @@ export const LAYA_BATCH_SIZE_MAX = 8;
 export const LAYA_QUEUE_BATCHES_MAX = 4;
 export const LAYA_TIMEOUT_MS_MAX = 20_000;
 export const LAYA_THREADS_MAX = 64;
+export const LAYA_THREADS_DEFAULT = 4;
 export const LAYA_DEFAULT_LOCK_FILE = 'config/laya-model.lock.json';
 export const LAYA_MODEL_SUBDIRECTORY = 'models/laya/runtime';
 
@@ -141,7 +142,7 @@ export const layaConfigSchema = z.strictObject({
   batch_size: z.int().min(1).max(LAYA_BATCH_SIZE_MAX).default(LAYA_BATCH_SIZE_MAX),
   queue_batches: z.int().min(1).max(LAYA_QUEUE_BATCHES_MAX).default(LAYA_QUEUE_BATCHES_MAX),
   timeout_ms: z.int().min(100).max(LAYA_TIMEOUT_MS_MAX).default(LAYA_TIMEOUT_MS_MAX),
-  threads: z.int().min(1).max(LAYA_THREADS_MAX).default(2)
+  threads: z.int().min(1).max(LAYA_THREADS_MAX).default(LAYA_THREADS_DEFAULT)
 });
 
 const DEFAULT_LAYA = {
@@ -150,7 +151,7 @@ const DEFAULT_LAYA = {
   batch_size: LAYA_BATCH_SIZE_MAX,
   queue_batches: LAYA_QUEUE_BATCHES_MAX,
   timeout_ms: LAYA_TIMEOUT_MS_MAX,
-  threads: 2
+  threads: LAYA_THREADS_DEFAULT
 };
 
 export const brainConfigSchema = z.strictObject({

@@ -106,6 +106,7 @@ interface PendingRequest {
   batches: Batch[];
   remaining: number;
   results: LayaScore[][];
+  order: readonly string[];
   resolve: (result: LayaScoreResult) => void;
   reject: (error: LayaWorkerError) => void;
   timer: NodeJS.Timeout;
@@ -205,6 +206,24 @@ export function layaWorkerOptions(
     batchSize: settings.batch_size,
     queueBatches: settings.queue_batches
   };
+}
+
+function layaItemSize(item: LayaWireItem): number {
+  return item.title.length + (item.heading?.length ?? 0) + item.excerpt.length;
+}
+
+function restoreScoreOrder(request: PendingRequest): LayaScore[] {
+  const flat = request.results.flat();
+  if (flat.length !== request.order.length) return flat;
+  const byKey = new Map<string, LayaScore>();
+  for (const score of flat) byKey.set(score.chunk_key, score);
+  const ordered: LayaScore[] = [];
+  for (const key of request.order) {
+    const score = byKey.get(key);
+    if (score === undefined) return flat;
+    ordered.push(score);
+  }
+  return ordered;
 }
 
 export class LayaWorker {
@@ -322,6 +341,7 @@ export class LayaWorker {
         batches: [],
         remaining: groups.length,
         results: groups.map(() => []),
+        order: parsed.data.candidates.map((candidate) => candidate.chunk_key),
         resolve,
         reject,
         timer: setTimeout(() => this.expire(request), this.timeoutMs),
@@ -390,15 +410,16 @@ export class LayaWorker {
   }
 
   private split(query: string, candidates: readonly { chunk_key: string; title: string; heading?: string | null; excerpt: string }[]): LayaWireItem[][] {
+    const items: LayaWireItem[] = candidates.map((candidate) => ({
+      chunk_key: candidate.chunk_key,
+      title: candidate.title,
+      heading: candidate.heading ?? null,
+      excerpt: candidate.excerpt
+    }));
+    const ordered = [...items].sort((left, right) => layaItemSize(right) - layaItemSize(left));
     const groups: LayaWireItem[][] = [];
     let current: LayaWireItem[] = [];
-    for (const candidate of candidates) {
-      const item: LayaWireItem = {
-        chunk_key: candidate.chunk_key,
-        title: candidate.title,
-        heading: candidate.heading ?? null,
-        excerpt: candidate.excerpt
-      };
+    for (const item of ordered) {
       encodeScoreBatch('b0', query, [item]);
       const next = [...current, item];
       let fits = next.length <= this.batchSize;
@@ -576,7 +597,7 @@ export class LayaWorker {
     request.remaining -= 1;
     if (request.remaining === 0 && this.ready !== null) {
       this.settle(request, {
-        scores: request.results.flat(),
+        scores: restoreScoreOrder(request),
         model_fingerprint: this.ready.model_fingerprint,
         question_version: this.ready.question_version
       });

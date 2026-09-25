@@ -534,7 +534,7 @@ function baseConfig(): Record<string, unknown> {
 describe('Laya configuration', () => {
   test('defaults to a disabled worker with the fixed bounds', () => {
     const config = brainConfigSchema.parse(baseConfig());
-    expect(config.laya).toEqual({ enabled: false, python: 'python3', batch_size: 8, queue_batches: 4, timeout_ms: 20000, threads: 2 });
+    expect(config.laya).toEqual({ enabled: false, python: 'python3', batch_size: 8, queue_batches: 4, timeout_ms: 20000, threads: 4 });
     expect(resolveLayaSettings(config, {})).toEqual({
       enabled: false,
       python: 'python3',
@@ -543,7 +543,7 @@ describe('Laya configuration', () => {
       batch_size: 8,
       queue_batches: 4,
       timeout_ms: 20000,
-      threads: 2
+      threads: 4
     });
   });
 
