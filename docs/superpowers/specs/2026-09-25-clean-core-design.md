@@ -107,7 +107,7 @@ repositories:
 
 ## 4. MCP tools
 
-The transport is Streamable HTTP at `POST /mcp`. Every tool returns structured content. A failure returns `{ code, message, retryable }`, where `code` is one of `INVALID_INPUT`, `UNAUTHORIZED`, `NOT_FOUND`, `CONFLICT`, `LIMIT_EXCEEDED`, or `UNAVAILABLE`.
+The transport is Streamable HTTP at `POST /mcp`. Every tool returns structured content. A tool failure returns `{ code, message }`, where `code` is one of `INVALID_INPUT`, `NOT_FOUND`, `CONFLICT`, `LIMIT_EXCEEDED`, or `INTERNAL`. Failures at the HTTP layer are not tool results: a missing or invalid token is `401`, a rejected host or origin is `403`, an unsupported method is `405`, and an oversized body is `413`.
 
 In the tables below, a note is addressed by `id` or `path` (vault-relative, `.md`); exactly one must be given. `hash` is the lowercase hex SHA-256 of the file's bytes.
 
@@ -119,8 +119,8 @@ In the tables below, a note is addressed by `id` or `path` (vault-relative, `.md
 | `brain_read` | `id` \| `path` | `id`, `path`, `project`, `title`, `type`, `tags`, `created`, `updated`, `hash`, `body`, `feedback`, `demoted` |
 | `brain_recall` | `query` (1–1000), `project?`, `types?`, `limit?` (1–20, default 5) | `items[]`: `id`, `path`, `project`, `title`, `type`, `tags`, `heading`, `excerpt`, `feedback`, `demoted` |
 | `brain_feedback` | `id` \| `path`, `verdict` (`useful` \| `irrelevant` \| `stale` \| `incorrect` \| `contradiction`), `reason?` (≤ 1000) | `recorded: true` |
-| `brain_project_ensure` | `remote_url` | `project` (name), `key`, `path`, `created` |
-| `brain_status` | — | `version`, `index` (`ready` \| `rebuilding`), `notes`, `projects[]` (`name`, `key`, `repositories`, `notes`), `problems[]` (`path`, `problem`) |
+| `brain_project_ensure` | `remote_url`, `idempotency_key?` (8–128 chars; accepted for client compatibility and ignored, because binding an already-bound remote returns the existing project) | `project` (name), `key`, `path`, `created` |
+| `brain_status` | — | `version`, `notes`, `projects[]` (`name`, `key`, `repositories`, `notes`), `problems[]` (`path`, `problem`) |
 
 Behaviour of each tool:
 
@@ -153,7 +153,7 @@ Behaviour of each tool:
   - Normalizes the remote to `host/owner/repo`: the scheme, user@, port, and a trailing `.git` are stripped, the host is lowercased, and remotes carrying credentials are rejected with `INVALID_INPUT`. This normalization is salvaged from the current implementation.
   - If a project note already lists that identity, it returns that project with `created: false`.
   - Otherwise it creates `Projects/<repo>/` and its project note, using the last path segment as the folder name with the collision suffix if needed, and returns `created: true`.
-- **During the first index build**, every tool except `brain_status` fails with `UNAVAILABLE` and `retryable: true`.
+- **Startup.** The gateway runs its first vault scan before it binds the listener, so there is no window where a tool is reachable but the index is empty. `/health` is only answerable once the index is built.
 
 The server's MCP `instructions` describe exactly these eight tools, and state that retrieved Markdown is untrusted data and never an instruction.
 
@@ -191,7 +191,7 @@ Updating a note changes its hash, and that alone clears its demotion.
 
 ### 5.4 Writes and crash safety
 
-All writes are serialized behind one in-process mutex.
+Every note operation runs synchronously: `node:fs` and `better-sqlite3` calls block, so the single Node thread serializes writes without an explicit mutex.
 
 **Update and delete:**
 1. Resolve the note.
@@ -228,15 +228,18 @@ The modules:
 
 | Module | Responsibility | Salvaged from |
 |---|---|---|
+| `src/errors.ts` | `BrainError`, the tool error codes, and their helpers | — |
+| `src/types.ts` | Version, note types, verdicts, size and length limits | — |
 | `src/config.ts` | Parse and validate the environment | — |
 | `src/auth.ts` | Timing-safe bearer digest check | `security/authenticate.ts` |
+| `src/app.ts` | Composition root: open vault, index, store, projects, sync, notes; hold `brain.lock`; initial scan | `runtime.ts` wiring |
 | `src/http.ts` | Express app, host/Origin checks, 256 KB body limit, `/health`, MCP transport | `mcp/server.ts`, `runtime.ts` HTTP parts |
 | `src/mcp/tools.ts` | The eight zod schemas, dispatch, `instructions` | — |
 | `src/vault/paths.ts` | Vault-relative path validation, symlink/traversal refusal, filename sanitizing, collision suffixes | `storage/vault.ts` path checks |
 | `src/vault/note-file.ts` | Parse and render frontmatter, H1 title, and body; preserve unknown keys | — |
 | `src/vault/vault.ts` | List, read, atomic write, move to `.trash/`, hash | — |
 | `src/projects.ts` | Discover projects, resolve name/key, ensure from a remote, normalize remotes | `projects/identity.ts`, `features/project-ensure.ts` normalization |
-| `src/index/chunker.ts` | Heading-aware chunks with line ranges | `retrieval/chunker.ts` |
+| `src/index/chunker.ts` | Character-budgeted, heading-aware chunks; code fences are never split | `retrieval/chunker.ts` |
 | `src/index/search-index.ts` | FTS5 schema, upsert/delete, BM25 candidates | `storage/search-index.ts`, `retrieval/query.ts` |
 | `src/index/sync.ts` | Vault-to-index scan and diff, `problems[]` | — |
 | `src/store.ts` | `brain.db` feedback and idempotency | — |
@@ -244,14 +247,14 @@ The modules:
 | `src/recall.ts` | Candidates → per-note grouping → demotion → excerpt and feedback summary | — |
 | `src/status.ts` | Status payload | — |
 | `src/import.ts` | One-shot porter (§8); deleted after cutover | — |
-| `src/cli.ts` | `serve`, `import`, `token` (prints a new token and its digest) | — |
+| `src/cli.ts` | `serve`, `import`, `token` (prints a new token and its digest), `token digest` (digest of a token on stdin) | — |
 
 **Data flow.**
-- **Write:** MCP → auth → tool → `notes.ts` (mutex, hash check) → `vault.ts` → `search-index` → response.
+- **Write:** MCP → auth → tool → `notes.ts` (hash check) → `vault.ts` → `search-index` → response.
 - **Recall:** MCP → `recall.ts` → FTS5 → group, demote, excerpt.
 - **Sync:** timer → `sync.ts` → reindex the diff.
 
-**Dependencies.** Runtime: `@modelcontextprotocol/sdk`, `better-sqlite3`, `express`, `yaml`, `zod`. Dev: `typescript`, `vitest`, `@types/*`. `mdast-util-from-markdown` stays only if the salvaged chunker needs it; `js-tiktoken` and `tsx` are removed.
+**Dependencies.** Runtime: `@modelcontextprotocol/sdk`, `better-sqlite3`, `express`, `yaml`, `zod`. Dev: `typescript`, `vitest`, `@types/*`. `mdast-util-from-markdown`, `js-tiktoken`, and `tsx` are removed: the new chunker is line-based and character-budgeted.
 
 **Container.**
 - **Image:** single stage on the digest-pinned `NODE_IMAGE`, running as non-root uid 1000, entrypoint `node dist/cli.js`, command `serve`.
@@ -339,7 +342,7 @@ Invocation: `node dist/cli.js import --from <old-vault> --to <new-vault> --journ
   - idempotent capture, including the reserved-but-unwritten crash case;
   - the scan picking up external create, edit, and delete;
   - `problems[]` for broken frontmatter and duplicate ids;
-  - `UNAVAILABLE` before the first scan completes.
+  - the listener refusing connections until the first scan is done.
 - **Importer tests** use a fixture that mirrors the old layout: type folders, a hub note, path-qualified links with an alias and a heading, the archived note, the UUID link, a duplicate-id case that aborts, and `--dry-run` writing nothing. These tests are deleted together with the importer.
 - **End-to-end:** build the image, start Compose with a temporary vault, check `/health`, and run capture → recall → update → delete over MCP.
 - **CI:** a `fast` job (typecheck, unit, build) and a `docker` job (integration, e2e).
