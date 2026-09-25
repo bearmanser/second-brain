@@ -20,3 +20,25 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run verify
+
+  docker:
+    name: docker (image build, end-to-end)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: fast
+    steps:
+      - name: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: setup-node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24.21.0'
+          cache: npm
+      - run: npm ci
+      - name: build the image
+        run: docker build -t second-brain:test .
+      - name: end-to-end suites
+        env:
+          BRAIN_E2E: '1'
+          BRAIN_E2E_IMAGE: second-brain:test
+        run: npm run test:e2e

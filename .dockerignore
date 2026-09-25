@@ -1,0 +1,16 @@
+node_modules
+dist
+coverage
+.git
+.gitignore
+.superpowers
+docs
+tests
+/vault
+.env
+.env.*
+!.env.example
+*.log
+*.db
+*.db-wal
+*.db-shm

@@ -1,0 +1,24 @@
+name: second-brain
+services:
+  brain:
+    build: .
+    image: second-brain:local
+    user: "${BRAIN_UID:-1000}:${BRAIN_GID:-1000}"
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${BRAIN_PORT:-7331}:7331"
+    environment:
+      BRAIN_TOKEN_SHA256: "${BRAIN_TOKEN_SHA256:?generate one with: node dist/cli.js token}"
+      BRAIN_VAULT_DIR: /vault
+      BRAIN_STATE_DIR: /var/lib/second-brain
+      BRAIN_PORT: '7331'
+      BRAIN_ALLOWED_HOSTS: ${BRAIN_ALLOWED_HOSTS:-127.0.0.1,localhost}
+      BRAIN_ALLOWED_ORIGINS: ${BRAIN_ALLOWED_ORIGINS:-}
+      BRAIN_SCAN_INTERVAL_MS: ${BRAIN_SCAN_INTERVAL_MS:-30000}
+    volumes:
+      - ${VAULT_PATH:-./vault}:/vault
+      - brain-data:/var/lib/second-brain
+
+volumes:
+  brain-data:
