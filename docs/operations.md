@@ -38,9 +38,9 @@ operator surfaces replace the earlier Basic Memory guidance:
 | `verify-backup` for the Compose volume archive | `verify-local-backup` for the local V2 stores; `verify-backup` remains for `scripts/backup.sh` archives |
 
 `scripts/backup.sh`, `scripts/restore.sh`, and `scripts/rebuild.sh` remain the
-Compose-volume level tools for `brain-state`/`memory-state`/`model-cache`. The
-`local-*` commands below are the store-level tools and are also used by the
-integration tests.
+Compose-volume level tools for the single `brain-state` volume. The `local-*`
+commands below are the store-level tools and are also used by the integration
+tests.
 
 ## Startup recovery
 
@@ -84,9 +84,9 @@ Run recovery explicitly:
 # error if journal.db is missing).
 docker compose exec brain node dist/cli.js recover
 
-# Owner-only, explicit recovery mode. Refuses without --mode=recover.
-# Requires an owner bearer token (BRAIN_TOKEN or --token) and an existing journal.db.
-docker compose exec brain node dist/cli.js recover-state --mode=recover --token "$OWNER_TOKEN"
+# Explicit recovery mode. Refuses without --mode=recover.
+# Requires the configured single bearer token (BRAIN_TOKEN or --token) and an existing journal.db.
+docker compose exec brain node dist/cli.js recover-state --mode=recover --token "$BRAIN_TOKEN"
 ```
 
 `recover-state` exits non-zero when ambiguity remains (`blocking_operations` is not
@@ -102,8 +102,9 @@ scripts/backup.sh /srv/backups/second-brain-2026-09-21
 ```
 
 The default cold backup archives the host vault **and every named volume Compose
-declares** (`brain-state`, `memory-state`, `model-cache`). `--exclude-volume` is the only
-opt-out for individual volumes; `--notes-only` is an explicit vault-only export.
+declares** (the single-container stack declares only `brain-state`). `--exclude-volume`
+is the only opt-out for individual volumes; `--notes-only` is an explicit vault-only
+export.
 
 The script:
 
@@ -114,7 +115,7 @@ The script:
    `docker compose config --volumes` for the volume keys and then resolves each key to
    the actual Docker volume by its `com.docker.compose.project`/`com.docker.compose.volume`
    labels. It never hard-codes the project prefix;
-4. stops **both** services before reading anything;
+4. stops the `brain` service before reading anything;
 5. under that stable stopped state, scans the vault and every selected volume for
    symbolic links and archives each store under its **stable logical key** (for example
    `volumes/brain-state.tar`), recording the resolved Compose-key-to-actual-volume-name
@@ -128,16 +129,16 @@ The script:
 8. writes `checksums.sha256` and a versioned `manifest.json` (format version, creation
    time, software/image versions, included stores, the volume mapping, sensitivity, and
    file entries) via `node dist/cli.js backup-manifest`;
-9. restarts both services from an `EXIT` trap **even if backup creation fails**.
+9. restarts the `brain` service from an `EXIT` trap **even if backup creation fails**.
 
 Symbolic links are **never dereferenced** (`tar` runs without `-h`). The rule is
 per-store:
 
 - **Vault:** any symbolic link is an error. The backup fails with the precise offending
   path, matching `FileVault`, which ignores links.
-- **Named volumes** (for example `model-cache`, which legitimately contains cache links):
-  links are preserved as links. One TypeScript resolver validates both the stopped live
-  volume and the produced archive, walking each target component, requiring every
+- **Named volumes:** links are preserved as links. One TypeScript resolver validates
+  both the stopped live volume and the produced archive, walking each target component,
+  requiring every
   intermediate component to be a directory, bounding link chains, and rejecting missing,
   absolute, or root-escaping targets with the precise link path. The before/after
   consistency snapshot includes link entries, so a link that appears while copying aborts
@@ -166,9 +167,9 @@ Compose-key-to-actual-name object, and `--image` entries are comma-separated):
 ```sh
 node dist/cli.js backup-manifest \
   --root /srv/backups/… --out /srv/backups/…/manifest.json \
-  --store vault,brain-state,memory-state,model-cache \
-  --volume brain-state=second-brain_brain-state,memory-state=second-brain_memory-state \
-  --image brain=node@sha256:…,basic-memory=ghcr.io/…@sha256:…
+  --store vault,brain-state \
+  --volume brain-state=second-brain_brain-state \
+  --image brain=node@sha256:…,python=python@sha256:…
 ```
 
 ### Local V2 store backup (`local-backup`)
@@ -284,52 +285,42 @@ BRAIN_REBUILD_ACKNOWLEDGE=yes scripts/rebuild.sh
 
 The script:
 
-1. checks for `journal.db` in the `brain-state` volume. If it is missing it **fails**
-   and tells you to restore it from a backup. Only an explicit
+1. resolves the `brain-state` Compose volume and checks for `journal.db`. If it is
+   missing it **fails** and tells you to restore it from a backup. Only an explicit
    `--accept-operational-loss` (or `BRAIN_REBUILD_ACCEPT_OPERATIONAL_LOSS=yes`) proceeds
-   without it: the script prints a loud warning, and `rebuild-catalogue` is invoked with
-   `--accept-operational-loss`, which initializes a fresh operation journal and labels
-   the result as lossy. Retry and feedback history is permanently discarded and the
-   result is **not** full operational recovery. This escape hatch is refused when the
-   vault contains a dynamic repository project not declared in `brain.yaml`, because
-   its canonical identity and grants cannot be reconstructed from Markdown; restore
-   `journal.db` instead;
-2. requires explicit owner acknowledgment (`--acknowledge` /
+   without it: the script prints a loud warning, and `rebuild-catalogue
+   --accept-operational-loss` initializes a fresh operation journal and labels the
+   result as lossy. Retry and feedback history is permanently discarded and the
+   result is **not** full operational recovery;
+2. requires explicit acknowledgment (`--acknowledge` /
    `BRAIN_REBUILD_ACKNOWLEDGE=yes`) so nobody mistakes an index rebuild for operational
    recovery;
 3. pauses gateway mutations by stopping the `brain` service (only if it is running);
-4. rebuilds the local V2 search index from current Markdown with
+4. rebuilds the disposable local V2 search index from current Markdown with
    `node dist/cli.js rebuild-index`, which stages, validates, and atomically
    publishes the index and refuses if the durable journal is missing or damaged.
-   The legacy Basic Memory reindex step is retired for the local V2 runtime; the
-   `scripts/rebuild.sh` script still contains it and Task 18 replaces it;
-5. rebuilds the gateway catalogue from Markdown with
-   `node dist/cli.js rebuild-catalogue`, which requires `journal.db` so authenticated
-   approval provenance is preserved;
-6. compares the catalogue's `scanned` count against the Markdown revision count and
-   **fails loudly** unless they match and `conflicts`/`malformed`/`unsupported_schema`
-   are all zero (a head-graph problem is never silently accepted);
-7. captures the pre-rebuild `operations`, `feedback_records`,
-   `repository_projects`, and `dynamic_project_grants` row counts and content
-   digests and repeats the measurement after the rebuild, **failing** unless
-   they are byte-for-byte identical (in the acknowledged-loss mode there is no
-   pre-state to compare, and the lossy label is printed instead);
-8. restarts the gateway from an `EXIT` trap.
+   The legacy Basic Memory reindex step is retired for the local V2 runtime;
+   `scripts/rebuild.sh` invokes only the local V2 CLI;
+5. when `journal.db` was missing and operational loss was explicitly accepted,
+   runs `rebuild-catalogue --accept-operational-loss` before the index rebuild to
+   initialize the fresh journal. When the journal is present it is left untouched,
+   so authenticated approval provenance is preserved;
+6. restarts the `brain` service from an `EXIT` trap.
 
 Rebuilding never revives an archived or superseded head: the catalogue marks heads by
 graph position, and retrieval continues to exclude archived and superseded statuses.
 
-**Limits.** An index rebuild restores derived search/catalogue state only. It does not
-reconstruct retry history, feedback, repository mappings, or grants, does not
+**Limits.** An index rebuild restores derived search state only. It does not
+reconstruct retry history, feedback, or repository mappings, does not
 recover a corrupt vault, and does not repair a damaged revision graph. Those
-require a backup or explicit owner recovery. A repository project in
-`recovery_required` must remain unavailable until an owner verifies backend,
-vault, mapping, and grant state. After correcting the underlying Basic Memory
-name/path conflict, the owner calls `brain_project_ensure` for the same remote
-with a new idempotency key; only successful exact-path verification returns the
-project to `ready`. Startup and every new-principal ensure re-verify persisted
-ready mappings against both the vault directory and Basic Memory. A broken
-dynamic scope is quarantined without hiding unrelated ready scopes.
+require a backup or explicit recovery. A repository project in
+`recovery_required` must remain unavailable until the persisted vault path and
+project mapping are verified. After correcting the underlying name/path
+conflict, call `brain_project_ensure` for the same remote with a new idempotency
+key; only successful exact-path verification returns the project to `ready`.
+Startup and every `brain_project_ensure` re-verify persisted ready mappings
+against the vault directory. A broken dynamic scope is quarantined without
+hiding unrelated ready scopes.
 
 ## Local V2 cutover runbook
 
@@ -381,7 +372,6 @@ and is labelled lossy; that is not full operational recovery.
 
 ```sh
 docker compose logs -f brain
-docker compose logs -f memory
 docker compose ps
 docker compose exec brain node dist/cli.js health
 docker compose exec brain node dist/cli.js recover
@@ -399,26 +389,29 @@ ambiguity remains.
 
 ## Offline cache
 
-The first hybrid search downloads the local FastEmbed model into the
-`model-cache` volume at the verified path
-`/home/appuser/.basic-memory/fastembed_cache`. After warm-up, hybrid search works
+When reranking is enabled, the local Laya model is prepared explicitly with
+`scripts/prepare-models.sh` into the `brain-state` volume at the configured path
+(`BRAIN_LAYA_MODEL_DIR`, default `/var/lib/second-brain/models/laya/runtime`).
+Normal startup never downloads a model. After preparation, reranked search works
 with no external egress (the Compose network can be switched to `internal: true`
-for a test), and restarts reuse the cached model. Index and embedding state are
-derived and rebuildable; the cache never contains authoritative notes.
+for a test), and restarts reuse the prepared artifacts. Text search never depends
+on the model, and index and model artifacts are derived and rebuildable; the
+model directory never contains authoritative notes.
 
 ## Safe upgrades
 
 1. Take a cold backup and validate it (`scripts/restore.sh ... --check`) before
    changing an image or configuration.
-2. Change `NODE_IMAGE`/`BASIC_MEMORY_IMAGE` only to another digest-pinned
+2. Change `NODE_IMAGE`/`PYTHON_IMAGE` only to another digest-pinned
    reference, then `docker compose up -d --build`.
 3. Re-run `bash scripts/setup.sh`; it preserves existing tokens, credentials,
    `.env` user settings, and the ownership of existing volumes.
 4. On start the gateway reconciles pending operations before accepting
    mutations. If `brain_status` reports `recovering`, inspect with
    `node dist/cli.js recover`.
-5. If the state schema changed, rebuild the catalogue only through
-   `scripts/rebuild.sh`; it requires `journal.db` and validates the graph.
+5. If the state schema changed, rebuild the derived search index from Markdown
+   through `scripts/rebuild.sh`; it requires `journal.db` (or the explicit lossy
+   opt-in) and never repairs durable state.
 6. Roll back by restoring the previous digest-pinned images and
    `config/brain.yaml`. The vault is authoritative and derived state rebuilds.
 7. No image publishing or release automation runs automatically; a registry and
@@ -429,18 +422,22 @@ review, credentials, and limitations), see `docs/setup.md`.
 
 ## Observed environment notes
 
-- The legacy Basic Memory image advertises `reindex` and `doctor`, but `basic-memory
-  reindex` is **not** the supported reindex path for the local V2 runtime; use
-  `node dist/cli.js rebuild-index`. `scripts/rebuild.sh` still invokes the Basic
-  Memory reindex and Task 18 removes that step.
-- `tests/e2e/operations.test.ts` deploys a disposable Compose project (its own project
-  name, port, vault, and volumes) and exercises the real stop/archive/restart cycle,
-  the Compose-key volume mapping, `restore.sh --check`, `restore.sh --start` under a
-  separate project and port, the rebuild count/graph/preservation checks, the
-  destructive-loss refusal path, and corrupt-backup rejection. It fails loudly when
-  Docker is unavailable and cleans up its project, volumes, images, and work directory
-  in all paths. This checkout had no pre-existing deployed `second-brain` project, so
-  the disposable project is the tested environment.
+- The legacy Basic Memory image and its `reindex`/`doctor` commands are retired
+  for the local V2 runtime; use `node dist/cli.js rebuild-index`. `scripts/rebuild.sh`
+  invokes only the local V2 CLI. Historical note: this entry previously recorded
+  that `scripts/rebuild.sh` still invoked the Basic Memory reindex, which Task 18
+  removed.
+- `tests/e2e/backup-single-container.test.ts` deploys a disposable single-container
+  Compose project (its own project name, port, vault, and `brain-state` volume) and
+  executes the real cold-backup stop/archive/restart cycle for `scripts/backup.sh`,
+  including the Compose-key volume mapping. It fails loudly when Docker is
+  unavailable and cleans up its project, volume, image, and work directory in all
+  paths. Historical note: the retired two-service
+  `tests/legacy/two-service/operations.test.ts` (excluded by `vitest.config.ts`, never
+  run) held the only previous script-level execution coverage for `backup.sh`; the V2
+  store-level `local-*` commands are covered by
+  `tests/integration/local-backup-restore.test.ts` and
+  `tests/integration/local-rebuild.test.ts`.
 - `restore.sh --check` and the manifest commands require only coreutils + `tar` (and,
   for `verify-backup`, the built CLI or its container image); the full restore and
   rebuild paths require Docker and the pinned images.

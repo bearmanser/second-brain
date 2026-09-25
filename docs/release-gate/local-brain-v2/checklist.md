@@ -21,10 +21,10 @@
 |---|---|---|---|
 | `npm ci` | network/npm cache | PASS | 185 packages; `better-sqlite3` and `esbuild` prebuilt bindings loaded under Node 24 (`node -e` SQLite probe OK). |
 | `npm run verify` | Node 24 | PASS | typecheck clean; 712 unit/contract tests in 45 files passed; `tsc -p tsconfig.build.json` build passed. |
-| `npm run test:integration` | Node 24 | PASS | 667 tests in 38 files passed (4m06s). `tests/integration/laya-local.test.ts` excluded by the script. |
+| `npm run test:integration` | Node 24 | PASS | 669 tests in 40 files passed (4m07s). `tests/integration/laya-local.test.ts` excluded by the script; the count includes `conflict-head-schema-skip.test.ts` and the `backup-script-stop.test.ts` single-container stop fixture. |
 | `python3 -m unittest discover -s workers/laya/tests -p 'test_*.py'` | Python 3.12 | PASS | 54 tests run, 6 skipped, `OK`. |
 | `npm run test:laya` | prepared Laya artifacts under `/var/lib/second-brain/models` | **NOT RUN (fails closed)** | 11 tests failed in the setup gate: `requiredArtifacts` cannot find the configured model directory, so the worker never reports `ready`. This is the accepted task 12/16/18 limitation, not a green run. |
-| `npm run test:e2e` (`BRAIN_E2E_LIVE=1`) | Docker + pinned images | PASS | 4 files, 28 passed, 1 skipped (`offline-local-brain` artifact check). `single-container` built and served the single container with reranking disabled; `local-brain-v2-lifecycle` passed; `recovery` passed. |
+| `npm run test:e2e` (`BRAIN_E2E_LIVE=1`) | Docker + pinned images | PASS | 5 files, 29 passed, 1 skipped (`offline-local-brain` artifact check). `single-container` built and served the single container with reranking disabled; `backup-single-container` executed the real cold-backup stop/archive/restart cycle against the running single container; `local-brain-v2-lifecycle` passed; `recovery` passed. |
 | `tests/e2e/local-brain-v2-lifecycle.test.ts` (included in `test:e2e`) | Docker + Node 24 | PASS | Full disposable lifecycle (below). |
 | `npm run eval:retrieval -- --backend local --mode text --dataset /var/lib/second-brain/evaluations/retrieval.jsonl` | real dataset | **NOT RUN** | exit 1, `ENOENT ... /var/lib/second-brain/evaluations/retrieval.jsonl`. |
 | `npm run eval:retrieval -- --backend local --mode reranked --dataset /var/lib/second-brain/evaluations/retrieval.jsonl` | real dataset + model artifacts | **NOT RUN** | exit 1, same `ENOENT`. |
@@ -95,7 +95,7 @@ schema-3 preserved notes plus a malformed schema-2 document).
 | AC08 | 9, 11, 14, 17 | `local-search`, `local-rebuild`, lifecycle `rebuild-index` | PASS |
 | AC09 | 12, 18 | gated `laya-local`, `laya-worker` contract, worker unit tests | NOT RUN (no model artifacts) |
 | AC10 | 12, 13, 14 | `reranker-fallback`, lifecycle worker disabled/text mode | PASS |
-| AC11 | 1, 11, 16, 19 | committed-fixture candidate recall + cross-mode harness | PASS (text candidate recall); NOT RUN (reranking latency/RSS) |
+| AC11 | 1, 11, 16, 19 | committed-fixture candidate recall + cross-mode harness | PARTIAL: **PASS on the synthetic fixture only**; the plan's locked-corpus/legacy-baseline comparison is **NOT RUN** (real dataset absent). Also **NOT RUN** for the reranking-specific latency/RSS gate. |
 | AC12 | 3, 13, 16 | `classifier-policy`, `feedback-export`, `feedback` | PASS |
 | AC13 | 16 | Machine: `feedback-export`, `feedback`, `local-operation-coordination`. Live export CLI: not run. | PARTIAL (machine PASS; live export NOT RUN: no journal/dataset) |
 | AC14 | 1, 10, 17, 19 | `vault-v2-migration` fault injection/rollback, lifecycle inspect→plan→verified apply→verify | PASS |
@@ -104,8 +104,10 @@ schema-3 preserved notes plus a malformed schema-2 document).
 
 Backend replacement is releasable only when AC01-AC08 and AC10-AC16 pass the
 applicable release checks. This release is **not yet authorized for full
-sign-off**: AC07, AC09, and the reranking-specific part of AC11 remain NOT RUN,
-and the no-answer false-positive result above is an open quality item. If a
+sign-off**: AC07 and AC09 remain NOT RUN, and both the plan's locked-corpus/
+legacy-baseline comparison and the reranking-specific latency/RSS part of AC11
+remain NOT RUN (AC11 is **PASS on the synthetic fixture only**), and the
+no-answer false-positive result above is an open quality item. If a
 deployment is authorized without reranking, it must use `search_mode: text` and
 Laya disabled, and must not be described as an enabled Laya improvement.
 

@@ -162,19 +162,19 @@ finish_backup() {
     rm -rf "$DESTINATION"
   fi
   if [ "$STACK_STOPPED" = "1" ]; then
-    note "restarting both services via the exit trap"
-    docker compose -p "$COMPOSE_PROJECT_NAME" up -d >&2 || note "warning: services could not be restarted automatically; run docker compose up -d"
+    note "restarting the brain service via the exit trap"
+    docker compose -p "$COMPOSE_PROJECT_NAME" up -d >&2 || note "warning: the brain service could not be restarted automatically; run docker compose up -d"
   fi
 }
 trap finish_backup EXIT
 
 RUNNING_SERVICES="$(docker compose -p "$COMPOSE_PROJECT_NAME" ps -q 2>/dev/null || true)"
 if [ -n "$RUNNING_SERVICES" ]; then
-  note "stopping both services (project $COMPOSE_PROJECT_NAME)"
+  note "stopping the brain service (project $COMPOSE_PROJECT_NAME)"
   STACK_STOPPED=1
-  docker compose -p "$COMPOSE_PROJECT_NAME" stop brain memory
+  docker compose -p "$COMPOSE_PROJECT_NAME" stop brain
 else
-  note "no running services in project $COMPOSE_PROJECT_NAME; nothing to stop"
+  note "the brain service is not running in project $COMPOSE_PROJECT_NAME; nothing to stop"
 fi
 
 snapshot_dir() {
