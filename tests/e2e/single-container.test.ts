@@ -48,6 +48,14 @@ let token = '';
 let composeConfig = '';
 let client: Client | undefined;
 
+function hostRuntimeIdentity(): NodeJS.ProcessEnv {
+  if (process.env.BRAIN_UID !== undefined || process.env.BRAIN_GID !== undefined) return {};
+  if (typeof process.getuid !== 'function' || typeof process.getgid !== 'function') return {};
+  const uid = process.getuid();
+  if (uid === 0) return {};
+  return { BRAIN_UID: String(uid), BRAIN_GID: String(process.getgid()) };
+}
+
 function env(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
     ...process.env,
@@ -56,6 +64,7 @@ function env(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     PYTHON_IMAGE: pythonImage,
     VAULT_PATH: vaultPath,
     BRAIN_PORT: String(brainPort),
+    ...hostRuntimeIdentity(),
     ...extra
   };
 }
