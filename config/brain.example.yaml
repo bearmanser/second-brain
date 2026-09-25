@@ -94,4 +94,4 @@ laya:
   threads: 2
   batch_size: 8
   queue_batches: 4
-  timeout_ms: 4000
+  timeout_ms: 20000

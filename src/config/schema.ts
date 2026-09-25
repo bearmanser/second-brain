@@ -124,7 +124,7 @@ const DEFAULT_LIMITS = {
 
 export const LAYA_BATCH_SIZE_MAX = 8;
 export const LAYA_QUEUE_BATCHES_MAX = 4;
-export const LAYA_TIMEOUT_MS_MAX = 4000;
+export const LAYA_TIMEOUT_MS_MAX = 20_000;
 export const LAYA_THREADS_MAX = 64;
 export const LAYA_DEFAULT_LOCK_FILE = 'config/laya-model.lock.json';
 export const LAYA_MODEL_SUBDIRECTORY = 'models/laya/runtime';

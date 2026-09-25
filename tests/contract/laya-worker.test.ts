@@ -514,7 +514,7 @@ describe('Laya worker supervision', () => {
   test('refuses options above the fixed batch, queue, and deadline bounds', () => {
     expect(() => fakeWorker('normal', { batchSize: 9 })).toThrow();
     expect(() => fakeWorker('normal', { queueBatches: 5 })).toThrow();
-    expect(() => fakeWorker('normal', { timeoutMs: 4001 })).toThrow();
+    expect(() => fakeWorker('normal', { timeoutMs: 20001 })).toThrow();
     expect(() => fakeWorker('normal', { maxRestarts: 4 })).toThrow();
     workers.splice(0);
   });
@@ -534,7 +534,7 @@ function baseConfig(): Record<string, unknown> {
 describe('Laya configuration', () => {
   test('defaults to a disabled worker with the fixed bounds', () => {
     const config = brainConfigSchema.parse(baseConfig());
-    expect(config.laya).toEqual({ enabled: false, python: 'python3', batch_size: 8, queue_batches: 4, timeout_ms: 4000, threads: 2 });
+    expect(config.laya).toEqual({ enabled: false, python: 'python3', batch_size: 8, queue_batches: 4, timeout_ms: 20000, threads: 2 });
     expect(resolveLayaSettings(config, {})).toEqual({
       enabled: false,
       python: 'python3',
@@ -542,13 +542,13 @@ describe('Laya configuration', () => {
       lock_file: 'config/laya-model.lock.json',
       batch_size: 8,
       queue_batches: 4,
-      timeout_ms: 4000,
+      timeout_ms: 20000,
       threads: 2
     });
   });
 
   test('rejects values above the bounds and unknown fields', () => {
-    for (const laya of [{ batch_size: 9 }, { queue_batches: 5 }, { timeout_ms: 4001 }, { threads: 0 }, { unknown: true }, { python: 'python3 -c x' }]) {
+    for (const laya of [{ batch_size: 9 }, { queue_batches: 5 }, { timeout_ms: 20001 }, { threads: 0 }, { unknown: true }, { python: 'python3 -c x' }]) {
       expect(brainConfigSchema.safeParse({ ...baseConfig(), laya }).success).toBe(false);
     }
   });
@@ -576,6 +576,6 @@ describe('Laya configuration', () => {
     });
     expect(() => resolveLayaSettings(config, { BRAIN_LAYA_BATCH_SIZE: '16' })).toThrow();
     expect(() => resolveLayaSettings(config, { BRAIN_LAYA_ENABLED: 'yes please' })).toThrow();
-    expect(() => resolveLayaSettings(config, { BRAIN_LAYA_TIMEOUT_MS: '9000' })).toThrow();
+    expect(() => resolveLayaSettings(config, { BRAIN_LAYA_TIMEOUT_MS: '30000' })).toThrow();
   });
 });

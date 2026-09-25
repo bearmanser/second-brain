@@ -235,7 +235,7 @@ describe('production Compose exposes a single application container', () => {
     );
     expect(composeYaml).toContain('BRAIN_LAYA_BATCH_SIZE: ${BRAIN_LAYA_BATCH_SIZE:-8}');
     expect(composeYaml).toContain('BRAIN_LAYA_QUEUE_BATCHES: ${BRAIN_LAYA_QUEUE_BATCHES:-4}');
-    expect(composeYaml).toContain('BRAIN_LAYA_TIMEOUT_MS: ${BRAIN_LAYA_TIMEOUT_MS:-4000}');
+    expect(composeYaml).toContain('BRAIN_LAYA_TIMEOUT_MS: ${BRAIN_LAYA_TIMEOUT_MS:-20000}');
     expect(composeYaml).toContain('BRAIN_LAYA_THREADS: ${BRAIN_LAYA_THREADS:-2}');
     expect(composeYaml).toContain('BRAIN_RECONCILE_INTERVAL_MS: ${BRAIN_RECONCILE_INTERVAL_MS:-30000}');
     expect(readText('.env.example')).not.toMatch(/^BASIC_MEMORY_IMAGE=/m);
