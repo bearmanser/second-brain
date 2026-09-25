@@ -2432,8 +2432,16 @@ export class LocalMutationCoordinator implements LocalMutationCoordinatorPort {
     if (!scan.complete) throw localRecovery('the current vault scan is incomplete');
     const heads: LocalConflictHead[] = [];
     for (const path of scan.paths.filter((path) => path.endsWith('.md'))) {
-      const entry = await this.readPathOrUndefined(path);
-      if (entry === undefined || parseDocument(entry.raw, path).id !== id) continue;
+      let entry;
+      try {
+        entry = await this.readPathOrUndefined(path);
+      } catch (error) {
+        if (isBrainError(error) && error.code === 'UNSUPPORTED_SCHEMA') continue;
+        throw error;
+      }
+      if (entry === undefined) continue;
+      const document = parseDocument(entry.raw, path);
+      if (document.id !== id) continue;
       const revisionId = await this.deps.revisions?.currentBinding(id, path, entry.etag);
       let parents: readonly { revision_id: string; raw_hash: string }[] = [];
       if (revisionId !== undefined) {
