@@ -4416,7 +4416,7 @@ function replaceLinks(
 function importedRaw(parsed: OldNote, content: string): string {
   const data: Record<string, unknown> = { id: parsed.id, type: parsed.type, tags: parsed.tags, created: parsed.created, updated: parsed.updated };
   if (parsed.id === null) delete data.id;
-  return `---\n${stringify(data).trimEnd()}\n---${content.length > 0 ? content : '\n'}`;
+  return `---\n${stringify(data).trimEnd()}\n---\n${content}`;
 }
 
 export function runImport(options: ImportOptions): ImportReport {
