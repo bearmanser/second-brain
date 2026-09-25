@@ -4706,7 +4706,7 @@ services:
     ports:
       - "127.0.0.1:${BRAIN_PORT:-7331}:7331"
     environment:
-      BRAIN_TOKEN_SHA256: ${BRAIN_TOKEN_SHA256:?generate one with: node dist/cli.js token}
+      BRAIN_TOKEN_SHA256: "${BRAIN_TOKEN_SHA256:?generate one with: node dist/cli.js token}"
       BRAIN_VAULT_DIR: /vault
       BRAIN_STATE_DIR: /var/lib/second-brain
       BRAIN_PORT: '7331'
@@ -4809,8 +4809,9 @@ test.runIf(enabled)('runs the published image and keeps its vault across a resta
     await first.close();
 
     docker(['restart', name]);
-    await waitForHealth(port);
-    const second = await connect(port);
+    const restartedPort = Number(docker(['port', name, '7331']).split('\n')[0].split(':').pop());
+    await waitForHealth(restartedPort);
+    const second = await connect(restartedPort);
     const recalled = await second.callTool({ name: 'brain_recall', arguments: { query: 'container' } });
     const items = JSON.parse((recalled.content as { text: string }[])[0].text).items as { path: string }[];
     expect(items.map((item) => item.path)).toEqual(['Notes/Container note.md']);
@@ -4819,7 +4820,7 @@ test.runIf(enabled)('runs the published image and keeps its vault across a resta
     execFileSync('docker', ['rm', '-f', name], { stdio: 'ignore' });
     execFileSync('docker', ['volume', 'rm', '-f', vaultVolume, stateVolume], { stdio: 'ignore' });
   }
-});
+}, 120_000);
 ```
 
 `StreamableHTTPClientTransport` and `Client` come from the two SDK imports already at the top of the test.
