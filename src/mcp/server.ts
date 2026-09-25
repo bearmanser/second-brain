@@ -158,7 +158,13 @@ const statusOutputSchema = z.strictObject({
       worker: z.strictObject({
         state: z.string(),
         model_fingerprint: z.string().optional()
-      })
+      }),
+      memory: z
+        .strictObject({
+          container_rss_bytes: z.number().optional(),
+          worker_rss_bytes: z.number().optional()
+        })
+        .optional()
     })
     .optional(),
   features: z
@@ -224,7 +230,9 @@ const statusOutputSchemaV2 = z.strictObject({
     gateway: z.enum(['ready', 'recovering', 'degraded']),
     index: z.enum(['ready', 'unavailable']),
     worker: z.enum(['ready', 'disabled', 'unavailable']),
-    pending_index: z.number().optional()
+    pending_index: z.number().optional(),
+    rss_bytes: z.number().optional(),
+    worker_rss_bytes: z.number().optional()
   }),
   features: z.strictObject({
     reranking: z.boolean(), text_search: z.boolean(), fallback: z.boolean()
@@ -279,7 +287,13 @@ function v2PublicResult(tool: ToolName, value: unknown): unknown {
         worker: workerState === 'ready' || workerState === 'disabled' ? workerState : 'unavailable',
         ...(result.local.index.pending_index === undefined
           ? {}
-          : { pending_index: result.local.index.pending_index })
+          : { pending_index: result.local.index.pending_index }),
+        ...(result.local.memory?.container_rss_bytes === undefined
+          ? {}
+          : { rss_bytes: result.local.memory.container_rss_bytes }),
+        ...(result.local.memory?.worker_rss_bytes === undefined
+          ? {}
+          : { worker_rss_bytes: result.local.memory.worker_rss_bytes })
       },
       features: result.features,
       pending_operations: result.pending_operations,

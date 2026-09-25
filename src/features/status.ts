@@ -20,6 +20,7 @@ import {
   type StatusResult
 } from '../core/types.js';
 import { mutationReceipt as localMutationReceipt, reconcileRetrievalDeps } from './local-support.js';
+import { containerRssBytes } from '../operations/memory.js';
 import { projectFilter } from '../projects/registry.js';
 import { projectEnsureReceipt } from '../storage/legacy-project-adapter.js';
 import {
@@ -330,6 +331,8 @@ export async function statusLocal(
   const workerHealth = deps.worker?.health();
   const workerState = workerHealth === undefined ? 'disabled' : workerHealth.state;
   const gateway = indexFailed ? 'degraded' : pending.length > 0 ? 'recovering' : 'ready';
+  const containerRss = containerRssBytes();
+  const workerRss = deps.worker?.rssBytes?.();
 
   const result: StatusResult = {
     version: APPLICATION_VERSION,
@@ -352,7 +355,15 @@ export async function statusLocal(
               ...(workerHealth.model_fingerprint === undefined
                 ? {}
                 : { model_fingerprint: workerHealth.model_fingerprint })
+            },
+      ...(containerRss === undefined && workerRss === undefined
+        ? {}
+        : {
+            memory: {
+              ...(containerRss === undefined ? {} : { container_rss_bytes: containerRss }),
+              ...(workerRss === undefined ? {} : { worker_rss_bytes: workerRss })
             }
+          })
     },
     features: {
       reranking: workerState === 'ready',

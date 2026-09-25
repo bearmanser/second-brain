@@ -819,19 +819,19 @@ function structuredReceipt(response: DockerToolResponse): DockerFixtureReceipt |
   };
 }
 
-function readImagesEnv(): { node: string; memory: string } {
+function readImagesEnv(): { node: string; python: string } {
   const text = readFileSync(join(DOCKER_REPO_ROOT, 'config/images.env'), 'utf8');
   let node = '';
-  let memory = '';
+  let python = '';
   for (const line of text.split('\n')) {
     const [key, ...rest] = line.split('=');
     if (key === 'NODE_IMAGE') node = rest.join('=');
-    if (key === 'BASIC_MEMORY_IMAGE') memory = rest.join('=');
+    if (key === 'PYTHON_IMAGE') python = rest.join('=');
   }
-  if (!node.includes('@sha256:') || !memory.includes('@sha256:')) {
+  if (!node.includes('@sha256:') || !python.includes('@sha256:')) {
     throw new Error('config/images.env does not contain digest-pinned images');
   }
-  return { node, memory };
+  return { node, python };
 }
 
 export async function startDockerHarness(): Promise<DockerHarness> {
@@ -864,7 +864,7 @@ export async function startDockerHarness(): Promise<DockerHarness> {
         ...process.env,
         COMPOSE_PROJECT_NAME: project,
         NODE_IMAGE: images.node,
-        BASIC_MEMORY_IMAGE: images.memory,
+        PYTHON_IMAGE: images.python,
         VAULT_PATH: vaultPath,
         BRAIN_PORT: String(port),
         BRAIN_UID: '1000',
@@ -1160,7 +1160,7 @@ export async function startDockerHarness(): Promise<DockerHarness> {
         ...process.env,
         COMPOSE_PROJECT_NAME: project,
         NODE_IMAGE: images.node,
-        BASIC_MEMORY_IMAGE: images.memory,
+        PYTHON_IMAGE: images.python,
         VAULT_PATH: vaultPath,
         BRAIN_PORT: String(port),
         BRAIN_UID: '1000',

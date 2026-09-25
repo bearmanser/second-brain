@@ -1,5 +1,11 @@
 import { pathToFileURL } from 'node:url';
-import { loadConfig, loadTokenDigest, resolveLayaSettings, resolveSearchSettings } from './config/load.js';
+import {
+  loadConfig,
+  loadTokenDigest,
+  resolveLayaSettings,
+  resolveReconcileInterval,
+  resolveSearchSettings
+} from './config/load.js';
 import type { BrainConfig } from './config/schema.js';
 import { createRuntime, type BrainRuntime } from './runtime.js';
 import { LayaWorker } from './retrieval/laya-worker.js';
@@ -8,7 +14,7 @@ import { layaWorkerOptions } from './retrieval/laya-worker.js';
 export const DEFAULT_CONFIG_PATH = '/run/brain/brain.yaml';
 
 function applyEnvironment(config: BrainConfig, env: NodeJS.ProcessEnv): BrainConfig {
-  const next: BrainConfig = { ...config, mounts: { ...config.mounts }, limits: { ...config.limits } };
+  const next: BrainConfig = { ...config, mounts: { ...config.mounts } };
   if (env.BRAIN_CURSOR_SECRET !== undefined && env.BRAIN_CURSOR_SECRET.length > 0) {
     next.cursor_secret_file = env.BRAIN_CURSOR_SECRET;
   }
@@ -22,42 +28,25 @@ function applyEnvironment(config: BrainConfig, env: NodeJS.ProcessEnv): BrainCon
     const port = Number(env.BRAIN_PORT);
     if (Number.isInteger(port) && port >= 0 && port <= 65535) next.port = port;
   }
-  if (env.BRAIN_SEARCH_MODE !== undefined && env.BRAIN_SEARCH_MODE.length > 0) {
-    if (env.BRAIN_SEARCH_MODE === 'text' || env.BRAIN_SEARCH_MODE === 'reranked') {
-      next.search_mode = env.BRAIN_SEARCH_MODE;
-    } else {
-      throw new Error('BRAIN_SEARCH_MODE must be text or reranked');
-    }
-  }
-  if (env.BRAIN_SEARCH_FALLBACK_ONLY !== undefined && env.BRAIN_SEARCH_FALLBACK_ONLY.length > 0) {
-    if (env.BRAIN_SEARCH_FALLBACK_ONLY === 'true') next.search_fallback_only = true;
-    else if (env.BRAIN_SEARCH_FALLBACK_ONLY === 'false') next.search_fallback_only = false;
-    else throw new Error('BRAIN_SEARCH_FALLBACK_ONLY must be true or false');
-  }
-  if (env.BRAIN_RECONCILE_INTERVAL_MS !== undefined && env.BRAIN_RECONCILE_INTERVAL_MS.length > 0) {
-    if (!/^[0-9]{1,9}$/.test(env.BRAIN_RECONCILE_INTERVAL_MS)) {
-      throw new Error('BRAIN_RECONCILE_INTERVAL_MS must be a positive integer');
-    }
-    const interval = Number(env.BRAIN_RECONCILE_INTERVAL_MS);
-    if (!Number.isInteger(interval) || interval < 1) {
-      throw new Error('BRAIN_RECONCILE_INTERVAL_MS must be a positive integer');
-    }
-    next.limits.reconcile_interval_ms = interval;
-  }
   return next;
 }
 
 export function resolveConfig(env: NodeJS.ProcessEnv = process.env): BrainConfig {
   const configPath = env.BRAIN_CONFIG ?? DEFAULT_CONFIG_PATH;
-  return applyEnvironment(loadConfig(configPath), env);
+  const config = applyEnvironment(loadConfig(configPath), env);
+  const search = resolveSearchSettings(config, env);
+  config.search_mode = search.mode;
+  config.search_fallback_only = search.fallback_only;
+  config.limits = {
+    ...config.limits,
+    reconcile_interval_ms: resolveReconcileInterval(config, env)
+  };
+  return config;
 }
 
 export async function main(env: NodeJS.ProcessEnv = process.env): Promise<BrainRuntime> {
   const tokenDigest = loadTokenDigest(env);
   const config = resolveConfig(env);
-  const search = resolveSearchSettings(config, env);
-  config.search_mode = search.mode;
-  config.search_fallback_only = search.fallback_only;
   const laya = resolveLayaSettings(config, env);
   const worker = new LayaWorker(layaWorkerOptions(laya, process.cwd(), env));
   worker.start();

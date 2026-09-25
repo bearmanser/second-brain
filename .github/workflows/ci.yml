@@ -65,11 +65,13 @@ jobs:
         run: |
           set -o pipefail
           npm run test:integration 2>&1 | tee "$GATE_LOGS/integration.log"
-      - name: end-to-end suites against disposable volumes
+      - name: end-to-end suites (single-container deployment, offline, recovery)
         env:
           BRAIN_E2E_LIVE: '1'
         run: |
           set -o pipefail
+          echo "e2e coverage: tests/e2e/{single-container,offline-local-brain,recovery}.test.ts"
+          echo "retired two-service suites: tests/legacy/two-service/** (excluded by vitest.config.ts, never run in CI)"
           npm run test:e2e 2>&1 | tee "$GATE_LOGS/e2e.log"
       - name: upload gate transcripts (actions/upload-artifact v4.6.0)
         if: always()

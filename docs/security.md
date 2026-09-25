@@ -28,12 +28,11 @@ rejected before method handling; non-`/mcp` paths return `404`.
   Tokens are never written to `config/brain.yaml`, logs, or the repository.
 - Authentication is per request. MCP session IDs are **not** authentication, and
   the endpoint is stateless.
-- Duplicate token digests are rejected rather than resolved to an arbitrary
-  principal.
-- Credentials are reloaded when the file changes and on `SIGHUP`; rotate by
-  adding a record, reloading, then removing the old one.
+- Rotation replaces `BRAIN_TOKEN_SHA256` and restarts the container; the old
+  token stops working on the next request. A `SIGHUP` cannot reload an
+  environment value already injected by Compose.
 
-### Single-token path (migration window)
+### Single-token model
 
 The replacement credential model is one operator-configured token digest, not a
 per-principal record:
@@ -66,35 +65,34 @@ per-principal record:
   level. A shared token cannot cryptographically distinguish the human from the
   agent.
 
-## Authorization
+## Project resolution
 
-Scope resolution happens **before** any knowledge backend call. A principal
-carries explicit reserved static scopes, while ready repository projects and
-their grants are loaded from `journal.db`. Requests for another scope or an
-ungranted dynamic project fail closed with `FORBIDDEN`.
-`include_shared` can only widen to a shared scope the principal is already
-allowed to read.
+There is no authorization layer. The one configured token can call every tool on
+every project. A request may name a project (or the legacy `scope` alias) to
+narrow the result set, but omitting it searches the whole brain and naming one
+never changes access. There is no role, ACL, scope grant, owner-only note, or
+reviewer credential, and no `FORBIDDEN` outcome for a well-formed token.
 
 - `brain_project_ensure` canonicalizes the supplied Git remote, rejects secrets
-  and local/file remotes, provisions only under `Projects/<server-scope>`, and
-  grants from the authenticated role: worker read/write, reviewer
-  read/write/review, owner full. Roles and scope names cannot be fabricated in
-  a tool argument.
+  and local/file remotes, and provisions only under `Projects/<display-name>`.
 - Equivalent SSH/HTTPS identities converge; deterministic suffixes prevent two
   different identities with the same repository basename from sharing a scope.
-- Provisioning has per-principal/global rate limits and a persisted project cap.
-  Non-ready states are visible only to the creator and owners.
-- Protected notes (preferences, `shared`/`profile` scopes, and decisions with an
-  approved ancestor) require owner review.
-- Related-note links are resolved only within the caller's read scopes.
-- Every scope query is bounded; there is no `search_all_projects` pass-through.
+- Provisioning has global rate limits and a persisted project cap. A non-ready
+  project is reported as such rather than treated as ready.
+- Related-note links resolve against current content, not caller privileges.
+- Every query is bounded; there is no `search_all_projects` pass-through.
+- Removing roles removed the former `worker`/`reviewer`/`owner` grants and the
+  legacy `secrets/credentials.json` records; operators migrating from that model
+  convert exactly one digest with
+  `node dist/cli.js auth migrate --credentials-file PATH --select-entry N`.
 
 ## Note content is data, never instructions
 
 - The gateway does not execute note content, does not fetch evidence URLs, and
   does not treat a note as permission to override instructions.
-- The only backend operations implemented are `connect`, `probe`, `create`,
-  `search`, and `isIndexed`. There is no backend `fetch` or arbitrary tool call.
+- The only retrieval operations implemented are local FTS5 candidate search, a
+  supervised local Python worker, and content-hash eligibility checks. There is
+  no remote backend call, no `fetch`, and no arbitrary tool call.
 - A note that asks the model to exfiltrate data is stored as inert Markdown and
   returned as text; it never triggers a server-side tool call or network fetch.
 - Tool arguments are validated against strict Zod schemas. Raw backend URLs,
@@ -179,13 +177,15 @@ The security behaviors above are exercised by:
   session.
 - `tests/integration/http-security.test.ts` — transport, host/origin, size, and
   method handling.
-- `tests/contract/backend.test.ts` — malformed backend responses and
-  protocol-error classification.
-- `tests/e2e/security.test.ts` — a real Docker gateway: cross-scope tokens, raw
-  backend tools, injection-like queries, poison notes, loopback publishing,
-  `/mcp`-only surface, bounded payloads, mixed-principal concurrency, lost write
-  acknowledgments, duplicate identities, missing parents, symlink traversal, and
-  unexpected backend faults.
-- `tests/e2e/lifecycle.test.ts` — restart durability, human-edit detection,
-  supersession authority, Unicode preservation, future-schema quarantine, process
-  death, and corrupt-restore rejection.
+- `tests/contract/backend.test.ts` — historical sanitized backend fixtures and
+  malformed-response classification retained for reproducible import tests.
+- `tests/e2e/single-container.test.ts` — a real Docker single container:
+  resolved-Compose assertions (one service, loopback publish, resident state
+  volume, no backend/embedding dependency), model-disabled lexical fallback,
+  capture, and recall.
+- `tests/e2e/offline-local-brain.test.ts` — no-model-fetch startup, the worker's
+  offline environment, and offline artifact verification.
+- `tests/e2e/recovery.test.ts` — recovery blocking, backup-manifest integrity,
+  and operator-script guards.
+- `tests/legacy/two-service/` — retired two-service/role suites retained as
+  historical reference and excluded from the test run by `vitest.config.ts`.

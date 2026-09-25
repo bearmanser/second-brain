@@ -243,6 +243,8 @@ test('V2 public result shapes do not carry backend-specific fields', () => {
   expectTypeOf<StatusResultV2['health']>().not.toHaveProperty('embeddings');
   expectTypeOf<StatusResultV2['health']>().toHaveProperty('index');
   expectTypeOf<StatusResultV2['health']>().toHaveProperty('worker');
+  expectTypeOf<StatusResultV2['health']>().toHaveProperty('rss_bytes');
+  expectTypeOf<StatusResultV2['health']>().toHaveProperty('worker_rss_bytes');
 
   const ensure: ProjectEnsureResultV2 = {
     operation_id: 'op',

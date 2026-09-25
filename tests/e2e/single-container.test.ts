@@ -126,12 +126,12 @@ async function waitForHealth(timeoutMs: number): Promise<void> {
 }
 
 function statusFrom(result: unknown): {
-  health?: { gateway?: string; index?: string; worker?: string };
+  health?: { gateway?: string; index?: string; worker?: string; rss_bytes?: number };
 } {
   if (typeof result !== 'object' || result === null) return {};
   const structured = (result as { structuredContent?: unknown }).structuredContent;
   return typeof structured === 'object' && structured !== null
-    ? (structured as { health?: { gateway?: string; index?: string; worker?: string } })
+    ? (structured as { health?: { gateway?: string; index?: string; worker?: string; rss_bytes?: number } })
     : {};
 }
 
@@ -219,6 +219,7 @@ describe('production Compose exposes a single application container', () => {
   test('maps the deployment search settings with strict defaults', () => {
     const composeYaml = readText('compose.yaml');
     expect(composeYaml).toContain('BRAIN_SEARCH_MODE: ${BRAIN_SEARCH_MODE:-text}');
+    expect(composeYaml).toContain('BRAIN_SEARCH_FALLBACK_ONLY: ${BRAIN_SEARCH_FALLBACK_ONLY:-false}');
     expect(composeYaml).toContain('BRAIN_LAYA_ENABLED: ${BRAIN_LAYA_ENABLED:-false}');
     expect(composeYaml).toContain(
       'BRAIN_LAYA_MODEL_DIR: ${BRAIN_LAYA_MODEL_DIR:-/var/lib/second-brain/models/laya/runtime}'
@@ -293,6 +294,7 @@ describe('production Compose exposes a single application container', () => {
     expect(health.health?.gateway).toBe('ready');
     expect(health.health?.worker).toBe('disabled');
     expect(health.health?.index).toBe('ready');
+    expect(typeof health.health?.rss_bytes).toBe('number');
     const recall = await client.callTool({
       name: 'brain_recall',
       arguments: { scope: 'freellmapi', query: 'lexical retrieval reranking disabled', include_candidates: true }

@@ -299,6 +299,7 @@ export interface StatusResult {
   local?: {
     index: { state: 'ready' | 'unavailable'; documents?: number; pending_index?: number };
     worker: { state: string; model_fingerprint?: string };
+    memory?: { container_rss_bytes?: number; worker_rss_bytes?: number };
   };
   features?: {
     reranking: boolean;
@@ -327,6 +328,8 @@ export interface StatusResultV2 {
     index: 'ready' | 'unavailable';
     worker: 'ready' | 'disabled' | 'unavailable';
     pending_index?: number;
+    rss_bytes?: number;
+    worker_rss_bytes?: number;
   };
   features: {
     reranking: boolean;

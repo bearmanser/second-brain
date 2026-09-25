@@ -18,6 +18,7 @@ services:
       BRAIN_STATE_DIR: /var/lib/second-brain
       BRAIN_VAULT_DIR: /vault
       BRAIN_SEARCH_MODE: ${BRAIN_SEARCH_MODE:-text}
+      BRAIN_SEARCH_FALLBACK_ONLY: ${BRAIN_SEARCH_FALLBACK_ONLY:-false}
       BRAIN_LAYA_ENABLED: ${BRAIN_LAYA_ENABLED:-false}
       BRAIN_LAYA_MODEL_DIR: ${BRAIN_LAYA_MODEL_DIR:-/var/lib/second-brain/models/laya/runtime}
       BRAIN_LAYA_BATCH_SIZE: ${BRAIN_LAYA_BATCH_SIZE:-8}

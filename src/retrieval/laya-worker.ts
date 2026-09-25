@@ -1,6 +1,7 @@
 import { spawn as spawnProcess, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { isAbsolute, join } from 'node:path';
 import type { LayaSettings } from '../config/schema.js';
+import { processRssBytes } from '../operations/memory.js';
 import {
   LAYA_DEADLINE_MS,
   LAYA_MAX_BATCH_ITEMS,
@@ -284,6 +285,10 @@ export class LayaWorker {
       case 'closed':
         return { state: 'unavailable', reason: 'closed', restarts_in_window: restarts };
     }
+  }
+
+  rssBytes(): number | undefined {
+    return processRssBytes(this.child?.pid);
   }
 
   score(input: LayaScoreInput): Promise<LayaScoreResult> {

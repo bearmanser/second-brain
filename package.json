@@ -7,7 +7,7 @@
     "node": ">=24 <25"
   },
   "scripts": {
-    "test": "vitest run --exclude tests/integration/laya-local.test.ts",
+    "test": "vitest run --exclude tests/integration/laya-local.test.ts --exclude tests/legacy/**",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json && node scripts/copy-assets.mjs",
     "verify": "npm run typecheck && vitest run tests/unit tests/contract && npm run build",

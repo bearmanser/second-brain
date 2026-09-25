@@ -31,6 +31,11 @@ test('the default integration harness runs the seven tools without an injected b
       expect(structured?.health).toMatchObject({ gateway: 'ready', index: 'ready', worker: 'disabled' });
       expect(structured?.health).not.toHaveProperty('backend');
       expect(structured?.health).not.toHaveProperty('embeddings');
+      if (process.platform === 'linux') {
+        const rss = (structured?.health as { rss_bytes?: unknown } | undefined)?.rss_bytes;
+        expect(typeof rss).toBe('number');
+        expect(rss as number).toBeGreaterThan(0);
+      }
       expect(JSON.stringify(structured)).not.toMatch(/permission|can_read|can_write|can_review/);
       const ensured = (await client.callTool({
         name: 'brain_project_ensure',

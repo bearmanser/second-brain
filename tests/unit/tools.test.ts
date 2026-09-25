@@ -384,7 +384,7 @@ test('the published tool contract is pinned', () => {
       {
         "input": "b08c7c6e06ed73a354cdcd37ef9fc28a5d454f4e7a7394270bc295db8a285579",
         "name": "brain_status",
-        "output": "0d51808afe512494a125cc12b40045a813442ba04aba7178776501e1e4c01dd5",
+        "output": "c746091a7c09287edd19d7bad6a41359779ebf8534c0265bc522da50e36561bb",
       },
     ]
   `);
@@ -541,6 +541,9 @@ test('representative tool schemas are pinned in full', () => {
             "pending_index": {
               "type": "number",
             },
+            "rss_bytes": {
+              "type": "number",
+            },
             "worker": {
               "enum": [
                 "ready",
@@ -548,6 +551,9 @@ test('representative tool schemas are pinned in full', () => {
                 "unavailable",
               ],
               "type": "string",
+            },
+            "worker_rss_bytes": {
+              "type": "number",
             },
           },
           "required": [

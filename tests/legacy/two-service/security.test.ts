@@ -3,12 +3,12 @@ import { symlinkSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
-import { TOOL_RESULT_MAX_BYTES } from '../../src/core/limits.js';
-import type { BackendHit } from '../../src/core/types.js';
-import { recall as recallFeature } from '../../src/features/recall.js';
-import { lessonFixture } from '../fixtures/content.js';
-import { reviewerContext } from '../fixtures/principals.js';
-import { recoverPending } from '../../src/operations/recovery.js';
+import { TOOL_RESULT_MAX_BYTES } from '../../../src/core/limits.js';
+import type { BackendHit } from '../../../src/core/types.js';
+import { recall as recallFeature } from '../../../src/features/recall.js';
+import { lessonFixture } from '../../fixtures/content.js';
+import { reviewerContext } from '../../fixtures/principals.js';
+import { recoverPending } from '../../../src/operations/recovery.js';
 import {
   createCandidateIntent,
   createLegacyHarness,
@@ -17,7 +17,7 @@ import {
   type DockerHarness,
   type HttpHarness,
   type MemoryHarness
-} from '../support/harness.js';
+} from '../../support/harness.js';
 
 const DOCKER_TIMEOUT = 2_400_000;
 const FORBIDDEN_MARKER = 'DO_NOT_RETURN_PRIVATE_PROJECT_MARKER';

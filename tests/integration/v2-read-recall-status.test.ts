@@ -157,6 +157,7 @@ async function put(ground: Ground, path: string, raw: string): Promise<void> {
 class FakeWorker implements RerankWorker {
   calls = 0;
   lastSignal: AbortSignal | undefined;
+  rssBytes?: () => number | undefined;
   constructor(
     private readonly behaviour: (candidates: readonly LayaCandidate[], signal?: AbortSignal) => Promise<LayaScoreResult>,
     private readonly state: RerankWorkerHealth['state'] = 'ready'
@@ -780,3 +781,22 @@ test('a real recall and rerank path populates trace identifiers, positions, and 
     await disabled.dispose();
   }
 });
+
+test.skipIf(process.platform !== 'linux')(
+  'local status reports whole-container and worker RSS separately when the worker runs',
+  async () => {
+    const worker = new FakeWorker((candidates) => Promise.resolve(scored(candidates, () => 0.5)));
+    worker.rssBytes = () => 314159;
+    const ground = await openGround({ worker });
+    try {
+      const status = await statusLocal(ctx(), {}, ground.deps);
+      expect(status.local?.memory?.worker_rss_bytes).toBe(314159);
+      const containerRss = status.local?.memory?.container_rss_bytes;
+      expect(typeof containerRss).toBe('number');
+      expect(containerRss as number).toBeGreaterThan(0);
+      expect(containerRss).not.toBe(314159);
+    } finally {
+      await ground.dispose();
+    }
+  }
+);

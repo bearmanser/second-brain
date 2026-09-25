@@ -138,6 +138,11 @@ main() {
   if [ "$vault_created" -eq 1 ]; then
     run_as_root -v "$vault_abs":/vault "$NODE_IMAGE" \
       sh -c "chown -R $BRAIN_UID:$BRAIN_GID /vault"
+  else
+    printf 'setup: validating that the existing vault is writable by uid %s\n' "$BRAIN_UID"
+    if ! volume_is_writable_by_runtime "$vault_abs"; then
+      fail "existing vault $vault_abs is not writable by uid $BRAIN_UID; the application container writes current Markdown through the gateway, so repair the permission or choose a different VAULT_PATH"
+    fi
   fi
 
   write_env_file "$vault_raw" "$brain_port"

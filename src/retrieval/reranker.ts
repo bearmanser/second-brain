@@ -53,6 +53,7 @@ export interface RerankWorker {
     candidates: readonly LayaCandidate[];
     signal?: AbortSignal;
   }): Promise<LayaScoreResult>;
+  rssBytes?(): number | undefined;
   close?(): Promise<void>;
 }
 

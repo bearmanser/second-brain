@@ -2,10 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
-import { verifyManifest } from '../../src/operations/backup.js';
-import { recoverPending } from '../../src/operations/recovery.js';
-import { lessonFixture } from '../fixtures/content.js';
-import { reviewerContext } from '../fixtures/principals.js';
+import { verifyManifest } from '../../../src/operations/backup.js';
+import { recoverPending } from '../../../src/operations/recovery.js';
+import { lessonFixture } from '../../fixtures/content.js';
+import { reviewerContext } from '../../fixtures/principals.js';
 import {
   createCandidateIntent,
   createLegacyHarness,
@@ -14,7 +14,7 @@ import {
   type DockerHarness,
   type DockerToolResponse,
   type MemoryHarness
-} from '../support/harness.js';
+} from '../../support/harness.js';
 
 const DOCKER_TIMEOUT = 2_400_000;
 

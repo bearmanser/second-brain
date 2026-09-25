@@ -272,7 +272,9 @@ const statusResultSchemaV2: Record<string, unknown> = {
         gateway: { type: 'string', enum: ['ready', 'recovering', 'degraded'] },
         index: { type: 'string', enum: ['ready', 'unavailable'] },
         worker: { type: 'string', enum: ['ready', 'disabled', 'unavailable'] },
-        pending_index: { type: 'number' }
+        pending_index: { type: 'number' },
+        rss_bytes: { type: 'number' },
+        worker_rss_bytes: { type: 'number' }
       }
     },
     features: {
@@ -356,6 +358,10 @@ const statusResultSchemaV1: Record<string, unknown> = {
         worker: {
           type: 'object', additionalProperties: false,
           properties: { state: STRING, model_fingerprint: STRING }
+        },
+        memory: {
+          type: 'object', additionalProperties: false,
+          properties: { container_rss_bytes: { type: 'number' }, worker_rss_bytes: { type: 'number' } }
         }
       }
     },
