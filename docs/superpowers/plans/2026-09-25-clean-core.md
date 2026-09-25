@@ -4476,7 +4476,7 @@ export function runImport(options: ImportOptions): ImportReport {
   const mapping = new Map<string, string>();
   const stems = new Map<string, string[]>();
   const planned = new Set<string>();
-  const outputs: { path: string; raw: string }[] = [];
+  const destinations = new Map<string, string>();
   for (const name of projectNames) addMapping(mapping, projectNotePath(name), projectNotePath(name));
 
   for (const note of kept) {
@@ -4488,9 +4488,15 @@ export function runImport(options: ImportOptions): ImportReport {
     });
     const path = `${directory}/${stem}.md`;
     planned.add(path);
+    destinations.set(note.oldPath, path);
     addMapping(mapping, note.oldPath, path);
     const key = stemOf(note.oldPath).toLowerCase();
     stems.set(key, [...(stems.get(key) ?? []), path.replace(/\.md$/, '')]);
+  }
+
+  const outputs: { path: string; raw: string }[] = [];
+  for (const note of kept) {
+    const path = destinations.get(note.oldPath)!;
     const content = replaceLinks(splitFrontmatter(note.raw).content, mapping, stems, report, unresolved);
     outputs.push({ path, raw: importedRaw(note.parsed, content) });
   }
@@ -4555,7 +4561,7 @@ export function formatReport(report: ImportReport): string {
 }
 ```
 
-The cleanup `unlinkSync` loop only removes files in a vault that `runImport` just created, because a non-empty target is rejected up front.
+The cleanup `unlinkSync` loop only removes files in a vault that `runImport` just created, because a non-empty target is rejected up front. Building the destination map and rewriting links are two separate passes on purpose: a path-qualified link must resolve through the complete old→new map, including targets that are processed later, and the hub self-mapping must exist before any hub body is rewritten. The regression test `rewrites a path-qualified cross-project link in a second pass` puts the target in a project that sorts after the source, so a single-pass implementation fails it.
 
 - [ ] **Step 4: Add the `import` branch to** `src/cli.ts`
 
