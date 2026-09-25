@@ -53,6 +53,20 @@ The floating discovery inputs `node:24-bookworm-slim` and `python:3.12-slim` are
 accepted only as arguments to `scripts/lock-images.mjs`. They are not written to
 `config/images.env` or the JSON lock.
 
+### Task 18 single-container runtime (current)
+
+| Item | Observed value |
+|---|---|
+| Built image | `second-brain:task18`, id `sha256:37c33eb62f5e1c2f2b745fa9991d2b46193365d66116d0cfbde72541ad50471c`, 431,536,371 bytes, `linux/amd64` |
+| Node | `v24.21.0` |
+| Python | `3.12.14` |
+| Laya / Torch | `laya 0.3.11` / `torch 2.14.0+cpu` |
+| Worker requirements lock sha256 | `9f9f72d5eddd1f9fc53a8cedc880fcc4a8eec8fc25734ae7c1462400e924dfc1` |
+| Model lock sha256 | `8a2e177bc4c666f89f861a1977efa8507a332d7cd8edf8814d4dd1d964195f91` (revision `55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851`) |
+| Offline artifact verify | `network_guard: true`, `runtime_fingerprint 5fe18a52e296cdaf0378bb171ce859cccdda1c8b9525c9fd5e38a2a5bba76ff6`, `source_files_verified 6`, `runtime_files_verified 5`, `unchanged_after_load true` |
+| Compose services | one `brain` service; only `127.0.0.1:<BRAIN_PORT>:7331` published; `brain-state` volume; vault mounted read-write |
+| Gates | `npm run verify` 712 passed; `npm run test:integration` 666 passed; `single-container.test.ts` + `offline-local-brain.test.ts` 11 passed / 1 host-artifact skip |
+
 ### Basic Memory backend identity (historical)
 
 | Field | Value |
