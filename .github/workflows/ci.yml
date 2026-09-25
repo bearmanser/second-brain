@@ -9,6 +9,7 @@ permissions:
 
 env:
   NODE_VERSION: '24.21.0'
+  PYTHON_VERSION: '3.12.3'
   GATE_LOGS: /tmp/opencode/ci-gate
 
 jobs:
@@ -26,8 +27,11 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run verify
-      - name: python worker unit tests
-        run: python3 -m unittest discover -s workers/laya/tests -p 'test_*.py'
+      - name: python worker unit tests (Python ${{ env.PYTHON_VERSION }})
+        run: |
+          set -euo pipefail
+          python3 -c "import sys; assert sys.version.split()[0] == '${PYTHON_VERSION}', sys.version"
+          python3 -m unittest discover -s workers/laya/tests -p 'test_*.py'
       - name: external-model-dependent tests
         run: |
           echo "NOT RUN: tests/eval/run.mts --mode instruction and --mode agent require an approved chat-model budget."

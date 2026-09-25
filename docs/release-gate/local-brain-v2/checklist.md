@@ -28,7 +28,7 @@
 | `tests/e2e/local-brain-v2-lifecycle.test.ts` (included in `test:e2e`) | Docker + Node 24 | PASS | Full disposable lifecycle (below). |
 | `npm run eval:retrieval -- --backend local --mode text --dataset /var/lib/second-brain/evaluations/retrieval.jsonl` | real dataset | **NOT RUN** | exit 1, `ENOENT ... /var/lib/second-brain/evaluations/retrieval.jsonl`. |
 | `npm run eval:retrieval -- --backend local --mode reranked --dataset /var/lib/second-brain/evaluations/retrieval.jsonl` | real dataset + model artifacts | **NOT RUN** | exit 1, same `ENOENT`. |
-| `npm run eval:retrieval -- --backend local --mode text --dataset tests/eval/fixtures/local-retrieval/dataset.jsonl` | committed fixture | PASS | exit 0; candidate recall@50 0.9252, graph recall@10 0.0748, nDCG@10 0.9252, MRR 0.9159, 12/12 no-answer empty, unjudged 0, p50 10 ms; `docs/release-gate/local-brain-v2/retrieval-text-fixture.json`. |
+| `npm run eval:retrieval -- --backend local --mode text --dataset tests/eval/fixtures/local-retrieval/dataset.jsonl` | committed fixture | PASS (with open quality item) | exit 0; candidate recall@50 0.9252, graph recall@10 0.0748, nDCG@10 0.9252, MRR 0.9159, unjudged 0, **12 no-answer queries; 12/12 returned a candidate — the strict empty-result gate was not met on this fixture**, p50 10 ms; `docs/release-gate/local-brain-v2/retrieval-text-fixture.json`. |
 | `npm run eval:retrieval -- --backend local --mode reranked --dataset tests/eval/fixtures/local-retrieval/dataset.jsonl` | committed fixture | PASS (mode label only, **not** a model run) | exit 0; identical offline metrics. No Laya worker was loaded; this is a mode label, never a reranking claim. Raw output in `retrieval-reranked-fixture.json`. |
 | `npm run eval:retrieval -- --backend local --compare true --dataset tests/eval/fixtures/local-retrieval/dataset.jsonl` | committed fixture | PASS | exit 0; `local_text` recall@50 0.9252 / nDCG@10 0.9252; `local_text_graph` recall@50 1.0 / nDCG@10 0.9724 / graph recall@10 0.0748; `laya_reranked` reported **NOT RUN** with the lexical fallback order reported separately. `retrieval-compare-fixture.json`. |
 
@@ -41,8 +41,9 @@ Fixture hashes: `dataset.jsonl`
 
 `tests/e2e/local-brain-v2-lifecycle.test.ts` is a single disposable scenario
 that restores the frozen V1 fixture
-(`tests/fixtures/vault-v2/manifest-cases.json`), then, using the real `dist/cli`
-entrypoints and a real in-process MCP runtime:
+(`tests/fixtures/vault-v2/manifest-cases.json`), then, using the in-process
+`runCli` module (not a spawned `dist/cli` process) and a real in-process MCP
+runtime:
 
 1. writes a Brain config and materializes the frozen V1 vault;
 2. runs `vault-v2 inspect` and `vault-v2 plan`, and asserts the deliberate fork
@@ -69,37 +70,44 @@ entrypoints and a real in-process MCP runtime:
     the original `id`, `revision_id`, and `operation_id`.
 
 The lifecycle test uncovered one real integration gap: after a documented partial
-migration, preserved schema-1 legacy notes made `LocalMutationCoordinator` throw
-`UNSUPPORTED_SCHEMA` while scanning conflict heads, blocking every mutation with
-a precondition. The minimal fix (committed with the test) skips
-`UNSUPPORTED_SCHEMA` documents during that scan; it does not weaken any existing
-assertion and no owner/role credential is used to bypass the model.
+migration, preserved **non-V2-schema** notes (any `brain_schema_version` other
+than 2, not only schema 1) made `LocalMutationCoordinator.resolveConflictHeads`
+throw `UNSUPPORTED_SCHEMA` while scanning conflict heads, blocking every mutation
+with a precondition. The minimal fix (committed with the test) skips documents
+whose schema version is not the supported V2 version during that scan, while a
+malformed schema-2 document still fails closed; it does not weaken any existing
+assertion and no owner/role credential is used to bypass the model. The focused
+regression test is
+`tests/integration/conflict-head-schema-skip.test.ts` (seeds schema-1 and
+schema-3 preserved notes plus a malformed schema-2 document).
 
 ## AC01-AC16 requirement-coverage matrix
 
 | ID | Owning tasks | Release evidence | Status |
 |---|---|---|---|
 | AC01 | 2, 3, 14, 19 | `local-brain-v2-lifecycle` tool matrix before/after rotation; `token-rotation`, `single-brain-access` | PASS |
-| AC02 | 3, 14, 18 | `single-brain-access`, `permissions`, `legacy-credentials`, `single-container` config review | PASS |
+| AC02 | 3, 14, 18 | `single-brain-access`, `single-token` (role-free context assertions), `legacy-credentials`, `single-container`; also confirmed by code/config/schema review | PASS |
 | AC03 | 5, 10, 15 | `vault-v2-migration`, `human-paths`, `local-brain-v2-lifecycle` | PASS |
 | AC04 | 6, 10, 17 | `vault-v2-migration` (exact history hashes), `local-recovery`, lifecycle history dir | PASS |
 | AC05 | 4, 6, 9, 14 | `manual-edits`, `manual-vault-edits`, lifecycle manual edit/rename | PASS |
-| AC06 | 7, 8, 10, 15 | `link-resolution`, `obsidian-links`, `vault-v2-migration`, lifecycle attachment link | PASS (Obsidian GUI re-check open) |
+| AC06 | 7, 8, 10, 15 | Machine: `link-resolution`, `obsidian-links`, `vault-v2-migration`, lifecycle attachment link. Manual Obsidian validation: not run. | PARTIAL (machine PASS; manual Obsidian NOT RUN) |
 | AC07 | 4, 15 | `obsidian-assets`, `obsidian-install`, lifecycle properties | NOT RUN for the manual Obsidian GUI/version check |
 | AC08 | 9, 11, 14, 17 | `local-search`, `local-rebuild`, lifecycle `rebuild-index` | PASS |
 | AC09 | 12, 18 | gated `laya-local`, `laya-worker` contract, worker unit tests | NOT RUN (no model artifacts) |
 | AC10 | 12, 13, 14 | `reranker-fallback`, lifecycle worker disabled/text mode | PASS |
 | AC11 | 1, 11, 16, 19 | committed-fixture candidate recall + cross-mode harness | PASS (text candidate recall); NOT RUN (reranking latency/RSS) |
 | AC12 | 3, 13, 16 | `classifier-policy`, `feedback-export`, `feedback` | PASS |
-| AC13 | 16 | `feedback-export`, `feedback`, `local-operation-coordination` | PASS (live export NOT RUN: no journal/dataset) |
+| AC13 | 16 | Machine: `feedback-export`, `feedback`, `local-operation-coordination`. Live export CLI: not run. | PARTIAL (machine PASS; live export NOT RUN: no journal/dataset) |
 | AC14 | 1, 10, 17, 19 | `vault-v2-migration` fault injection/rollback, lifecycle inspect→plan→verified apply→verify | PASS |
 | AC15 | 14, 18, 19 | `single-container`, `offline-local-brain`, lifecycle | PASS |
 | AC16 | 14, 18, 19 | `single-container` resolved Compose/env/mounts, `mcp`, `local-capabilities` | PASS |
 
 Backend replacement is releasable only when AC01-AC08 and AC10-AC16 pass the
-applicable release checks. **AC09 and the reranking-specific part of AC11 are
-NOT RUN**, so the release ships with `search_mode: text` and Laya disabled.
-AC07's manual Obsidian GUI check remains open.
+applicable release checks. This release is **not yet authorized for full
+sign-off**: AC07, AC09, and the reranking-specific part of AC11 remain NOT RUN,
+and the no-answer false-positive result above is an open quality item. If a
+deployment is authorized without reranking, it must use `search_mode: text` and
+Laya disabled, and must not be described as an enabled Laya improvement.
 
 ## Deployment runbook (exact ordering)
 

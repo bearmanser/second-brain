@@ -356,11 +356,16 @@ Retain the old backup/image/configuration; never delete them during cutover.
 Command sketch (run inside the container or with the built CLI):
 
 ```sh
-node dist/cli.js vault-v2 inspect --report /var/lib/second-brain/migrations/inspection.json
-node dist/cli.js vault-v2 plan --output /var/lib/second-brain/migrations/manifest.json
+node dist/cli.js vault-v2 inspect --report /var/lib/second-brain/migrations/inspection.json --projects freellmapi="FreeLLM API"
+node dist/cli.js vault-v2 plan --output /var/lib/second-brain/migrations/manifest.json --projects freellmapi="FreeLLM API"
+# Refuses when any blocker is present:
 node dist/cli.js vault-v2 apply --manifest /var/lib/second-brain/migrations/manifest.json \
   --backup-receipt /var/lib/second-brain/migrations/backup.json \
   --backup-root /var/lib/second-brain/backup --maintenance
+# Explicit opt-in that migrates only the unblocked notes and prints every blocker:
+node dist/cli.js vault-v2 apply --manifest /var/lib/second-brain/migrations/manifest.json \
+  --backup-receipt /var/lib/second-brain/migrations/backup.json \
+  --backup-root /var/lib/second-brain/backup --maintenance --partial
 node dist/cli.js vault-v2 verify --manifest /var/lib/second-brain/migrations/manifest.json
 ```
 

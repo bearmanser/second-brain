@@ -605,7 +605,7 @@ run are **NOT RUN** with the exact blocker; none is reported as green.
 |---|---|---|
 | `npm run eval:retrieval -- --backend local --mode text --dataset /var/lib/second-brain/evaluations/retrieval.jsonl` | **NOT RUN** | exit 1, `ENOENT` for the absent real dataset |
 | `npm run eval:retrieval -- --backend local --mode reranked --dataset /var/lib/second-brain/evaluations/retrieval.jsonl` | **NOT RUN** | exit 1, same absent dataset; no prepared model artifacts either |
-| `npm run eval:retrieval -- --backend local --mode text --dataset tests/eval/fixtures/local-retrieval/dataset.jsonl` | RUN (committed fixture) | candidate recall@50 0.9252, graph recall@10 0.0748, nDCG@10 0.9252, MRR 0.9159, unjudged 0, 12/12 no-answer empty, p50 10 ms / p95 15 ms |
+| `npm run eval:retrieval -- --backend local --mode text --dataset tests/eval/fixtures/local-retrieval/dataset.jsonl` | RUN (committed fixture) | candidate recall@50 0.9252, graph recall@10 0.0748, nDCG@10 0.9252, MRR 0.9159, unjudged 0, **12 no-answer queries; 12/12 returned a candidate** (the strict empty-result gate was **not** met on this fixture), p50 10 ms / p95 15 ms |
 | `npm run eval:retrieval -- --backend local --mode reranked --dataset tests/eval/fixtures/local-retrieval/dataset.jsonl` | RUN (mode label only) | identical offline metrics; **no Laya worker loaded**, so this is not a reranking measurement |
 | `npm run eval:retrieval -- --backend local --compare true --dataset tests/eval/fixtures/local-retrieval/dataset.jsonl` | RUN (cross-mode harness) | `local_text` recall@50 0.9252 / nDCG@10 0.9252 / MRR 0.9159; `local_text_graph` recall@50 1.0 / nDCG@10 0.9724 / graph recall@10 0.0748; `laya_reranked` **NOT RUN** with fallback order reported separately |
 
@@ -627,9 +627,14 @@ claim.
 ### Interpretation
 
 - The local candidate-recall gate is measured on a synthetic committed fixture,
-  not on real user notes. It supports the deterministic release gate (candidate
-  recall, no-answer behavior, per-slice reporting), not broad semantic-quality
-  claims.
+  not on real user notes. It supports the candidate-recall and per-slice
+  reporting, not broad semantic-quality claims.
+- The no-answer behavior on this fixture does **not** meet a strict
+  empty-result gate: all 12 no-answer queries returned at least one candidate
+  (`no_answer_false_positives: 12`). This is consistent with the pre-existing
+  baseline table above (`12 / 12`) and means the release evidence cannot claim
+  an empty-result guarantee; a stricter no-answer gate remains an open quality
+  item and blocks a full sign-off together with AC07/AC09/AC11.
 - The `reranked` label on the fixture run is a mode label only. The only honest
   reranking statement is `laya_reranked: NOT RUN`.
 - The real-dataset commands and the manual Obsidian GUI check remain open
