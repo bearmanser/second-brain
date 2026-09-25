@@ -4910,7 +4910,7 @@ Content must cover:
 - State directory contents: `index.db` (derived and rebuildable), `brain.db` (feedback and idempotency keys), `brain.lock` (one instance per state directory).
 - Rebuilding the index after an upgrade: stop the container, delete `index.db` (and its `-wal`/`-shm`), start it again; the startup scan rebuilds from the vault. Never delete `brain.db` casually: it holds feedback.
 - Scanning: the vault is scanned at startup and every `BRAIN_SCAN_INTERVAL_MS`. Hand edits in Obsidian are picked up within one interval. Notes with parse errors are reported by `brain_status` and skipped.
-- Health: `GET /health` is unauthenticated and returns `{ status, version, notes }`. Liveness checks should use it.
+- Health: `GET /health` is unauthenticated and returns `{ status: "ok" }` only, so it leaks no version or note count. Liveness checks should use it.
 - Backup: back up the vault (the source of truth) plus `brain.db` (feedback). `index.db` does not need backup.
 - Recovery: if a note is broken, `brain_status` names it; fix the frontmatter in Obsidian and it indexes on the next scan. If duplicate ids are reported, rename or remove one.
 - Trash: `brain_delete` moves files to `.trash/`, which is never indexed.
