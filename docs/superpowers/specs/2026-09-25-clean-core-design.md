@@ -119,7 +119,7 @@ In the tables below, a note is addressed by `id` or `path` (vault-relative, `.md
 | `brain_read` | `id` \| `path` | `id`, `path`, `project`, `title`, `type`, `tags`, `created`, `updated`, `hash`, `body`, `feedback`, `demoted` |
 | `brain_recall` | `query` (1–1000), `project?`, `types?`, `limit?` (1–20, default 5) | `items[]`: `id`, `path`, `project`, `title`, `type`, `tags`, `heading`, `excerpt`, `feedback`, `demoted` |
 | `brain_feedback` | `id` \| `path`, `verdict` (`useful` \| `irrelevant` \| `stale` \| `incorrect` \| `contradiction`), `reason?` (≤ 1000) | `recorded: true` |
-| `brain_project_ensure` | `remote_url`, `idempotency_key?` (8–128 chars; accepted for client compatibility and ignored, because binding an already-bound remote returns the existing project) | `project` (name), `key`, `path`, `created` |
+| `brain_project_ensure` | `remote_url`, `idempotency_key?` (8–128 chars; accepted for client compatibility and ignored, because binding an already-bound remote returns the existing project) | `project` (`name`, `key`, `repositories`, `notePath`, `hasNote`), `created` |
 | `brain_status` | — | `version`, `notes`, `projects[]` (`name`, `key`, `repositories`, `notes`), `problems[]` (`path`, `problem`) |
 
 Behaviour of each tool:
