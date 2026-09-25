@@ -216,9 +216,11 @@ export function runImport(options: ImportOptions): ImportReport {
   const mapping = new Map<string, string>();
   const stems = new Map<string, string[]>();
   const planned = new Set<string>();
-  const outputs: { path: string; raw: string }[] = [];
+  const destinations = new Map<string, string>();
   for (const name of projectNames) addMapping(mapping, projectNotePath(name), projectNotePath(name));
 
+  // Pass 1: build the complete old->new map before rewriting any link, so a
+  // path-qualified link resolves even when its target is processed later.
   for (const note of kept) {
     const directory = `Projects/${note.project}`;
     const title = note.parsed.title ?? stemOf(note.oldPath);
@@ -228,9 +230,16 @@ export function runImport(options: ImportOptions): ImportReport {
     });
     const path = `${directory}/${stem}.md`;
     planned.add(path);
+    destinations.set(note.oldPath, path);
     addMapping(mapping, note.oldPath, path);
     const key = stemOf(note.oldPath).toLowerCase();
     stems.set(key, [...(stems.get(key) ?? []), path.replace(/\.md$/, '')]);
+  }
+
+  const outputs: { path: string; raw: string }[] = [];
+  // Pass 2: rewrite links against the complete map and assemble each note.
+  for (const note of kept) {
+    const path = destinations.get(note.oldPath)!;
     const content = replaceLinks(splitFrontmatter(note.raw).content, mapping, stems, report, unresolved);
     outputs.push({ path, raw: importedRaw(note.parsed, content) });
   }

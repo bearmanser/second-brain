@@ -66,6 +66,22 @@ test('ports notes, rewrites links, and generates project notes', () => {
   expect(existsSync(join(to, 'Projects/Doccary/archive/old.md'))).toBe(false);
 });
 
+test('rewrites a path-qualified cross-project link in a second pass', () => {
+  const from = scratch('v1');
+  writeTree(from, {
+    'Projects/Alpha/alpha.md':
+      '---\nid: alpha-id\ntype: note\n---\n\n# Alpha intro\n\nSee [[Projects/Beta/bravo]] and [[Projects/Beta/bravo|alias]] and [[Projects/Beta/bravo#section]].\n',
+    'Projects/Beta/bravo.md': '---\nid: beta-id\ntype: note\n---\n\n# Bravo note\n\nbody\n'
+  });
+  const to = scratch('v2');
+  const report = runImport({ from, to, journal: journalWith([]) });
+  expect(report.unresolvedLinks).toEqual([]);
+  expect(report.linksRewritten).toBe(3);
+  expect(readFileSync(join(to, 'Projects/Alpha/Alpha intro.md'), 'utf8')).toContain(
+    'See [[Projects/Beta/Bravo note]] and [[Projects/Beta/Bravo note|alias]] and [[Projects/Beta/Bravo note#section]].'
+  );
+});
+
 test('keeps ported content byte-identical after the rewritten frontmatter', () => {
   const to = scratch('v2');
   runImport({ from: oldVault(), to, journal: journalWith([]) });
