@@ -1,9 +1,0 @@
-# Release gate transcript: npm run verify (host: Operational, node v24.21.0, 2026-09-21T04:05:18Z)
-
-> second-brain@0.1.0 verify
-> second-brain@0.1.0 typecheck
-> tsc --noEmit
- Test Files  16 passed (16)
-      Tests  278 passed (278)
-> second-brain@0.1.0 build
-> tsc -p tsconfig.build.json && node scripts/copy-assets.mjs
