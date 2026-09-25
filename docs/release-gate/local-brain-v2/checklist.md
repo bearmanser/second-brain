@@ -3,6 +3,11 @@
 - **Release-verification commit:** `c05d252fc2be81c381035d9e4c035c27d39e9f18`
   (`test: verify local Brain V2 migration and lifecycle`), on top of the
   verified task 1-18 series at `a883dcf98ba53ec38e5611f1c5febe8952be7383`.
+- **Final-review fix wave:** `47e4326803607d03bfd5618b1823017e46ec8fab`
+  (`fix: repair single-container cold backup and reconcile operator docs`). The
+  `verify`/`test:integration`/`test:e2e` counts in the table below were re-run and
+  recorded at that HEAD under Node `v24.21.0`; the AC11 label is qualified there.
+  Details are in the task 19 report's "Final review fix wave" section.
 - **Recorded:** 2026-09-25.
 - **Host:** Linux (WSL2 kernel) 6.8.0, x86_64, 11th Gen Intel Core i5-1135G7,
   8 vCPU, 15 GiB RAM, Ubuntu, CPU-only (no GPU).
