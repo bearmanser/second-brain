@@ -83,7 +83,7 @@ This task deletes the legacy tree and establishes the new toolchain with the two
 
 **Files:**
 - Delete (tracked): `src/`, `tests/`, `scripts/`, `workers/`, `config/`, `compose.yaml`, `Dockerfile`, `.dockerignore`, `.env.example`, `README.md`, every file under `docs/` except `docs/superpowers/specs/2026-09-25-clean-core-design.md` and `docs/superpowers/plans/2026-09-25-clean-core.md`
-- Delete (untracked): `dist/`, `node_modules/`, `.superpowers/`
+- Delete (untracked): `dist/`, `node_modules/`
 - Create: `package.json`, `tsconfig.json`, `tsconfig.build.json`, `vitest.config.ts`, `.gitignore`, `src/errors.ts`, `src/types.ts`, `tests/unit/errors.test.ts`, `.github/workflows/ci.yml` (fast job only; Task 16 adds the Docker job)
 - Regenerate: `package-lock.json`
 
@@ -97,9 +97,11 @@ This task deletes the legacy tree and establishes the new toolchain with the two
 cd /root/git/second-brain-v2
 git rm -r -q src tests scripts workers config compose.yaml Dockerfile .dockerignore .env.example README.md
 git ls-files docs | grep -v -e 'docs/superpowers/specs/2026-09-25-clean-core-design.md' -e 'docs/superpowers/plans/2026-09-25-clean-core.md' | xargs git rm -q
-rm -rf dist node_modules .superpowers
+rm -rf dist node_modules
 git status --short | head
 ```
+
+Do not delete `.superpowers/`: it holds the execution ledger for this plan.
 
 Expected: only deletions are listed, and the spec and this plan remain.
 
@@ -3651,12 +3653,17 @@ test('runs the full capture, recall, read, update, feedback, delete cycle', asyn
   const id = captured.id as string;
   expect(captured).toMatchObject({ path: 'Projects/second-brain/Recall budget note.md' });
   expect(await client.call('brain_capture', {
-    title: 'Recall budget note',
-    body: 'Budget details about laya.',
-    type: 'lesson',
+    title: 'Collision probe',
+    body: 'Nothing to find here.',
     project: 'second-brain',
     idempotency_key: randomUUID()
-  })).toMatchObject({ path: 'Projects/second-brain/Recall budget note (2).md' });
+  })).toMatchObject({ path: 'Projects/second-brain/Collision probe.md' });
+  expect(await client.call('brain_capture', {
+    title: 'Collision probe',
+    body: 'Nothing to find here.',
+    project: 'second-brain',
+    idempotency_key: randomUUID()
+  })).toMatchObject({ path: 'Projects/second-brain/Collision probe (2).md' });
 
   const recalled = await client.call('brain_recall', { query: 'budget laya', project: 'second-brain' });
   expect((recalled.items as unknown[]).length).toBe(1);
@@ -3708,8 +3715,11 @@ test('rejects arguments that fail schema validation', async () => {
   const root = scratch('gateway');
   writeTree(join(root, 'vault'), {});
   const client = await mcpClient(await startTestGateway(join(root, 'vault'), join(root, 'state')));
-  const result = await client.raw('brain_read', { id: 42 });
-  expect(result.isError).toBe(true);
+  const rejected = await client.raw('brain_read', { id: 42 }).catch((error: Error) => ({
+    isError: true,
+    text: error.message
+  }));
+  expect(rejected.isError).toBe(true);
   await client.close();
 });
 ```
