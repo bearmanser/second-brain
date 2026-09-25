@@ -192,7 +192,7 @@ coverage/
 !.env.example
 *.log
 .DS_Store
-vault/
+/vault/
 ```
 
 `.github/workflows/ci.yml`:
@@ -4672,7 +4672,7 @@ coverage
 .superpowers
 docs
 tests
-vault
+/vault
 .env
 .env.*
 !.env.example
