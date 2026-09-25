@@ -3571,7 +3571,7 @@ export async function mcpClient(gateway: Gateway): Promise<TestClient> {
 
 ```ts
 import { randomUUID } from 'node:crypto';
-import { writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { expect, test } from 'vitest';
 import {
@@ -3693,6 +3693,7 @@ test('picks up files written directly into the vault', async () => {
   const vaultDir = join(root, 'vault');
   writeTree(vaultDir, {});
   const client = await mcpClient(await startTestGateway(vaultDir, join(root, 'state')));
+  mkdirSync(join(vaultDir, 'Notes'), { recursive: true });
   writeFileSync(join(vaultDir, 'Notes/hand.md'), '---\nid: hand-id\ntype: fact\n---\n\n# Hand written\n\nobsidian edit\n');
   await waitFor(async () => {
     const read = await client.call('brain_read', { id: 'hand-id' });
@@ -3892,7 +3893,7 @@ The `brain_project_ensure` tool ignores `idempotency_key` beyond validating it: 
 - [ ] **Step 5: Implement** `src/http.ts`
 
 ```ts
-import { randomUUID } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import express, { type Express, type Request, type Response } from 'express';
@@ -3957,7 +3958,7 @@ export function createApp(brain: Brain, config: Config): Express {
     }
     const server = createMcpServer(brain);
     const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
+      sessionIdGenerator: undefined,
       onsessionclosed: () => {
         void transport.close();
         void server.close();
@@ -4001,6 +4002,7 @@ export interface Gateway {
 }
 
 export async function startGateway(config: Config): Promise<Gateway> {
+  mkdirSync(config.vaultDir, { recursive: true });
   const brain = openBrain(config);
   const server: Server = createServer(createApp(brain, config));
   try {
