@@ -916,6 +916,7 @@ class BrainRuntimeImpl implements BrainRuntime {
     this.currentObserver = undefined;
     await this.localBrain?.close().catch(() => undefined);
     this.localBrain = undefined;
+    await this.options.local?.worker?.close?.().catch(() => undefined);
     this.localDeps = undefined;
     this.currentIndex?.close();
     this.currentIndex = undefined;

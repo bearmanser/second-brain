@@ -4,48 +4,49 @@ A portable personal memory system that an AI coding agent can use through one
 authenticated remote MCP connection, with the knowledge stored as plain Markdown
 that the owner can open in Obsidian.
 
-The deployment is **one repository** and **one Docker Compose application with
-two services**:
+The deployment is **one repository** and **one Docker Compose application with a
+single `brain` service**. The Node process owns the application interface and
+supervises a private Python child for optional local Laya reranking:
 
 | Service | Role | Published? |
 |---|---|---|
-| `brain` | Custom TypeScript MCP gateway; the only application interface | `127.0.0.1:7331/mcp` (loopback only) |
-| `memory` | Basic Memory MCP backend; indexing and retrieval | not published |
+| `brain` | TypeScript MCP gateway, local document/retrieval store, and supervised Python worker | `127.0.0.1:7331/mcp` (loopback only) |
 
 There is **no OpenCode plugin, no separate REST application API, no server-side
-chat model, and no automatic transcript ingestion**. The working agent calls one
-MCP endpoint; the gateway validates requests, authorizes scopes, serializes
-writes, and adapts to Basic Memory.
+chat model, no external memory backend, and no automatic transcript ingestion**.
+The working agent calls one MCP endpoint; the gateway validates requests,
+serializes writes, and serves owned local retrieval.
 
 ## What it provides
 
 - Seven typed note kinds: `lesson`, `decision`, `playbook`, `fact`,
   `preference`, `session`, and flexible `note`.
-- Candidate capture and an explicit, owner-aware review workflow.
+- Candidate capture and an explicit review workflow.
 - Non-destructive, idempotent revisions; manual Obsidian edits are detected and
   never silently overwritten.
-- Scope authorization: a project, its explicitly permitted shared scope, and an
-  owner-only profile scope, never inferred from a folder name.
+- One configured bearer token that grants access to every brain operation and
+  every project. Projects organize information; they are not authorization.
 - Bounded retrieval with explicit empty/partial/degraded states, not invented
   confidence.
+- Rebuildable SQLite FTS5 search with optional local Laya reranking.
 - Cold backup, restore verification, and index rebuild procedures.
-- Offline hybrid search after the local embedding model has been warmed once.
+- Offline operation after the explicit model-preparation step; normal startup
+  never fetches models.
 
 ## The seven tools
 
 | Tool | Purpose |
 |---|---|
-| `brain_project_ensure` | Canonicalize the current repository remote, create or reuse its project, and grant role-matched access. |
-| `brain_recall` | Scoped text/hybrid retrieval with phase, kind, and budget options. |
+| `brain_project_ensure` | Canonicalize the current repository remote and create or reuse its project. |
+| `brain_recall` | Scoped text/reranked retrieval with phase, kind, and budget options. |
 | `brain_read` | Current or explicit historical revision with bounded pagination and an etag. |
 | `brain_capture` | Create a structured candidate with evidence and an idempotency key. |
 | `brain_review` | List candidates/conflicts; approve, revise, supersede, archive, or resolve. |
 | `brain_feedback` | Record useful/irrelevant/stale/incorrect/contradiction feedback. |
-| `brain_status` | Authorized scopes, schema/version, backend health, pending work, operation state. |
+| `brain_status` | Projects, schema/version, local gateway/index/model health, pending work, operation state. |
 
-Raw Basic Memory tools (`write_note`, `search_notes`, `delete_note`,
-`read_note`, `fetch`, ...) are **not exposed**; the backend port is private to
-the Compose network.
+There is no raw backend tool surface; retrieval and indexing run inside the
+`brain` container.
 
 ## Quick start
 
@@ -53,11 +54,19 @@ the Compose network.
 # 1. Load the pinned image references and build once.
 bash scripts/setup.sh
 
-# 2. Start the two services.
+# 2. Start the single application container.
 docker compose up -d
 
 # 3. Verify.
 docker compose exec brain node dist/cli.js health
+```
+
+Optional reranking stays disabled until the operator prepares the immutable
+model snapshot explicitly and passes the evaluated release gate:
+
+```sh
+bash scripts/prepare-models.sh
+# then set BRAIN_LAYA_ENABLED=true and BRAIN_SEARCH_MODE=reranked in .env
 ```
 
 Then register the gateway with your MCP client. A verified OpenCode v2 snippet is
@@ -75,7 +84,7 @@ project setup is required.
 | Document | Contents |
 |---|---|
 | [docs/setup.md](docs/setup.md) | User runbook: setup, client registration, tools, credentials, upgrades. |
-| [docs/security.md](docs/security.md) | Authentication, authorization, note-as-data, logging, network exposure. |
+| [docs/security.md](docs/security.md) | Authentication, note-as-data, logging, network exposure. |
 | [docs/operations.md](docs/operations.md) | Recovery, backup, restore, index rebuild, logs, safe upgrades. |
 | [docs/agent-protocol.md](docs/agent-protocol.md) | Wire protocol and error codes. |
 | [docs/compatibility.md](docs/compatibility.md) | Observed toolchain, pinned digests, and release-gate results. |
@@ -87,10 +96,10 @@ project setup is required.
 | Command | What it runs |
 |---|---|
 | `npm run verify` | Type check, offline unit and contract tests, production build. |
-| `npm run test:contract` | Pinned backend wire-contract tests (offline fixtures). |
+| `npm run test:contract` | Offline contract tests, including historical import fixtures. |
 | `npm run test:integration` | In-process gateway integration suites. |
-| `npm run test:e2e` | Docker end-to-end, security, lifecycle, and operations suites. |
-| `npm run eval:retrieval` | Labeled retrieval evaluation against a real disposable Docker Brain and pinned Basic Memory backend (no chat model). Needs Docker; the offline lexical fallback is not the release-gate metric. |
+| `npm run test:e2e` | Docker end-to-end, single-container, offline, security, lifecycle, and operations suites. |
+| `npm run eval:retrieval` | Labeled retrieval evaluation against a real disposable Docker Brain (no chat model). Needs Docker; the offline lexical fallback is not the release-gate metric. |
 
 Docker-dependent suites are explicit jobs, not silent skips. Tests that require
 an external chat model (the instruction/agent pilot) are **NOT RUN** without an
@@ -113,16 +122,23 @@ approved budget and are recorded as not run, never as green.
   guarantee.
 - Retrieval limits are reference-token estimates for one documented tokenizer
   (`cl100k_base`); they are not guaranteed to match every model family.
+- Reranking quality is not claimed before the evaluated release gate. A failed
+  gate leaves the deployment on lexical text mode.
 
-## Third-party component: Basic Memory
+## Historical third-party component: Basic Memory
 
-The `memory` service runs the unmodified Basic Memory Docker image pinned in
-`config/images.env` and `config/dependency-lock.json`
+Basic Memory is no longer installed, started, or contacted by the production
+deployment. The following notice is retained because earlier releases shipped
+the component and its sanitized wire fixtures remain in the repository for
+reproducible historical import tests.
+
+Earlier releases ran the unmodified Basic Memory Docker image
 (`ghcr.io/basicmachines-co/basic-memory@sha256:939f1173...`, OCI image version
-`0.23.2`, MCP server `4.0.0b1`). Basic Memory is a **third-party component**, not
-part of this repository, and it is used through its published MCP interface only.
+`0.23.2`, MCP server `4.0.0b1`) as a separate `memory` service. Basic Memory is a
+**third-party component**, not part of this repository, and it was used through
+its published MCP interface only.
 
-The license and notices found in that pinned distribution are:
+The license and notices found in that pinned distribution were:
 
 - `LICENSE`: **GNU Affero General Public License, Version 3** (`AGPL-3.0-or-later`).
 - `pyproject.toml`: `license = { text = "AGPL-3.0-or-later" }`.

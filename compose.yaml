@@ -5,6 +5,7 @@ services:
       context: .
       args:
         NODE_IMAGE: ${NODE_IMAGE:?Run setup to load the pinned image reference}
+        PYTHON_IMAGE: ${PYTHON_IMAGE:?Run setup to load the pinned image reference}
     command: [serve]
     user: "${BRAIN_UID:-1000}:${BRAIN_GID:-1000}"
     ports:
@@ -16,15 +17,19 @@ services:
       BRAIN_CURSOR_SECRET: /run/secrets/brain_cursor
       BRAIN_STATE_DIR: /var/lib/second-brain
       BRAIN_VAULT_DIR: /vault
-      BRAIN_BACKEND_URL: http://memory:8000/mcp
+      BRAIN_SEARCH_MODE: ${BRAIN_SEARCH_MODE:-text}
+      BRAIN_LAYA_ENABLED: ${BRAIN_LAYA_ENABLED:-false}
+      BRAIN_LAYA_MODEL_DIR: ${BRAIN_LAYA_MODEL_DIR:-/var/lib/second-brain/models/laya/runtime}
+      BRAIN_LAYA_BATCH_SIZE: ${BRAIN_LAYA_BATCH_SIZE:-8}
+      BRAIN_LAYA_QUEUE_BATCHES: ${BRAIN_LAYA_QUEUE_BATCHES:-4}
+      BRAIN_LAYA_TIMEOUT_MS: ${BRAIN_LAYA_TIMEOUT_MS:-4000}
+      BRAIN_LAYA_THREADS: ${BRAIN_LAYA_THREADS:-2}
+      BRAIN_RECONCILE_INTERVAL_MS: ${BRAIN_RECONCILE_INTERVAL_MS:-30000}
     volumes:
-      - ${VAULT_PATH:-./vault}:/vault:ro
+      - ${VAULT_PATH:-./vault}:/vault
       - ./config/brain.yaml:/run/brain/brain.yaml:ro
       - brain-state:/var/lib/second-brain
     secrets: [brain_token, brain_cursor]
-    depends_on:
-      memory:
-        condition: service_started
     healthcheck:
       test: [CMD, node, dist/cli.js, health]
       interval: 30s
@@ -32,24 +37,10 @@ services:
       retries: 3
       start_period: 120s
     init: true
-    restart: unless-stopped
-  memory:
-    image: ${BASIC_MEMORY_IMAGE:?Run setup to load the pinned image reference}
-    command: [basic-memory, mcp, --transport, streamable-http, --host, 0.0.0.0, --port, "8000"]
-    user: "${BRAIN_UID:-1000}:${BRAIN_GID:-1000}"
-    environment:
-      BASIC_MEMORY_CONFIG_DIR: /home/appuser/.basic-memory
-      BASIC_MEMORY_HOME: /home/appuser/.basic-memory/home
-      BASIC_MEMORY_PROJECT_ROOT: /app/data/Projects
-      BASIC_MEMORY_INDEX_CHANGES: "true"
-      BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED: "true"
-      BASIC_MEMORY_SEMANTIC_EMBEDDING_PROVIDER: fastembed
-      BASIC_MEMORY_RERANKER_ENABLED: "false"
-    volumes:
-      - ${VAULT_PATH:-./vault}:/app/data
-      - memory-state:/home/appuser/.basic-memory
-      - model-cache:/home/appuser/.basic-memory/fastembed_cache
-    init: true
+    mem_limit: ${BRAIN_MEMORY_LIMIT:-6g}
+    cpus: ${BRAIN_CPU_LIMIT:-2.0}
+    pids_limit: 512
+    stop_grace_period: 30s
     restart: unless-stopped
 secrets:
   brain_token:
@@ -58,5 +49,3 @@ secrets:
     file: ./secrets/cursor-key
 volumes:
   brain-state:
-  memory-state:
-  model-cache:

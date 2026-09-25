@@ -17,13 +17,13 @@ const fixtureNames = [
   'create-memory-project'
 ];
 
-test('requires note and project creation, search, read, and project discovery tools', () => {
+test('requires note and project creation, search, read, and project discovery tools (historical Basic Memory fixture)', () => {
   expect(() => assertBackendCapabilities([
     { name: 'search_notes', inputSchema: {} }
   ])).toThrow(/write_note/);
 });
 
-test('accepts the observed Basic Memory tool surface', () => {
+test('accepts the observed Basic Memory tool surface (historical fixture retained for reproducible import tests)', () => {
   const fixture = readJson<{ observedToolCount: number; tools: { name: string; inputSchema: unknown }[] }>(
     'tests/fixtures/backend/tools-list.json'
   );
@@ -41,17 +41,21 @@ test('pins validated image digests consistently across images.env and the depend
   );
   const lock = readJson<{ images: Record<string, string> }>('config/dependency-lock.json');
   expect(env.size).toBe(2);
-  for (const name of ['NODE_IMAGE', 'BASIC_MEMORY_IMAGE']) {
+  for (const name of ['NODE_IMAGE', 'PYTHON_IMAGE']) {
     expect(env.get(name)).toBe(lock.images[name]);
     expect(env.get(name)).toMatch(/@sha256:[a-f0-9]{64}$/);
   }
+  expect(lock.images).not.toHaveProperty('BASIC_MEMORY_IMAGE');
 });
 
-test('constrains backend-created projects to the Projects subtree', () => {
+test('ships a single application service with no live Basic Memory backend', () => {
   const compose = readText('compose.yaml');
-  expect(compose).toContain('BASIC_MEMORY_PROJECT_ROOT: /app/data/Projects');
-  expect(compose).toContain('${VAULT_PATH:-./vault}:/vault:ro');
-  expect(compose).toContain('${VAULT_PATH:-./vault}:/app/data');
+  expect(compose).not.toMatch(/^\s{2}memory:\s*$/m);
+  expect(compose).not.toMatch(/BASIC_MEMORY|backend_endpoint|BRAIN_BACKEND_URL/);
+  expect(compose).not.toMatch(/embedding|fastembed/i);
+  expect(compose).toContain('${VAULT_PATH:-./vault}:/vault');
+  expect(compose).not.toContain('/vault:ro');
+  expect(compose).not.toContain('/app/data');
 });
 
 test('records exact resolved dependency versions and the Node 24 engine range', () => {
@@ -71,7 +75,7 @@ test('records exact resolved dependency versions and the Node 24 engine range', 
   }
 });
 
-test('ships sanitized fixtures for the observed backend wire responses', () => {
+test('ships sanitized historical fixtures for the observed backend wire responses', () => {
   const combined = fixtureNames.map((name) => readText(`tests/fixtures/backend/${name}.json`)).join('\n');
   const initialize = readJson<{ protocolVersion: string; serverInfo: { name: string; version: string } }>(
     'tests/fixtures/backend/initialize.json'

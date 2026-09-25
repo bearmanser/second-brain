@@ -53,6 +53,7 @@ export interface RerankWorker {
     candidates: readonly LayaCandidate[];
     signal?: AbortSignal;
   }): Promise<LayaScoreResult>;
+  close?(): Promise<void>;
 }
 
 export interface RerankedCandidate extends Candidate {

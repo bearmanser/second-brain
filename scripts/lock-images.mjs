@@ -7,8 +7,8 @@ const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 
 const digestPattern = /^([a-z0-9][a-z0-9._/-]*)@(sha256:[a-f0-9]{64})$/;
 const defaultDiscoveryInputs = {
-  node: 'node:24-alpine',
-  backend: 'ghcr.io/basicmachines-co/basic-memory:latest'
+  node: 'node:24-bookworm-slim',
+  python: 'python:3.12-slim'
 };
 
 function docker(args) {
@@ -19,7 +19,7 @@ function parseArguments(argv) {
   const inputs = { ...defaultDiscoveryInputs, configDirectory: join(repoRoot, 'config') };
   for (let index = 0; index < argv.length; index += 1) {
     if (argv[index] === '--node') inputs.node = argv[index + 1];
-    if (argv[index] === '--backend') inputs.backend = argv[index + 1];
+    if (argv[index] === '--python') inputs.python = argv[index + 1];
     if (argv[index] === '--config-dir') inputs.configDirectory = resolve(argv[index + 1]);
   }
   return inputs;
@@ -33,10 +33,6 @@ function repodigest(reference) {
     if (match !== null) return `${match[1]}@${match[2]}`;
   }
   throw new Error(`No sha256 RepoDigest found for image: ${reference}`);
-}
-
-function imageLabel(reference, label) {
-  return docker(['image', 'inspect', '--format', `{{index .Config.Labels "${label}"}}`, reference]);
 }
 
 function readJson(path) {
@@ -64,7 +60,7 @@ const packageJson = readJson(join(repoRoot, 'package.json'));
 const preserved = preservedSections(join(configDirectory, 'dependency-lock.json'));
 
 const nodeImage = repodigest(inputs.node);
-const basicMemoryImage = repodigest(inputs.backend);
+const pythonImage = repodigest(inputs.python);
 
 const lock = {
   schemaVersion: 1,
@@ -77,15 +73,7 @@ const lock = {
   devDependencies: packageJson.devDependencies,
   images: {
     NODE_IMAGE: nodeImage,
-    BASIC_MEMORY_IMAGE: basicMemoryImage
-  },
-  backend: {
-    name: 'basic-memory',
-    imageVersion: imageLabel(inputs.backend, 'org.opencontainers.image.version'),
-    revision: imageLabel(inputs.backend, 'org.opencontainers.image.revision'),
-    transport: 'streamable-http',
-    mcpPath: '/mcp',
-    port: 8000
+    PYTHON_IMAGE: pythonImage
   },
   ...preserved
 };
@@ -94,8 +82,8 @@ mkdirSync(configDirectory, { recursive: true });
 writeFileSync(join(configDirectory, 'dependency-lock.json'), `${JSON.stringify(lock, null, 2)}\n`, 'utf8');
 writeFileSync(
   join(configDirectory, 'images.env'),
-  `NODE_IMAGE=${nodeImage}\nBASIC_MEMORY_IMAGE=${basicMemoryImage}\n`,
+  `NODE_IMAGE=${nodeImage}\nPYTHON_IMAGE=${pythonImage}\n`,
   'utf8'
 );
 
-process.stdout.write(`Wrote ${join(configDirectory, 'dependency-lock.json')} and ${join(configDirectory, 'images.env')} for:\n${nodeImage}\n${basicMemoryImage}\n`);
+process.stdout.write(`Wrote ${join(configDirectory, 'dependency-lock.json')} and ${join(configDirectory, 'images.env')} for:\n${nodeImage}\n${pythonImage}\n`);

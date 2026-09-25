@@ -620,10 +620,10 @@ test('the operational scripts carry the required restart and validation guards',
   expect(restore).toMatch(/compose.*project|COMPOSE_PROJECT_NAME/);
 
   const rebuild = await readFile(join(REPO_ROOT, 'scripts', 'rebuild.sh'), 'utf8');
-  expect(rebuild).toMatch(/basic-memory reindex/);
+  expect(rebuild).toMatch(/rebuild-index/);
   expect(rebuild).toMatch(/rebuild-catalogue/);
   expect(rebuild).toMatch(/journal\.db/);
-  expect(rebuild).toMatch(/feedback/);
+  expect(rebuild).toMatch(/operational recovery/);
 
   for (const script of ['backup.sh', 'restore.sh', 'rebuild.sh']) {
     const result = run('bash', ['-n', join(REPO_ROOT, 'scripts', script)]);

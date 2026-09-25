@@ -100,7 +100,6 @@ function buildScopes(primary: string | undefined): ScopeConfig[] {
 function buildConfig(scopes: ScopeConfig[]): BrainConfig {
   return {
     endpoint: 'http://127.0.0.1:7331/mcp',
-    backend_endpoint: 'http://memory:8000/mcp',
     port: 7331,
     mounts: { vault: DEFAULT_VAULT_MOUNT, state: DEFAULT_STATE_MOUNT },
     cursor_secret_file: DEFAULT_CURSOR_MOUNT,

@@ -9,9 +9,9 @@ single-owner personal deployment.
 | Boundary | Property |
 |---|---|
 | Public interface | Exactly one MCP endpoint, `POST http://127.0.0.1:7331/mcp`. |
-| Network | Only the gateway port is published, and Compose binds it to loopback. The Basic Memory backend port is not published. |
-| Backend | The gateway reaches Basic Memory over the private Compose network through its MCP interface. It never reads Basic Memory's SQLite tables. |
-| Vault | Mounted **read-only** into the gateway and read/write into Basic Memory, which is the only process that writes knowledge revisions. |
+| Network | Only the gateway port is published, and Compose binds it to loopback. There is no backend service or published backend port. |
+| Retrieval | The gateway owns a local SQLite FTS5 index and an optional supervised Python worker inside the same container. It never contacts an external memory backend. |
+| Vault | Mounted **read-write** into the application container; every write goes through the gateway's validated, journaled operations, and containment checks still apply. |
 | Application surface | No OpenCode plugin, no REST application API, no server-side chat model, no transcript ingestion. |
 
 There is no knowledge endpoint outside `/mcp`. Unauthenticated methods are
@@ -22,8 +22,9 @@ rejected before method handling; non-`/mcp` paths return `404`.
 - Every request must carry `Authorization: Bearer <token>`. Missing, malformed,
   empty, or unknown credentials get `401` with a `WWW-Authenticate: Bearer`
   challenge.
-- Credentials are high-entropy random bearer tokens. Only their SHA-256 digests
-  are stored, in `secrets/credentials.json` (mode `0600`, directory `0700`).
+- Credentials are a single high-entropy random bearer token. Only its SHA-256
+  digest is stored, as `BRAIN_TOKEN_SHA256` in the operator `.env` file; the raw
+  token lives only in `secrets/brain-token` (mode `0600`, directory `0700`).
   Tokens are never written to `config/brain.yaml`, logs, or the repository.
 - Authentication is per request. MCP session IDs are **not** authentication, and
   the endpoint is stateless.
@@ -143,10 +144,12 @@ allowed to read.
 ## Remote deployment
 
 The shipped configuration is loopback-only. For a deliberate remote deployment,
-place the gateway behind a TLS-terminating reverse proxy, keep the basic
+place the gateway behind a TLS-terminating reverse proxy, keep the
 authentication boundary at the proxy **and** the bearer boundary at the gateway,
-restrict the proxy to the client network, and keep the backend port private.
-Never expose the unauthenticated Basic Memory backend to reach it remotely.
+and restrict the proxy to the client network. For example, a private ingress such
+as Tailscale may publish the port on the private interface, but the token, host,
+and origin checks still apply and must not be weakened. The worker is private to
+the container and is never exposed.
 
 ## Residual risk
 
@@ -154,9 +157,9 @@ Never expose the unauthenticated Basic Memory backend to reach it remotely.
   edit files directly; this deployment is not a sandbox against that actor.
 - Client instruction delivery is outside the server's control; the gateway
   cannot force an unseen client to inject initialization guidance.
-- A cloud-hosted working agent sees the notes it retrieves. Local embeddings
-  avoid a hosted embedding API, but returned notes still enter that agent's
-  context.
+- A cloud-hosted working agent sees the notes it retrieves. Local retrieval and
+  local inference avoid a hosted model API, but returned notes still enter that
+  agent's context.
 - Cross-client or company isolation requires separate instances or deployment
   permissions beyond this gateway.
 

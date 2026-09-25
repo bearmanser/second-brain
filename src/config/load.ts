@@ -9,9 +9,12 @@ import {
   layaConfigSchema,
   tokenDigestSchema
 } from './schema.js';
-import type { BrainConfig, LayaSettings } from './schema.js';
+import type { BrainConfig, LayaSettings, SearchMode } from './schema.js';
 
 export const BRAIN_TOKEN_ENV = 'BRAIN_TOKEN_SHA256';
+export const SEARCH_MODE_ENV = 'BRAIN_SEARCH_MODE';
+export const SEARCH_FALLBACK_ONLY_ENV = 'BRAIN_SEARCH_FALLBACK_ONLY';
+export const RECONCILE_INTERVAL_ENV = 'BRAIN_RECONCILE_INTERVAL_MS';
 
 const invalidConfig = (message: string, cause?: unknown): BrainError =>
   new BrainError({ code: 'INVALID_INPUT', message, cause });
@@ -112,4 +115,48 @@ export function resolveLayaSettings(config: BrainConfig, env: NodeJS.ProcessEnv 
     timeout_ms: laya.timeout_ms,
     threads: laya.threads
   };
+}
+
+export interface SearchSettings {
+  mode: SearchMode;
+  fallback_only: boolean;
+}
+
+export function resolveSearchSettings(
+  config: BrainConfig,
+  env: NodeJS.ProcessEnv = process.env
+): SearchSettings {
+  const rawMode = env[SEARCH_MODE_ENV] ?? config.search_mode ?? 'text';
+  if (rawMode !== 'text' && rawMode !== 'reranked') {
+    throw invalidConfig(`${SEARCH_MODE_ENV} must be text or reranked`);
+  }
+  const rawFallback =
+    env[SEARCH_FALLBACK_ONLY_ENV] ?? ((config.search_fallback_only ?? false) ? 'true' : 'false');
+  if (rawFallback !== 'true' && rawFallback !== 'false') {
+    throw invalidConfig(`${SEARCH_FALLBACK_ONLY_ENV} must be true or false`);
+  }
+  const fallback_only = rawFallback === 'true';
+  if (rawMode === 'reranked' && !resolveLayaSettings(config, env).enabled && !fallback_only) {
+    throw invalidConfig(
+      `${SEARCH_MODE_ENV}=reranked requires BRAIN_LAYA_ENABLED=true, unless ` +
+        `${SEARCH_FALLBACK_ONLY_ENV}=true explicitly selects lexical fallback`
+    );
+  }
+  return { mode: rawMode, fallback_only };
+}
+
+export function resolveReconcileInterval(
+  config: BrainConfig,
+  env: NodeJS.ProcessEnv = process.env
+): number {
+  const raw = env[RECONCILE_INTERVAL_ENV];
+  if (raw === undefined || raw.length === 0) return config.limits.reconcile_interval_ms;
+  if (!/^[0-9]{1,9}$/.test(raw)) {
+    throw invalidConfig(`${RECONCILE_INTERVAL_ENV} must be a positive integer`);
+  }
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1) {
+    throw invalidConfig(`${RECONCILE_INTERVAL_ENV} must be a positive integer`);
+  }
+  return value;
 }

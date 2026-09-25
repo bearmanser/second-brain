@@ -46,7 +46,9 @@ test('loads the documented example configuration', () => {
   const config = loadConfig(exampleConfigPath);
   expect(config.scopes.map((scope) => scope.id)).toEqual(['freellmapi', 'shared', 'profile']);
   expect(config.endpoint).toBe('http://127.0.0.1:7331/mcp');
-  expect(config.backend_endpoint).toBe('http://memory:8000/mcp');
+  expect(config.backend_endpoint).toBeUndefined();
+  expect(config.search_mode).toBe('text');
+  expect(config.search_fallback_only).toBe(false);
   expect(config.mounts.vault).toBe('/vault');
   expect(config.allowed_hosts.length).toBeGreaterThan(0);
   expect(config.limits.backend_timeout_ms).toBe(15000);

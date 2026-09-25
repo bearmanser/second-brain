@@ -8,7 +8,8 @@ docs
 tests
 vault
 secrets
-config
+config/brain.yaml
+config/opencode.example.jsonc
 .env
 .env.*
 !.env.example
@@ -16,4 +17,3 @@ config
 *.db
 *.db-wal
 *.db-shm
-basic-memory-data

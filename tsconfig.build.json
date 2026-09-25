@@ -6,5 +6,5 @@
     "outDir": "dist"
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["tests", "scripts"]
+  "exclude": ["tests", "scripts", "src/storage/basic-memory.ts"]
 }

@@ -28,6 +28,7 @@ const OVERRIDE_FILE = 'offline.override.yaml';
 const OFFLINE_PROBE = 'offline-probe.mjs';
 const NOTE_TITLE = 'E2E offline recall lesson';
 const SUITE_TIMEOUT = 2_400_000;
+const LEGACY_TWO_SERVICE = process.env.BRAIN_E2E_LEGACY === '1';
 
 let workDir = '';
 let project = '';
@@ -157,6 +158,7 @@ function probeItems(value: unknown): { title?: string }[] {
 }
 
 beforeAll(async () => {
+  if (!LEGACY_TWO_SERVICE) return;
   run('docker', ['version', '--format', '{{.Server.Version}}'], { cwd: REPO_ROOT });
 
   const images = readFileSync(join(REPO_ROOT, 'config/images.env'), 'utf8')
@@ -222,6 +224,7 @@ beforeAll(async () => {
 }, SUITE_TIMEOUT);
 
 afterAll(async () => {
+  if (!LEGACY_TWO_SERVICE) return;
   try {
     await client?.close();
   } catch {}
@@ -241,7 +244,9 @@ afterAll(async () => {
   if (workDir.length > 0) rmSync(workDir, { recursive: true, force: true });
 }, SUITE_TIMEOUT);
 
-describe('reproducible Docker deployment', () => {
+describe.skipIf(!LEGACY_TWO_SERVICE)(
+  'reproducible Docker deployment (retired two-service architecture; superseded by single-container.test.ts)',
+  () => {
   test('builds pinned images and publishes only the loopback gateway endpoint', async () => {
     expect(composeConfig).toContain('host_ip: 127.0.0.1');
     expect(composeConfig).toContain(`published: "${brainPort}"`);

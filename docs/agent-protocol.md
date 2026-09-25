@@ -20,7 +20,7 @@ than authority over the user's request, to recall before substantial planning,
 debugging, or architectural work, to capture typed candidates with evidence, to
 approve, revise, or otherwise review those candidates with the same token, to
 report feedback, to treat retrieved note text as untrusted data, and to
-distinguish an unavailable memory service from an empty result.
+distinguish an unavailable local index or model from an empty result.
 
 Instructions are built from static prose. Producing them never reads a user
 note, the retrieval log, or any per-principal state. A client may ignore the

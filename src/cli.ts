@@ -1,12 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { loadTokenDigest } from './config/load.js';
+import type { BrainConfig } from './config/schema.js';
 import { BrainError, isBrainError } from './contracts/errors.js';
-import type { Clock, IdSource } from './core/types.js';
-import { MutationCoordinator, InstanceLock, type BrainDeps } from './core/mutation.js';
+import type { Clock, IdSource, LocalHandlerDeps } from './core/types.js';
+import { InstanceLock } from './core/mutation.js';
 import { installShutdownHandlers, main, resolveConfig } from './main.js';
 import { APPLICATION_VERSION, SCHEMA_VERSION } from './mcp/tools.js';
 import { installObsidianAssets } from './obsidian/install.js';
@@ -28,9 +29,7 @@ import { selectLegacyCredentialDigest } from './operations/legacy-credentials.js
 import {
   assertRecoveryMode,
   describeRecoveryInput,
-  recoverPending,
   requireRecoveryAuthorization,
-  summariseRecovery,
   summariseRecoveryInput
 } from './operations/recovery.js';
 import {
@@ -59,8 +58,12 @@ import {
 import { readEvaluationDataset } from './retrieval/evaluation-dataset.js';
 import { retrievalQueryId } from './retrieval/evaluation.js';
 import { generateBearerToken } from './security/authenticate.js';
-import { BasicMemoryBackend } from './storage/basic-memory.js';
-import { Journal } from './storage/journal.js';
+import { Journal, LocalOperationJournal } from './storage/journal.js';
+import { openSearchIndex } from './storage/search-index.js';
+import { openRevisionStore } from './storage/revision-store.js';
+import { openDocumentStore } from './storage/document-store.js';
+import { CurrentCatalogue, type CurrentVault } from './notes/current-catalogue.js';
+import { buildLocalHandlerDeps, type LocalBrain } from './features/local-support.js';
 import { FileVault } from './storage/vault.js';
 
 export type CliCommand =
@@ -228,47 +231,74 @@ async function runHealth(parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promi
   return healthy ? 0 : 1;
 }
 
-async function runRecover(_parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promise<number> {
-  const config = resolveConfig(env);
-  const lock = InstanceLock.acquire(config.mounts.state);
-  let journal: Journal | undefined;
-  let catalogue: RevisionCatalogue | undefined;
-  let backend: BasicMemoryBackend | undefined;
+interface LocalRecovery {
+  deps: LocalHandlerDeps;
+  close(): Promise<void>;
+}
+
+async function openLocalRecovery(config: BrainConfig): Promise<LocalRecovery> {
+  const journal = Journal.open(join(config.mounts.state, 'journal.db'), { requireExisting: true });
+  const vault = new FileVault(config.mounts.vault, config.scopes);
+  const revisions = await openRevisionStore(config.mounts.state);
+  const catalogue = CurrentCatalogue.open({ revisions, ids: systemIds });
+  const indexPath = join(config.mounts.state, 'index', 'search.sqlite');
+  mkdirSync(dirname(indexPath), { recursive: true });
+  const index = openSearchIndex(indexPath);
+  let documents;
   try {
-    journal = Journal.open(join(config.mounts.state, 'journal.db'), { requireExisting: true });
-    const vault = new FileVault(config.mounts.vault, config.scopes);
-    const scopeRegistry = new ScopeRegistry(config.scopes, journal);
-    for (const scope of scopeRegistry.all()) vault.registerScope(scope);
-    catalogue = RevisionCatalogue.open(join(config.mounts.state, 'catalogue.db'), {
-      vault,
-      scopes: scopeRegistry.all(),
-      clock: systemClock,
-      approval_provenance: new JournalApprovalProvenance(journal)
-    });
-    backend = new BasicMemoryBackend({
-      url: config.backend_endpoint,
-      projects: scopeRegistry.all().map((scope) => scope.backend_project),
-      timeout_ms: config.limits.backend_timeout_ms
-    });
-    await backend.connect();
-    for (const scope of scopeRegistry.all()) backend.registerScope(scope);
-    const mutations = new MutationCoordinator({
-      config,
-      scopeRegistry,
-      backend,
-      vault,
-      catalogue,
-      journal,
+    documents = await openDocumentStore({
+      vault: config.mounts.vault,
+      state: config.mounts.state,
+      index: { upsert: (entry) => index.upsert(entry), remove: (path) => index.remove(path) },
       clock: systemClock,
       ids: systemIds
     });
-    await mutations.recover();
+  } catch (error) {
+    index.close();
+    catalogue.close();
+    journal.close();
+    throw error;
+  }
+  const operations = LocalOperationJournal.open(join(config.mounts.state, 'operations.sqlite'));
+  const brain: LocalBrain = {
+    config,
+    clock: systemClock,
+    ids: systemIds,
+    documents,
+    catalogue,
+    index,
+    journal,
+    operations,
+    vault: vault as unknown as CurrentVault,
+    vaultRoot: config.mounts.vault,
+    close: async () => {
+      operations.close();
+      await documents.close();
+    }
+  };
+  const deps = await buildLocalHandlerDeps(brain);
+  return {
+    deps,
+    close: async () => {
+      await documents.close().catch(() => undefined);
+      index.close();
+      catalogue.close();
+      journal.close();
+    }
+  };
+}
+
+async function runRecover(_parsed: ParsedArguments, env: NodeJS.ProcessEnv): Promise<number> {
+  const config = resolveConfig(env);
+  const lock = InstanceLock.acquire(config.mounts.state);
+  let recovery: LocalRecovery | undefined;
+  try {
+    recovery = await openLocalRecovery(config);
+    await recovery.deps.mutations.recover();
     process.stdout.write('recovery complete\n');
     return 0;
   } finally {
-    await backend?.close().catch(() => undefined);
-    catalogue?.close();
-    journal?.close();
+    await recovery?.close().catch(() => undefined);
     lock.release();
   }
 }
@@ -445,61 +475,15 @@ async function runRecoverState(parsed: ParsedArguments, env: NodeJS.ProcessEnv):
       })
     )}\n`
   );
-  let journal: Journal | undefined;
-  let catalogue: RevisionCatalogue | undefined;
-  let backend: BasicMemoryBackend | undefined;
+  let recovery: LocalRecovery | undefined;
   try {
-    journal = Journal.open(join(config.mounts.state, 'journal.db'), { requireExisting: true });
-    const vault = new FileVault(config.mounts.vault, config.scopes);
-    const scopeRegistry = new ScopeRegistry(config.scopes, journal);
-    for (const scope of scopeRegistry.all()) vault.registerScope(scope);
-    catalogue = RevisionCatalogue.open(join(config.mounts.state, 'catalogue.db'), {
-      vault,
-      scopes: scopeRegistry.all(),
-      clock: systemClock,
-      approval_provenance: new JournalApprovalProvenance(journal)
-    });
-    backend = new BasicMemoryBackend({
-      url: config.backend_endpoint,
-      projects: scopeRegistry.all().map((scope) => scope.backend_project),
-      timeout_ms: config.limits.backend_timeout_ms
-    });
-    await backend.connect();
-    for (const scope of scopeRegistry.all()) backend.registerScope(scope);
-    const mutations = new MutationCoordinator({
-      config,
-      scopeRegistry,
-      backend,
-      vault,
-      catalogue,
-      journal,
-      clock: systemClock,
-      ids: systemIds
-    });
-    const deps: BrainDeps = {
-      config,
-      scopeRegistry,
-      backend,
-      vault,
-      catalogue,
-      journal,
-      clock: systemClock,
-      ids: systemIds,
-      mutations
-    };
-    const report = await recoverPending(deps);
-    process.stdout.write(`${summariseRecovery(report)}\n`);
-    for (const operation of report.operations) {
-      process.stdout.write(
-        `  ${operation.operation_id} ${operation.previous_state}->${operation.state} ` +
-          `${operation.outcome}${operation.reason === undefined ? '' : ` (${operation.reason})`}\n`
-      );
-    }
-    return report.blocking_operations.length > 0 ? 1 : 0;
+    recovery = await openLocalRecovery(config);
+    await recovery.deps.mutations.recover();
+    const pending = recovery.deps.mutations.pending().length;
+    process.stdout.write(`recovery complete; ${pending} pending operation(s) remain\n`);
+    return 0;
   } finally {
-    await backend?.close().catch(() => undefined);
-    catalogue?.close();
-    journal?.close();
+    await recovery?.close().catch(() => undefined);
     lock.release();
   }
 }

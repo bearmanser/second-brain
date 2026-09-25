@@ -16,6 +16,9 @@ import type { ScopeConfig } from '../core/types.js';
 export const RESULT_DELIVERY_MODES = ['structured', 'text-json'] as const;
 export type ResultDelivery = (typeof RESULT_DELIVERY_MODES)[number];
 
+export const SEARCH_MODES = ['text', 'reranked'] as const;
+export type SearchMode = (typeof SEARCH_MODES)[number];
+
 export const TOKEN_SHA256_PATTERN = /^[a-f0-9]{64}$/;
 
 export const tokenDigestSchema = z.string().regex(TOKEN_SHA256_PATTERN, {
@@ -152,7 +155,7 @@ const DEFAULT_LAYA = {
 
 export const brainConfigSchema = z.strictObject({
   endpoint: httpEndpoint,
-  backend_endpoint: httpEndpoint,
+  backend_endpoint: httpEndpoint.optional(),
   port: z.int().min(1).max(65535),
   mounts: brainMountsSchema,
   cursor_secret_file: mountPath.optional(),
@@ -161,6 +164,8 @@ export const brainConfigSchema = z.strictObject({
   allowed_hosts: z.array(safeName).min(1),
   allowed_origins: z.array(httpEndpoint).default([]),
   result_delivery: z.enum(RESULT_DELIVERY_MODES).default('structured'),
+  search_mode: z.enum(SEARCH_MODES).default('text'),
+  search_fallback_only: z.boolean().default(false),
   laya: layaConfigSchema.default(() => ({ ...DEFAULT_LAYA }))
 });
 
@@ -205,7 +210,7 @@ export interface LayaSettings {
 
 export interface BrainConfig {
   endpoint: string;
-  backend_endpoint: string;
+  backend_endpoint?: string;
   port: number;
   mounts: BrainMounts;
   cursor_secret_file?: string;
@@ -214,5 +219,7 @@ export interface BrainConfig {
   allowed_hosts: string[];
   allowed_origins: string[];
   result_delivery: ResultDelivery;
+  search_mode?: SearchMode;
+  search_fallback_only?: boolean;
   laya?: LayaConfig;
 }

@@ -5,14 +5,12 @@ import { join } from 'node:path';
 import { afterEach, expect, test } from 'vitest';
 
 const NODE_DIGEST = `node@sha256:${'a'.repeat(64)}`;
-const BACKEND_DIGEST = `ghcr.io/basicmachines-co/basic-memory@sha256:${'b'.repeat(64)}`;
+const PYTHON_DIGEST = `python@sha256:${'b'.repeat(64)}`;
 
 const FAKE_DOCKER = `#!/bin/sh
 case "$*" in
-  *RepoDigests*node:24-alpine) echo '["${NODE_DIGEST}"]' ;;
-  *RepoDigests*basic-memory:latest) echo '["${BACKEND_DIGEST}"]' ;;
-  *image.version*) echo '0.23.2' ;;
-  *image.revision*) echo 'c0bd87c6d5a4a58034b1d6c8c5018e443b0bd048' ;;
+  *RepoDigests*node:24-bookworm-slim) echo '["${NODE_DIGEST}"]' ;;
+  *RepoDigests*python:3.12-slim) echo '["${PYTHON_DIGEST}"]' ;;
   *) echo "unexpected docker call: $*" >&2; exit 9 ;;
 esac
 `;
@@ -52,15 +50,15 @@ function runLockImages(bin: string, config: string) {
 test('refreshing image metadata preserves the committed Laya provenance section', () => {
   const committed = JSON.parse(readFileSync('config/dependency-lock.json', 'utf8')) as Record<string, unknown>;
   expect(committed.laya).toBeDefined();
-  const stale = { ...committed, images: { NODE_IMAGE: 'old', BASIC_MEMORY_IMAGE: 'old' } };
+  const stale = { ...committed, images: { NODE_IMAGE: 'old', PYTHON_IMAGE: 'old' } };
   const { bin, config } = sandbox(`${JSON.stringify(stale, null, 2)}\n`);
   const run = runLockImages(bin, config);
   expect(run.status, run.stderr).toBe(0);
   const refreshed = JSON.parse(readFileSync(join(config, 'dependency-lock.json'), 'utf8')) as Record<string, unknown>;
   expect(refreshed.laya).toEqual(committed.laya);
-  expect(refreshed.images).toEqual({ NODE_IMAGE: NODE_DIGEST, BASIC_MEMORY_IMAGE: BACKEND_DIGEST });
+  expect(refreshed.images).toEqual({ NODE_IMAGE: NODE_DIGEST, PYTHON_IMAGE: PYTHON_DIGEST });
   expect((refreshed.runtime as Record<string, unknown>).npm).toBe('10.9.9');
-  expect(readFileSync(join(config, 'images.env'), 'utf8')).toBe(`NODE_IMAGE=${NODE_DIGEST}\nBASIC_MEMORY_IMAGE=${BACKEND_DIGEST}\n`);
+  expect(readFileSync(join(config, 'images.env'), 'utf8')).toBe(`NODE_IMAGE=${NODE_DIGEST}\nPYTHON_IMAGE=${PYTHON_DIGEST}\n`);
 });
 
 test('a fresh lock without a previous file has no Laya section to preserve', () => {
@@ -69,7 +67,7 @@ test('a fresh lock without a previous file has no Laya section to preserve', () 
   expect(run.status, run.stderr).toBe(0);
   const created = JSON.parse(readFileSync(join(config, 'dependency-lock.json'), 'utf8')) as Record<string, unknown>;
   expect(created.laya).toBeUndefined();
-  expect(created.images).toEqual({ NODE_IMAGE: NODE_DIGEST, BASIC_MEMORY_IMAGE: BACKEND_DIGEST });
+  expect(created.images).toEqual({ NODE_IMAGE: NODE_DIGEST, PYTHON_IMAGE: PYTHON_DIGEST });
 });
 
 test('refuses to overwrite an unreadable or malformed previous lock', () => {

@@ -16,7 +16,7 @@ fail() {
 }
 
 NODE_IMAGE=""
-BASIC_MEMORY_IMAGE=""
+PYTHON_IMAGE=""
 
 parse_images_env() {
   local file="$1"
@@ -38,11 +38,11 @@ parse_images_env() {
         [ -z "$NODE_IMAGE" ] || fail "duplicate NODE_IMAGE in $file"
         NODE_IMAGE="$value"
         ;;
-      BASIC_MEMORY_IMAGE)
-        [ -z "$BASIC_MEMORY_IMAGE" ] || fail "duplicate BASIC_MEMORY_IMAGE in $file"
-        BASIC_MEMORY_IMAGE="$value"
+      PYTHON_IMAGE)
+        [ -z "$PYTHON_IMAGE" ] || fail "duplicate PYTHON_IMAGE in $file"
+        PYTHON_IMAGE="$value"
         ;;
-      *) fail "unexpected key '$key' in $file (only NODE_IMAGE and BASIC_MEMORY_IMAGE are allowed)" ;;
+      *) fail "unexpected key '$key' in $file (only NODE_IMAGE and PYTHON_IMAGE are allowed)" ;;
     esac
     case "$value" in
       '' ) fail "empty value for $key in $file" ;;
@@ -50,10 +50,10 @@ parse_images_env() {
     esac
   done < "$file"
   [ -n "$NODE_IMAGE" ] || fail "NODE_IMAGE is missing from $file"
-  [ -n "$BASIC_MEMORY_IMAGE" ] || fail "BASIC_MEMORY_IMAGE is missing from $file"
+  [ -n "$PYTHON_IMAGE" ] || fail "PYTHON_IMAGE is missing from $file"
   require_digest_reference "NODE_IMAGE" "$NODE_IMAGE"
-  require_digest_reference "BASIC_MEMORY_IMAGE" "$BASIC_MEMORY_IMAGE"
-  case "$NODE_IMAGE$BASIC_MEMORY_IMAGE" in
+  require_digest_reference "PYTHON_IMAGE" "$PYTHON_IMAGE"
+  case "$NODE_IMAGE$PYTHON_IMAGE" in
     *:latest*) fail "floating 'latest' references are not allowed" ;;
   esac
 }
@@ -85,13 +85,13 @@ write_env_file() {
     while IFS= read -r raw || [ -n "$raw" ]; do
       line="${raw%$'\r'}"
       case "$line" in
-        NODE_IMAGE=* | BASIC_MEMORY_IMAGE=* | VAULT_PATH=* | BRAIN_PORT=* | BRAIN_UID=* | BRAIN_GID=*) continue ;;
+        NODE_IMAGE=* | PYTHON_IMAGE=* | BASIC_MEMORY_IMAGE=* | VAULT_PATH=* | BRAIN_PORT=* | BRAIN_UID=* | BRAIN_GID=*) continue ;;
       esac
       printf '%s\n' "$line" >> "$tmp"
     done < "$ROOT_DIR/.env"
   fi
   printf 'NODE_IMAGE=%s\n' "$NODE_IMAGE" >> "$tmp"
-  printf 'BASIC_MEMORY_IMAGE=%s\n' "$BASIC_MEMORY_IMAGE" >> "$tmp"
+  printf 'PYTHON_IMAGE=%s\n' "$PYTHON_IMAGE" >> "$tmp"
   printf 'VAULT_PATH=%s\n' "${existing_vault:-$vault}" >> "$tmp"
   printf 'BRAIN_PORT=%s\n' "${existing_port:-$port}" >> "$tmp"
   printf 'BRAIN_UID=%s\n' "$BRAIN_UID" >> "$tmp"
@@ -101,34 +101,6 @@ write_env_file() {
 
 run_as_root() {
   docker run --rm --user 0:0 "$@"
-}
-
-scope_relative_root() {
-  case "$1" in
-    freellmapi) printf 'Projects/freellmapi' ;;
-    shared) printf 'Shared' ;;
-    profile) printf 'Profile' ;;
-    *) printf 'Projects/%s' "$1" ;;
-  esac
-}
-
-required_projects() {
-  [ -z "$BRAIN_SCOPE" ] || printf '%s\n' "$BRAIN_SCOPE"
-  [ "$BRAIN_SCOPE" = "shared" ] || printf 'shared\n'
-  [ "$BRAIN_SCOPE" = "profile" ] || printf 'profile\n'
-}
-
-expected_project_path() {
-  printf '/app/data/%s' "$(scope_relative_root "$1")"
-}
-
-inspect_memory_mappings() {
-  local config_volume="$1" expected_file="$2" script
-  script='const fs=require("fs");let doc;try{doc=JSON.parse(fs.readFileSync("/cfg/config.json","utf8"));}catch(e){if(e&&e.code==="ENOENT"){console.log("CONFIG_MISSING");process.exit(0);}console.log("CONFIG_INVALID");process.exit(0);}const projects=(doc&&doc.projects)||{};const lines=fs.readFileSync("/expected.txt","utf8").split("\n").filter(Boolean);for(const line of lines){const parts=line.split("\t");const entry=projects[parts[0]];if(!entry){console.log("MISSING\t"+parts[0]);}else if(entry.path!==parts[1]){console.log("MISMATCH\t"+parts[0]+"\t"+entry.path);}}'
-  docker run --rm --user 0:0 \
-    -v "$config_volume":/cfg:ro \
-    -v "$expected_file":/expected.txt:ro \
-    --entrypoint node "$NODE_IMAGE" -e "$script"
 }
 
 volume_is_writable_by_runtime() {
@@ -171,8 +143,11 @@ main() {
   write_env_file "$vault_raw" "$brain_port"
   chmod 600 "$ROOT_DIR/.env"
 
-  printf 'setup: building second-brain:local from %s\n' "$NODE_IMAGE"
-  docker build --build-arg "NODE_IMAGE=$NODE_IMAGE" -t second-brain:local "$ROOT_DIR"
+  printf 'setup: building second-brain:local from %s and %s\n' "$NODE_IMAGE" "$PYTHON_IMAGE"
+  docker build \
+    --build-arg "NODE_IMAGE=$NODE_IMAGE" \
+    --build-arg "PYTHON_IMAGE=$PYTHON_IMAGE" \
+    -t second-brain:local "$ROOT_DIR"
 
   printf 'setup: generating configuration and secrets in %s\n' "$ROOT_DIR"
   local scope_args=()
@@ -199,7 +174,7 @@ main() {
   fi
 
   local name vol
-  for name in brain-state memory-state model-cache; do
+  for name in brain-state; do
     vol="${COMPOSE_PROJECT_NAME}_${name}"
     if docker volume inspect "$vol" >/dev/null 2>&1; then
       if volume_is_writable_by_runtime "$vol"; then
@@ -215,65 +190,9 @@ main() {
     chown_new_volume "$vol"
   done
 
-  local config_volume="${COMPOSE_PROJECT_NAME}_memory-state"
-  local expected_file
-  expected_file="$(mktemp "$ROOT_DIR/.brain-projects.XXXXXX")"
-  local project
-  while IFS= read -r project; do
-    printf '%s\t%s\n' "$project" "$(expected_project_path "$project")" >> "$expected_file"
-  done < <(required_projects)
-
-  local verdict mismatch=()
-  verdict="$(inspect_memory_mappings "$config_volume" "$expected_file")"
-  if printf '%s' "$verdict" | grep -q '^CONFIG_INVALID$'; then
-    rm -f "$expected_file"
-    fail "Basic Memory config.json is not valid JSON; refusing to seed project mappings"
-  fi
-
-  local missing=()
-  while IFS=$'\t' read -r kind first second; do
-    case "$kind" in
-      CONFIG_MISSING) while IFS= read -r project; do missing+=("$project"); done < <(required_projects) ;;
-      MISSING) missing+=("$first") ;;
-      MISMATCH) mismatch+=("$first=$second") ;;
-    esac
-  done <<< "$verdict"
-
-  if [ ${#mismatch[@]} -gt 0 ]; then
-    rm -f "$expected_file"
-    fail "Basic Memory project mapping mismatch (expected path differs): ${mismatch[*]}"
-  fi
-
-  if [ ${#missing[@]} -eq 0 ]; then
-    printf 'setup: Basic Memory project mappings already correct; preserving\n'
-  else
-    if ! docker run --rm --user "$BRAIN_UID:$BRAIN_GID" -v "$vault_abs":/app/data "$NODE_IMAGE" \
-        sh -c 'test -w /app/data'; then
-      rm -f "$expected_file"
-      fail "vault path is not writable by uid $BRAIN_UID: $vault_abs"
-    fi
-    local bm=(docker run --rm --user "$BRAIN_UID:$BRAIN_GID"
-      -e BASIC_MEMORY_CONFIG_DIR=/home/appuser/.basic-memory
-      -e BASIC_MEMORY_HOME=/home/appuser/.basic-memory/home
-      -e BASIC_MEMORY_PROJECT_ROOT=
-      -v "$config_volume":/home/appuser/.basic-memory
-      -v "$vault_abs":/app/data
-      --entrypoint basic-memory "$BASIC_MEMORY_IMAGE")
-    for project in ${missing[@]+"${missing[@]}"}; do
-      "${bm[@]}" project add "$project" "$(expected_project_path "$project")"
-    done
-    local after
-    after="$(inspect_memory_mappings "$config_volume" "$expected_file")"
-    if printf '%s' "$after" | grep -qE '^(MISSING|MISMATCH|CONFIG_)'; then
-      rm -f "$expected_file"
-      fail "Basic Memory project mappings are still incomplete after seeding"
-    fi
-    printf 'setup: seeded Basic Memory project mappings: %s\n' "${missing[*]}"
-  fi
-  rm -f "$expected_file"
-
   printf 'setup: complete\n'
   printf 'setup: next run "docker compose up -d --build"\n'
+  printf 'setup: prepare the local model explicitly with "bash scripts/prepare-models.sh" before enabling reranking\n'
   printf 'setup: check with "docker compose exec brain node dist/cli.js health"\n'
 }
 

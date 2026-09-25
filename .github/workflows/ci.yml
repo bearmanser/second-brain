@@ -9,7 +9,6 @@ permissions:
 
 env:
   NODE_VERSION: '24.21.0'
-  FASTEMBED_MODEL: bge-small-en-v1.5-onnx-q
   GATE_LOGS: /tmp/opencode/ci-gate
 
 jobs:
@@ -31,11 +30,11 @@ jobs:
         run: |
           echo "NOT RUN: tests/eval/run.mts --mode instruction and --mode agent require an approved chat-model budget."
           echo "NOT RUN: the remote Streamable-HTTP MCP transport pilot requires a reachable client host."
-          echo "NOT RUN: the real-backend retrieval gate needs Docker and runs in the docker job."
+          echo "NOT RUN: offline Laya artifact checks need prepared model snapshots on a target CPU host."
           echo "These are reported as NOT RUN, never as green."
 
   docker:
-    name: docker (integration, e2e, real-backend retrieval)
+    name: docker (integration, e2e, single-container lifecycle)
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     needs: fast
@@ -47,52 +46,31 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
-      - name: resolve pinned dependency and container inputs
+      - name: resolve pinned container inputs
         run: |
           set -euo pipefail
-          node -e '
-            const fs = require("fs");
-           for (const line of fs.readFileSync("config/images.env", "utf8").split("\n")) {
-              const [key, ...rest] = line.split("=");
-              if (key === "NODE_IMAGE" || key === "BASIC_MEMORY_IMAGE") {
-                fs.appendFileSync(process.env.GITHUB_ENV, `${key}=${rest.join("=")}\n`);
-             }
-           }
-           '
-          export NODE_IMAGE="$(sed -n 's/^NODE_IMAGE=//p' config/images.env)"
-          export BASIC_MEMORY_IMAGE="$(sed -n 's/^BASIC_MEMORY_IMAGE=//p' config/images.env)"
-          test -n "$NODE_IMAGE"
-          test -n "$BASIC_MEMORY_IMAGE"
+          for key in NODE_IMAGE PYTHON_IMAGE; do
+            value="$(sed -n "s/^${key}=//p" config/images.env)"
+            test -n "$value"
+            printf '%s=%s\n' "$key" "$value" >> "$GITHUB_ENV"
+          done
       - name: pull pinned images
         run: |
           docker pull "$NODE_IMAGE"
-          docker pull "$BASIC_MEMORY_IMAGE"
-      - name: restore FastEmbed model assets keyed by model and pinned backend digest (actions/cache v4.2.0)
-        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57
-        with:
-          path: ${{ runner.temp }}/fastembed-cache
-          key: fastembed-${{ env.FASTEMBED_MODEL }}-${{ env.BASIC_MEMORY_IMAGE }}
+          docker pull "$PYTHON_IMAGE"
       - run: npm ci
       - name: prepare the scratch workspace used by the Docker suites
         run: mkdir -p /tmp/opencode "$GATE_LOGS"
       - name: integration suites
-        env:
-          BRAIN_E2E_MODEL_CACHE: ${{ runner.temp }}/fastembed-cache
         run: |
           set -o pipefail
           npm run test:integration 2>&1 | tee "$GATE_LOGS/integration.log"
-      - name: end-to-end suites against synthetic volumes
+      - name: end-to-end suites against disposable volumes
         env:
-          BRAIN_E2E_MODEL_CACHE: ${{ runner.temp }}/fastembed-cache
+          BRAIN_E2E_LIVE: '1'
         run: |
           set -o pipefail
           npm run test:e2e 2>&1 | tee "$GATE_LOGS/e2e.log"
-      - name: retrieval gate against the real disposable Brain (no chat model)
-        env:
-          BRAIN_E2E_MODEL_CACHE: ${{ runner.temp }}/fastembed-cache
-        run: |
-          set -o pipefail
-          npm run eval:retrieval 2>&1 | tee "$GATE_LOGS/eval-retrieval.log"
       - name: upload gate transcripts (actions/upload-artifact v4.6.0)
         if: always()
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08

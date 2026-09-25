@@ -72,16 +72,16 @@ read_images_env() {
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       NODE_IMAGE=*) NODE_IMAGE="${line#NODE_IMAGE=}" ;;
-      BASIC_MEMORY_IMAGE=*) BASIC_MEMORY_IMAGE="${line#BASIC_MEMORY_IMAGE=}" ;;
+      PYTHON_IMAGE=*) PYTHON_IMAGE="${line#PYTHON_IMAGE=}" ;;
     esac
   done < "$file"
   [ -n "${NODE_IMAGE:-}" ] || fail "NODE_IMAGE is missing from $file"
-  [ -n "${BASIC_MEMORY_IMAGE:-}" ] || fail "BASIC_MEMORY_IMAGE is missing from $file"
+  [ -n "${PYTHON_IMAGE:-}" ] || fail "PYTHON_IMAGE is missing from $file"
 }
 NODE_IMAGE=""
-BASIC_MEMORY_IMAGE=""
+PYTHON_IMAGE=""
 read_images_env
-export NODE_IMAGE BASIC_MEMORY_IMAGE
+export NODE_IMAGE PYTHON_IMAGE
 
 if [ "$ASSUME_YES" != "1" ]; then
   if [ -t 0 ]; then
@@ -116,7 +116,7 @@ resolve_compose_volumes() {
 }
 
 SELECTED_VOLUMES=()
-EXPECTED_VOLUMES=("brain-state" "memory-state" "model-cache")
+EXPECTED_VOLUMES=("brain-state")
 if [ "$NOTES_ONLY" = "0" ]; then
   if ! RESOLVED_VOLUMES="$(resolve_compose_volumes)"; then
     fail "Compose volume discovery failed"
@@ -321,7 +321,7 @@ MANIFEST_ARGS=(
   --root /backup
   --out /backup/manifest.json
   --store "$STORE_ARG"
-  --image "brain=$NODE_IMAGE,basic-memory=$BASIC_MEMORY_IMAGE"
+  --image "brain=$NODE_IMAGE,python=$PYTHON_IMAGE"
 )
 if [ -n "$VOLUME_MAP" ]; then
   MANIFEST_ARGS+=(--volume "$VOLUME_MAP")

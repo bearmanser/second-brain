@@ -244,15 +244,6 @@ OVERRIDE="$(mktemp)"
   printf '      - %s:/vault:ro\n' "$NEW_ROOT/vault"
   printf '      - %s:/var/lib/second-brain\n' "$NEW_ROOT/volumes/brain-state"
   printf '      - %s/config/brain.yaml:/run/brain/brain.yaml:ro\n' "$ROOT_DIR"
-  printf '  memory:\n'
-  printf '    volumes: !override\n'
-  printf '      - %s:/app/data\n' "$NEW_ROOT/vault"
-  if [ -d "$NEW_ROOT/volumes/memory-state" ]; then
-    printf '      - %s:/home/appuser/.basic-memory\n' "$NEW_ROOT/volumes/memory-state"
-  fi
-  if [ -d "$NEW_ROOT/volumes/model-cache" ]; then
-    printf '      - %s:/home/appuser/.basic-memory/fastembed_cache\n' "$NEW_ROOT/volumes/model-cache"
-  fi
 } > "$OVERRIDE"
 
 cleanup_stack() {

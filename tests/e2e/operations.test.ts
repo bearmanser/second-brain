@@ -24,6 +24,7 @@ const COPY_ITEMS = [
   'config'
 ] as const;
 const SUITE_TIMEOUT = 2_400_000;
+const LEGACY_TWO_SERVICE = process.env.BRAIN_E2E_LEGACY === '1';
 const NOTE_TITLE = 'Operations integration lesson';
 
 let workDir = '';
@@ -168,6 +169,7 @@ function projectStateFromDirectory(directory: string): {
 }
 
 beforeAll(async () => {
+  if (!LEGACY_TWO_SERVICE) return;
   run('docker', ['version', '--format', '{{.Server.Version}}'], { cwd: REPO_ROOT });
 
   for (const line of readFileSync(join(REPO_ROOT, 'config/images.env'), 'utf8').split('\n')) {
@@ -249,6 +251,7 @@ beforeAll(async () => {
 }, SUITE_TIMEOUT);
 
 afterAll(async () => {
+  if (!LEGACY_TWO_SERVICE) return;
   try {
     await client?.close();
   } catch {
@@ -271,7 +274,9 @@ afterAll(async () => {
   if (workDir.length > 0) rmSync(workDir, { recursive: true, force: true });
 }, SUITE_TIMEOUT);
 
-describe('disposable Compose operations', () => {
+describe.skipIf(!LEGACY_TWO_SERVICE)(
+  'disposable Compose operations (retired two-service architecture; superseded by single-container.test.ts)',
+  () => {
   test('backup.sh archives the vault and volumes with a stable Compose-key mapping', async () => {
     const manifest = manifestOf(backupDir);
     expect(manifest.format_version).toBe(1);

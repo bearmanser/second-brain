@@ -830,7 +830,7 @@ export async function recallLocalTraced(
   const scope = normalizeRecallScope(request, {
     canonicalId: (identifier) => deps.projects.canonicalId(identifier)
   });
-  const modeInfo = normalizeRecallMode(request.mode);
+  const modeInfo = normalizeRecallMode(request.mode ?? deps.config.search_mode);
   const warnings = [...scope.warnings, ...modeInfo.warnings];
   const projectId = scope.filter.mode === 'project' ? scope.filter.identifier : undefined;
   const projectRoots: string[] = [];

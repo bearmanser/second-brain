@@ -13,9 +13,6 @@
 # the shipped Compose file: only the gateway endpoint is published.
 endpoint: http://127.0.0.1:7331/mcp
 
-# Private Basic Memory MCP endpoint. It is reachable only from the gateway.
-backend_endpoint: http://memory:8000/mcp
-
 # Listen port inside the gateway container.
 port: 7331
 
@@ -40,7 +37,7 @@ allowed_origins:
   - http://127.0.0.1:7331
   - http://localhost:7331
 
-# Reserved static scopes map to separate Basic Memory projects and vault roots.
+# Reserved static scopes map to separate vault roots and project records.
 # Repository projects are normally created dynamically by brain_project_ensure
 # and persisted in journal.db; they do not need entries here. The freellmapi
 # entry below demonstrates compatibility with an explicitly pre-provisioned
@@ -81,3 +78,20 @@ limits:
 # only after confirming with the installed client which representation it
 # actually injects into the model context.
 result_delivery: structured
+
+# Retrieval mode. `text` never depends on the local Laya model. Enabling
+# `reranked` requires `laya.enabled: true` (or BRAIN_LAYA_ENABLED=true) unless
+# `search_fallback_only: true` explicitly records a lexical-fallback-only
+# deployment; an inconsistent pair fails closed with INVALID_INPUT.
+search_mode: text
+search_fallback_only: false
+
+# Local Laya reranker. Disabled by default; the operator prepares the immutable
+# model snapshot explicitly and enables it only after the evaluated gate.
+laya:
+  enabled: false
+  python: python3
+  threads: 2
+  batch_size: 8
+  queue_batches: 4
+  timeout_ms: 4000

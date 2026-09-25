@@ -39,7 +39,8 @@ export function resolveHealthToken(options: HealthOptions = {}): string | undefi
 }
 
 interface StatusEnvelope {
-  health?: { gateway?: unknown; backend?: unknown };
+  health?: { gateway?: unknown; backend?: unknown; index?: unknown; worker?: unknown };
+  local?: { worker?: { state?: unknown }; index?: { state?: unknown } };
 }
 
 function readStatus(result: unknown): StatusEnvelope | undefined {
@@ -96,9 +97,25 @@ export async function health(
     const status = readStatus(result);
     const gateway = status?.health?.gateway;
     const backend = status?.health?.backend;
+    const localIndex = status?.health?.index;
     if (gateway !== 'ready') {
       diagnostic(`the gateway is not ready (${String(gateway ?? 'unknown')})`);
       return false;
+    }
+    if (localIndex !== undefined) {
+      if (localIndex !== 'ready') {
+        diagnostic(`the local index is not ready (${String(localIndex)})`);
+        return false;
+      }
+      return true;
+    }
+    if (status?.local !== undefined) {
+      const index = status.local.index?.state;
+      if (index !== undefined && index !== 'ready') {
+        diagnostic(`the local index is not ready (${String(index)})`);
+        return false;
+      }
+      return true;
     }
     if (backend !== 'ready') {
       diagnostic(`the backend is not ready (${String(backend ?? 'unknown')})`);

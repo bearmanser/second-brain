@@ -1,5 +1,12 @@
 # Compatibility baseline
 
+> **Historical record.** The Basic Memory observations in this document were
+> captured before Task 18 removed the live Basic Memory dependency. They are
+> retained for reproducibility of the legacy import fixtures and are **not** the
+> current deployment. The current deployment is one application container with
+> owned local retrieval (Node 24 + Python 3.12 + supervised Laya worker); see
+> `docs/setup.md`.
+
 Task 1 executable compatibility baseline for the second-brain gateway. Every version,
 digest, tool name, and wire shape below was observed on the execution host on 2026-09-20.
 Nothing here is inferred from documentation. Where a value could not be observed it is
@@ -10,7 +17,8 @@ marked as such.
 | Component | Version |
 |---|---|
 | Node.js (host, `process.version`) | v24.21.0 |
-| Node.js (pinned image `node:24-alpine`) | v24.21.0 |
+| Node.js (pinned image `node:24-bookworm-slim`) | v24.21.0 |
+| Python (pinned image `python:3.12-slim`) | 3.12 |
 | npm | 11.19.0 |
 | TypeScript | 7.0.2 |
 | Vitest | 5.0.1 |
@@ -38,14 +46,14 @@ writes the `RepoDigest` values to both `config/images.env` and `config/dependenc
 
 | Image | Reference in lock |
 |---|---|
-| Node base | `node@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1` |
-| Basic Memory | `ghcr.io/basicmachines-co/basic-memory@sha256:939f1173d96626c280763e14622f2381d49fbbb7db17cae2e832f4f639405643` |
+| Node base | `node@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6` |
+| Python base | `python@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9` |
 
-The floating discovery inputs `node:24-alpine` and
-`ghcr.io/basicmachines-co/basic-memory:latest` are accepted only as arguments to
-`scripts/lock-images.mjs`. They are not written to `config/images.env` or the JSON lock.
+The floating discovery inputs `node:24-bookworm-slim` and `python:3.12-slim` are
+accepted only as arguments to `scripts/lock-images.mjs`. They are not written to
+`config/images.env` or the JSON lock.
 
-### Basic Memory backend identity
+### Basic Memory backend identity (historical)
 
 | Field | Value |
 |---|---|

@@ -1,3 +1,6 @@
+// Historical compatibility probe for the retired Basic Memory backend. It is
+// retained so the sanitized fixtures used by the legacy import tests can be
+// regenerated reproducibly; the production deployment no longer runs it.
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
