@@ -4152,7 +4152,16 @@ function journalWith(rows: [string, string][]): string {
   const dir = scratch('journal');
   const file = join(dir, 'journal.db');
   const db = new Database(file);
-  db.exec('CREATE TABLE projects_v2 (name TEXT, repository_identity TEXT)');
+  db.exec(`CREATE TABLE projects_v2 (
+    id TEXT PRIMARY KEY,
+    repository_identity TEXT UNIQUE,
+    display_name TEXT NOT NULL,
+    relative_root TEXT NOT NULL UNIQUE,
+    legacy_scope TEXT UNIQUE,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`);
   const insert = db.prepare('INSERT INTO projects_v2 (name, repository_identity) VALUES (?, ?)');
   for (const [name, identity] of rows) insert.run(name, identity);
   db.close();
