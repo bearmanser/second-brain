@@ -6,9 +6,7 @@ coverage
 .superpowers
 docs
 tests
-vault
-secrets
-config
+/vault
 .env
 .env.*
 !.env.example
@@ -16,4 +14,3 @@ config
 *.db
 *.db-wal
 *.db-shm
-basic-memory-data

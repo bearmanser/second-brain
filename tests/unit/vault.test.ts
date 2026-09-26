@@ -1,350 +1,77 @@
-import { afterEach, expect, test } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { open } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-import { BrainError, type BrainErrorCode } from '../../src/contracts/errors.js';
-import { RENDERED_NOTE_MAX_BYTES } from '../../src/core/limits.js';
-import type { ScopeConfig, StoredRevision } from '../../src/core/types.js';
-import { renderRevision } from '../../src/notes/codec.js';
-import { hashRaw, relativePathFor } from '../../src/notes/identity.js';
-import { FileVault, readBoundedBytes, type ByteReader } from '../../src/storage/vault.js';
-import { fixtureIds, lessonFixture } from '../fixtures/content.js';
+import { existsSync, readFileSync, readdirSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { expect, test } from 'vitest';
+import { Vault, sha256 } from '../../src/vault/vault.js';
+import { scratch, writeTree } from '../helpers.js';
 
-const temporaryRoot = join('/tmp/opencode', 'brain-vault-tests');
-const temporaryDirectories: string[] = [];
+function vaultWith(files: Record<string, string>): { vault: Vault; root: string } {
+  const root = scratch('vault');
+  writeTree(root, files);
+  return { vault: new Vault(root), root };
+}
 
-const scopeConfig: ScopeConfig = {
-  id: 'freellmapi',
-  backend_project: 'freellmapi',
-  relative_root: 'freellmapi',
-  repository_aliases: []
-};
-
-const sharedScope: ScopeConfig = {
-  id: 'shared',
-  backend_project: 'shared',
-  relative_root: 'shared',
-  repository_aliases: []
-};
-
-afterEach(() => {
-  while (temporaryDirectories.length > 0) {
-    const directory = temporaryDirectories.pop();
-    if (directory !== undefined) rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-const makeVaultRoot = (): string => {
-  mkdirSync(temporaryRoot, { recursive: true });
-  const directory = mkdtempSync(join(temporaryRoot, 'case-'));
-  temporaryDirectories.push(directory);
-  return directory;
-};
-
-const writeFile = (root: string, relativePath: string, contents: string): string => {
-  const absolute = join(root, ...relativePath.split('/'));
-  mkdirSync(dirname(absolute), { recursive: true });
-  writeFileSync(absolute, contents, 'utf8');
-  return absolute;
-};
-
-let sequence = 0;
-const nextUuid = (): string => {
-  sequence += 1;
-  return `00000000-0000-4000-8000-${sequence.toString(16).padStart(12, '0')}`;
-};
-
-const makeRevision = (overrides: Partial<StoredRevision> = {}): StoredRevision => ({
-  id: nextUuid(),
-  revision_id: nextUuid(),
-  parents: [],
-  scope: scopeConfig.id,
-  status: 'candidate',
-  note: lessonFixture,
-  created_at: '2026-09-01T00:00:00Z',
-  modified_at: '2026-09-01T00:05:00Z',
-  operation_id: fixtureIds.idempotencyKey,
-  extra_frontmatter: {},
-  extra_markdown: '',
-  ...overrides
-});
-
-test('registers only an existing dynamic scope directory and rejects mapping changes', async () => {
-  const root = makeVaultRoot();
-  mkdirSync(join(root, scopeConfig.relative_root), { recursive: true });
-  const vault = new FileVault(root, [scopeConfig]);
-  const dynamic: ScopeConfig = {
-    id: 'second-brain',
-    backend_project: 'second-brain',
-    relative_root: 'Projects/second-brain',
-    repository_aliases: []
-  };
-  expect(() => vault.registerScope(dynamic)).toThrow(/RECOVERY_REQUIRED/);
-  mkdirSync(join(root, 'Projects', 'second-brain'), { recursive: true });
-  expect(() => vault.registerScope(dynamic)).not.toThrow();
-  expect(() => vault.registerScope(dynamic)).not.toThrow();
-  await expect(vault.list(dynamic.id)).resolves.toEqual([]);
-  expect(() => vault.registerScope({ ...dynamic, relative_root: 'Projects/other' })).toThrow(
-    /FORBIDDEN/
-  );
-});
-
-const managedPath = (revision: StoredRevision): string =>
-  relativePathFor(
-    scopeConfig.relative_root,
-    revision.note.content.kind,
-    revision.id,
-    revision.note.title,
-    revision.revision_id
-  );
-
-const expectBrain = async (action: Promise<unknown>, code: BrainErrorCode): Promise<void> => {
-  try {
-    await action;
-  } catch (error) {
-    expect(error).toBeInstanceOf(BrainError);
-    expect((error as BrainError).code).toBe(code);
-    return;
-  }
-  throw new Error(`expected BrainError ${code} but the action resolved`);
-};
-
-test('lists only managed Markdown inside the configured scope root', async () => {
-  const root = makeVaultRoot();
-  const first = makeRevision();
-  const nested = makeRevision();
-  const otherScopeRevision = makeRevision({ scope: sharedScope.id });
-
-  const firstPath = managedPath(first);
-  writeFile(root, firstPath, renderRevision(first, scopeConfig));
-  const nestedPath = managedPath(nested);
-  writeFile(root, nestedPath, renderRevision(nested, scopeConfig));
-  writeFile(root, 'freellmapi/.obsidian/hidden.md', renderRevision(otherScopeRevision, sharedScope));
-  writeFile(root, 'freellmapi/.git/config', 'not markdown');
-  writeFile(root, 'freellmapi/README.txt', renderRevision(otherScopeRevision, sharedScope));
-  writeFile(root, 'freellmapi/Notes/plain.md', '# A human note with no Brain schema marker\n');
-  writeFile(root, 'freellmapi/Lessons/notes.txt', 'ignored');
-  writeFile(root, 'shared/Projects/kept.md', renderRevision(otherScopeRevision, sharedScope));
-
-  const vault = new FileVault(root, [scopeConfig, sharedScope]);
-  const listed = await vault.list(scopeConfig.id);
-  expect(listed).toEqual([firstPath, nestedPath].sort());
-  expect(await vault.list(sharedScope.id)).toEqual(['shared/Projects/kept.md']);
-});
-
-test('reads managed bytes and returns their exact hash and relative path', async () => {
-  const root = makeVaultRoot();
-  const revision = makeRevision();
-  const path = managedPath(revision);
-  const raw = renderRevision(revision, scopeConfig);
-  writeFile(root, path, raw);
-
-  const vault = new FileVault(root, [scopeConfig]);
-  const read = await vault.read(scopeConfig.id, path);
-  expect(read.raw).toBe(raw);
-  expect(read.raw_hash).toBe(hashRaw(raw));
-  expect(read.raw_hash).toMatch(/^[a-f0-9]{64}$/);
-  expect(read.relative_path).toBe(path);
-  expect(await vault.read(scopeConfig.id, path)).toEqual(read);
-});
-
-test('rejects traversal, encoded traversal, absolute, and foreign-root paths', async () => {
-  const root = makeVaultRoot();
-  const vault = new FileVault(root, [scopeConfig, sharedScope]);
-
-  await expectBrain(vault.read(scopeConfig.id, 'freellmapi/../shared/secret.md'), 'FORBIDDEN');
-  await expectBrain(vault.read(scopeConfig.id, 'freellmapi/Notes/%2e%2e/%2e%2e/secret.md'), 'FORBIDDEN');
-  await expectBrain(vault.read(scopeConfig.id, 'freellmapi/Notes/%2E%2E/secret.md'), 'FORBIDDEN');
-  await expectBrain(vault.read(scopeConfig.id, '/etc/passwd'), 'FORBIDDEN');
-  await expectBrain(vault.read(scopeConfig.id, 'freellmapi\\Notes\\lesson.md'), 'FORBIDDEN');
-  await expectBrain(vault.read(scopeConfig.id, 'shared/secret.md'), 'FORBIDDEN');
-  await expectBrain(vault.read(scopeConfig.id, 'freellmapi'), 'FORBIDDEN');
-  await expectBrain(vault.read(scopeConfig.id, 'freellmapi/Notes/./lesson.md'), 'FORBIDDEN');
-  await expectBrain(vault.read(scopeConfig.id, 'freellmapi/Notes//lesson.md'), 'FORBIDDEN');
-  await expectBrain(vault.read(scopeConfig.id, 'freellmapi/Notes/lesson.txt'), 'INVALID_INPUT');
-});
-
-test('rejects a symlinked directory and a symlinked Markdown leaf', async () => {
-  const root = makeVaultRoot();
-  const outside = makeVaultRoot();
-  const revision = makeRevision();
-  writeFile(outside, 'secret.md', renderRevision(revision, scopeConfig));
-
-  mkdirSync(join(root, 'freellmapi', 'Lessons'), { recursive: true });
-  symlinkSync(outside, join(root, 'freellmapi', 'Lessons', 'linked'), 'dir');
-  mkdirSync(join(root, 'freellmapi', 'Notes', revision.id), { recursive: true });
-  symlinkSync(
-    join(outside, 'secret.md'),
-    join(root, 'freellmapi', 'Notes', revision.id, 'leaf.md'),
-    'file'
-  );
-
-  const vault = new FileVault(root, [scopeConfig]);
-  expect(await vault.list(scopeConfig.id)).toEqual([]);
-  await expectBrain(
-    vault.read(scopeConfig.id, 'freellmapi/Lessons/linked/secret.md'),
-    'FORBIDDEN'
-  );
-  await expectBrain(
-    vault.read(scopeConfig.id, `freellmapi/Notes/${revision.id}/leaf.md`),
-    'FORBIDDEN'
-  );
-});
-
-test('revalidates the scope directory chain after construction', async () => {
-  const root = makeVaultRoot();
-  const outside = makeVaultRoot();
-  const revision = makeRevision();
-  writeFile(outside, 'secret.md', renderRevision(revision, scopeConfig));
-  mkdirSync(join(root, 'freellmapi', 'Lessons'), { recursive: true });
-  const vault = new FileVault(root, [scopeConfig]);
-  symlinkSync(outside, join(root, 'freellmapi', 'Lessons', 'linked'), 'dir');
-  expect(await vault.list(scopeConfig.id)).toEqual([]);
-  await expectBrain(
-    vault.read(scopeConfig.id, 'freellmapi/Lessons/linked/secret.md'),
-    'FORBIDDEN'
-  );
-});
-
-test('rejects an intermediate configured-root component replaced by a symlink', async () => {
-  const root = makeVaultRoot();
-  const outside = makeVaultRoot();
-  const nestedScope: ScopeConfig = {
-    id: 'nested',
-    backend_project: 'nested',
-    relative_root: 'freellmapi/team/scope',
-    repository_aliases: []
-  };
-  const revision = makeRevision();
-  const filePath = 'freellmapi/team/scope/Lessons/x/note.md';
-  writeFile(root, filePath, renderRevision(revision, scopeConfig));
-  const vault = new FileVault(root, [nestedScope]);
-  expect(await vault.list('nested')).toEqual([filePath]);
-
-  rmSync(join(root, 'freellmapi', 'team'), { recursive: true, force: true });
-  mkdirSync(join(outside, 'scope', 'Lessons', 'x'), { recursive: true });
-  writeFileSync(join(outside, 'scope', 'Lessons', 'x', 'note.md'), renderRevision(revision, scopeConfig), 'utf8');
-  symlinkSync(outside, join(root, 'freellmapi', 'team'), 'dir');
-
-  await expectBrain(vault.list('nested'), 'FORBIDDEN');
-  await expectBrain(vault.read('nested', filePath), 'FORBIDDEN');
-});
-
-test('rejects a read that overflows the byte budget after the size check', async () => {
-  let allocated = 0;
-  const growing: ByteReader = {
-    read: async (buffer, _offset, length) => {
-      allocated = buffer.length;
-      buffer.fill(0x61, 0, length);
-      return { bytesRead: length };
-    }
-  };
-  const result = await readBoundedBytes(growing, RENDERED_NOTE_MAX_BYTES);
-  expect(result).toEqual({ kind: 'overflow' });
-  expect(allocated).toBe(RENDERED_NOTE_MAX_BYTES + 1);
-});
-
-test('bounds the file size at the rendered-note limit', async () => {
-  const root = makeVaultRoot();
-  writeFile(root, 'freellmapi/Notes/big.md', 'x'.repeat(RENDERED_NOTE_MAX_BYTES + 1));
-  const vault = new FileVault(root, [scopeConfig]);
-  await expectBrain(vault.read(scopeConfig.id, 'freellmapi/Notes/big.md'), 'LIMIT_EXCEEDED');
-});
-
-test('reads at most the byte budget instead of allocating a growing file', async () => {
-  const root = makeVaultRoot();
-  const absolute = writeFile(root, 'freellmapi/Notes/small.md', '0123456789');
-  const overflowing = await open(absolute, 'r');
-  try {
-    expect(await readBoundedBytes(overflowing, 4)).toEqual({ kind: 'overflow' });
-  } finally {
-    await overflowing.close();
-  }
-  const within = await open(absolute, 'r');
-  try {
-    const result = await readBoundedBytes(within, 32);
-    expect(result.kind).toBe('ok');
-    if (result.kind === 'ok') expect(result.buffer.toString('utf8')).toBe('0123456789');
-  } finally {
-    await within.close();
-  }
-});
-
-test('rejects a configured scope root that traverses a symbolic link', () => {
-  const root = makeVaultRoot();
-  const outside = makeVaultRoot();
-  mkdirSync(join(outside, 'scope'), { recursive: true });
-  symlinkSync(outside, join(root, 'link'), 'dir');
-  const config: ScopeConfig = {
-    id: 'linked',
-    backend_project: 'linked',
-    relative_root: 'link/scope',
-    repository_aliases: []
-  };
-  expect(() => new FileVault(root, [config])).toThrow(/FORBIDDEN/);
-  expect(() => new FileVault(root, [config])).toThrow(BrainError);
-});
-
-test('rejects an unsafe configured relative_root instead of resolving it', () => {
-  const root = makeVaultRoot();
-  const config = (relativeRoot: string): ScopeConfig => ({
-    id: 'escape',
-    backend_project: 'escape',
-    relative_root: relativeRoot,
-    repository_aliases: []
+test('lists markdown notes and skips dot entries, other files, and symlinks', () => {
+  const { vault, root } = vaultWith({
+    'Projects/A/one.md': '1',
+    'Notes/two.md': '22',
+    '.obsidian/app.md': 'x',
+    '.trash/old.md': 'x',
+    'Projects/A/.hidden.md': 'x',
+    'Projects/A/image.png': 'x'
   });
-  expect(() => new FileVault(root, [config('../escape')])).toThrow(/FORBIDDEN/);
-  expect(() => new FileVault(root, [config('/etc')])).toThrow(/FORBIDDEN/);
-  expect(() => new FileVault(root, [config('a\\b')])).toThrow(/FORBIDDEN/);
-  expect(() => new FileVault(root, [config('.hidden')])).toThrow(/FORBIDDEN/);
-  expect(() => new FileVault(root, [config('a/%2e%2e/b')])).toThrow(/FORBIDDEN/);
+  symlinkSync(join(root, 'Notes/two.md'), join(root, 'Notes/link.md'));
+  const files = vault.list().map((f) => f.path).sort();
+  expect(files).toEqual(['Notes/two.md', 'Projects/A/one.md']);
+  expect(vault.list().find((f) => f.path === 'Notes/two.md')?.size).toBe(2);
 });
 
-test('retries an unstable read and succeeds on a later attempt', async () => {
-  const root = makeVaultRoot();
-  const revision = makeRevision();
-  const path = managedPath(revision);
-  const raw = renderRevision(revision, scopeConfig);
-  writeFile(root, path, raw);
-  const vault = new FileVault(root, [scopeConfig]);
-  const internals = vault as unknown as {
-    readOnce: (...args: unknown[]) => Promise<unknown>;
-  };
-  const original = internals.readOnce.bind(vault);
-  let calls = 0;
-  internals.readOnce = async (...args: unknown[]) => {
-    calls += 1;
-    if (calls === 1) return { kind: 'unstable' };
-    return original(...args);
-  };
-  const read = await vault.read(scopeConfig.id, path);
-  expect(calls).toBe(2);
-  expect(read.raw).toBe(raw);
+test('reads, stats, and checks existence', () => {
+  const { vault } = vaultWith({ 'Notes/a.md': 'hello' });
+  expect(vault.read('Notes/a.md')).toBe('hello');
+  expect(vault.stat('Notes/a.md').size).toBe(5);
+  expect(vault.exists('Notes/a.md')).toBe(true);
+  expect(vault.exists('Notes/missing.md')).toBe(false);
+  expect(() => vault.read('Notes/missing.md')).toThrow(expect.objectContaining({ code: 'NOT_FOUND' }));
 });
 
-test('returns CONFLICT after exhausting the unstable-read retries', async () => {
-  const root = makeVaultRoot();
-  const revision = makeRevision();
-  const path = managedPath(revision);
-  writeFile(root, path, renderRevision(revision, scopeConfig));
-  const vault = new FileVault(root, [scopeConfig]);
-  const internals = vault as unknown as { readOnce: () => Promise<unknown> };
-  let calls = 0;
-  internals.readOnce = async () => {
-    calls += 1;
-    return { kind: 'unstable' };
-  };
-  await expectBrain(vault.read(scopeConfig.id, path), 'CONFLICT');
-  expect(calls).toBe(4);
+test('refuses to cross symbolic links', () => {
+  const { vault, root } = vaultWith({ 'real/a.md': 'x' });
+  symlinkSync(join(root, 'real'), join(root, 'linked'));
+  expect(() => vault.read('linked/a.md')).toThrow(expect.objectContaining({ code: 'INVALID_INPUT' }));
+  expect(() => vault.write('linked/b.md', 'y')).toThrow(expect.objectContaining({ code: 'INVALID_INPUT' }));
 });
 
-test('reports missing files and unconfigured scopes distinctly', async () => {
-  const root = makeVaultRoot();
-  const vault = new FileVault(root, [scopeConfig]);
-  await expectBrain(
-    vault.read(scopeConfig.id, 'freellmapi/Notes/00000000-0000-4000-8000-000000000000/x.md'),
-    'NOT_FOUND'
-  );
-  await expectBrain(vault.read('profile', 'profile/x.md'), 'FORBIDDEN');
-  await expectBrain(vault.list('profile'), 'FORBIDDEN');
+test('writes atomically into new directories without leaving temp files', () => {
+  const { vault, root } = vaultWith({});
+  vault.write('Projects/New/note.md', 'content');
+  expect(readFileSync(join(root, 'Projects/New/note.md'), 'utf8')).toBe('content');
+  vault.write('Projects/New/note.md', 'replaced');
+  expect(readFileSync(join(root, 'Projects/New/note.md'), 'utf8')).toBe('replaced');
+  expect(readdirSync(join(root, 'Projects/New'))).toEqual(['note.md']);
+});
+
+test('moves notes into .trash with collision suffixes', () => {
+  const { vault, root } = vaultWith({ 'Notes/a.md': '1', 'Projects/P/a.md': '2' });
+  expect(vault.trash('Notes/a.md')).toBe('.trash/a.md');
+  expect(vault.trash('Projects/P/a.md')).toBe('.trash/a (2).md');
+  expect(existsSync(join(root, 'Notes/a.md'))).toBe(false);
+  expect(readFileSync(join(root, '.trash/a (2).md'), 'utf8')).toBe('2');
+});
+
+test('removes files and lists project folders', () => {
+  const { vault, root } = vaultWith({ 'Projects/B/x.md': '', 'Projects/A/y.md': '', 'Projects/.hidden/z.md': '' });
+  writeFileSync(join(root, 'Projects/file.md'), '');
+  vault.remove('Projects/B/x.md');
+  expect(vault.exists('Projects/B/x.md')).toBe(false);
+  expect(vault.projectFolders()).toEqual(['A', 'B']);
+});
+
+test('reports mtime changes', () => {
+  const { vault, root } = vaultWith({ 'Notes/a.md': 'x' });
+  utimesSync(join(root, 'Notes/a.md'), new Date(1000), new Date(2000));
+  expect(vault.stat('Notes/a.md').mtimeMs).toBe(2000);
+});
+
+test('hashes with sha256', () => {
+  expect(sha256('abc')).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
 });

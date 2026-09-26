@@ -1,28 +1,20 @@
 {
   "name": "second-brain",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
-  "engines": {
-    "node": ">=24 <25"
-  },
+  "engines": { "node": ">=24 <25" },
   "scripts": {
-    "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "build": "tsc -p tsconfig.build.json && node scripts/copy-assets.mjs",
-    "verify": "npm run typecheck && vitest run tests/unit tests/contract && npm run build",
-    "test:contract": "vitest run tests/contract",
-    "test:integration": "vitest run tests/integration",
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run tests/unit tests/integration",
     "test:e2e": "vitest run tests/e2e",
-    "eval:retrieval": "tsx tests/eval/run.mts --mode retrieval",
-    "probe": "tsx scripts/probe-compatibility.mts"
+    "verify": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
     "better-sqlite3": "13.0.3",
     "express": "5.2.1",
-    "js-tiktoken": "1.0.21",
-    "mdast-util-from-markdown": "2.0.3",
     "yaml": "2.9.1",
     "zod": "4.6.5"
   },
@@ -30,7 +22,6 @@
     "@types/better-sqlite3": "9.6.0",
     "@types/express": "5.0.6",
     "@types/node": "24.13.6",
-    "tsx": "4.23.15",
     "typescript": "7.0.2",
     "vitest": "5.0.1"
   }
