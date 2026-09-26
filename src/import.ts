@@ -99,17 +99,18 @@ function readJournal(file: string): Map<string, string[]> {
   let db: Database.Database | null = null;
   try {
     db = new Database(file, { readonly: true, fileMustExist: true });
-    const rows = db.prepare('SELECT name, repository_identity FROM projects_v2').all() as {
-      name: string;
+    const rows = db.prepare('SELECT display_name, repository_identity FROM projects_v2').all() as {
+      display_name: string;
       repository_identity: string;
     }[];
     for (const row of rows) {
-      const list = out.get(row.name) ?? [];
+      const list = out.get(row.display_name) ?? [];
       list.push(row.repository_identity);
-      out.set(row.name, list);
+      out.set(row.display_name, list);
     }
-  } catch {
-    return out;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`cannot read the project journal at ${file}: ${message}`);
   } finally {
     db?.close();
   }

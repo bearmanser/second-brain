@@ -12,9 +12,33 @@ function journalWith(rows: [string, string][]): string {
   const dir = scratch('journal');
   const file = join(dir, 'journal.db');
   const db = new Database(file);
-  db.exec('CREATE TABLE projects_v2 (name TEXT, repository_identity TEXT)');
-  const insert = db.prepare('INSERT INTO projects_v2 (name, repository_identity) VALUES (?, ?)');
-  for (const [name, identity] of rows) insert.run(name, identity);
+  db.exec(`
+    CREATE TABLE projects_v2 (
+      id TEXT PRIMARY KEY,
+      repository_identity TEXT UNIQUE,
+      display_name TEXT NOT NULL,
+      relative_root TEXT NOT NULL UNIQUE,
+      legacy_scope TEXT UNIQUE,
+      state TEXT NOT NULL CHECK (state IN ('provisioning', 'ready', 'recovery_required')),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `);
+  const insert = db.prepare(
+    'INSERT INTO projects_v2 (id, repository_identity, display_name, relative_root, legacy_scope, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+  );
+  rows.forEach(([displayName, identity], index) => {
+    insert.run(
+      `project-${index}`,
+      identity,
+      displayName,
+      displayName,
+      null,
+      'ready',
+      '2026-09-24T07:36:00.360Z',
+      '2026-09-24T07:36:00.360Z'
+    );
+  });
   db.close();
   return file;
 }
@@ -64,6 +88,38 @@ test('ports notes, rewrites links, and generates project notes', () => {
   expect(readFileSync(join(to, 'Projects/Shared/Shared.md'), 'utf8')).toBe('---\ntype: project\nrepositories: []\n---\n\n# Shared\n');
   expect(existsSync(join(to, '.obsidian/app.json'))).toBe(true);
   expect(existsSync(join(to, 'Projects/Doccary/archive/old.md'))).toBe(false);
+});
+
+test('throws when the journal has the old wrong schema', () => {
+  const from = oldVault();
+  const to = scratch('v2');
+  const dir = scratch('journal');
+  const file = join(dir, 'journal.db');
+  const db = new Database(file);
+  db.exec('CREATE TABLE projects_v2 (name TEXT, repository_identity TEXT)');
+  db.prepare('INSERT INTO projects_v2 (name, repository_identity) VALUES (?, ?)').run('Doccary', 'github.com/Doccary/doccary');
+  db.close();
+
+  let thrown: unknown;
+  try {
+    runImport({ from, to, journal: file });
+  } catch (error) {
+    thrown = error;
+  }
+  expect(thrown).toBeInstanceOf(Error);
+  expect((thrown as Error).message).toContain('cannot read the project journal');
+  expect((thrown as Error).message).toContain(file);
+});
+
+test('imports an existing vault when the journal file is absent', () => {
+  const from = oldVault();
+  const to = scratch('v2');
+  const missing = join(scratch('journal'), 'missing.db');
+  const report = runImport({ from, to, journal: missing });
+  expect(report.written).toContain('Projects/Doccary/Doccary.md');
+  expect(readFileSync(join(to, 'Projects/Doccary/Doccary.md'), 'utf8')).toBe(
+    '---\ntype: project\nrepositories: []\n---\n\n# Doccary\n\n![[Projects/Doccary/Token audit parent worker]]\n'
+  );
 });
 
 test('rewrites a path-qualified cross-project link in a second pass', () => {
