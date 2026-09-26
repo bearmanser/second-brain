@@ -4,12 +4,6 @@ import { pathToFileURL } from 'node:url';
 import { generateBearerToken, sha256Hex } from './auth.js';
 import { loadConfig } from './config.js';
 import { startGateway } from './http.js';
-import { formatReport, runImport } from './import.js';
-
-function flag(args: string[], name: string): string | undefined {
-  const index = args.indexOf(`--${name}`);
-  return index >= 0 ? args[index + 1] : undefined;
-}
 
 export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const [command, ...args] = argv;
@@ -27,18 +21,6 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
     const { token, token_sha256 } = generateBearerToken();
     console.log(`token:         ${token}`);
     console.log(`token_sha256:  ${token_sha256}`);
-    return;
-  }
-  if (command === 'import') {
-    const from = flag(args, 'from');
-    const to = flag(args, 'to');
-    const journal = flag(args, 'journal');
-    if (from === undefined || to === undefined || journal === undefined) {
-      console.error('usage: second-brain import --from <v1 vault> --to <clean vault> --journal <journal.db> [--dry-run]');
-      process.exitCode = 1;
-      return;
-    }
-    process.stdout.write(formatReport(runImport({ from, to, journal, dryRun: args.includes('--dry-run') })));
     return;
   }
   if (command !== undefined && command !== 'serve') {
