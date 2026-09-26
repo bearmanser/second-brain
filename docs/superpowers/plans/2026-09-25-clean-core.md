@@ -4162,8 +4162,10 @@ function journalWith(rows: [string, string][]): string {
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )`);
-  const insert = db.prepare('INSERT INTO projects_v2 (name, repository_identity) VALUES (?, ?)');
-  for (const [name, identity] of rows) insert.run(name, identity);
+  const insert = db.prepare('INSERT INTO projects_v2 (id, display_name, repository_identity, relative_root, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
+  for (const [name, identity] of rows) {
+    insert.run(name, name, identity, `Projects/${name}`, 'ready', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+  }
   db.close();
   return file;
 }
